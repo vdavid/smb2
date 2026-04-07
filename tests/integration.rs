@@ -373,6 +373,108 @@ async fn smb_client_list_shares() {
 
 #[tokio::test]
 #[ignore]
+async fn pipelined_read_large_file() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+
+    // Create a 1 MB test file on the NAS.
+    let test_path = "smb2_test_pipelined_read.tmp";
+    let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
+
+    let written = tree
+        .write_file(&mut conn, test_path, &test_data)
+        .await
+        .expect("write_file failed");
+    println!("Setup: wrote {} bytes to {}", written, test_path);
+
+    // Read it back with pipelined I/O.
+    let start = std::time::Instant::now();
+    let data = tree
+        .read_file_pipelined(&mut conn, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    let elapsed = start.elapsed();
+
+    println!(
+        "Pipelined read: {} bytes in {:.2?} ({:.1} MB/s)",
+        data.len(),
+        elapsed,
+        data.len() as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+    );
+
+    assert_eq!(data.len(), test_data.len(), "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    // Compare with sequential read for timing.
+    let start_seq = std::time::Instant::now();
+    let data_seq = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect("read_file (sequential) failed");
+    let elapsed_seq = start_seq.elapsed();
+
+    println!(
+        "Sequential read: {} bytes in {:.2?} ({:.1} MB/s)",
+        data_seq.len(),
+        elapsed_seq,
+        data_seq.len() as f64 / (1024.0 * 1024.0) / elapsed_seq.as_secs_f64()
+    );
+
+    // Clean up.
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pipelined_write_large_file() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+
+    let test_path = "smb2_test_pipelined_write.tmp";
+    let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 199) as u8).collect();
+
+    // Write with pipelined I/O.
+    let start = std::time::Instant::now();
+    let written = tree
+        .write_file_pipelined(&mut conn, test_path, &test_data)
+        .await
+        .expect("write_file_pipelined failed");
+    let elapsed = start.elapsed();
+
+    println!(
+        "Pipelined write: {} bytes in {:.2?} ({:.1} MB/s)",
+        written,
+        elapsed,
+        written as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+    );
+
+    assert_eq!(written, test_data.len() as u64);
+
+    // Read it back (sequential is fine) and verify.
+    let data = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect("read_file failed");
+
+    assert_eq!(data.len(), test_data.len(), "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    // Clean up.
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn reconnect_after_disconnect() {
     let _ = env_logger::try_init();
 
