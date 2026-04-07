@@ -54,6 +54,9 @@ digest = "0.10"
 md-5 = "0.10"
 md4 = "0.10"
 
+# Cryptographically secure random (already a transitive dep via aes-gcm)
+getrandom = "0.3"
+
 # Compression
 lz4_flex = "0.11"
 

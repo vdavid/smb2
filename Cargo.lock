@@ -799,6 +799,7 @@ dependencies = [
  "cmac",
  "digest",
  "futures",
+ "getrandom 0.3.4",
  "hmac",
  "lz4_flex",
  "md-5",

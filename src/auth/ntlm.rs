@@ -315,22 +315,15 @@ impl NtlmAuthenticator {
         }
 
         let mut challenge = [0u8; 8];
-        // Use a simple PRNG seeded from system time for client challenge.
-        // This doesn't need to be cryptographically secure since the server
-        // challenge provides the primary entropy.
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut state = seed;
-        for byte in &mut challenge {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *byte = (state >> 33) as u8;
-        }
+        getrandom::fill(&mut challenge).expect("system RNG failed");
         challenge
     }
 
     /// Get the random session key (random 16 bytes, or test override).
+    ///
+    /// This MUST be cryptographically secure — the ExportedSessionKey
+    /// is used for all subsequent signing and encryption. A predictable
+    /// key would let an attacker forge messages and decrypt traffic.
     fn get_random_session_key(&self) -> [u8; 16] {
         #[cfg(test)]
         if let Some(rsk) = self.test_random_session_key {
@@ -338,15 +331,7 @@ impl NtlmAuthenticator {
         }
 
         let mut key = [0u8; 16];
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut state = seed;
-        for byte in &mut key {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *byte = (state >> 33) as u8;
-        }
+        getrandom::fill(&mut key).expect("system RNG failed");
         key
     }
 }
