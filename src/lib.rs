@@ -6,3 +6,9 @@
 //! No C dependencies, no FFI. Built for speed — pipelined reads/writes
 //! match native OS SMB performance on metadata-heavy operations and
 //! close the gap on bulk transfers.
+
+pub mod error;
+pub mod pack;
+pub mod types;
+
+pub use error::Error;
