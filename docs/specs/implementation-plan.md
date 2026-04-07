@@ -79,6 +79,10 @@ smb2/
       mod.rs                # Auth trait
       ntlm.rs              # NTLM authentication (from MS-NLMP)
 
+    rpc/                    # Named pipe RPC (MS-RPCE / NDR)
+      mod.rs                # RPC PDU types, NDR encoding/decoding
+      srvsvc.rs             # NetShareEnumAll — list shares on a server
+
     client/                 # High-level client API
       mod.rs                # SmbClient (entry point)
       connection.rs         # Connection state, credit management, response demux, OpenTable
@@ -87,6 +91,7 @@ smb2/
       file.rs               # Single-file convenience methods (wraps pipeline)
       pipeline.rs           # Unified operation pipeline (reads, writes, deletes, stats, listings)
       directory.rs          # Directory listing helpers
+      shares.rs             # Share enumeration (IPC$ + srvsvc RPC)
 
   tests/
     pack_roundtrip.rs       # Property-based tests for pack/unpack
@@ -212,8 +217,8 @@ Each message struct needs:
 | P2 | Lock | 2.2.26/2.2.27 | Low | Byte-range locks |
 | P2 | Echo | 2.2.28/2.2.29 | Low | Trivial |
 | P2 | Cancel | 2.2.30 | Low | Request only |
-| P2 | Ioctl | 2.2.31/2.2.32 | High | Many sub-commands |
-| P2 | ChangeNotify | 2.2.35/2.2.36 | Medium | Async operation |
+| P1 | Ioctl | 2.2.31/2.2.32 | High | FSCTL_PIPE_TRANSCEIVE needed for share enumeration; other sub-commands can wait |
+| P1 | ChangeNotify | 2.2.35/2.2.36 | Medium | Needed for Cmdr live directory updates |
 | P2 | OplockBreak | 2.2.23-25 | Medium | Multiple variants |
 | P3 | Transform | 2.2.41/2.2.42 | Medium | Encryption/compression wrappers |
 
@@ -396,7 +401,20 @@ TCP implementation uses `tokio::io::split()` or `Arc<Mutex<ReadHalf>>`
 - Roundtrip: encrypt then decrypt
 - Verify signature, then tamper, verify rejection
 
-**Dependencies added:** `hmac`, `sha2`, `aes`, `aes-gcm`, `ccm`, `cmac`
+**5d. Compression**
+- LZ4 via `lz4_flex` (pure Rust, zero deps)
+- Negotiate compression support in NEGOTIATE contexts
+  (SMB2_COMPRESSION_CAPABILITIES)
+- Compress outgoing messages in COMPRESSION_TRANSFORM_HEADER
+- Decompress incoming messages before processing
+- Only unchained compression (chained is rarely used, defer)
+
+**Tests:**
+- Roundtrip: compress then decompress
+- Negotiate compression capability, verify it's used
+- Large message compression reduces wire size
+
+**Dependencies added:** `hmac`, `sha2`, `aes`, `aes-gcm`, `ccm`, `cmac`, `lz4_flex`
 
 ---
 
@@ -974,11 +992,132 @@ OpResult::DirEntryBatch {
 - `read_file(path)` -> bytes
 - `write_file(path, data)` -> bytes_written
 - `delete(path)`
-- `stat(path)` -> FileInfo
+- `stat(path)` -> FileInfo (timestamps, size, attributes)
+- `rename(from, to)` -> () (SET_INFO with FileRenameInformation)
+- `set_timestamps(path, created, modified, accessed)` -> ()
+- `truncate(path, size)` -> () (SET_INFO with FileEndOfFileInformation)
+- `flush(path)` -> ()
+- `fs_info()` -> FsInfo (total space, free space, sector size)
+- `server_copy(src, dst)` -> () (FSCTL_SRV_COPYCHUNK, same-share only)
+
+**Client-level configuration** (`ClientConfig`):
+- `min_dialect` / `max_dialect`: restrict negotiated SMB version range
+- `signing`: Required, Allowed, or Disabled
+- `encryption`: Required, Allowed, or Disabled
+- `allow_unsigned_guest_access`: skip signing for guest/anonymous
+  (required for many Samba NAS setups)
+- `connect_timeout`, `request_timeout`: configurable timeouts
+- `auto_reconnect`: enable automatic reconnection on network failure
+  (default: true, see Phase 7i)
 
 **7g. Directory operations** (also wrap the pipeline)
 - `list(path, pattern)` -> stream of directory entries (paginated)
 - `create_directory(path)`
+- `watch(path, recursive)` -> stream of change notifications
+  (CHANGE_NOTIFY, important for Cmdr's live directory updates)
+
+**7h. Share enumeration** (required for Cmdr)
+
+Cmdr uses SMB for two things: server discovery (mDNS, not our concern)
+and share enumeration (listing shares on a known server). The `smb`
+crate provides `list_shares()` which internally does IPC$ + srvsvc RPC.
+We need to replicate this.
+
+**How it works:**
+1. TREE_CONNECT to `IPC$` (the inter-process communication share)
+2. CREATE on `\pipe\srvsvc` (open the Server Service named pipe)
+3. IOCTL with `FSCTL_PIPE_TRANSCEIVE` — send an NDR-encoded
+   `NetShareEnumAll` RPC request, receive NDR-encoded response
+4. Parse the response into a list of `ShareInfo` (name, type, comment)
+5. CLOSE the pipe handle
+6. TREE_DISCONNECT from `IPC$`
+
+**What we need to build:**
+- `rpc/mod.rs`: RPC PDU types (bind, bind_ack, request, response),
+  NDR base encoding/decoding (~200 lines)
+- `rpc/srvsvc.rs`: `NetShareEnumAll` request/response NDR encoding,
+  `ShareInfo1` struct (name, type, comment) (~150 lines)
+- `client/shares.rs`: High-level `client.list_shares()` method that
+  orchestrates the IPC$ flow above (~100 lines)
+
+**Share filtering** (matching Cmdr's current behavior):
+- Only return disk shares (type 0x00000000 = STYPE_DISKTREE)
+- Skip IPC$ shares, printer shares, and admin shares ending with `$`
+- Return share name and comment
+
+**High-level API:**
+```rust
+let client = SmbClient::connect("192.168.1.100", "user", "pass").await?;
+
+// List shares (connects to IPC$, does RPC, disconnects)
+let shares = client.list_shares().await?;
+for share in &shares {
+    println!("{}: {}", share.name, share.comment);
+}
+
+// Then connect to a specific share
+let share = client.connect_share(&shares[0].name).await?;
+```
+
+**Auth flow** (matching Cmdr's current pattern):
+- Try guest access first (empty password)
+- If `STATUS_ACCESS_DENIED`, try provided credentials
+- Return specific error if auth is required
+
+**Tests:**
+- Mock: IPC$ → srvsvc → NetShareEnumAll round-trip
+- Mock: guest access succeeds → shares returned
+- Mock: guest access denied → retry with credentials → shares returned
+- Mock: admin shares ($) filtered out
+- Mock: NDR encoding/decoding roundtrip for ShareInfo1
+- Integration: list shares on Docker Samba (ignored by default)
+
+**7i. Reconnection and durable handles**
+
+Cmdr runs on laptops. Wi-Fi drops, sleep/wake cycles, and network
+switches are routine. The library must handle these gracefully.
+
+**Three levels of reconnection support:**
+
+1. **`client.reconnect()`** — explicit manual reconnection. Re-does
+   NEGOTIATE + SESSION_SETUP + TREE_CONNECT for all previously
+   connected shares. All previous file handles are invalidated
+   (server-side state is gone). Caller must re-open files.
+
+2. **Auto-reconnect** — when a connection drop is detected (transport
+   error, ECHO timeout), automatically attempt reconnection with
+   configurable backoff (default: 1s, 2s, 4s, 8s, max 30s). Enabled
+   by `ClientConfig::auto_reconnect` (default: true). During
+   reconnection, new pipeline ops queue up. Once reconnected, queued
+   ops proceed. In-flight ops at the time of disconnect get errors.
+
+3. **Durable handles (SMB 3.0+)** — request durable handles on CREATE
+   (via `SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2` create context). When
+   the connection drops and reconnects, re-open files using
+   `SMB2_CREATE_DURABLE_HANDLE_RECONNECT_V2` with the stored
+   `CreateGuid`. The server preserves the open's state (locks, byte
+   ranges, cached data). This makes large transfers survive transient
+   network hiccups without restarting from scratch.
+
+**Implementation:**
+- Connection state machine: `Connected` → `Disconnected` → `Reconnecting` → `Connected`
+- Pipeline driver detects disconnect (transport error or ECHO timeout),
+  transitions to `Reconnecting`, starts reconnect loop
+- During `Reconnecting`: queue new ops, drain in-flight with errors
+  (unless durable handles are in play)
+- On successful reconnect: re-issue TREE_CONNECT for all shares,
+  re-open durable handles, resume pipeline
+- On reconnect failure after max retries: fail all pending ops, report
+  `Error::Disconnected`
+
+**Tests:**
+- Mock: connection drops → auto-reconnect → ops resume
+- Mock: connection drops → reconnect fails after retries → all ops error
+- Mock: manual `client.reconnect()` → new session, new tree connects
+- Mock: durable handle survives reconnect (CREATE with durable context,
+  disconnect, reconnect, re-open with reconnect context)
+- Mock: non-durable handle invalidated after reconnect → error on use
+- Mock: ops queued during reconnection → execute after reconnect
 
 **Tests per sub-phase:**
 - Script full conversation in mock transport
@@ -995,7 +1134,15 @@ pipeline for power users.
 
 ```rust
 let client = SmbClient::connect("192.168.1.1", Credentials::ntlm("user", "pass")).await?;
-let share = client.connect_share("Documents").await?;
+
+// --- Share enumeration (IPC$ + srvsvc RPC) ---
+
+let shares = client.list_shares().await?;
+for s in &shares {
+    println!("{}: {}", s.name, s.comment);
+}
+
+let share = client.connect_share(&shares[0].name).await?;
 
 // --- Simple API (one-shot, wraps pipeline internally) ---
 
@@ -1115,26 +1262,40 @@ Group into batches of 3-4 agents:
 
 ---
 
-## Open questions
+## Resolved questions
 
-1. **Crate name:** `smb2`, `smb2-rs`, or `smb`? (`smb` is taken on crates.io by smb-rs)
-2. **MSRV:** 1.85 (matching mtp-rs) or newer?
-3. **Kerberos:** Include in initial release or defer? Leaning defer.
-4. **Server implementation:** Out of scope for now? We're building a client.
-5. **QUIC/RDMA transports:** Defer to post-1.0?
-6. **Compression:** Defer to post-1.0?
-7. **Named pipes / RPC:** Needed for share enumeration. Include in Phase 7 or defer?
-8. **DFS support:** STATUS_PATH_NOT_COVERED returns a specific error for now. Full DFS follow-through (FSCTL_DFS_GET_REFERRALS, reconnect to target server) deferred to post-1.0?
-9. **DialectRevision 0x02FF:** Support older servers via two-round-trip negotiation, or fail fast with a clear error?
-10. **Reconnection after network failure:** Currently, connection drop
-    is permanent — all operations fail and the user must reconnect
-    manually. For Cmdr on laptops (sleep/wake, Wi-Fi switches), this
-    is a poor UX. At minimum, expose a `client.reconnect()` method
-    that re-does NEGOTIATE + SESSION_SETUP + TREE_CONNECT. Note: all
-    previous file handles are invalidated (server-side state is gone).
-    Automatic reconnection with configurable backoff is desirable but
-    can be deferred. Durable handles (SMB 3.0+) would allow
-    reconnecting to existing server-side opens — also deferrable.
+1. **Crate name:** **`smb2`**. Clear (SMB2/3 protocol), short, available
+   on crates.io. `smb` is taken by smb-rs and would be confusing since
+   we don't support SMB1.
+2. **MSRV:** **1.85** (matching mtp-rs). No compelling Rust features
+   worth raising it for.
+3. **Kerberos:** **Defer to post-1.0.** NTLM covers home NAS setups
+   (Pi, QNAP, Synology, most Samba). Kerberos is needed for enterprise
+   Active Directory environments that disable NTLM. Add when enterprise
+   users ask.
+4. **Server implementation:** **Out of scope.** Client library only.
+5. **QUIC/RDMA transports:** **Defer to post-1.0.** QUIC is for Azure
+   Files / Windows Server 2022+ over internet. RDMA is datacenter-only.
+   Neither helps Cmdr.
+6. **Compression:** **Include in v1.** LZ4 via `lz4_flex` (pure Rust,
+   zero dependencies, ~15K lines). ~200 lines to negotiate in
+   NEGOTIATE contexts and compress/decompress in the TRANSFORM_HEADER
+   path. LZNT1 deferred (rarely used, LZ4 is the modern choice).
+7. **Named pipes / RPC:** **RESOLVED: Include in Phase 7h.** Required
+   for Cmdr's share enumeration. IOCTL promoted to P1 for
+   `FSCTL_PIPE_TRANSCEIVE`. Added `rpc/` module and `client/shares.rs`.
+8. **DFS support:** **Defer full follow-through to post-1.0.** Returns
+   `Error::DfsReferralRequired` with the path for v1. Enterprise users
+   can follow referrals manually. Automatic DFS resolution
+   (FSCTL_DFS_GET_REFERRALS + reconnect) is ~500-800 lines and needed
+   mainly in Windows domain environments.
+9. **DialectRevision 0x02FF:** **Support.** Issue a second NEGOTIATE
+   with MessageId=1 when 0x02FF is received. Handles older servers
+   (pre-Windows 8) gracefully.
+10. **Reconnection:** **Full support in Phase 7i.** `client.reconnect()`
+    for manual reconnection, auto-reconnect with configurable backoff
+    (default: enabled), and durable handles (SMB 3.0+) to survive
+    transient network hiccups without restarting transfers.
 
 ---
 
@@ -1168,5 +1329,7 @@ or clarifications published during development.
 | MS-DTYP spec | `related-repos/openspecs/skills/windows-protocols/MS-DTYP/MS-DTYP.md` |
 | MS-FSCC spec | `related-repos/openspecs/skills/windows-protocols/MS-FSCC/MS-FSCC.md` |
 | MS-NLMP spec | `related-repos/openspecs/skills/windows-protocols/MS-NLMP/MS-NLMP.md` |
+| MS-RPCE spec (RPC) | `related-repos/openspecs/skills/windows-protocols/MS-RPCE/MS-RPCE.md` |
+| MS-SRVS spec (srvsvc) | `related-repos/openspecs/skills/windows-protocols/MS-SRVS/MS-SRVS.md` |
 | smb-rs reference | `related-repos/smb-rs/` |
 | mtp-rs reference | `../mtp-rs/` |

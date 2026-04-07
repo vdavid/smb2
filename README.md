@@ -25,16 +25,26 @@ I built this because I needed fast SMB access for [Cmdr](https://github.com/vdav
 - Pipeline operations: push requests into one end, results stream out the other
 - Large file transfers chunked at the server's `MaxReadSize`/`MaxWriteSize`
 - Credit-window-based flow control (the server tells us how fast to go)
-- Handles SMB 3.x signing and encryption
+- SMB 3.x signing, encryption, and LZ4 compression
+- Share enumeration (list shares on a server)
+- Directory change notifications (watch for file changes)
+- Auto-reconnect with durable handles (survives Wi-Fi drops)
+- Server-side copy
 
 ## What it doesn't do (yet)
 
-- Kerberos authentication (NTLM only for now)
-- DFS path resolution (returns a clear error so you can handle it)
-- QUIC transport (SMB over QUIC, for Azure Files)
-- RDMA transport
+If you need any of these, check the [`smb`](https://crates.io/crates/smb) crate which supports them:
+
+- **Kerberos authentication** — NTLM only for now. Kerberos is needed for Active Directory environments that disable NTLM. Most home NAS setups (Synology, QNAP, Pi) use NTLM.
+- **DFS path resolution** — returns `Error::DfsReferralRequired` with the path so you can handle it yourself. Full automatic DFS follow-through is planned for post-1.0.
+- **Multi-channel** — multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
+- **QUIC transport** — SMB over QUIC for Azure Files and Windows Server 2022+ over the internet
+- **RDMA transport** — datacenter-only, ultra-low-latency storage
+
+These aren't planned:
+
 - Server implementation (this is a client library)
-- Multi-channel (multiple TCP connections to the same server)
+- SMB1 (deprecated, insecure)
 
 ## Quick start
 
@@ -144,20 +154,25 @@ The exact speedup depends on network latency and server configuration. Higher la
 
 | Limitation | Details |
 |---|---|
-| NTLM only | No Kerberos yet (NTLM works against Samba and most Windows servers) |
-| No DFS | Returns `Error::DfsReferralRequired` with the path, you handle it |
+| NTLM only | No Kerberos yet (works against Samba and most Windows servers) |
+| No DFS follow-through | Returns `Error::DfsReferralRequired` with the path, you handle it |
 | No multi-channel | Single TCP connection per client |
+| No QUIC/RDMA | TCP only (covers ~99% of use cases) |
 | SMB1 not supported | SMB2/3 only (SMB1 is deprecated and insecure) |
+| LZ4 only | No LZNT1 compression (LZ4 is the modern choice, LZNT1 is legacy) |
 
 ## Comparison with existing libraries
 
 ### vs `smb` crate
 
-The [`smb`](https://crates.io/crates/smb) crate is the main Rust SMB2 option right now. It works for basic operations, but:
+The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 option right now. It covers more features than `smb2` (Kerberos, DFS, multi-channel, QUIC, RDMA). If you need those, use it.
 
-- No pipelining (one request at a time, ~10x slower for downloads)
-- Almost no tests
-- MIT-only license (this crate is MIT OR Apache-2.0)
+But for the common case (connect to a NAS, move files around), `smb2` is a better fit:
+
+- **Pipelined I/O** — `smb` sends one request at a time, making downloads ~10x slower
+- **Auto-reconnect with durable handles** — survives Wi-Fi drops without restarting transfers
+- **Comprehensive test suite** — `smb` has almost no tests
+- **MIT OR Apache-2.0** — `smb` is MIT-only
 
 I initially considered forking `smb`, but the architecture didn't support pipelining well, and adding it would have been a near-complete rewrite anyway.
 

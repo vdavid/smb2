@@ -68,6 +68,10 @@ src/
     mod.rs                # Auth trait
     ntlm.rs              # NTLM authentication (from MS-NLMP)
 
+  rpc/                    # Named pipe RPC (MS-RPCE / NDR)
+    mod.rs                # RPC PDU types, NDR encoding/decoding
+    srvsvc.rs             # NetShareEnumAll — list shares on a server
+
   client/                 # High-level client API
     mod.rs                # SmbClient (entry point)
     connection.rs         # Connection state, credit management, response demux
@@ -76,6 +80,7 @@ src/
     file.rs               # Single-file convenience methods
     pipeline.rs           # Unified operation pipeline
     directory.rs          # Directory listing helpers
+    shares.rs             # Share enumeration (IPC$ + srvsvc RPC)
 
 tests/
   pack_roundtrip.rs       # Property-based tests for pack/unpack
