@@ -10,6 +10,7 @@
 pub mod error;
 pub mod msg;
 pub mod pack;
+pub mod transport;
 pub mod types;
 
 pub use error::Error;

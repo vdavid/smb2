@@ -38,6 +38,9 @@ num_enum = "0.7"
 # Byte handling
 bytes = "1.5"
 
+# Async runtime — transport layer needs net, io-util, time, sync
+tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 proptest = "1"
