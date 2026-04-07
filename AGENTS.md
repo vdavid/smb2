@@ -189,6 +189,30 @@ Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy
 - Newtypes for all protocol IDs
 - `thiserror` for error types
 
+## Logging
+
+The crate uses `log` (a facade) for structured logging. The application picks the backend (for example, `env_logger`, `tracing`).
+
+**Log levels:**
+
+| Level   | Use for                                                                      | Examples                                                  |
+|---------|-----------------------------------------------------------------------------|-----------------------------------------------------------|
+| `info`  | Major lifecycle events users care about                                      | Connected, negotiated dialect, session established, tree connected/disconnected |
+| `debug` | Protocol details useful for debugging                                        | Negotiate params, session setup rounds, signing activation, credit changes, each request/response |
+| `trace` | Very verbose, byte-level                                                     | Raw message sizes, signature bytes (first 4), nonce values, preauth hash updates, TCP framing, individual directory entries |
+| `warn`  | Unexpected but recoverable                                                   | Signature verification skipped, credit starvation, retryable errors |
+| `error` | Should not happen during normal operation                                    | Protocol violations, decryption/signature failures, connection drops |
+
+**How to enable:**
+
+```sh
+RUST_LOG=smb2=debug cargo test --test integration -- --ignored
+```
+
+**Security rule:** Never log passwords, session keys, signing keys, or full signatures. At most log key lengths and the first four bytes of signatures for correlation.
+
+**Backend note:** `log` is a facade. This crate does NOT depend on any specific backend. Applications using smb2 pick their own (for example, `env_logger`). The `env_logger` dev-dependency is only used in integration tests.
+
 ## Spec files
 
 Agents MUST read the actual spec files, not work from memory. Protocol specs are dense and full of edge cases that are easy to get wrong.

@@ -7,6 +7,8 @@
 //!
 //! Only NTLMv2 is supported. NTLMv1 is insecure and not implemented.
 
+use log::{debug, trace};
+
 use crate::Error;
 use digest::Digest;
 use hmac::{Hmac, Mac};
@@ -158,6 +160,7 @@ impl NtlmAuthenticator {
         // WorkstationFields: Len(2) + MaxLen(2) + Offset(4) = all zeros
         buf.extend_from_slice(&[0u8; 8]);
 
+        debug!("ntlm: negotiate message built, len={}", buf.len());
         self.negotiate_bytes = Some(buf.clone());
         buf
     }
@@ -167,10 +170,12 @@ impl NtlmAuthenticator {
     ///
     /// Returns the raw bytes for the next SESSION_SETUP.
     pub fn authenticate(&mut self, challenge_bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        debug!("ntlm: processing challenge, len={}", challenge_bytes.len());
         self.challenge_bytes = Some(challenge_bytes.to_vec());
 
         // Parse the CHALLENGE_MESSAGE
         let challenge = parse_challenge_message(challenge_bytes)?;
+        trace!("ntlm: challenge flags=0x{:08x}, target_info_len={}", challenge.negotiate_flags, challenge.target_info.len());
 
         // Compute NTLMv2 response
         let nt_hash = compute_nt_hash(&self.credentials.password);
@@ -276,6 +281,7 @@ impl NtlmAuthenticator {
         };
 
         self.session_key = Some(exported_session_key);
+        debug!("ntlm: authenticate message built, len={}, mic={}", final_msg.len(), has_timestamp);
         Ok(final_msg)
     }
 

@@ -6,6 +6,7 @@
 //! encoding in the entire SMB2 protocol.
 
 use async_trait::async_trait;
+use log::{debug, error, trace};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -50,6 +51,7 @@ impl TcpTransport {
         // Disable Nagle's algorithm for lower latency on small messages.
         stream.set_nodelay(true).map_err(Error::Io)?;
 
+        debug!("tcp: connected, nodelay=true");
         let (reader, writer) = stream.into_split();
 
         Ok(Self {
@@ -82,6 +84,7 @@ impl TransportSend for TcpTransport {
         writer.write_all(data).await.map_err(Error::Io)?;
         writer.flush().await.map_err(Error::Io)?;
 
+        trace!("tcp: sent frame, len={}", len);
         Ok(())
     }
 }
@@ -106,6 +109,7 @@ impl TransportReceive for TcpTransport {
 
         // Validate the first byte is 0x00.
         if frame_header[0] != 0x00 {
+            error!("tcp: invalid frame, first byte=0x{:02X}", frame_header[0]);
             return Err(Error::invalid_data(format!(
                 "invalid transport frame: first byte must be 0x00, got 0x{:02X}",
                 frame_header[0]
@@ -125,6 +129,8 @@ impl TransportReceive for TcpTransport {
             )));
         }
 
+        trace!("tcp: receiving frame, len={}", msg_len);
+
         // Read the message body.
         let mut buf = vec![0u8; msg_len];
         reader.read_exact(&mut buf).await.map_err(|e| {
@@ -135,6 +141,7 @@ impl TransportReceive for TcpTransport {
             }
         })?;
 
+        trace!("tcp: received frame, len={}", msg_len);
         Ok(buf)
     }
 }

@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use log::{debug, info, trace, warn};
+
 use crate::crypto::kdf::PreauthHasher;
 use crate::crypto::signing::{self, SigningAlgorithm};
 use crate::error::Result;
@@ -118,6 +120,7 @@ impl Connection {
             .to_string();
 
         let transport = TcpTransport::connect(addr, timeout).await?;
+        info!("connection: connected to {}", addr);
         // Clone into two Arc-wrapped halves is not needed because TcpTransport
         // implements both traits. We wrap it in Arc for the split.
         let transport = std::sync::Arc::new(transport);
@@ -142,6 +145,7 @@ impl Connection {
     /// contexts, processes the response, validates it, and stores the
     /// negotiated parameters.
     pub async fn negotiate(&mut self) -> Result<()> {
+        debug!("negotiate: sending request, dialects={:?}", Dialect::ALL);
         let client_guid = generate_guid();
 
         let request = NegotiateRequest {
@@ -180,12 +184,14 @@ impl Connection {
 
         // Update preauth hash with request bytes.
         self.preauth_hasher.update(&req_bytes);
+        trace!("negotiate: preauth hash updated with request ({} bytes)", req_bytes.len());
 
         // Send.
         self.sender.send(&req_bytes).await?;
 
         // Receive.
         let resp_bytes = self.receiver.receive().await?;
+        trace!("negotiate: received response ({} bytes)", resp_bytes.len());
 
         // Update preauth hash with response bytes.
         self.preauth_hasher.update(&resp_bytes);
@@ -284,6 +290,16 @@ impl Connection {
             cipher,
         });
 
+        info!(
+            "negotiate: dialect={}, signing_required={}, capabilities={:?}",
+            resp.dialect_revision, signing_required, resp.capabilities
+        );
+        debug!(
+            "negotiate: max_read={}, max_write={}, max_transact={}, server_guid={:?}, cipher={:?}, gmac={}",
+            resp.max_read_size, resp.max_write_size, resp.max_transact_size,
+            resp.server_guid, cipher, gmac_negotiated
+        );
+
         Ok(())
     }
 
@@ -322,6 +338,10 @@ impl Connection {
         }
 
         self.sender.send(&msg_bytes).await?;
+        debug!(
+            "send: cmd={:?}, msg_id={}, tree_id={:?}, signed={}, len={}",
+            command, msg_id.0, tree_id, self.should_sign, msg_bytes.len()
+        );
         Ok((msg_id, msg_bytes))
     }
 
@@ -331,6 +351,7 @@ impl Connection {
     /// response bytes (needed for preauth hash updates).
     pub async fn receive_response(&mut self) -> Result<(Header, Vec<u8>, Vec<u8>)> {
         let resp_bytes = self.receiver.receive().await?;
+        trace!("recv: raw response {} bytes", resp_bytes.len());
 
         // Verify signature if signing is active AND the response has the
         // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
@@ -369,12 +390,22 @@ impl Connection {
         let header = Header::unpack(&mut cursor)?;
 
         // Update credits.
+        let prev_credits = self.credits;
         if header.credits > 0 {
             self.credits = self.credits.saturating_add(header.credits);
         }
 
         // Consume one credit for the request that generated this response.
         self.credits = self.credits.saturating_sub(1);
+
+        debug!(
+            "recv: cmd={:?}, status={:?}, msg_id={}, credits={} (was {}, granted {})",
+            header.command, header.status, header.message_id.0,
+            self.credits, prev_credits, header.credits
+        );
+        if self.credits == 0 {
+            warn!("recv: zero credits remaining — credit starvation");
+        }
 
         // Return the body bytes (everything after the header).
         let body_bytes = resp_bytes[Header::SIZE..].to_vec();
@@ -409,6 +440,7 @@ impl Connection {
 
     /// Activate signing with the given key and algorithm.
     pub fn activate_signing(&mut self, key: Vec<u8>, algorithm: SigningAlgorithm) {
+        debug!("signing: activated, algo={:?}, key_len={}", algorithm, key.len());
         self.signing_key = Some(key);
         self.signing_algorithm = Some(algorithm);
         self.should_sign = true;

@@ -3,6 +3,8 @@
 //! The [`Session`] type manages the multi-round-trip SESSION_SETUP exchange
 //! (NTLM authentication), key derivation, and signing activation.
 
+use log::{debug, info, trace};
+
 use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
 use crate::client::connection::Connection;
 use crate::crypto::kdf::derive_session_keys;
@@ -69,6 +71,7 @@ impl Session {
         let mut session_hasher = conn.preauth_hasher().clone();
 
         // ── Round 1: NEGOTIATE_MESSAGE ──
+        debug!("session: round 1, sending NTLM negotiate");
 
         let type1_bytes = auth.negotiate();
 
@@ -113,6 +116,7 @@ impl Session {
         }
 
         // The server assigned a session ID — use it for subsequent requests.
+        debug!("session: round 1 complete, status={:?}, session_id={}", resp1_header.status, resp1_header.session_id);
         conn.set_session_id(resp1_header.session_id);
 
         // Parse the challenge response.
@@ -120,6 +124,7 @@ impl Session {
         let setup_resp1 = SessionSetupResponse::unpack(&mut cursor1)?;
 
         // ── Round 2: AUTHENTICATE_MESSAGE ──
+        debug!("session: round 2, sending NTLM authenticate");
 
         let type3_bytes = auth.authenticate(&setup_resp1.security_buffer)?;
 
@@ -176,8 +181,10 @@ impl Session {
         // Determine signing algorithm.
         let gmac_negotiated = params.gmac_negotiated;
         let signing_algorithm = algorithm_for_dialect(params.dialect, gmac_negotiated);
+        debug!("session: signing_algo={:?}, dialect={}", signing_algorithm, params.dialect);
 
         // Derive keys for SMB 3.x, or use session key directly for SMB 2.x.
+        trace!("session: deriving keys, session_key_len={}", session_key.len());
         let (signing_key, encryption_key, decryption_key) = match params.dialect {
             Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
                 let keys = derive_session_keys(&session_key, params.dialect, None, 128);
@@ -216,6 +223,11 @@ impl Session {
         if should_sign {
             conn.activate_signing(signing_key.clone(), signing_algorithm);
         }
+
+        info!(
+            "session: established, session_id={}, sign={}, encrypt={}",
+            session_id, should_sign, should_encrypt
+        );
 
         Ok(Session {
             session_id,

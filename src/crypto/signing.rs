@@ -8,6 +8,8 @@
 //!
 //! Reference: MS-SMB2 sections 3.1.4.1 (signing) and 3.1.5.1 (verification).
 
+use log::{debug, error, trace};
+
 use crate::types::Dialect;
 use crate::Error;
 
@@ -85,6 +87,10 @@ pub fn sign_message(
     // Step 3: write the signature back.
     message[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].copy_from_slice(&signature);
 
+    debug!(
+        "signing: signed msg_id={}, algo={:?}, sig={:02x}{:02x}{:02x}{:02x}...",
+        message_id, algorithm, signature[0], signature[1], signature[2], signature[3]
+    );
     Ok(())
 }
 
@@ -124,9 +130,19 @@ pub fn verify_signature(
 
     // Step 4: compare.
     if received_sig != expected_sig {
+        error!(
+            "signing: verification failed, msg_id={}, algo={:?}, got={:02x}{:02x}{:02x}{:02x}..., want={:02x}{:02x}{:02x}{:02x}...",
+            message_id, algorithm,
+            received_sig[0], received_sig[1], received_sig[2], received_sig[3],
+            expected_sig[0], expected_sig[1], expected_sig[2], expected_sig[3]
+        );
         return Err(Error::invalid_data("signature verification failed"));
     }
 
+    trace!(
+        "signing: verified msg_id={}, algo={:?}, sig={:02x}{:02x}{:02x}{:02x}...",
+        message_id, algorithm, received_sig[0], received_sig[1], received_sig[2], received_sig[3]
+    );
     Ok(())
 }
 

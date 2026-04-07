@@ -10,6 +10,8 @@ use smb2::client::{Connection, Session, Tree};
 #[tokio::test]
 #[ignore]
 async fn connect_and_list_directory_on_real_nas() {
+    let _ = env_logger::try_init();
+
     // Connect to 192.168.1.111.
     let mut conn = Connection::connect("192.168.1.111:445", Duration::from_secs(5))
         .await

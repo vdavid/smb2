@@ -3,6 +3,8 @@
 //! The [`Tree`] type represents a connection to a specific share on the server.
 //! It provides methods for directory listing, file reading, and tree disconnect.
 
+use log::{debug, info, trace};
+
 use crate::client::connection::Connection;
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
@@ -98,6 +100,12 @@ impl Tree {
             .tree_id
             .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
 
+        info!("tree: connected share={}, tree_id={}", share_name, tree_id);
+        debug!("tree: is_dfs={}, encrypt_data={}",
+            resp.capabilities.contains(crate::types::flags::ShareCapabilities::DFS),
+            resp.share_flags.contains(crate::types::flags::ShareFlags::ENCRYPT_DATA),
+        );
+
         Ok(Tree {
             tree_id,
             share_name: share_name.to_string(),
@@ -116,6 +124,7 @@ impl Tree {
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
         let normalized = normalize_path(path);
+        debug!("tree: list_directory path={}", normalized);
 
         // Open the directory.
         let file_id = self.open_directory(conn, &normalized).await?;
@@ -129,6 +138,7 @@ impl Tree {
         // Return the query result, or if it succeeded, check the close result.
         let entries = result?;
         close_result?;
+        debug!("tree: list_directory done, entries={}", entries.len());
         Ok(entries)
     }
 
@@ -145,6 +155,9 @@ impl Tree {
 
         // Open the file.
         let (file_id, file_size) = self.open_file(conn, &normalized).await?;
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        let chunks = file_size.div_ceil(max_read as u64);
+        debug!("tree: read_file path={}, size={}, chunks={}", normalized, file_size, chunks);
 
         // Read the file in chunks.
         let result = self.read_loop(conn, file_id, file_size).await;
@@ -154,6 +167,7 @@ impl Tree {
 
         let data = result?;
         close_result?;
+        debug!("tree: read_file done, read {} bytes", data.len());
         Ok(data)
     }
 
@@ -162,6 +176,7 @@ impl Tree {
         &self,
         conn: &mut Connection,
     ) -> Result<()> {
+        debug!("tree: disconnecting share={}, tree_id={}", self.share_name, self.tree_id);
         let body = TreeDisconnectRequest;
         let (_, _) = conn
             .send_request(Command::TreeDisconnect, &body, Some(self.tree_id))
@@ -176,6 +191,7 @@ impl Tree {
             });
         }
 
+        info!("tree: disconnected share={}, tree_id={}", self.share_name, self.tree_id);
         Ok(())
     }
 
@@ -320,6 +336,9 @@ impl Tree {
 
             // Parse FileBothDirectoryInformation entries from the output buffer.
             let entries = parse_file_both_directory_info(&resp.output_buffer)?;
+            for e in &entries {
+                trace!("tree: dir_entry name={}, size={}, is_dir={}", e.name, e.size, e.is_directory);
+            }
             all_entries.extend(entries);
         }
 
