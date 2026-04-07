@@ -123,6 +123,46 @@ client.write_file_pipelined(&share, "copy.iso", &data).await?;
 # }
 ```
 
+## Streaming I/O
+
+For large files that don't fit in memory, use the streaming API. It downloads one chunk at a time and supports progress reporting and cancellation.
+
+### Streaming download
+
+```rust
+use tokio::io::AsyncWriteExt;
+
+# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+let mut download = client.download(&share, "big_video.mp4").await?;
+println!("Downloading {} bytes...", download.size());
+
+let mut file = tokio::fs::File::create("big_video.mp4").await?;
+while let Some(chunk) = download.next_chunk().await {
+    let bytes = chunk?;
+    file.write_all(&bytes).await?;
+    println!("{:.1}%", download.progress().percent());
+}
+# Ok(())
+# }
+```
+
+### Write with progress and cancellation
+
+```rust
+use std::ops::ControlFlow;
+
+# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+let data = std::fs::read("big_file.bin")?;
+client.write_file_with_progress(&share, "remote.bin", &data, |progress| {
+    println!("{:.1}%", progress.percent());
+    ControlFlow::Continue(()) // return ControlFlow::Break(()) to cancel
+}).await?;
+# Ok(())
+# }
+```
+
+All write methods (`write_file`, `write_file_pipelined`, `write_file_with_progress`) flush data to persistent storage before closing the file handle.
+
 ## Installation
 
 Add to your `Cargo.toml`:
@@ -157,6 +197,9 @@ For when you want to do one thing and get the result:
 - `client.rename(&share, from, to)` -- rename a file
 - `client.create_directory(&share, path)` -- create a directory
 - `client.delete_directory(&share, path)` -- remove a directory
+- `client.download(&share, path)` -- streaming download (memory-efficient)
+- `client.write_file_with_progress(&share, path, data, callback)` -- upload with progress
+- `client.flush_file(&share, file_id)` -- flush file to persistent storage
 - `client.disconnect_share(&share)` -- disconnect from a share
 
 ### Pipeline API

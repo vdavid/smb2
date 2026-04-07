@@ -12,6 +12,7 @@ use crate::msg::close::CloseRequest;
 use crate::msg::create::{
     CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
 };
+use crate::msg::flush::FlushRequest;
 use crate::msg::query_directory::{
     FileInformationClass, QueryDirectoryFlags, QueryDirectoryRequest, QueryDirectoryResponse,
 };
@@ -422,7 +423,8 @@ impl Tree {
     /// Write data to a file (create or overwrite).
     ///
     /// Opens the file with `FileOverwriteIf` (creates if it does not exist,
-    /// overwrites if it does), writes the data in chunks, then closes the handle.
+    /// overwrites if it does), writes the data in chunks, flushes to ensure
+    /// data is persisted on the server, then closes the handle.
     /// Returns the total number of bytes written.
     pub async fn write_file(
         &self,
@@ -469,6 +471,11 @@ impl Tree {
 
         // Write the data in chunks.
         let result = self.write_loop(conn, file_id, data).await;
+
+        // Flush to ensure data is persisted on the server.
+        if result.is_ok() {
+            self.flush_handle(conn, file_id).await?;
+        }
 
         // Close the handle.
         let close_result = self.close_handle(conn, file_id).await;
@@ -560,7 +567,8 @@ impl Tree {
     /// Write a file using pipelined I/O.
     ///
     /// Opens/creates the file, sends multiple WRITE requests concurrently
-    /// (filling the credit window), collects responses. Much faster than
+    /// (filling the credit window), collects responses, then flushes to
+    /// ensure data is persisted on the server. Much faster than
     /// sequential [`write_file`](Self::write_file) for large data.
     ///
     /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
@@ -634,6 +642,11 @@ impl Tree {
         let result = self
             .write_pipelined_loop(conn, file_id, data, chunk_size, credit_charge, total_chunks)
             .await;
+
+        // Flush to ensure data is persisted on the server.
+        if result.is_ok() {
+            self.flush_handle(conn, file_id).await?;
+        }
 
         // Close the handle.
         let close_result = self.close_handle(conn, file_id).await;
@@ -808,7 +821,7 @@ impl Tree {
     }
 
     /// Open a file handle and return the file ID and size.
-    async fn open_file(
+    pub(crate) async fn open_file(
         &self,
         conn: &mut Connection,
         path: &str,
@@ -1190,8 +1203,36 @@ impl Tree {
         Ok(total_written)
     }
 
+    /// Flush a file handle to ensure data is persisted on the server.
+    ///
+    /// Sends an SMB2 FLUSH request and waits for the server to confirm
+    /// that all cached data has been written to persistent storage.
+    pub(crate) async fn flush_handle(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+    ) -> Result<()> {
+        debug!("tree: flushing file handle");
+        let req = FlushRequest { file_id };
+
+        let (_, _) = conn
+            .send_request(Command::Flush, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, _, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Flush,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Close a file handle.
-    async fn close_handle(
+    pub(crate) async fn close_handle(
         &self,
         conn: &mut Connection,
         file_id: FileId,
@@ -1593,6 +1634,15 @@ mod tests {
         pack_message(&h, &body)
     }
 
+    fn build_flush_response() -> Vec<u8> {
+        let mut h = Header::new_request(Command::Flush);
+        h.flags.set_response();
+        h.credits = 32;
+
+        let body = crate::msg::flush::FlushResponse;
+        pack_message(&h, &body)
+    }
+
     fn build_query_directory_response(status: NtStatus, entries_data: Vec<u8>) -> Vec<u8> {
         let mut h = Header::new_request(Command::QueryDirectory);
         h.flags.set_response();
@@ -1957,9 +2007,10 @@ mod tests {
             volatile: 0xDD,
         };
 
-        // WRITE = CREATE + WRITE + CLOSE
+        // WRITE = CREATE + WRITE + FLUSH + CLOSE
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_write_response(5));
+        mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
@@ -1972,7 +2023,7 @@ mod tests {
 
         let written = tree.write_file(&mut conn, "out.txt", b"hello").await.unwrap();
         assert_eq!(written, 5);
-        assert_eq!(mock.sent_count(), 3);
+        assert_eq!(mock.sent_count(), 4);
     }
 
     // ── Stat tests ───────────────────────────────────────────────────
@@ -2493,7 +2544,8 @@ mod tests {
             ));
         }
 
-        // CLOSE response.
+        // FLUSH + CLOSE responses.
+        mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
@@ -2510,8 +2562,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(written, 256 * 1024);
-        // 1 CREATE + 4 WRITEs + 1 CLOSE = 6.
-        assert_eq!(mock.sent_count(), 6);
+        // 1 CREATE + 4 WRITEs + 1 FLUSH + 1 CLOSE = 7.
+        assert_eq!(mock.sent_count(), 7);
 
         // Verify that each WRITE request contains the correct data chunk.
         for i in 0..4 {
@@ -2544,6 +2596,7 @@ mod tests {
             MessageId(2),
             36 * 1024,
         ));
+        mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
@@ -2560,6 +2613,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(written, 65536 + 36 * 1024);
-        assert_eq!(mock.sent_count(), 4); // CREATE + 2 WRITEs + CLOSE
+        assert_eq!(mock.sent_count(), 5); // CREATE + 2 WRITEs + FLUSH + CLOSE
     }
 }

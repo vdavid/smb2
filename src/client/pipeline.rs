@@ -281,6 +281,15 @@ mod tests {
         pack_message(&h, &body)
     }
 
+    fn build_flush_response() -> Vec<u8> {
+        let mut h = Header::new_request(Command::Flush);
+        h.flags.set_response();
+        h.credits = 32;
+
+        let body = crate::msg::flush::FlushResponse;
+        pack_message(&h, &body)
+    }
+
     fn build_read_response(data: Vec<u8>) -> Vec<u8> {
         let mut h = Header::new_request(Command::Read);
         h.flags.set_response();
@@ -533,9 +542,10 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId { persistent: 1, volatile: 2 };
 
-        // WRITE = CREATE + WRITE + CLOSE
+        // WRITE = CREATE + WRITE + FLUSH + CLOSE
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_write_response(11));
+        mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);

@@ -3,6 +3,7 @@
 //! These tests require local network access and are marked `#[ignore]`.
 //! Run with: `RUST_LOG=smb2=debug cargo test --test integration -- --ignored --nocapture`
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tree};
@@ -503,4 +504,152 @@ async fn reconnect_after_disconnect() {
     println!("After reconnect: {} entries", entries2.len());
     assert!(!entries2.is_empty());
     tree2.disconnect(client.connection_mut()).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn streaming_download_large_file() {
+    let _ = env_logger::try_init();
+
+    let mut client = connect_client_to_nas().await;
+    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+
+    // Write a 1 MB test file.
+    let test_path = "smb2_test_streaming_download.tmp";
+    let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
+
+    client
+        .write_file(&tree, test_path, &test_data)
+        .await
+        .expect("write_file failed");
+    println!("Setup: wrote {} bytes", test_data.len());
+
+    // Download it with the streaming API.
+    let mut download = client.download(&tree, test_path).await.expect("download failed");
+    assert_eq!(download.size(), test_data.len() as u64);
+    println!("Downloading {} bytes...", download.size());
+
+    let mut received = Vec::new();
+    let mut chunk_count = 0u32;
+    while let Some(chunk) = download.next_chunk().await {
+        let bytes = chunk.expect("next_chunk failed");
+        assert!(!bytes.is_empty(), "received empty chunk");
+        received.extend_from_slice(&bytes);
+        chunk_count += 1;
+        println!(
+            "  chunk {}: {} bytes, progress={:.1}%",
+            chunk_count,
+            bytes.len(),
+            download.progress().percent()
+        );
+    }
+
+    // Verify progress reached 100%.
+    assert!(
+        (download.progress().fraction() - 1.0).abs() < f64::EPSILON,
+        "expected progress to reach 1.0, got {}",
+        download.progress().fraction()
+    );
+
+    // Verify at least one chunk was received.
+    // Note: the number of chunks depends on the server's max_read_size.
+    // A server with max_read_size >= 1 MB will deliver the file in one chunk.
+    assert!(
+        chunk_count >= 1,
+        "expected at least one chunk, got {}",
+        chunk_count
+    );
+
+    // Verify data integrity.
+    assert_eq!(received.len(), test_data.len(), "size mismatch");
+    assert_eq!(received, test_data, "content mismatch");
+
+    // The download auto-closed the file handle after the last chunk.
+    // Drop the download to release the borrow on the connection.
+    drop(download);
+
+    // Clean up.
+    client
+        .delete_file(&tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn write_with_progress_and_cancel() {
+    let _ = env_logger::try_init();
+
+    let mut client = connect_client_to_nas().await;
+    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+
+    // Write a file with progress callback, verifying progress updates.
+    let test_path = "smb2_test_write_progress.tmp";
+    let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 199) as u8).collect();
+
+    let mut progress_updates = Vec::new();
+    let written = client
+        .write_file_with_progress(&tree, test_path, &test_data, |progress| {
+            println!(
+                "  progress: {}/{} ({:.1}%)",
+                progress.bytes_transferred,
+                progress.total_bytes.unwrap_or(0),
+                progress.percent()
+            );
+            progress_updates.push(progress.bytes_transferred);
+            ControlFlow::Continue(())
+        })
+        .await
+        .expect("write_file_with_progress failed");
+
+    assert_eq!(written, test_data.len() as u64);
+    assert!(
+        !progress_updates.is_empty(),
+        "expected at least one progress update"
+    );
+
+    // Verify the data was written correctly by reading it back.
+    let readback = client
+        .read_file(&tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(readback, test_data, "content mismatch after write_with_progress");
+
+    // Clean up the first file.
+    client
+        .delete_file(&tree, test_path)
+        .await
+        .expect("delete_file failed");
+
+    // Write another file, cancel at ~50%.
+    let cancel_path = "smb2_test_write_cancel.tmp";
+    let half = test_data.len() as u64 / 2;
+    let result = client
+        .write_file_with_progress(&tree, cancel_path, &test_data, |progress| {
+            if progress.bytes_transferred >= half {
+                println!("  cancelling at {:.1}%", progress.percent());
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .await;
+
+    // Verify Error::Cancelled was returned.
+    match result {
+        Err(smb2::Error::Cancelled) => println!("  correctly received Error::Cancelled"),
+        other => panic!("expected Error::Cancelled, got {:?}", other),
+    }
+
+    // The partially written file may or may not exist. Try to clean up.
+    let _ = client.delete_file(&tree, cancel_path).await;
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
 }

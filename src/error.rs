@@ -53,6 +53,10 @@ pub enum Error {
         path: String,
     },
 
+    /// The operation was cancelled by the caller (via progress callback).
+    #[error("Operation cancelled")]
+    Cancelled,
+
     /// The session expired and reauthentication failed.
     ///
     /// The pipeline normally handles `STATUS_NETWORK_SESSION_EXPIRED`

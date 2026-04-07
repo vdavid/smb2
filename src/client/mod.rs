@@ -9,23 +9,28 @@ pub mod connection;
 pub mod pipeline;
 pub mod session;
 pub mod shares;
+pub mod stream;
 pub mod tree;
 
 pub use connection::{Cipher, Connection, NegotiatedParams};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
+pub use stream::{FileDownload, Progress};
 pub use tree::{DirectoryEntry, FileInfo, Tree};
 
 // Re-export high-level client types.
 // (SmbClient, ClientConfig, and connect are defined below in this file.)
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use log::info;
 
 use crate::error::Result;
+use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
+use crate::types::FileId;
 
 /// Configuration for an SMB client connection.
 #[derive(Debug, Clone)]
@@ -252,6 +257,207 @@ impl SmbClient {
     /// Delete an empty directory on the given share.
     pub async fn delete_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
         tree.delete_directory(&mut self.conn, path).await
+    }
+
+    /// Start a streaming file download (memory-efficient for large files).
+    ///
+    /// Returns a [`FileDownload`] that yields chunks one at a time without
+    /// buffering the entire file in memory. Each call to
+    /// [`next_chunk`](FileDownload::next_chunk) sends one READ request.
+    ///
+    /// The connection is borrowed mutably for the lifetime of the download,
+    /// so no other operations can run concurrently. This prevents accidental
+    /// interleaving of SMB messages.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// let mut download = client.download(&share, "big_video.mp4").await?;
+    /// println!("Downloading {} bytes...", download.size());
+    ///
+    /// let mut file = tokio::fs::File::create("big_video.mp4").await?;
+    /// while let Some(chunk) = download.next_chunk().await {
+    ///     let bytes = chunk?;
+    ///     file.write_all(&bytes).await?;
+    ///     println!("{:.1}%", download.progress().percent());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn download<'a>(
+        &'a mut self,
+        tree: &'a Tree,
+        path: &str,
+    ) -> Result<FileDownload<'a>> {
+        let normalized = path.replace('/', "\\");
+        let normalized = normalized.trim_start_matches('\\');
+
+        let (file_id, file_size) = tree.open_file(&mut self.conn, normalized).await?;
+        let chunk_size = self.conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+
+        Ok(FileDownload::new(
+            tree,
+            &mut self.conn,
+            file_id,
+            file_size,
+            chunk_size,
+        ))
+    }
+
+    /// Write a file with progress reporting and cancellation.
+    ///
+    /// Writes data in chunks, calling `on_progress` after each chunk.
+    /// Return `ControlFlow::Break(())` to cancel the write.
+    ///
+    /// The file is flushed before closing to ensure data is persisted
+    /// on the server.
+    pub async fn write_file_with_progress<F>(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        data: &[u8],
+        mut on_progress: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(Progress) -> ControlFlow<()>,
+    {
+        let normalized = path.replace('/', "\\");
+        let normalized = normalized.trim_start_matches('\\');
+
+        // Open the file for writing.
+        let req = crate::msg::create::CreateRequest {
+            requested_oplock_level: crate::types::OplockLevel::None,
+            impersonation_level: crate::msg::create::ImpersonationLevel::Impersonation,
+            desired_access: crate::types::flags::FileAccessMask::new(
+                crate::types::flags::FileAccessMask::FILE_WRITE_DATA
+                    | crate::types::flags::FileAccessMask::FILE_WRITE_ATTRIBUTES
+                    | crate::types::flags::FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            share_access: crate::msg::create::ShareAccess(0),
+            create_disposition: crate::msg::create::CreateDisposition::FileOverwriteIf,
+            create_options: 0x0000_0040, // FILE_NON_DIRECTORY_FILE
+            name: normalized.to_string(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = self
+            .conn
+            .send_request(
+                crate::types::Command::Create,
+                &req,
+                Some(tree.tree_id),
+            )
+            .await?;
+
+        let (resp_header, resp_body, _) = self.conn.receive_response().await?;
+
+        if resp_header.status != crate::types::status::NtStatus::SUCCESS {
+            return Err(crate::Error::Protocol {
+                status: resp_header.status,
+                command: crate::types::Command::Create,
+            });
+        }
+
+        let mut cursor = crate::pack::ReadCursor::new(&resp_body);
+        let create_resp = crate::msg::create::CreateResponse::unpack(&mut cursor)?;
+        let file_id = create_resp.file_id;
+
+        let max_write = self
+            .conn
+            .params()
+            .map(|p| p.max_write_size)
+            .unwrap_or(65536);
+
+        let mut total_written = 0u64;
+        let mut offset = 0usize;
+        let mut cancelled = false;
+
+        while offset < data.len() {
+            let remaining = data.len() - offset;
+            let chunk_size = remaining.min(max_write as usize);
+            let chunk = &data[offset..offset + chunk_size];
+
+            let write_req = crate::msg::write::WriteRequest {
+                data_offset: 0x70,
+                offset: offset as u64,
+                file_id,
+                channel: 0,
+                remaining_bytes: 0,
+                write_channel_info_offset: 0,
+                write_channel_info_length: 0,
+                flags: 0,
+                data: chunk.to_vec(),
+            };
+
+            let (_, _) = self
+                .conn
+                .send_request(
+                    crate::types::Command::Write,
+                    &write_req,
+                    Some(tree.tree_id),
+                )
+                .await?;
+
+            let (resp_header, resp_body, _) = self.conn.receive_response().await?;
+
+            if resp_header.status != crate::types::status::NtStatus::SUCCESS {
+                // Close handle before returning error.
+                let _ = tree.close_handle(&mut self.conn, file_id).await;
+                return Err(crate::Error::Protocol {
+                    status: resp_header.status,
+                    command: crate::types::Command::Write,
+                });
+            }
+
+            let mut cursor = crate::pack::ReadCursor::new(&resp_body);
+            let resp = crate::msg::write::WriteResponse::unpack(&mut cursor)?;
+
+            total_written += resp.count as u64;
+            offset += chunk_size;
+
+            let progress = Progress {
+                bytes_transferred: total_written,
+                total_bytes: Some(data.len() as u64),
+            };
+
+            if let ControlFlow::Break(()) = on_progress(progress) {
+                cancelled = true;
+                break;
+            }
+        }
+
+        if cancelled {
+            // Best-effort close without flush.
+            let _ = tree.close_handle(&mut self.conn, file_id).await;
+            return Err(crate::Error::Cancelled);
+        }
+
+        // Flush to ensure data is persisted.
+        tree.flush_handle(&mut self.conn, file_id).await?;
+
+        // Close the handle.
+        tree.close_handle(&mut self.conn, file_id).await?;
+
+        Ok(total_written)
+    }
+
+    /// Flush a file to ensure data is persisted on the server.
+    ///
+    /// This sends an SMB2 FLUSH request for the given file handle.
+    /// Write methods (`write_file`, `write_file_pipelined`,
+    /// `write_file_with_progress`) flush automatically before closing.
+    /// Use this if you need to flush a handle obtained through the
+    /// low-level API.
+    pub async fn flush_file(
+        &mut self,
+        tree: &Tree,
+        file_id: FileId,
+    ) -> Result<()> {
+        tree.flush_handle(&mut self.conn, file_id).await
     }
 
     /// Disconnect from a share.
