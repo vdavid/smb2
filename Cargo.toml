@@ -1,0 +1,43 @@
+[package]
+name = "smb2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust SMB2/3 client library with pipelined I/O"
+repository = "https://github.com/vdavid/smb2"
+keywords = ["smb", "smb2", "smb3", "cifs", "network"]
+categories = ["network-programming", "filesystem"]
+readme = "README.md"
+documentation = "https://docs.rs/smb2"
+exclude = [
+    ".github/",
+    "AGENTS.md",
+    "docs/",
+    "justfile",
+    "deny.toml",
+    "clippy.toml",
+    "rustfmt.toml",
+    "related-repos/",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+# Async runtime agnostic
+futures = "0.3"
+async-trait = "0.1"
+
+# Error handling
+thiserror = "2"
+
+# Enum conversion derives
+num_enum = "0.7"
+
+# Byte handling
+bytes = "1.5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+proptest = "1"

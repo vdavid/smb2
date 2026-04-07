@@ -1,0 +1,14 @@
+# SMB protocol state machines (negotiate, session setup, tree connect, pipeline
+# driver) have inherently high cyclomatic complexity. Keeping them in one function
+# is clearer than splitting across many tiny helpers.
+cognitive-complexity-threshold = 25
+
+# Pipeline operations, compound request builders, and CREATE requests need many
+# parameters (file path, access mask, share mode, disposition, create options,
+# create contexts, impersonation level, flags). Wrapping every call in a builder
+# isn't worth it for internal code.
+too-many-arguments-threshold = 8
+
+# Nested futures, compound response types, and the pipeline driver's select! loop
+# produce complex types. This is inherent to async protocol code.
+type-complexity-threshold = 250

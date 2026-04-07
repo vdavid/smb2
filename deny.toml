@@ -1,0 +1,33 @@
+# deny.toml - cargo-deny configuration for smb2
+#
+# Run with: cargo deny check
+# Documentation: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = []
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "ISC",
+]
+
+[bans]
+multiple-versions = "allow"  # Transitive deps often have duplicates we can't control
+wildcards = "allow"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
