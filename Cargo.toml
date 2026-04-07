@@ -41,6 +41,18 @@ bytes = "1.5"
 # Async runtime — transport layer needs net, io-util, time, sync
 tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
 
+# Crypto — signing, encryption, key derivation
+hmac = "0.12"
+sha2 = "0.10"
+aes = "0.8"
+aes-gcm = "0.10"
+ccm = "0.5"
+cmac = "0.7"
+digest = "0.10"
+
+# Compression
+lz4_flex = "0.11"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 proptest = "1"
