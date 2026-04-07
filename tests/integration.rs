@@ -46,21 +46,22 @@ async fn connect_and_list_directory_on_real_nas() {
 
     println!("Tree ID: {}", tree.tree_id);
 
-    // List the "_test_" directory.
+    // List the root directory of the share.
     let entries = tree
-        .list_directory(&mut conn, "_test_")
+        .list_directory(&mut conn, "")
         .await
         .expect("list directory failed");
 
-    println!("Directory entries:");
-    for entry in &entries {
-        println!(
-            "  {} (size={}, dir={})",
-            entry.name, entry.size, entry.is_directory
-        );
+    println!("Directory entries ({} total):", entries.len());
+    for entry in entries.iter().take(10) {
+        let kind = if entry.is_directory { "dir " } else { "file" };
+        println!("  {} {} ({} bytes)", kind, entry.name, entry.size);
+    }
+    if entries.len() > 10 {
+        println!("  ... and {} more", entries.len() - 10);
     }
 
-    assert!(!entries.is_empty(), "expected at least one entry in _test_");
+    assert!(!entries.is_empty(), "expected at least one entry in root");
 
     // Disconnect.
     tree.disconnect(&mut conn)

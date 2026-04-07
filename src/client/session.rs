@@ -141,13 +141,17 @@ impl Session {
             .send_request(Command::SessionSetup, &req2, None)
             .await?;
 
-        // Update session preauth hash with request.
+        // Update session preauth hash with the request ONLY.
+        // The final SESSION_SETUP response (STATUS_SUCCESS) is NOT
+        // included in the preauth hash (spec section 3.2.5.3.1).
+        // Only STATUS_MORE_PROCESSING_REQUIRED responses are hashed.
         session_hasher.update(&req2_raw);
 
-        let (resp2_header, resp2_body, resp2_raw) = conn.receive_response().await?;
+        let (resp2_header, resp2_body, _resp2_raw) = conn.receive_response().await?;
 
-        // Update session preauth hash with response.
-        session_hasher.update(&resp2_raw);
+        // Do NOT hash the success response — the preauth hash used for
+        // key derivation contains only messages up to (and including)
+        // the final authenticate request, not the success response.
 
         if resp2_header.command != Command::SessionSetup {
             return Err(Error::invalid_data(format!(
