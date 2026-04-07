@@ -17,7 +17,7 @@ use crate::msg::negotiate::{
 };
 use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
 use crate::transport::{TcpTransport, TransportReceive, TransportSend};
-use crate::types::flags::{Capabilities, SecurityMode};
+use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, Dialect, MessageId, SessionId, TreeId};
 use crate::Error;
@@ -332,16 +332,35 @@ impl Connection {
     pub async fn receive_response(&mut self) -> Result<(Header, Vec<u8>, Vec<u8>)> {
         let resp_bytes = self.receiver.receive().await?;
 
-        // Verify signature if signing is active.
-        if self.should_sign {
-            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
-                // Extract message_id from the raw bytes for GMAC nonce.
-                let msg_id = u64::from_le_bytes(
-                    resp_bytes[24..32].try_into().map_err(|_| {
-                        Error::invalid_data("response too short for message ID")
-                    })?,
-                );
-                signing::verify_signature(&resp_bytes, key, *algo, msg_id, false)?;
+        // Verify signature if signing is active AND the response has the
+        // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
+        // interim responses and unsolicited oplock break notifications.
+        if self.should_sign && resp_bytes.len() >= 20 {
+            let flags = u32::from_le_bytes(
+                resp_bytes[16..20]
+                    .try_into()
+                    .map_err(|_| Error::invalid_data("response too short for flags"))?,
+            );
+            let is_signed = (flags & HeaderFlags::SIGNED) != 0;
+
+            // Also check for STATUS_PENDING (skip verification) and
+            // unsolicited messages (MessageId 0xFFFFFFFFFFFFFFFF).
+            let status = u32::from_le_bytes(
+                resp_bytes[8..12]
+                    .try_into()
+                    .map_err(|_| Error::invalid_data("response too short for status"))?,
+            );
+            let msg_id_bytes: [u8; 8] = resp_bytes[24..32]
+                .try_into()
+                .map_err(|_| Error::invalid_data("response too short for message ID"))?;
+            let msg_id = u64::from_le_bytes(msg_id_bytes);
+            let is_pending = status == NtStatus::PENDING.0;
+            let is_unsolicited = msg_id == 0xFFFF_FFFF_FFFF_FFFF;
+
+            if is_signed && !is_pending && !is_unsolicited {
+                if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+                    signing::verify_signature(&resp_bytes, key, *algo, msg_id, false)?;
+                }
             }
         }
 

@@ -184,12 +184,11 @@ impl Session {
                 (keys.signing_key, Some(keys.encryption_key), Some(keys.decryption_key))
             }
             Dialect::Smb3_1_1 => {
-                // Key length: 256 bits if AES-256 cipher OR GMAC signing is
-                // negotiated (GMAC uses AES-256-GCM internally, needs 32-byte key).
+                // Key length: 256 bits only for AES-256 ciphers. GMAC signing
+                // uses AES-128-GCM internally, so it needs 128-bit (16-byte) keys.
                 let key_len_bits = match params.cipher {
                     Some(super::connection::Cipher::Aes256Ccm)
                     | Some(super::connection::Cipher::Aes256Gcm) => 256,
-                    _ if params.gmac_negotiated => 256,
                     _ => 128,
                 };
                 let keys = derive_session_keys(
