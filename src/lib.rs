@@ -8,6 +8,7 @@
 //! close the gap on bulk transfers.
 
 pub mod error;
+pub mod msg;
 pub mod pack;
 pub mod types;
 

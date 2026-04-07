@@ -1,5 +1,7 @@
 //! Error types for the SMB2 library.
 
+use crate::types::status::NtStatus;
+use crate::types::Command;
 use thiserror::Error;
 
 /// Top-level error type for SMB2 operations.
@@ -11,6 +13,19 @@ pub enum Error {
         /// Description of what went wrong.
         message: String,
     },
+
+    /// The server returned a non-success NTSTATUS.
+    #[error("Protocol error: {status} during {command:?}")]
+    Protocol {
+        /// The NTSTATUS code from the response header.
+        status: NtStatus,
+        /// The command that triggered the error.
+        command: Command,
+    },
+
+    /// An I/O error occurred.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl Error {
