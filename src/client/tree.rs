@@ -34,7 +34,10 @@ use crate::Error;
 /// With 32 credits and 64 KB chunks, we get 32 concurrent reads/writes = 2 MB
 /// per round-trip window, and the latency savings from concurrent requests
 /// far outweigh any benefit from larger per-request payloads.
-const PIPELINE_CHUNK_SIZE: u32 = 65536;
+/// Minimum number of requests to keep in flight during pipelining.
+/// We target at least 2 to hide network latency. With 2 in flight,
+/// the server processes one request while we're receiving the other.
+const MIN_PIPELINE_INFLIGHT: u16 = 2;
 
 /// File attribute constant: the entry is a directory.
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
@@ -502,16 +505,33 @@ impl Tree {
             return Ok(Vec::new());
         }
 
-        let chunk_size = PIPELINE_CHUNK_SIZE;
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        let credits = conn.credits();
+
+        // Choose the largest chunk size that allows at least MIN_PIPELINE_INFLIGHT
+        // requests in flight. Each chunk costs ceil(chunk_size / 65536) credits.
+        // With `credits` available and target `MIN_PIPELINE_INFLIGHT` in flight:
+        //   max_credits_per_chunk = credits / MIN_PIPELINE_INFLIGHT
+        //   max_chunk_from_credits = max_credits_per_chunk * 65536
+        //   chunk_size = min(max_read_size, max_chunk_from_credits)
+        let max_credits_per_chunk = credits / MIN_PIPELINE_INFLIGHT.max(1);
+        let chunk_size = if max_credits_per_chunk == 0 {
+            65536_u32 // fallback: 1 credit, 1 in flight
+        } else {
+            let from_credits = max_credits_per_chunk as u32 * 65536;
+            from_credits.min(max_read)
+        };
+
+        let credit_charge = chunk_size.div_ceil(65536) as u16;
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         debug!(
-            "tree: read_file_pipelined path={}, size={}, chunk_size={}, total_chunks={}, credits={}",
-            normalized, file_size, chunk_size, total_chunks, conn.credits()
+            "tree: read_file_pipelined path={}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
+            normalized, file_size, chunk_size, credit_charge, total_chunks, conn.credits()
         );
 
         let start = std::time::Instant::now();
         let result = self
-            .read_pipelined_loop(conn, file_id, file_size, chunk_size, total_chunks)
+            .read_pipelined_loop(conn, file_id, file_size, chunk_size, credit_charge, total_chunks)
             .await;
 
         // Close the handle regardless of read result.
@@ -592,16 +612,27 @@ impl Tree {
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
-        let chunk_size = PIPELINE_CHUNK_SIZE;
+        let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+        let credits = conn.credits();
+
+        let max_credits_per_chunk = credits / MIN_PIPELINE_INFLIGHT.max(1);
+        let chunk_size = if max_credits_per_chunk == 0 {
+            65536_u32
+        } else {
+            let from_credits = max_credits_per_chunk as u32 * 65536;
+            from_credits.min(max_write)
+        };
+
+        let credit_charge = chunk_size.div_ceil(65536) as u16;
         let total_chunks = data.len().div_ceil(chunk_size as usize);
         debug!(
-            "tree: write_file_pipelined path={}, len={}, chunk_size={}, total_chunks={}, credits={}",
-            normalized, data.len(), chunk_size, total_chunks, conn.credits()
+            "tree: write_file_pipelined path={}, len={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
+            normalized, data.len(), chunk_size, credit_charge, total_chunks, conn.credits()
         );
 
         let start = std::time::Instant::now();
         let result = self
-            .write_pipelined_loop(conn, file_id, data, chunk_size, total_chunks)
+            .write_pipelined_loop(conn, file_id, data, chunk_size, credit_charge, total_chunks)
             .await;
 
         // Close the handle.
@@ -958,6 +989,7 @@ impl Tree {
         file_id: FileId,
         file_size: u64,
         chunk_size: u32,
+        credit_charge: u16,
         total_chunks: usize,
     ) -> Result<Vec<u8>> {
         let mut data = vec![0u8; file_size as usize];
@@ -967,7 +999,9 @@ impl Tree {
         while chunks_sent < total_chunks && !hit_eof {
             let remaining_chunks = total_chunks - chunks_sent;
             // Don't send more requests than we have credits for.
-            let window_size = remaining_chunks.min(conn.credits() as usize);
+            // Each request costs credit_charge credits.
+            let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
+            let window_size = remaining_chunks.min(max_from_credits);
 
             if window_size == 0 {
                 return Err(Error::invalid_data(
@@ -1005,7 +1039,12 @@ impl Tree {
                 };
 
                 let (msg_id, _) = conn
-                    .send_request(Command::Read, &req, Some(self.tree_id))
+                    .send_request_with_credits(
+                        Command::Read,
+                        &req,
+                        Some(self.tree_id),
+                        credit_charge,
+                    )
                     .await?;
 
                 in_flight.push((msg_id, chunk_index));
@@ -1074,6 +1113,7 @@ impl Tree {
         file_id: FileId,
         data: &[u8],
         chunk_size: u32,
+        credit_charge: u16,
         total_chunks: usize,
     ) -> Result<u64> {
         let mut chunks_sent = 0usize;
@@ -1081,7 +1121,8 @@ impl Tree {
 
         while chunks_sent < total_chunks {
             let remaining_chunks = total_chunks - chunks_sent;
-            let window_size = remaining_chunks.min(conn.credits() as usize);
+            let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
+            let window_size = remaining_chunks.min(max_from_credits);
 
             if window_size == 0 {
                 return Err(Error::invalid_data(
@@ -1115,7 +1156,12 @@ impl Tree {
                 };
 
                 let (msg_id, _) = conn
-                    .send_request(Command::Write, &req, Some(self.tree_id))
+                    .send_request_with_credits(
+                        Command::Write,
+                        &req,
+                        Some(self.tree_id),
+                        credit_charge,
+                    )
                     .await?;
 
                 in_flight.push((msg_id, chunk.len() as u32));

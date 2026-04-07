@@ -86,6 +86,8 @@ pub struct Connection {
     session_id: SessionId,
     /// The server name (hostname or IP) used for UNC paths.
     server_name: String,
+    /// Estimated round-trip time, measured during negotiate.
+    estimated_rtt: Option<Duration>,
 }
 
 impl Connection {
@@ -107,6 +109,7 @@ impl Connection {
             should_sign: false,
             session_id: SessionId::NONE,
             server_name: server_name.into(),
+            estimated_rtt: None,
         }
     }
 
@@ -136,6 +139,7 @@ impl Connection {
             should_sign: false,
             session_id: SessionId::NONE,
             server_name,
+            estimated_rtt: None,
         })
     }
 
@@ -186,12 +190,18 @@ impl Connection {
         self.preauth_hasher.update(&req_bytes);
         trace!("negotiate: preauth hash updated with request ({} bytes)", req_bytes.len());
 
-        // Send.
+        // Send and measure RTT.
+        let rtt_start = std::time::Instant::now();
         self.sender.send(&req_bytes).await?;
 
         // Receive.
         let resp_bytes = self.receiver.receive().await?;
-        trace!("negotiate: received response ({} bytes)", resp_bytes.len());
+        self.estimated_rtt = Some(rtt_start.elapsed());
+        trace!(
+            "negotiate: received response ({} bytes), rtt={:?}",
+            resp_bytes.len(),
+            self.estimated_rtt.unwrap()
+        );
 
         // Update preauth hash with response bytes.
         self.preauth_hasher.update(&resp_bytes);
@@ -343,6 +353,55 @@ impl Connection {
             command, msg_id.0, tree_id, self.should_sign, msg_bytes.len()
         );
         Ok((msg_id, msg_bytes))
+    }
+
+    /// Send a request with a custom CreditCharge (for multi-credit operations).
+    ///
+    /// The CreditCharge determines how many credits this request consumes
+    /// and how many consecutive MessageIds it uses. For READ/WRITE with
+    /// payloads larger than 64KB, CreditCharge = ceil(payload / 65536).
+    pub async fn send_request_with_credits(
+        &mut self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: u16,
+    ) -> Result<(MessageId, Vec<u8>)> {
+        let mut header = Header::new_request(command);
+        header.message_id = MessageId(self.next_message_id);
+        header.credits = 32; // Request more credits.
+        header.credit_charge = CreditCharge(credit_charge);
+        header.session_id = self.session_id;
+        if let Some(tid) = tree_id {
+            header.tree_id = Some(tid);
+        }
+
+        if self.should_sign {
+            header.flags.set_signed();
+        }
+
+        let mut msg_bytes = pack_message(&header, body);
+        let msg_id = MessageId(self.next_message_id);
+        // Multi-credit requests consume consecutive MessageIds.
+        self.next_message_id += credit_charge as u64;
+
+        if self.should_sign {
+            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+                signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)?;
+            }
+        }
+
+        self.sender.send(&msg_bytes).await?;
+        debug!(
+            "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, len={}",
+            command, msg_id.0, credit_charge, tree_id, self.should_sign, msg_bytes.len()
+        );
+        Ok((msg_id, msg_bytes))
+    }
+
+    /// Get the estimated round-trip time (measured during negotiate).
+    pub fn estimated_rtt(&self) -> Option<Duration> {
+        self.estimated_rtt
     }
 
     /// Receive a response, verify signature if needed, and update credits.
