@@ -4,6 +4,7 @@
 //! data. The response returns output data from the control operation.
 
 use crate::error::Result;
+use crate::msg::header::Header;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::FileId;
 use crate::Error;
@@ -90,8 +91,9 @@ impl Pack for IoctlRequest {
         cursor.write_u64_le(self.file_id.volatile);
 
         let input_count = self.input_data.len() as u32;
+        // Offset is from the beginning of the SMB2 header per spec.
         let input_offset = if input_count > 0 {
-            header_offset + Self::FIXED_SIZE
+            (Header::SIZE as u32) + header_offset + Self::FIXED_SIZE
         } else {
             0
         };
@@ -142,7 +144,7 @@ impl Unpack for IoctlRequest {
         let _reserved2 = cursor.read_u32_le()?;
 
         let input_data = if input_count > 0 {
-            cursor.read_bytes(input_count as usize)?.to_vec()
+            cursor.read_bytes_bounded(input_count as usize)?.to_vec()
         } else {
             Vec::new()
         };
@@ -213,8 +215,9 @@ impl Pack for IoctlResponse {
         cursor.write_u64_le(self.file_id.volatile);
 
         let output_count = self.output_data.len() as u32;
+        // Offset is from the beginning of the SMB2 header per spec.
         let output_offset = if output_count > 0 {
-            header_offset + Self::FIXED_SIZE
+            (Header::SIZE as u32) + header_offset + Self::FIXED_SIZE
         } else {
             0
         };
@@ -259,7 +262,7 @@ impl Unpack for IoctlResponse {
         let _reserved2 = cursor.read_u32_le()?;
 
         let output_data = if output_count > 0 {
-            cursor.read_bytes(output_count as usize)?.to_vec()
+            cursor.read_bytes_bounded(output_count as usize)?.to_vec()
         } else {
             Vec::new()
         };

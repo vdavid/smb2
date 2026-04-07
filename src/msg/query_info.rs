@@ -5,6 +5,7 @@
 //! information classes is deferred.
 
 use crate::error::Result;
+use crate::msg::header::Header;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::FileId;
 use crate::Error;
@@ -100,7 +101,8 @@ impl Pack for QueryInfoRequest {
 
         // Buffer (variable)
         if !self.input_buffer.is_empty() {
-            let buf_offset = cursor.position() - start;
+            // Offset is from the beginning of the SMB2 header per spec.
+            let buf_offset = Header::SIZE + (cursor.position() - start);
             cursor.write_bytes(&self.input_buffer);
             cursor.set_u16_le_at(input_offset_pos, buf_offset as u16);
         }
@@ -146,13 +148,15 @@ impl Unpack for QueryInfoRequest {
         };
 
         // Read input buffer
+        // Offset on the wire is from beginning of SMB2 header.
         let input_buffer = if input_length > 0 {
             let current = cursor.position();
-            let target = start + input_offset;
+            let body_offset = input_offset.saturating_sub(Header::SIZE);
+            let target = start + body_offset;
             if target > current {
                 cursor.skip(target - current)?;
             }
-            cursor.read_bytes(input_length)?.to_vec()
+            cursor.read_bytes_bounded(input_length)?.to_vec()
         } else {
             Vec::new()
         };
@@ -200,7 +204,8 @@ impl Pack for QueryInfoResponse {
 
         // Buffer
         if !self.output_buffer.is_empty() {
-            let buf_offset = cursor.position() - start;
+            // Offset is from the beginning of the SMB2 header per spec.
+            let buf_offset = Header::SIZE + (cursor.position() - start);
             cursor.write_bytes(&self.output_buffer);
             cursor.set_u16_le_at(offset_pos, buf_offset as u16);
         }
@@ -227,13 +232,15 @@ impl Unpack for QueryInfoResponse {
         let buf_length = cursor.read_u32_le()? as usize;
 
         // Read buffer
+        // Offset on the wire is from beginning of SMB2 header.
         let output_buffer = if buf_length > 0 {
             let current = cursor.position();
-            let target = start + buf_offset;
+            let body_offset = buf_offset.saturating_sub(Header::SIZE);
+            let target = start + body_offset;
             if target > current {
                 cursor.skip(target - current)?;
             }
-            cursor.read_bytes(buf_length)?.to_vec()
+            cursor.read_bytes_bounded(buf_length)?.to_vec()
         } else {
             Vec::new()
         };

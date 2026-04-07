@@ -39,5 +39,5 @@ num_enum = "0.7"
 bytes = "1.5"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 proptest = "1"

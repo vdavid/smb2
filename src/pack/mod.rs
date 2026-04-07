@@ -125,6 +125,21 @@ impl<'a> ReadCursor<'a> {
         self.remaining() == 0
     }
 
+    /// Maximum buffer size we'll allocate from untrusted data (16 MB).
+    pub const MAX_UNPACK_BUFFER: usize = 16 * 1024 * 1024;
+
+    /// Read `n` bytes, but refuse if `n` exceeds [`Self::MAX_UNPACK_BUFFER`].
+    pub fn read_bytes_bounded(&mut self, n: usize) -> Result<&'a [u8]> {
+        if n > Self::MAX_UNPACK_BUFFER {
+            return Err(Error::invalid_data(format!(
+                "buffer size {} exceeds maximum {} bytes",
+                n,
+                Self::MAX_UNPACK_BUFFER
+            )));
+        }
+        self.read_bytes(n)
+    }
+
     // -- private helpers --
 
     fn ensure(&self, n: usize) -> Result<()> {

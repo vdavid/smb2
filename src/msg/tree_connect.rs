@@ -114,6 +114,13 @@ impl Unpack for TreeConnectRequest {
         // PathLength (2 bytes)
         let path_length = cursor.read_u16_le()? as usize;
         // Buffer: path in UTF-16LE
+        if path_length > ReadCursor::MAX_UNPACK_BUFFER {
+            return Err(Error::invalid_data(format!(
+                "buffer size {} exceeds maximum {} bytes",
+                path_length,
+                ReadCursor::MAX_UNPACK_BUFFER
+            )));
+        }
         let path = cursor.read_utf16_le(path_length)?;
 
         Ok(TreeConnectRequest { flags, path })

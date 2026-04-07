@@ -5,6 +5,44 @@ pub mod status;
 
 use std::fmt;
 
+use crate::Error;
+
+/// Requested oplock level (MS-SMB2 2.2.13, 2.2.23).
+///
+/// Used across CREATE requests/responses and oplock break messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OplockLevel {
+    /// No oplock is requested.
+    None = 0x00,
+    /// Level II oplock is requested.
+    LevelII = 0x01,
+    /// Exclusive oplock is requested.
+    Exclusive = 0x08,
+    /// Batch oplock is requested.
+    Batch = 0x09,
+    /// Lease is requested.
+    Lease = 0xFF,
+}
+
+impl TryFrom<u8> for OplockLevel {
+    type Error = Error;
+
+    fn try_from(value: u8) -> crate::error::Result<Self> {
+        match value {
+            0x00 => Ok(Self::None),
+            0x01 => Ok(Self::LevelII),
+            0x08 => Ok(Self::Exclusive),
+            0x09 => Ok(Self::Batch),
+            0xFF => Ok(Self::Lease),
+            _ => Err(Error::invalid_data(format!(
+                "invalid OplockLevel: 0x{:02X}",
+                value
+            ))),
+        }
+    }
+}
+
 /// 64-bit session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SessionId(pub u64);

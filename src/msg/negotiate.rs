@@ -233,7 +233,7 @@ fn unpack_negotiate_context(cursor: &mut ReadCursor<'_>) -> Result<NegotiateCont
             for _ in 0..hash_count {
                 hash_algorithms.push(cursor.read_u16_le()?);
             }
-            let salt = cursor.read_bytes(salt_length)?.to_vec();
+            let salt = cursor.read_bytes_bounded(salt_length)?.to_vec();
             Ok(NegotiateContext::PreauthIntegrity {
                 hash_algorithms,
                 salt,
@@ -266,7 +266,7 @@ fn unpack_negotiate_context(cursor: &mut ReadCursor<'_>) -> Result<NegotiateCont
             Ok(NegotiateContext::Signing { algorithms })
         }
         _ => {
-            let data = cursor.read_bytes(data_length)?.to_vec();
+            let data = cursor.read_bytes_bounded(data_length)?.to_vec();
             Ok(NegotiateContext::Unknown { context_type, data })
         }
     }
@@ -599,7 +599,7 @@ impl Unpack for NegotiateResponse {
 
         // SecurityBuffer (variable)
         let security_buffer = if sec_buf_length > 0 {
-            cursor.read_bytes(sec_buf_length)?.to_vec()
+            cursor.read_bytes_bounded(sec_buf_length)?.to_vec()
         } else {
             Vec::new()
         };

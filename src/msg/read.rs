@@ -207,7 +207,7 @@ impl Unpack for ReadResponse {
         let flags = cursor.read_u32_le()?;
 
         let data = if data_length > 0 {
-            cursor.read_bytes(data_length as usize)?.to_vec()
+            cursor.read_bytes_bounded(data_length as usize)?.to_vec()
         } else {
             Vec::new()
         };

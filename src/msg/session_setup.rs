@@ -141,7 +141,7 @@ impl Unpack for SessionSetupRequest {
         let previous_session_id = cursor.read_u64_le()?;
         // Buffer (variable)
         let security_buffer = if buffer_length > 0 {
-            cursor.read_bytes(buffer_length)?.to_vec()
+            cursor.read_bytes_bounded(buffer_length)?.to_vec()
         } else {
             Vec::new()
         };
@@ -212,7 +212,7 @@ impl Unpack for SessionSetupResponse {
         let buffer_length = cursor.read_u16_le()? as usize;
         // Buffer (variable)
         let security_buffer = if buffer_length > 0 {
-            cursor.read_bytes(buffer_length)?.to_vec()
+            cursor.read_bytes_bounded(buffer_length)?.to_vec()
         } else {
             Vec::new()
         };

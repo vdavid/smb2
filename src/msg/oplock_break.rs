@@ -16,25 +16,8 @@
 
 use crate::error::Result;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
-use crate::types::FileId;
+use crate::types::{FileId, OplockLevel};
 use crate::Error;
-
-// ── OplockLevel values ─────────────────────────────────────────────────
-
-/// No oplock is held.
-pub const OPLOCK_LEVEL_NONE: u8 = 0x00;
-
-/// Level II (shared/read) oplock.
-pub const OPLOCK_LEVEL_II: u8 = 0x01;
-
-/// Exclusive oplock.
-pub const OPLOCK_LEVEL_EXCLUSIVE: u8 = 0x08;
-
-/// Batch oplock.
-pub const OPLOCK_LEVEL_BATCH: u8 = 0x09;
-
-/// Lease (used to distinguish oplock vs lease break messages).
-pub const OPLOCK_LEVEL_LEASE: u8 = 0xFF;
 
 // ── OplockBreak (shared struct) ────────────────────────────────────────
 
@@ -46,8 +29,8 @@ pub const OPLOCK_LEVEL_LEASE: u8 = 0xFF;
 /// command code and flags, not by this structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OplockBreak {
-    /// The oplock level. One of `OPLOCK_LEVEL_*` constants.
-    pub oplock_level: u8,
+    /// The oplock level.
+    pub oplock_level: OplockLevel,
     /// The file handle associated with the oplock.
     pub file_id: FileId,
 }
@@ -62,7 +45,7 @@ impl Pack for OplockBreak {
         // StructureSize (2 bytes)
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
         // OplockLevel (1 byte)
-        cursor.write_u8(self.oplock_level);
+        cursor.write_u8(self.oplock_level as u8);
         // Reserved (1 byte)
         cursor.write_u8(0);
         // Reserved2 (4 bytes)
@@ -84,7 +67,7 @@ impl Unpack for OplockBreak {
             )));
         }
 
-        let oplock_level = cursor.read_u8()?;
+        let oplock_level = OplockLevel::try_from(cursor.read_u8()?)?;
         let _reserved = cursor.read_u8()?;
         let _reserved2 = cursor.read_u32_le()?;
         let persistent = cursor.read_u64_le()?;
@@ -120,7 +103,7 @@ mod tests {
     #[test]
     fn oplock_break_notification_roundtrip() {
         let original = OplockBreakNotification {
-            oplock_level: OPLOCK_LEVEL_II,
+            oplock_level: OplockLevel::LevelII,
             file_id: FileId {
                 persistent: 0x1122_3344_5566_7788,
                 volatile: 0xAABB_CCDD_EEFF_0011,
@@ -137,14 +120,14 @@ mod tests {
         let mut r = ReadCursor::new(&bytes);
         let decoded = OplockBreakNotification::unpack(&mut r).unwrap();
 
-        assert_eq!(decoded.oplock_level, OPLOCK_LEVEL_II);
+        assert_eq!(decoded.oplock_level, OplockLevel::LevelII);
         assert_eq!(decoded.file_id, original.file_id);
     }
 
     #[test]
     fn oplock_break_notification_exclusive_level() {
         let original = OplockBreakNotification {
-            oplock_level: OPLOCK_LEVEL_EXCLUSIVE,
+            oplock_level: OplockLevel::Exclusive,
             file_id: FileId {
                 persistent: 0x42,
                 volatile: 0x99,
@@ -158,7 +141,7 @@ mod tests {
         let mut r = ReadCursor::new(&bytes);
         let decoded = OplockBreakNotification::unpack(&mut r).unwrap();
 
-        assert_eq!(decoded.oplock_level, OPLOCK_LEVEL_EXCLUSIVE);
+        assert_eq!(decoded.oplock_level, OplockLevel::Exclusive);
         assert_eq!(decoded.file_id.persistent, 0x42);
         assert_eq!(decoded.file_id.volatile, 0x99);
     }
@@ -168,7 +151,7 @@ mod tests {
     #[test]
     fn oplock_break_acknowledgment_roundtrip() {
         let original = OplockBreakAcknowledgment {
-            oplock_level: OPLOCK_LEVEL_NONE,
+            oplock_level: OplockLevel::None,
             file_id: FileId {
                 persistent: 0xDEAD,
                 volatile: 0xBEEF,
@@ -184,7 +167,7 @@ mod tests {
         let mut r = ReadCursor::new(&bytes);
         let decoded = OplockBreakAcknowledgment::unpack(&mut r).unwrap();
 
-        assert_eq!(decoded.oplock_level, OPLOCK_LEVEL_NONE);
+        assert_eq!(decoded.oplock_level, OplockLevel::None);
         assert_eq!(decoded.file_id, original.file_id);
     }
 
@@ -193,7 +176,7 @@ mod tests {
     #[test]
     fn oplock_break_response_roundtrip() {
         let original = OplockBreakResponse {
-            oplock_level: OPLOCK_LEVEL_BATCH,
+            oplock_level: OplockLevel::Batch,
             file_id: FileId {
                 persistent: 0xCAFE,
                 volatile: 0xFACE,
@@ -209,7 +192,7 @@ mod tests {
         let mut r = ReadCursor::new(&bytes);
         let decoded = OplockBreakResponse::unpack(&mut r).unwrap();
 
-        assert_eq!(decoded.oplock_level, OPLOCK_LEVEL_BATCH);
+        assert_eq!(decoded.oplock_level, OplockLevel::Batch);
         assert_eq!(decoded.file_id, original.file_id);
     }
 
@@ -233,7 +216,7 @@ mod tests {
         // StructureSize = 24
         buf[0..2].copy_from_slice(&24u16.to_le_bytes());
         // OplockLevel = LEVEL_II
-        buf[2] = OPLOCK_LEVEL_II;
+        buf[2] = OplockLevel::LevelII as u8;
         // Reserved = 0xFF (should be ignored)
         buf[3] = 0xFF;
         // Reserved2 = 0xDEADBEEF (should be ignored)
@@ -246,7 +229,7 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         let decoded = OplockBreak::unpack(&mut cursor).unwrap();
 
-        assert_eq!(decoded.oplock_level, OPLOCK_LEVEL_II);
+        assert_eq!(decoded.oplock_level, OplockLevel::LevelII);
         assert_eq!(decoded.file_id.persistent, 1);
         assert_eq!(decoded.file_id.volatile, 2);
     }

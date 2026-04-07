@@ -256,7 +256,7 @@ impl Unpack for ErrorResponse {
 
         // ErrorData (variable)
         let error_data = if byte_count > 0 {
-            cursor.read_bytes(byte_count)?.to_vec()
+            cursor.read_bytes_bounded(byte_count)?.to_vec()
         } else {
             Vec::new()
         };

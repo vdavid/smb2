@@ -5,46 +5,13 @@
 //! attributes, and optional create contexts.
 
 use crate::error::Result;
+use crate::msg::header::Header;
 use crate::pack::{FileTime, Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::flags::FileAccessMask;
-use crate::types::FileId;
+use crate::types::{FileId, OplockLevel};
 use crate::Error;
 
 // ── Enums ────────────────────────────────────────────────────────────────
-
-/// Requested oplock level (MS-SMB2 2.2.13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum OplockLevel {
-    /// No oplock is requested.
-    None = 0x00,
-    /// Level II oplock is requested.
-    LevelII = 0x01,
-    /// Exclusive oplock is requested.
-    Exclusive = 0x08,
-    /// Batch oplock is requested.
-    Batch = 0x09,
-    /// Lease is requested.
-    Lease = 0xFF,
-}
-
-impl TryFrom<u8> for OplockLevel {
-    type Error = Error;
-
-    fn try_from(value: u8) -> Result<Self> {
-        match value {
-            0x00 => Ok(Self::None),
-            0x01 => Ok(Self::LevelII),
-            0x08 => Ok(Self::Exclusive),
-            0x09 => Ok(Self::Batch),
-            0xFF => Ok(Self::Lease),
-            _ => Err(Error::invalid_data(format!(
-                "invalid OplockLevel: 0x{:02X}",
-                value
-            ))),
-        }
-    }
-}
 
 /// Impersonation level (MS-SMB2 2.2.13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +200,8 @@ impl Pack for CreateRequest {
         cursor.write_u32_le(0);
 
         // Buffer: filename in UTF-16LE
-        let name_offset = cursor.position() - start;
+        // Offsets are from the beginning of the SMB2 header per spec.
+        let name_offset = Header::SIZE + (cursor.position() - start);
         let name_start = cursor.position();
         cursor.write_utf16_le(&self.name);
         let name_byte_len = cursor.position() - name_start;
@@ -246,7 +214,7 @@ impl Pack for CreateRequest {
         if !self.create_contexts.is_empty() {
             // Align to 8-byte boundary before create contexts
             cursor.align_to(8);
-            let ctx_offset = cursor.position() - start;
+            let ctx_offset = Header::SIZE + (cursor.position() - start);
             cursor.write_bytes(&self.create_contexts);
             let ctx_len = self.create_contexts.len();
 
@@ -306,10 +274,12 @@ impl Unpack for CreateRequest {
         let ctx_length = cursor.read_u32_le()? as usize;
 
         // Read filename
+        // Offsets on the wire are from the beginning of the SMB2 header,
+        // so subtract Header::SIZE to get position within the body.
         let name = if name_length > 0 {
-            // Skip to name offset relative to start
             let current = cursor.position();
-            let target = start + name_offset;
+            let body_offset = name_offset.saturating_sub(Header::SIZE);
+            let target = start + body_offset;
             if target > current {
                 cursor.skip(target - current)?;
             }
@@ -321,11 +291,12 @@ impl Unpack for CreateRequest {
         // Read create contexts
         let create_contexts = if ctx_length > 0 {
             let current = cursor.position();
-            let target = start + ctx_offset;
+            let body_offset = ctx_offset.saturating_sub(Header::SIZE);
+            let target = start + body_offset;
             if target > current {
                 cursor.skip(target - current)?;
             }
-            cursor.read_bytes(ctx_length)?.to_vec()
+            cursor.read_bytes_bounded(ctx_length)?.to_vec()
         } else {
             Vec::new()
         };
@@ -424,7 +395,7 @@ impl Pack for CreateResponse {
         // Create contexts (if any)
         if !self.create_contexts.is_empty() {
             cursor.align_to(8);
-            let ctx_offset = cursor.position() - start;
+            let ctx_offset = Header::SIZE + (cursor.position() - start);
             cursor.write_bytes(&self.create_contexts);
             let ctx_len = self.create_contexts.len();
 
@@ -483,13 +454,15 @@ impl Unpack for CreateResponse {
         let ctx_length = cursor.read_u32_le()? as usize;
 
         // Read create contexts
+        // Offset on the wire is from beginning of SMB2 header.
         let create_contexts = if ctx_length > 0 {
             let current = cursor.position();
-            let target = start + ctx_offset;
+            let body_offset = ctx_offset.saturating_sub(Header::SIZE);
+            let target = start + body_offset;
             if target > current {
                 cursor.skip(target - current)?;
             }
-            cursor.read_bytes(ctx_length)?.to_vec()
+            cursor.read_bytes_bounded(ctx_length)?.to_vec()
         } else {
             Vec::new()
         };

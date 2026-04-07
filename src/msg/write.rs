@@ -103,7 +103,7 @@ impl Unpack for WriteRequest {
         let flags = cursor.read_u32_le()?;
 
         let data = if length > 0 {
-            cursor.read_bytes(length as usize)?.to_vec()
+            cursor.read_bytes_bounded(length as usize)?.to_vec()
         } else {
             // Skip the minimum 1-byte buffer
             cursor.skip(1)?;

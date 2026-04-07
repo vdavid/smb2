@@ -5,6 +5,7 @@
 //! The response is a minimal 2-byte structure.
 
 use crate::error::Result;
+use crate::msg::header::Header;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::FileId;
 use crate::Error;
@@ -62,7 +63,8 @@ impl Pack for SetInfoRequest {
 
         // Buffer (variable)
         if !self.buffer.is_empty() {
-            let buf_offset = cursor.position() - start;
+            // Offset is from the beginning of the SMB2 header per spec.
+            let buf_offset = Header::SIZE + (cursor.position() - start);
             cursor.write_bytes(&self.buffer);
             cursor.set_u16_le_at(offset_pos, buf_offset as u16);
         }
@@ -104,13 +106,15 @@ impl Unpack for SetInfoRequest {
         };
 
         // Read buffer
+        // Offset on the wire is from beginning of SMB2 header.
         let buffer = if buffer_length > 0 {
             let current = cursor.position();
-            let target = start + buf_offset;
+            let body_offset = buf_offset.saturating_sub(Header::SIZE);
+            let target = start + body_offset;
             if target > current {
                 cursor.skip(target - current)?;
             }
-            cursor.read_bytes(buffer_length)?.to_vec()
+            cursor.read_bytes_bounded(buffer_length)?.to_vec()
         } else {
             Vec::new()
         };

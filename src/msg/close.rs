@@ -5,7 +5,7 @@
 //! `SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB` flag was set.
 
 use crate::error::Result;
-use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
+use crate::pack::{FileTime, Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::FileId;
 use crate::Error;
 
@@ -91,14 +91,14 @@ pub struct CloseResponse {
     /// Flags echoed from the request. If `SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB`
     /// is set, the attribute fields below contain valid data.
     pub flags: u16,
-    /// File creation time (FILETIME).
-    pub creation_time: u64,
-    /// Last access time (FILETIME).
-    pub last_access_time: u64,
-    /// Last write time (FILETIME).
-    pub last_write_time: u64,
-    /// Change time (FILETIME).
-    pub change_time: u64,
+    /// File creation time.
+    pub creation_time: FileTime,
+    /// Last access time.
+    pub last_access_time: FileTime,
+    /// Last write time.
+    pub last_write_time: FileTime,
+    /// Change time.
+    pub change_time: FileTime,
     /// Size of allocated data in bytes.
     pub allocation_size: u64,
     /// End-of-file position in bytes.
@@ -117,10 +117,10 @@ impl Pack for CloseResponse {
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
         cursor.write_u16_le(self.flags);
         cursor.write_u32_le(0); // Reserved
-        cursor.write_u64_le(self.creation_time);
-        cursor.write_u64_le(self.last_access_time);
-        cursor.write_u64_le(self.last_write_time);
-        cursor.write_u64_le(self.change_time);
+        self.creation_time.pack(cursor);
+        self.last_access_time.pack(cursor);
+        self.last_write_time.pack(cursor);
+        self.change_time.pack(cursor);
         cursor.write_u64_le(self.allocation_size);
         cursor.write_u64_le(self.end_of_file);
         cursor.write_u32_le(self.file_attributes);
@@ -140,10 +140,10 @@ impl Unpack for CloseResponse {
 
         let flags = cursor.read_u16_le()?;
         let _reserved = cursor.read_u32_le()?;
-        let creation_time = cursor.read_u64_le()?;
-        let last_access_time = cursor.read_u64_le()?;
-        let last_write_time = cursor.read_u64_le()?;
-        let change_time = cursor.read_u64_le()?;
+        let creation_time = FileTime::unpack(cursor)?;
+        let last_access_time = FileTime::unpack(cursor)?;
+        let last_write_time = FileTime::unpack(cursor)?;
+        let change_time = FileTime::unpack(cursor)?;
         let allocation_size = cursor.read_u64_le()?;
         let end_of_file = cursor.read_u64_le()?;
         let file_attributes = cursor.read_u32_le()?;
@@ -231,10 +231,10 @@ mod tests {
     fn close_response_roundtrip() {
         let original = CloseResponse {
             flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB,
-            creation_time: 0x01D8_AAAA_BBBB_CCCC,
-            last_access_time: 0x01D8_DDDD_EEEE_FFFF,
-            last_write_time: 0x01D8_1111_2222_3333,
-            change_time: 0x01D8_4444_5555_6666,
+            creation_time: FileTime(0x01D8_AAAA_BBBB_CCCC),
+            last_access_time: FileTime(0x01D8_DDDD_EEEE_FFFF),
+            last_write_time: FileTime(0x01D8_1111_2222_3333),
+            change_time: FileTime(0x01D8_4444_5555_6666),
             allocation_size: 4096,
             end_of_file: 2048,
             file_attributes: 0x20, // FILE_ATTRIBUTE_ARCHIVE
@@ -288,10 +288,10 @@ mod tests {
         let resp = CloseResponse::unpack(&mut cursor).unwrap();
 
         assert_eq!(resp.flags, SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB);
-        assert_eq!(resp.creation_time, 100);
-        assert_eq!(resp.last_access_time, 200);
-        assert_eq!(resp.last_write_time, 300);
-        assert_eq!(resp.change_time, 400);
+        assert_eq!(resp.creation_time, FileTime(100));
+        assert_eq!(resp.last_access_time, FileTime(200));
+        assert_eq!(resp.last_write_time, FileTime(300));
+        assert_eq!(resp.change_time, FileTime(400));
         assert_eq!(resp.allocation_size, 8192);
         assert_eq!(resp.end_of_file, 1024);
         assert_eq!(resp.file_attributes, 0x10);
@@ -313,10 +313,10 @@ mod tests {
     fn close_response_zero_flags_has_zeroed_attributes() {
         let original = CloseResponse {
             flags: 0,
-            creation_time: 0,
-            last_access_time: 0,
-            last_write_time: 0,
-            change_time: 0,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: FileTime::ZERO,
+            change_time: FileTime::ZERO,
             allocation_size: 0,
             end_of_file: 0,
             file_attributes: 0,
@@ -330,7 +330,7 @@ mod tests {
         let decoded = CloseResponse::unpack(&mut r).unwrap();
 
         assert_eq!(decoded.flags, 0);
-        assert_eq!(decoded.creation_time, 0);
+        assert_eq!(decoded.creation_time, FileTime::ZERO);
         assert_eq!(decoded.file_attributes, 0);
     }
 }
