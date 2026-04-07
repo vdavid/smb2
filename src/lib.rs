@@ -8,10 +8,12 @@
 //! close the gap on bulk transfers.
 
 pub mod auth;
+pub mod client;
 pub mod crypto;
 pub mod error;
 pub mod msg;
 pub mod pack;
+pub mod rpc;
 pub mod transport;
 pub mod types;
 
