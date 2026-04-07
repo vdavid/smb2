@@ -50,6 +50,10 @@ ccm = "0.5"
 cmac = "0.7"
 digest = "0.10"
 
+# NTLM authentication (MS-NLMP)
+md-5 = "0.10"
+md4 = "0.10"
+
 # Compression
 lz4_flex = "0.11"
 

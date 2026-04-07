@@ -7,6 +7,7 @@
 //! match native OS SMB performance on metadata-heavy operations and
 //! close the gap on bulk transfers.
 
+pub mod auth;
 pub mod crypto;
 pub mod error;
 pub mod msg;
