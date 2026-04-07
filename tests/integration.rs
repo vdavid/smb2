@@ -653,3 +653,58 @@ async fn write_with_progress_and_cancel() {
         .await
         .expect("disconnect failed");
 }
+
+#[tokio::test]
+#[ignore]
+async fn debug_rapid_pipelined_writes() {
+    let _ = env_logger::try_init();
+
+    let config = ClientConfig {
+        addr: "192.168.1.111:445".into(),
+        timeout: Duration::from_secs(5),
+        username: "david".into(),
+        password: "cVYiKPJK*fRbQN5!%b&cBb63".into(),
+        domain: String::new(),
+        auto_reconnect: false,
+    };
+
+    let mut client = SmbClient::connect(config).await.expect("connect failed");
+    let share = client.connect_share("naspi").await.expect("tree failed");
+
+    eprintln!("Connected. Credits: {}", client.credits());
+
+    let data = vec![0xAA; 100 * 1024]; // 100 KB
+
+    for i in 0..20 {
+        let path = format!("_test/smb2_diag_{}.tmp", i);
+        let start = std::time::Instant::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.write_file_pipelined(&share, &path, &data),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(n)) => eprintln!(
+                "  [{}] wrote {} bytes in {:?}, credits={}",
+                i, n, start.elapsed(), client.credits()
+            ),
+            Ok(Err(e)) => {
+                eprintln!("  [{}] WRITE ERROR: {}", i, e);
+                break;
+            }
+            Err(_) => {
+                eprintln!("  [{}] TIMEOUT after 10s, credits={}", i, client.credits());
+                break;
+            }
+        }
+    }
+
+    // Cleanup
+    for i in 0..20 {
+        let path = format!("_test/smb2_diag_{}.tmp", i);
+        let _ = client.delete_file(&share, &path).await;
+    }
+    let _ = client.disconnect_share(&share).await;
+}

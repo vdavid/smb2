@@ -28,17 +28,12 @@ use crate::types::status::NtStatus;
 use crate::types::{Command, FileId, MessageId, OplockLevel, TreeId};
 use crate::Error;
 
-/// Chunk size for pipelined I/O: 64 KB.
+/// Maximum number of requests to keep in flight during pipelining.
 ///
-/// Using 64 KB means each request costs exactly 1 credit (CreditCharge=1),
-/// which avoids the consecutive-MessageId complexity of multi-credit requests.
-/// With 32 credits and 64 KB chunks, we get 32 concurrent reads/writes = 2 MB
-/// per round-trip window, and the latency savings from concurrent requests
-/// far outweigh any benefit from larger per-request payloads.
-/// Minimum number of requests to keep in flight during pipelining.
-/// We target at least 2 to hide network latency. With 2 in flight,
-/// the server processes one request while we're receiving the other.
-const MIN_PIPELINE_INFLIGHT: u16 = 2;
+/// More than 32 in-flight requests creates diminishing returns and
+/// increases memory usage (buffering responses). 32 x 64 KB = 2 MB
+/// in flight is plenty for Gigabit LAN.
+const MAX_PIPELINE_WINDOW: usize = 32;
 
 /// File attribute constant: the entry is a directory.
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
@@ -486,16 +481,15 @@ impl Tree {
         Ok(bytes_written)
     }
 
-    /// Read a file using pipelined I/O.
+    /// Read a file using pipelined I/O with a sliding window.
     ///
-    /// Opens the file, determines its size, sends multiple READ requests
-    /// concurrently (filling the credit window), collects responses,
-    /// reassembles in order. Much faster than sequential [`read_file`](Self::read_file)
+    /// Opens the file, determines its size, then uses a sliding window to
+    /// keep the pipe full: as each response arrives, the next request is sent
+    /// immediately. Much faster than sequential [`read_file`](Self::read_file)
     /// for large files.
     ///
     /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
-    /// With 32 credits, each window sends up to 32 reads in parallel (2 MB),
-    /// reducing round-trips from N to ceil(N/32).
+    /// The window is capped at 32 in-flight requests (2 MB).
     pub async fn read_file_pipelined(
         &self,
         conn: &mut Connection,
@@ -512,24 +506,11 @@ impl Tree {
             return Ok(Vec::new());
         }
 
-        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
-        let credits = conn.credits();
-
-        // Choose the largest chunk size that allows at least MIN_PIPELINE_INFLIGHT
-        // requests in flight. Each chunk costs ceil(chunk_size / 65536) credits.
-        // With `credits` available and target `MIN_PIPELINE_INFLIGHT` in flight:
-        //   max_credits_per_chunk = credits / MIN_PIPELINE_INFLIGHT
-        //   max_chunk_from_credits = max_credits_per_chunk * 65536
-        //   chunk_size = min(max_read_size, max_chunk_from_credits)
-        let max_credits_per_chunk = credits / MIN_PIPELINE_INFLIGHT.max(1);
-        let chunk_size = if max_credits_per_chunk == 0 {
-            65536_u32 // fallback: 1 credit, 1 in flight
-        } else {
-            let from_credits = max_credits_per_chunk as u32 * 65536;
-            from_credits.min(max_read)
-        };
-
-        let credit_charge = chunk_size.div_ceil(65536) as u16;
+        // Always use 64 KB chunks for pipelined reads: CreditCharge=1,
+        // maximizes concurrency. With the sliding window, more smaller
+        // chunks keeps the pipe fuller.
+        let chunk_size = 65536_u32;
+        let credit_charge = 1_u16;
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         debug!(
             "tree: read_file_pipelined path={}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
@@ -564,14 +545,14 @@ impl Tree {
         Ok(data)
     }
 
-    /// Write a file using pipelined I/O.
+    /// Write a file using pipelined I/O with a sliding window.
     ///
-    /// Opens/creates the file, sends multiple WRITE requests concurrently
-    /// (filling the credit window), collects responses, then flushes to
-    /// ensure data is persisted on the server. Much faster than
+    /// Opens/creates the file, then uses a sliding window to keep the pipe
+    /// full: as each response arrives, the next request is sent immediately.
+    /// Flushes to ensure data is persisted on the server. Much faster than
     /// sequential [`write_file`](Self::write_file) for large data.
     ///
-    /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
+    /// Uses MaxWriteSize chunks to minimize overhead for large payloads.
     pub async fn write_file_pipelined(
         &self,
         conn: &mut Connection,
@@ -620,17 +601,10 @@ impl Tree {
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
+        // Use MaxWriteSize for pipelined writes: minimizes overhead for
+        // large payloads being sent (we're sending data, not just a small request).
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-        let credits = conn.credits();
-
-        let max_credits_per_chunk = credits / MIN_PIPELINE_INFLIGHT.max(1);
-        let chunk_size = if max_credits_per_chunk == 0 {
-            65536_u32
-        } else {
-            let from_credits = max_credits_per_chunk as u32 * 65536;
-            from_credits.min(max_write)
-        };
-
+        let chunk_size = max_write;
         let credit_charge = chunk_size.div_ceil(65536) as u16;
         let total_chunks = data.len().div_ceil(chunk_size as usize);
         debug!(
@@ -995,7 +969,11 @@ impl Tree {
         Ok(data)
     }
 
-    /// Pipelined read: send windows of READ requests and collect responses.
+    /// Pipelined read using a sliding window.
+    ///
+    /// Instead of batch send/receive phases, each received response
+    /// immediately triggers the next send. The pipe stays full at all times,
+    /// eliminating idle gaps between batches.
     async fn read_pipelined_loop(
         &self,
         conn: &mut Connection,
@@ -1007,100 +985,94 @@ impl Tree {
     ) -> Result<Vec<u8>> {
         let mut data = vec![0u8; file_size as usize];
         let mut chunks_sent = 0usize;
-        let mut hit_eof = false;
+        let mut chunks_received = 0usize;
+        let mut in_flight: Vec<(MessageId, usize)> = Vec::new();
 
-        while chunks_sent < total_chunks && !hit_eof {
-            let remaining_chunks = total_chunks - chunks_sent;
-            // Don't send more requests than we have credits for.
-            // Each request costs credit_charge credits.
-            let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
-            let window_size = remaining_chunks.min(max_from_credits);
+        // Initial fill: send up to window_size reads.
+        let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
+        let initial_window = total_chunks
+            .min(max_from_credits)
+            .min(MAX_PIPELINE_WINDOW);
 
-            if window_size == 0 {
-                return Err(Error::invalid_data(
-                    "no credits available for pipelined read",
-                ));
+        if initial_window == 0 {
+            return Err(Error::invalid_data(
+                "no credits available for pipelined read",
+            ));
+        }
+
+        debug!(
+            "tree: pipeline read sliding window: initial_window={}, total_chunks={}, credits={}",
+            initial_window, total_chunks, conn.credits()
+        );
+
+        for _ in 0..initial_window {
+            let offset = chunks_sent as u64 * chunk_size as u64;
+            let this_chunk = if chunks_sent == total_chunks - 1 {
+                (file_size - offset) as u32
+            } else {
+                chunk_size
+            };
+
+            let req = ReadRequest {
+                padding: 0x50,
+                flags: 0,
+                length: this_chunk,
+                offset,
+                file_id,
+                minimum_count: 0,
+                channel: SMB2_CHANNEL_NONE,
+                remaining_bytes: 0,
+                read_channel_info: vec![],
+            };
+
+            let (msg_id, _) = conn
+                .send_request_with_credits(
+                    Command::Read,
+                    &req,
+                    Some(self.tree_id),
+                    credit_charge,
+                )
+                .await?;
+
+            in_flight.push((msg_id, chunks_sent));
+            chunks_sent += 1;
+        }
+
+        // Sliding loop: receive one, send one, until all chunks received.
+        while chunks_received < total_chunks {
+            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            chunks_received += 1;
+
+            if resp_header.status == NtStatus::END_OF_FILE {
+                // File is shorter than expected. Continue collecting remaining
+                // in-flight responses but don't send more.
+                continue;
             }
 
-            debug!(
-                "tree: pipeline read window: sending {} requests (chunk {}/{}), credits={}",
-                window_size, chunks_sent, total_chunks, conn.credits()
-            );
-
-            // SEND phase: fire off window_size READ requests.
-            let mut in_flight: Vec<(MessageId, usize)> = Vec::with_capacity(window_size);
-            for i in 0..window_size {
-                let chunk_index = chunks_sent + i;
-                let offset = chunk_index as u64 * chunk_size as u64;
-                let this_chunk = if chunk_index == total_chunks - 1 {
-                    // Last chunk may be smaller.
-                    (file_size - offset) as u32
-                } else {
-                    chunk_size
-                };
-
-                let req = ReadRequest {
-                    padding: 0x50,
-                    flags: 0,
-                    length: this_chunk,
-                    offset,
-                    file_id,
-                    minimum_count: 0,
-                    channel: SMB2_CHANNEL_NONE,
-                    remaining_bytes: 0,
-                    read_channel_info: vec![],
-                };
-
-                let (msg_id, _) = conn
-                    .send_request_with_credits(
-                        Command::Read,
-                        &req,
-                        Some(self.tree_id),
-                        credit_charge,
-                    )
-                    .await?;
-
-                in_flight.push((msg_id, chunk_index));
+            if resp_header.status != NtStatus::SUCCESS {
+                return Err(Error::Protocol {
+                    status: resp_header.status,
+                    command: Command::Read,
+                });
             }
 
-            // RECEIVE phase: collect window_size responses.
-            for _ in 0..window_size {
-                let (resp_header, resp_body, _) = conn.receive_response().await?;
+            // Find which chunk this response belongs to by matching MessageId.
+            let msg_id = resp_header.message_id;
+            let chunk_index = in_flight
+                .iter()
+                .find(|(mid, _)| *mid == msg_id)
+                .map(|(_, idx)| *idx)
+                .ok_or_else(|| {
+                    Error::invalid_data(format!(
+                        "received response with unexpected MessageId {}",
+                        msg_id
+                    ))
+                })?;
 
-                if resp_header.status == NtStatus::END_OF_FILE {
-                    // File is shorter than expected. Stop reading.
-                    hit_eof = true;
-                    continue;
-                }
+            let mut cursor = ReadCursor::new(&resp_body);
+            let resp = ReadResponse::unpack(&mut cursor)?;
 
-                if resp_header.status != NtStatus::SUCCESS {
-                    return Err(Error::Protocol {
-                        status: resp_header.status,
-                        command: Command::Read,
-                    });
-                }
-
-                // Find which chunk this response belongs to by matching MessageId.
-                let msg_id = resp_header.message_id;
-                let chunk_index = in_flight
-                    .iter()
-                    .find(|(mid, _)| *mid == msg_id)
-                    .map(|(_, idx)| *idx)
-                    .ok_or_else(|| {
-                        Error::invalid_data(format!(
-                            "received response with unexpected MessageId {}",
-                            msg_id
-                        ))
-                    })?;
-
-                let mut cursor = ReadCursor::new(&resp_body);
-                let resp = ReadResponse::unpack(&mut cursor)?;
-
-                if resp.data.is_empty() {
-                    hit_eof = true;
-                    continue;
-                }
-
+            if !resp.data.is_empty() {
                 // Place data at the correct offset.
                 let dest_offset = chunk_index as u64 * chunk_size as u64;
                 let dest_end = (dest_offset as usize + resp.data.len()).min(data.len());
@@ -1109,17 +1081,51 @@ impl Tree {
                     .copy_from_slice(&resp.data[..src_len]);
             }
 
-            chunks_sent += window_size;
+            // Immediately send the next chunk if available and credits allow.
+            if chunks_sent < total_chunks {
+                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
+                if credits_available > 0 {
+                    let offset = chunks_sent as u64 * chunk_size as u64;
+                    let this_chunk = if chunks_sent == total_chunks - 1 {
+                        (file_size - offset) as u32
+                    } else {
+                        chunk_size
+                    };
+
+                    let req = ReadRequest {
+                        padding: 0x50,
+                        flags: 0,
+                        length: this_chunk,
+                        offset,
+                        file_id,
+                        minimum_count: 0,
+                        channel: SMB2_CHANNEL_NONE,
+                        remaining_bytes: 0,
+                        read_channel_info: vec![],
+                    };
+
+                    let (msg_id, _) = conn
+                        .send_request_with_credits(
+                            Command::Read,
+                            &req,
+                            Some(self.tree_id),
+                            credit_charge,
+                        )
+                        .await?;
+
+                    in_flight.push((msg_id, chunks_sent));
+                    chunks_sent += 1;
+                }
+            }
         }
 
-        // If EOF was hit early, truncate the buffer.
-        // The actual data length is the last byte we wrote.
-        // For simplicity, we keep the full buffer since we allocated based on file_size.
-        // The server told us the file_size in CreateResponse, so it should be accurate.
         Ok(data)
     }
 
-    /// Pipelined write: send windows of WRITE requests and collect responses.
+    /// Pipelined write using a sliding window.
+    ///
+    /// Instead of batch send/receive phases, each received response
+    /// immediately triggers the next send. The pipe stays full at all times.
     async fn write_pipelined_loop(
         &self,
         conn: &mut Connection,
@@ -1130,74 +1136,103 @@ impl Tree {
         total_chunks: usize,
     ) -> Result<u64> {
         let mut chunks_sent = 0usize;
+        let mut chunks_received = 0usize;
         let mut total_written = 0u64;
 
-        while chunks_sent < total_chunks {
-            let remaining_chunks = total_chunks - chunks_sent;
-            let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
-            let window_size = remaining_chunks.min(max_from_credits);
+        // Initial fill: send up to window_size writes.
+        let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
+        let initial_window = total_chunks
+            .min(max_from_credits)
+            .min(MAX_PIPELINE_WINDOW);
 
-            if window_size == 0 {
-                return Err(Error::invalid_data(
-                    "no credits available for pipelined write",
-                ));
+        if initial_window == 0 {
+            return Err(Error::invalid_data(
+                "no credits available for pipelined write",
+            ));
+        }
+
+        debug!(
+            "tree: pipeline write sliding window: initial_window={}, total_chunks={}, credits={}",
+            initial_window, total_chunks, conn.credits()
+        );
+
+        for _ in 0..initial_window {
+            let offset = chunks_sent * chunk_size as usize;
+            let end = (offset + chunk_size as usize).min(data.len());
+            let chunk = &data[offset..end];
+
+            let req = WriteRequest {
+                data_offset: 0x70, // header (64) + fixed write body (48) = 112 = 0x70
+                offset: offset as u64,
+                file_id,
+                channel: 0,
+                remaining_bytes: 0,
+                write_channel_info_offset: 0,
+                write_channel_info_length: 0,
+                flags: 0,
+                data: chunk.to_vec(),
+            };
+
+            let (_, _) = conn
+                .send_request_with_credits(
+                    Command::Write,
+                    &req,
+                    Some(self.tree_id),
+                    credit_charge,
+                )
+                .await?;
+
+            chunks_sent += 1;
+        }
+
+        // Sliding loop: receive one, send one, until all chunks received.
+        while chunks_received < total_chunks {
+            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            chunks_received += 1;
+
+            if resp_header.status != NtStatus::SUCCESS {
+                return Err(Error::Protocol {
+                    status: resp_header.status,
+                    command: Command::Write,
+                });
             }
 
-            debug!(
-                "tree: pipeline write window: sending {} requests (chunk {}/{}), credits={}",
-                window_size, chunks_sent, total_chunks, conn.credits()
-            );
+            let mut cursor = ReadCursor::new(&resp_body);
+            let resp = WriteResponse::unpack(&mut cursor)?;
+            total_written += resp.count as u64;
 
-            // SEND phase: fire off window_size WRITE requests.
-            let mut in_flight: Vec<(MessageId, u32)> = Vec::with_capacity(window_size);
-            for i in 0..window_size {
-                let chunk_index = chunks_sent + i;
-                let offset = chunk_index * chunk_size as usize;
-                let end = (offset + chunk_size as usize).min(data.len());
-                let chunk = &data[offset..end];
+            // Immediately send the next chunk if available and credits allow.
+            if chunks_sent < total_chunks {
+                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
+                if credits_available > 0 {
+                    let offset = chunks_sent * chunk_size as usize;
+                    let end = (offset + chunk_size as usize).min(data.len());
+                    let chunk = &data[offset..end];
 
-                let req = WriteRequest {
-                    data_offset: 0x70, // header (64) + fixed write body (48) = 112 = 0x70
-                    offset: offset as u64,
-                    file_id,
-                    channel: 0,
-                    remaining_bytes: 0,
-                    write_channel_info_offset: 0,
-                    write_channel_info_length: 0,
-                    flags: 0,
-                    data: chunk.to_vec(),
-                };
+                    let req = WriteRequest {
+                        data_offset: 0x70,
+                        offset: offset as u64,
+                        file_id,
+                        channel: 0,
+                        remaining_bytes: 0,
+                        write_channel_info_offset: 0,
+                        write_channel_info_length: 0,
+                        flags: 0,
+                        data: chunk.to_vec(),
+                    };
 
-                let (msg_id, _) = conn
-                    .send_request_with_credits(
-                        Command::Write,
-                        &req,
-                        Some(self.tree_id),
-                        credit_charge,
-                    )
-                    .await?;
+                    let (_, _) = conn
+                        .send_request_with_credits(
+                            Command::Write,
+                            &req,
+                            Some(self.tree_id),
+                            credit_charge,
+                        )
+                        .await?;
 
-                in_flight.push((msg_id, chunk.len() as u32));
-            }
-
-            // RECEIVE phase: collect window_size responses.
-            for _ in 0..window_size {
-                let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-                if resp_header.status != NtStatus::SUCCESS {
-                    return Err(Error::Protocol {
-                        status: resp_header.status,
-                        command: Command::Write,
-                    });
+                    chunks_sent += 1;
                 }
-
-                let mut cursor = ReadCursor::new(&resp_body);
-                let resp = WriteResponse::unpack(&mut cursor)?;
-
-                total_written += resp.count as u64;
             }
-
-            chunks_sent += window_size;
         }
 
         Ok(total_written)
@@ -2519,6 +2554,88 @@ mod tests {
         assert_eq!(data, expected_data);
         // 1 CREATE + 3 READs + 1 CLOSE = 5.
         assert_eq!(mock.sent_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn sliding_window_sends_immediately_after_receive() {
+        // File: 512 KB = 8 chunks of 64 KB. Only 4 credits available initially.
+        // With sliding window: 4 sends, then each receive triggers a new send.
+        // Total: 8 sends interleaved with 8 receives (not 2 batches of 4).
+        let file_id = FileId {
+            persistent: 0xF00,
+            volatile: 0xF01,
+        };
+        let file_size = 8 * 65536u64;
+
+        let mut expected_data = vec![0u8; file_size as usize];
+        for (i, byte) in expected_data.iter_mut().enumerate() {
+            *byte = (i % 137) as u8;
+        }
+
+        let mock = Arc::new(MockTransport::new());
+
+        // CREATE response grants 4 credits (not the default 32).
+        let create_resp = {
+            let mut h = Header::new_request(Command::Create);
+            h.flags.set_response();
+            h.credits = 4;
+            let body = CreateResponse {
+                oplock_level: OplockLevel::None,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: file_size,
+                file_attributes: 0,
+                file_id,
+                create_contexts: vec![],
+            };
+            pack_message(&h, &body)
+        };
+        mock.queue_response(create_resp);
+
+        // Queue 8 READ responses. Each grants 1 credit so the window
+        // stays at 1 after the initial 4 are consumed (4 - 4 + 1 per response).
+        // With sliding window, after initial 4 sends, each response triggers 1 more send.
+        for i in 0u64..8 {
+            let offset = (i * 65536) as usize;
+            let chunk_data = expected_data[offset..offset + 65536].to_vec();
+            let mut h = Header::new_request(Command::Read);
+            h.flags.set_response();
+            h.credits = 1; // Grant 1 credit per response.
+            h.message_id = MessageId(i + 1);
+            let body = ReadResponse {
+                data_offset: 0x50,
+                data_remaining: 0,
+                flags: 0,
+                data: chunk_data,
+            };
+            mock.queue_response(pack_message(&h, &body));
+        }
+
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(20),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let data = tree
+            .read_file_pipelined(&mut conn, "sliding_test.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(data.len(), expected_data.len());
+        assert_eq!(data, expected_data);
+
+        // 1 CREATE + 8 READs + 1 CLOSE = 10 messages sent.
+        assert_eq!(mock.sent_count(), 10);
     }
 
     // ── Pipelined write tests ───────────────────────────────────────

@@ -324,7 +324,7 @@ impl Connection {
     ) -> Result<(MessageId, Vec<u8>)> {
         let mut header = Header::new_request(command);
         header.message_id = MessageId(self.next_message_id);
-        header.credits = 32; // Request more credits.
+        header.credits = 256; // Request more credits.
         header.credit_charge = CreditCharge(1);
         header.session_id = self.session_id;
         if let Some(tid) = tree_id {
@@ -369,7 +369,7 @@ impl Connection {
     ) -> Result<(MessageId, Vec<u8>)> {
         let mut header = Header::new_request(command);
         header.message_id = MessageId(self.next_message_id);
-        header.credits = 32; // Request more credits.
+        header.credits = 256; // Request more credits.
         header.credit_charge = CreditCharge(credit_charge);
         header.session_id = self.session_id;
         if let Some(tid) = tree_id {

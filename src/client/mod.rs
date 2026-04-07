@@ -181,6 +181,16 @@ impl SmbClient {
         &self.config
     }
 
+    /// Current number of available credits.
+    pub fn credits(&self) -> u16 {
+        self.conn.credits()
+    }
+
+    /// Estimated round-trip time from the negotiate exchange.
+    pub fn estimated_rtt(&self) -> Option<Duration> {
+        self.conn.estimated_rtt()
+    }
+
     /// Get a mutable reference to the underlying connection.
     ///
     /// Needed when using [`Tree`] methods directly, since they require
