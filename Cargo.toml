@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "benchmarks/smb"]
+
 [package]
 name = "smb2"
 version = "0.1.0"
