@@ -107,7 +107,7 @@ transport:: (Transport trait)
 tcp::TcpTransport  or  mock::MockTransport
 ```
 
-**Entry points:** `SmbClient::connect()` (not yet implemented)
+**Entry points:** `SmbClient::connect()` for high-level use (handles negotiate + session setup + reconnection), or `Connection::connect()` + `Session::setup()` for low-level control
 
 **Key types:** `SessionId(u64)`, `TreeId(u32)`, `FileId { persistent: u64, volatile: u64 }`, `MessageId(u64)`, `CreditCharge(u16)`
 
