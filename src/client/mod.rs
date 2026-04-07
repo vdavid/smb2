@@ -178,10 +178,85 @@ impl SmbClient {
 
     /// Get a mutable reference to the underlying connection.
     ///
-    /// Needed when using a [`Tree`] obtained via [`SmbClient::connect_share`],
-    /// since tree operations require `&mut Connection`.
+    /// Needed when using [`Tree`] methods directly, since they require
+    /// `&mut Connection`. For most use cases, prefer the convenience methods
+    /// on `SmbClient` (like [`list_directory`](Self::list_directory)) instead.
     pub fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+
+    // ── Convenience methods that delegate to Tree ──────────────────────
+
+    /// List files in a directory on the given share.
+    ///
+    /// This is a convenience wrapper around [`Tree::list_directory`] that
+    /// saves you from threading `connection_mut()` through every call.
+    pub async fn list_directory(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+    ) -> Result<Vec<DirectoryEntry>> {
+        tree.list_directory(&mut self.conn, path).await
+    }
+
+    /// Read a file from the given share.
+    pub async fn read_file(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
+        tree.read_file(&mut self.conn, path).await
+    }
+
+    /// Read a file using pipelined I/O (faster for large files).
+    pub async fn read_file_pipelined(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
+        tree.read_file_pipelined(&mut self.conn, path).await
+    }
+
+    /// Write data to a file on the given share (create or overwrite).
+    pub async fn write_file(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        data: &[u8],
+    ) -> Result<u64> {
+        tree.write_file(&mut self.conn, path, data).await
+    }
+
+    /// Write data to a file using pipelined I/O (faster for large files).
+    pub async fn write_file_pipelined(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        data: &[u8],
+    ) -> Result<u64> {
+        tree.write_file_pipelined(&mut self.conn, path, data).await
+    }
+
+    /// Delete a file on the given share.
+    pub async fn delete_file(&mut self, tree: &Tree, path: &str) -> Result<()> {
+        tree.delete_file(&mut self.conn, path).await
+    }
+
+    /// Get file metadata (size, timestamps, whether it's a directory).
+    pub async fn stat(&mut self, tree: &Tree, path: &str) -> Result<FileInfo> {
+        tree.stat(&mut self.conn, path).await
+    }
+
+    /// Rename a file or directory on the given share.
+    pub async fn rename(&mut self, tree: &Tree, from: &str, to: &str) -> Result<()> {
+        tree.rename(&mut self.conn, from, to).await
+    }
+
+    /// Create a directory on the given share.
+    pub async fn create_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
+        tree.create_directory(&mut self.conn, path).await
+    }
+
+    /// Delete an empty directory on the given share.
+    pub async fn delete_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
+        tree.delete_directory(&mut self.conn, path).await
+    }
+
+    /// Disconnect from a share.
+    pub async fn disconnect_share(&mut self, tree: &Tree) -> Result<()> {
+        tree.disconnect(&mut self.conn).await
     }
 }
 

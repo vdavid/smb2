@@ -1,4 +1,7 @@
 //! Newtypes, enums, and common data structures for SMB2/3 protocol fields.
+//!
+//! Most users don't need to import from this module directly -- the commonly
+//! used types are re-exported at the crate root.
 
 pub mod flags;
 pub mod status;

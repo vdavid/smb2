@@ -2,6 +2,9 @@
 //!
 //! Each sub-module corresponds to one SMB2 command type with its
 //! request and response structures.
+//!
+//! Most users don't need this module directly -- use [`SmbClient`](crate::SmbClient)
+//! for high-level file operations.
 
 pub mod cancel;
 pub mod change_notify;

@@ -3,6 +3,9 @@
 //! Provides [`ReadCursor`] and [`WriteCursor`] for reading and writing
 //! little-endian binary data, plus [`Pack`] and [`Unpack`] traits for
 //! structured types.
+//!
+//! Most users don't need this module directly -- use [`SmbClient`](crate::SmbClient)
+//! for high-level file operations.
 
 pub mod filetime;
 pub mod guid;

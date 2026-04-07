@@ -90,9 +90,9 @@ tests/
 
 examples/
   list_shares.rs          # Connect and enumerate shares
+  list_directory.rs       # List files in a directory
   read_file.rs            # Read a file from a share
   write_file.rs           # Write a file to a share
-  watch_directory.rs      # Monitor directory changes
 ```
 
 ## Architecture

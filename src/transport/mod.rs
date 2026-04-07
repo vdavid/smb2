@@ -5,8 +5,11 @@
 //! pipeline's `tokio::select!` loop.
 //!
 //! Two implementations are provided:
-//! - [`TcpTransport`] — direct TCP connection to an SMB server (port 445)
-//! - [`MockTransport`] — canned responses for testing
+//! - [`TcpTransport`] -- direct TCP connection to an SMB server (port 445)
+//! - [`MockTransport`] -- canned responses for testing
+//!
+//! Most users don't need this module directly -- use [`SmbClient`](crate::SmbClient)
+//! which handles transport setup internally.
 
 pub mod mock;
 pub mod tcp;

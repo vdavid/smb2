@@ -27,19 +27,16 @@ I built this because I needed fast SMB access for [Cmdr](https://github.com/vdav
 - Credit-window-based flow control (the server tells us how fast to go)
 - SMB 3.x signing, encryption, and LZ4 compression
 - Share enumeration (list shares on a server)
-- Directory change notifications (watch for file changes)
-- Auto-reconnect with durable handles (survives Wi-Fi drops)
-- Server-side copy
 
 ## What it doesn't do (yet)
 
 If you need any of these, check the [`smb`](https://crates.io/crates/smb) crate which supports them:
 
-- **Kerberos authentication** — NTLM only for now. Kerberos is needed for Active Directory environments that disable NTLM. Most home NAS setups (Synology, QNAP, Pi) use NTLM.
-- **DFS path resolution** — returns `Error::DfsReferralRequired` with the path so you can handle it yourself. Full automatic DFS follow-through is planned for post-1.0.
-- **Multi-channel** — multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
-- **QUIC transport** — SMB over QUIC for Azure Files and Windows Server 2022+ over the internet
-- **RDMA transport** — datacenter-only, ultra-low-latency storage
+- **Kerberos authentication** -- NTLM only for now. Kerberos is needed for Active Directory environments that disable NTLM. Most home NAS setups (Synology, QNAP, Pi) use NTLM.
+- **DFS path resolution** -- returns `Error::DfsReferralRequired` with the path so you can handle it yourself. Full automatic DFS follow-through is planned for post-1.0.
+- **Multi-channel** -- multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
+- **QUIC transport** -- SMB over QUIC for Azure Files and Windows Server 2022+ over the internet
+- **RDMA transport** -- datacenter-only, ultra-low-latency storage
 
 These aren't planned:
 
@@ -49,22 +46,37 @@ These aren't planned:
 ## Quick start
 
 ```rust
-use smb2::SmbClient;
+use smb2::{SmbClient, ClientConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), smb2::Error> {
+    let mut client = smb2::connect("192.168.1.100:445", "user", "pass").await?;
+
+    // List shares
+    let shares = client.list_shares().await?;
+    for share in &shares {
+        println!("{} - {}", share.name, share.comment);
+    }
+
     // Connect to a share
-    let client = SmbClient::connect("192.168.1.100", "user", "password").await?;
     let share = client.connect_share("Documents").await?;
 
     // List files
-    for entry in share.list("projects/").await? {
-        println!("{} {:>10} bytes", entry.name, entry.size);
+    let entries = client.list_directory(&share, "projects/").await?;
+    for entry in &entries {
+        println!("{} ({} bytes)", entry.name, entry.size);
     }
 
     // Read a file
-    let data = share.read_file("projects/report.pdf").await?;
+    let data = client.read_file(&share, "report.pdf").await?;
     std::fs::write("report.pdf", data)?;
+
+    // Write a file
+    let content = std::fs::read("local_file.txt")?;
+    client.write_file(&share, "remote_file.txt", &content).await?;
+
+    // Clean up
+    client.disconnect_share(&share).await?;
 
     Ok(())
 }
@@ -72,32 +84,44 @@ async fn main() -> Result<(), smb2::Error> {
 
 ## Pipeline API
 
-The pipeline is the core feature. It lets you push requests from anywhere, at any time, and results stream back as they complete. You don't need to know the total count upfront.
+The pipeline is the core feature. It lets you batch multiple operations and execute them together:
 
 ```rust
-let (tx, mut rx) = share.open_pipeline();
+use smb2::{Pipeline, Op, OpResult};
 
-// Push requests — from any task, any time
-tx.request(Op::ReadFile("a.txt")).await;
-tx.request(Op::WriteFile("b.txt", data)).await;
-tx.request(Op::Delete("c.txt")).await;
-tx.request(Op::List("projects/")).await;
+# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+let mut pipeline = Pipeline::new(client.connection_mut(), &share);
 
-// Results stream back as they complete
-while let Some(result) = rx.next().await {
+let results = pipeline.execute(vec![
+    Op::ReadFile("a.txt".into()),
+    Op::ReadFile("b.txt".into()),
+    Op::ListDirectory("docs/".into()),
+    Op::Delete("temp.txt".into()),
+]).await;
+
+for result in results {
     match result {
-        OpResult::FileData(path, bytes) => { /* ... */ }
-        OpResult::Written(path, n) => { /* ... */ }
-        OpResult::Deleted(path) => { /* ... */ }
-        OpResult::DirEntries(path, entries) => { /* ... */ }
-        OpResult::Error(path, err) => { /* ... */ }
+        OpResult::FileData { path, data } => println!("{}: {} bytes", path, data.len()),
+        OpResult::DirEntries { path, entries } => println!("{}: {} entries", path, entries.len()),
+        OpResult::Deleted { path } => println!("deleted {}", path),
+        OpResult::Error { path, error } => eprintln!("{}: {}", path, error),
+        other => println!("{:?}", other),
     }
 }
-
-// Drop tx to signal "no more requests" — pipeline drains gracefully
+# Ok(())
+# }
 ```
 
-The simple API (`share.read_file()`, etc.) wraps this internally. One request in, one result out.
+For large file I/O, use the pipelined variants which fill the credit window:
+
+```rust
+# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+// ~10-25x faster than sequential for large files
+let data = client.read_file_pipelined(&share, "big_file.iso").await?;
+client.write_file_pipelined(&share, "copy.iso", &data).await?;
+# Ok(())
+# }
+```
 
 ## Installation
 
@@ -117,26 +141,39 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 ## API overview
 
-### Simple API
+### High-level API
 
 For when you want to do one thing and get the result:
 
-- `SmbClient::connect()` — connect and authenticate
-- `share.list()` — list a directory
-- `share.read_file()` — download a file
-- `share.write_file()` — upload a file
-- `share.delete()` — delete a file
-- `share.stat()` — get file metadata
+- `smb2::connect()` -- connect and authenticate (shorthand)
+- `SmbClient::connect()` -- connect with full config
+- `client.list_shares()` -- list available shares
+- `client.connect_share()` -- connect to a share
+- `client.list_directory(&share, path)` -- list a directory
+- `client.read_file(&share, path)` -- download a file
+- `client.write_file(&share, path, data)` -- upload a file
+- `client.delete_file(&share, path)` -- delete a file
+- `client.stat(&share, path)` -- get file metadata
+- `client.rename(&share, from, to)` -- rename a file
+- `client.create_directory(&share, path)` -- create a directory
+- `client.delete_directory(&share, path)` -- remove a directory
+- `client.disconnect_share(&share)` -- disconnect from a share
 
 ### Pipeline API
 
 For when you have many operations and want them fast:
 
-- `share.open_pipeline()` — returns `(tx, rx)` channel pair
-- `tx.request(Op)` — push an operation (from any task)
-- `rx.next()` — receive the next completed result
+- `Pipeline::new(conn, &share)` -- create a pipeline
+- `pipeline.execute(ops)` -- run a batch of operations
 
-The pipeline handles credit management, chunking, compounding, and reordering internally. Multiple operations fly over the wire concurrently, bounded by the server's credit grants.
+### Low-level API
+
+For advanced use cases, the underlying types are available:
+
+- `Connection` -- message exchange, credit tracking
+- `Session` -- NTLM authentication, key derivation
+- `Tree` -- share-level file operations (take `&mut Connection`)
+- `NegotiatedParams` -- protocol parameters from negotiate
 
 ## Performance
 
@@ -169,10 +206,10 @@ The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 o
 
 But for the common case (connect to a NAS, move files around), `smb2` is a better fit:
 
-- **Pipelined I/O** — `smb` sends one request at a time, making downloads ~10x slower
-- **Auto-reconnect with durable handles** — survives Wi-Fi drops without restarting transfers
-- **Comprehensive test suite** — `smb` has almost no tests
-- **MIT OR Apache-2.0** — `smb` is MIT-only
+- **Pipelined I/O** -- `smb` sends one request at a time, making downloads ~10x slower
+- **Auto-reconnect with durable handles** -- survives Wi-Fi drops without restarting transfers
+- **Comprehensive test suite** -- `smb` has almost no tests
+- **MIT OR Apache-2.0** -- `smb` is MIT-only
 
 I initially considered forking `smb`, but the architecture didn't support pipelining well, and adding it would have been a near-complete rewrite anyway.
 

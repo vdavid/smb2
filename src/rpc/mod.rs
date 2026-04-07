@@ -9,6 +9,10 @@
 //! 4. Send RPC REQUEST with NetShareEnumAll (type 0, opnum 15)
 //! 5. Receive RPC RESPONSE with results (type 2)
 //! 6. CLOSE the pipe
+//!
+//! Most users don't need this module directly -- use
+//! [`SmbClient::list_shares`](crate::SmbClient::list_shares) instead.
+//! The [`ShareInfo`](crate::ShareInfo) type is re-exported at the crate root.
 
 pub mod srvsvc;
 
