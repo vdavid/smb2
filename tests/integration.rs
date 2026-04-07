@@ -708,3 +708,140 @@ async fn debug_rapid_pipelined_writes() {
     }
     let _ = client.disconnect_share(&share).await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn micro_benchmark_smb2_vs_native() {
+    let _ = env_logger::try_init();
+
+    // --- smb2 setup ---
+    let config = ClientConfig {
+        addr: "192.168.1.111:445".into(),
+        timeout: Duration::from_secs(5),
+        username: "david".into(),
+        password: "cVYiKPJK*fRbQN5!%b&cBb63".into(),
+        domain: String::new(),
+        auto_reconnect: false,
+    };
+    let mut client = SmbClient::connect(config).await.expect("connect");
+    let share = client.connect_share("naspi").await.expect("tree");
+
+    let _ = client.create_directory(&share, "_test/smb2_bench").await;
+
+    let file_count = 50;
+    let file_size = 100 * 1024; // 100 KB
+    let data = vec![0x42u8; file_size];
+
+    // --- UPLOAD (smb2) ---
+    let start = std::time::Instant::now();
+    for i in 0..file_count {
+        let path = format!("_test/smb2_bench/f_{}.bin", i);
+        client.write_file_pipelined(&share, &path, &data).await.expect("write");
+    }
+    let smb2_upload = start.elapsed();
+
+    // --- LIST (smb2) ---
+    let start = std::time::Instant::now();
+    let entries = client.list_directory(&share, "_test/smb2_bench").await.expect("list");
+    let smb2_list = start.elapsed();
+    assert!(entries.len() >= file_count, "expected {} entries, got {}", file_count, entries.len());
+
+    // --- DOWNLOAD (smb2) ---
+    // Use sequential read for files that fit in one MaxReadSize chunk,
+    // pipelined for larger files.
+    let max_read = client.params().map(|p| p.max_read_size as usize).unwrap_or(65536);
+    let start = std::time::Instant::now();
+    for i in 0..file_count {
+        let path = format!("_test/smb2_bench/f_{}.bin", i);
+        let d = if file_size <= max_read {
+            client.read_file(&share, &path).await.expect("read")
+        } else {
+            client.read_file_pipelined(&share, &path).await.expect("read")
+        };
+        assert_eq!(d.len(), file_size);
+    }
+    let smb2_download = start.elapsed();
+
+    // --- DELETE (smb2) ---
+    let start = std::time::Instant::now();
+    for i in 0..file_count {
+        let path = format!("_test/smb2_bench/f_{}.bin", i);
+        client.delete_file(&share, &path).await.expect("delete");
+    }
+    let smb2_delete = start.elapsed();
+
+    // --- NATIVE (via OS mount) ---
+    let mount_path = std::path::Path::new("/Volumes/naspi/_test/smb2_bench_native");
+    let native_available = std::path::Path::new("/Volumes/naspi").exists();
+
+    let (nat_upload, nat_list, nat_download, nat_delete) = if native_available {
+        let _ = std::fs::create_dir_all(mount_path);
+
+        let start = std::time::Instant::now();
+        for i in 0..file_count {
+            let p = mount_path.join(format!("f_{}.bin", i));
+            std::fs::write(&p, &data).expect("native write");
+        }
+        let nu = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let n = std::fs::read_dir(mount_path).unwrap().count();
+        let nl = start.elapsed();
+        assert!(n >= file_count);
+
+        let start = std::time::Instant::now();
+        for i in 0..file_count {
+            let p = mount_path.join(format!("f_{}.bin", i));
+            let d = std::fs::read(&p).expect("native read");
+            assert_eq!(d.len(), file_size);
+        }
+        let nd = start.elapsed();
+
+        let start = std::time::Instant::now();
+        for i in 0..file_count {
+            let p = mount_path.join(format!("f_{}.bin", i));
+            std::fs::remove_file(&p).expect("native delete");
+        }
+        let ndel = start.elapsed();
+        let _ = std::fs::remove_dir(mount_path);
+
+        (nu, nl, nd, ndel)
+    } else {
+        eprintln!("WARNING: /Volumes/naspi not mounted, skipping native comparison");
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO)
+    };
+
+    // Cleanup
+    let _ = client.delete_directory(&share, "_test/smb2_bench").await;
+    let _ = client.disconnect_share(&share).await;
+
+    // Results
+    let total_mb = (file_count * file_size) as f64 / (1024.0 * 1024.0);
+    println!("\n╔══════════════════════════════════════════════════════════╗");
+    println!("║  MICRO BENCHMARK: {} × {} KB = {:.1} MB          ║", file_count, file_size / 1024, total_mb);
+    println!("╚══════════════════════════════════════════════════════════╝\n");
+    println!("┌────────────┬────────────┬────────────┬──────────┐");
+    println!("│ operation  │ native     │ smb2       │ ratio    │");
+    println!("├────────────┼────────────┼────────────┼──────────┤");
+
+    let ops = [
+        ("upload", nat_upload, smb2_upload),
+        ("list", nat_list, smb2_list),
+        ("download", nat_download, smb2_download),
+        ("delete", nat_delete, smb2_delete),
+    ];
+
+    for (name, nat, smb2) in &ops {
+        let ratio = if nat.as_secs_f64() > 0.0 {
+            format!("{:.2}x", smb2.as_secs_f64() / nat.as_secs_f64())
+        } else {
+            "N/A".to_string()
+        };
+        println!(
+            "│ {:<10} │ {:>8.0?} │ {:>8.0?} │ {:>8} │",
+            name, nat, smb2, ratio
+        );
+    }
+    println!("└────────────┴────────────┴────────────┴──────────┘");
+    println!("\nRatio < 1.0 means smb2 is faster than native.");
+}
