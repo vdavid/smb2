@@ -114,16 +114,23 @@ impl Pack for QueryDirectoryRequest {
         // OutputBufferLength (4 bytes)
         cursor.write_u32_le(self.output_buffer_length);
 
-        // Buffer: filename pattern in UTF-16LE
-        // Offset is from the beginning of the SMB2 header per spec.
-        let name_offset = Header::SIZE + (cursor.position() - start);
-        let name_start = cursor.position();
-        cursor.write_utf16_le(&self.file_name);
-        let name_byte_len = cursor.position() - name_start;
+        if self.file_name.is_empty() {
+            // No search pattern: FileNameOffset and FileNameLength stay 0
+            // per spec section 2.2.33. Write 1 padding byte to satisfy
+            // StructureSize=33 (32 fixed + 1 byte buffer minimum).
+            cursor.write_u8(0);
+        } else {
+            // Buffer: filename pattern in UTF-16LE.
+            // Offset is from the beginning of the SMB2 header per spec.
+            let name_offset = Header::SIZE + (cursor.position() - start);
+            let name_start = cursor.position();
+            cursor.write_utf16_le(&self.file_name);
+            let name_byte_len = cursor.position() - name_start;
 
-        // Backpatch
-        cursor.set_u16_le_at(name_offset_pos, name_offset as u16);
-        cursor.set_u16_le_at(name_length_pos, name_byte_len as u16);
+            // Backpatch
+            cursor.set_u16_le_at(name_offset_pos, name_offset as u16);
+            cursor.set_u16_le_at(name_length_pos, name_byte_len as u16);
+        }
     }
 }
 

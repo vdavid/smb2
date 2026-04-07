@@ -291,9 +291,13 @@ impl Tree {
         conn: &mut Connection,
         file_id: FileId,
     ) -> Result<Vec<DirectoryEntry>> {
+        // Cap output buffer to 65536 so that CreditCharge=1 is valid.
+        // The spec requires CreditCharge = 1 + (OutputBufferLength - 1) / 65536
+        // for multi-credit dialects. Using 65536 keeps CreditCharge=1 which
+        // matches what send_request sets, while still being plenty for dir entries.
         let max_output = conn
             .params()
-            .map(|p| p.max_transact_size)
+            .map(|p| p.max_transact_size.min(65536))
             .unwrap_or(65536);
 
         let mut all_entries = Vec::new();
@@ -310,7 +314,7 @@ impl Tree {
                 file_index: 0,
                 file_id,
                 output_buffer_length: max_output,
-                file_name: if first { "*".to_string() } else { String::new() },
+                file_name: "*".to_string(),
             };
             first = false;
 
