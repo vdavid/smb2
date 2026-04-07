@@ -1,7 +1,8 @@
-//! Tree (share) connection and basic file operations.
+//! Tree (share) connection and file operations.
 //!
 //! The [`Tree`] type represents a connection to a specific share on the server.
-//! It provides methods for directory listing, file reading, and tree disconnect.
+//! It provides methods for directory listing, file reading/writing, deletion,
+//! renaming, stat, and directory creation.
 
 use log::{debug, info, trace};
 
@@ -14,9 +15,12 @@ use crate::msg::create::{
 use crate::msg::query_directory::{
     FileInformationClass, QueryDirectoryFlags, QueryDirectoryRequest, QueryDirectoryResponse,
 };
+use crate::msg::query_info::{InfoType, QueryInfoRequest, QueryInfoResponse};
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
+use crate::msg::set_info::SetInfoRequest;
 use crate::msg::tree_connect::{TreeConnectRequest, TreeConnectRequestFlags, TreeConnectResponse};
 use crate::msg::tree_disconnect::TreeDisconnectRequest;
+use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{FileTime, ReadCursor, Unpack};
 use crate::types::flags::FileAccessMask;
 use crate::types::status::NtStatus;
@@ -28,6 +32,21 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 
 /// Create option: the target must be a directory.
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+
+/// Create option: the target must not be a directory.
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
+/// Create option: delete file when all handles are closed.
+const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+
+/// FileBasicInformation class for QUERY_INFO (MS-FSCC 2.4.7).
+const FILE_BASIC_INFORMATION: u8 = 4;
+
+/// FileStandardInformation class for QUERY_INFO (MS-FSCC 2.4.41).
+const FILE_STANDARD_INFORMATION: u8 = 5;
+
+/// FileRenameInformation class for SET_INFO (MS-FSCC 2.4.34.2).
+const FILE_RENAME_INFORMATION: u8 = 10;
 
 /// A directory entry returned by [`Tree::list_directory`].
 #[derive(Debug, Clone)]
@@ -42,6 +61,21 @@ pub struct DirectoryEntry {
     pub created: FileTime,
     /// The last modification time.
     pub modified: FileTime,
+}
+
+/// File metadata returned by [`Tree::stat`].
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    /// The file size in bytes.
+    pub size: u64,
+    /// Whether this is a directory.
+    pub is_directory: bool,
+    /// The creation time.
+    pub created: FileTime,
+    /// The last modification time.
+    pub modified: FileTime,
+    /// The last access time.
+    pub accessed: FileTime,
 }
 
 /// A connection to a specific share (tree connect).
@@ -192,6 +226,349 @@ impl Tree {
         }
 
         info!("tree: disconnected share={}, tree_id={}", self.share_name, self.tree_id);
+        Ok(())
+    }
+
+    /// Delete a file.
+    ///
+    /// Opens the file with `DELETE_ON_CLOSE`, then closes the handle.
+    /// The server deletes the file when the last handle is closed.
+    pub async fn delete_file(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<()> {
+        let normalized = normalize_path(path);
+        debug!("tree: delete_file path={}", normalized);
+
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let resp = CreateResponse::unpack(&mut cursor)?;
+        let file_id = resp.file_id;
+
+        // Close the handle, which triggers deletion.
+        self.close_handle(conn, file_id).await?;
+
+        info!("tree: deleted file={}", normalized);
+        Ok(())
+    }
+
+    /// Get file metadata (size, timestamps, is_directory).
+    ///
+    /// Opens the file, queries `FileBasicInformation` and
+    /// `FileStandardInformation`, then closes the handle.
+    pub async fn stat(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<FileInfo> {
+        let normalized = normalize_path(path);
+        debug!("tree: stat path={}", normalized);
+
+        // Open the file/directory for reading attributes.
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let create_resp = CreateResponse::unpack(&mut cursor)?;
+        let file_id = create_resp.file_id;
+
+        // Query FileBasicInformation (timestamps + attributes).
+        let result = self.query_file_info(conn, file_id).await;
+
+        // Close regardless of query result.
+        let close_result = self.close_handle(conn, file_id).await;
+
+        let info = result?;
+        close_result?;
+        debug!("tree: stat done, size={}, is_dir={}", info.size, info.is_directory);
+        Ok(info)
+    }
+
+    /// Rename or move a file within the same share.
+    ///
+    /// Opens the source file, issues a SET_INFO with
+    /// `FileRenameInformation`, then closes the handle.
+    pub async fn rename(
+        &self,
+        conn: &mut Connection,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let from_normalized = normalize_path(from);
+        let to_normalized = normalize_path(to);
+        debug!("tree: rename from={} to={}", from_normalized, to_normalized);
+
+        // Open the source file with DELETE access (required for rename).
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: from_normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let create_resp = CreateResponse::unpack(&mut cursor)?;
+        let file_id = create_resp.file_id;
+
+        // Build FileRenameInformation buffer.
+        let rename_result = self
+            .set_rename_info(conn, file_id, &to_normalized)
+            .await;
+
+        // Close regardless.
+        let close_result = self.close_handle(conn, file_id).await;
+
+        rename_result?;
+        close_result?;
+        info!("tree: renamed from={} to={}", from_normalized, to_normalized);
+        Ok(())
+    }
+
+    /// Write data to a file (create or overwrite).
+    ///
+    /// Opens the file with `FileOverwriteIf` (creates if it does not exist,
+    /// overwrites if it does), writes the data in chunks, then closes the handle.
+    /// Returns the total number of bytes written.
+    pub async fn write_file(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        data: &[u8],
+    ) -> Result<u64> {
+        let normalized = normalize_path(path);
+        debug!("tree: write_file path={}, len={}", normalized, data.len());
+
+        // Open (or create) the file for writing.
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_WRITE_DATA
+                    | FileAccessMask::FILE_WRITE_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            share_access: ShareAccess(0),
+            create_disposition: CreateDisposition::FileOverwriteIf,
+            create_options: FILE_NON_DIRECTORY_FILE,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let create_resp = CreateResponse::unpack(&mut cursor)?;
+        let file_id = create_resp.file_id;
+
+        // Write the data in chunks.
+        let result = self.write_loop(conn, file_id, data).await;
+
+        // Close the handle.
+        let close_result = self.close_handle(conn, file_id).await;
+
+        let bytes_written = result?;
+        close_result?;
+        debug!("tree: write_file done, wrote {} bytes", bytes_written);
+        Ok(bytes_written)
+    }
+
+    /// Create a directory.
+    ///
+    /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
+    /// option, then immediately closes the handle.
+    pub async fn create_directory(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<()> {
+        let normalized = normalize_path(path);
+        debug!("tree: create_directory path={}", normalized);
+
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: FILE_ATTRIBUTE_DIRECTORY,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileCreate,
+            create_options: FILE_DIRECTORY_FILE,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let create_resp = CreateResponse::unpack(&mut cursor)?;
+        let file_id = create_resp.file_id;
+
+        // Close the handle immediately.
+        self.close_handle(conn, file_id).await?;
+        info!("tree: created directory={}", normalized);
+        Ok(())
+    }
+
+    /// Delete a directory.
+    ///
+    /// Opens the directory with `DELETE_ON_CLOSE`, then closes the handle.
+    /// The directory must be empty.
+    pub async fn delete_directory(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<()> {
+        let normalized = normalize_path(path);
+        debug!("tree: delete_directory path={}", normalized);
+
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_DELETE_ON_CLOSE | FILE_DIRECTORY_FILE,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let resp = CreateResponse::unpack(&mut cursor)?;
+        let file_id = resp.file_id;
+
+        self.close_handle(conn, file_id).await?;
+        info!("tree: deleted directory={}", normalized);
         Ok(())
     }
 
@@ -441,6 +818,208 @@ impl Tree {
         }
 
         Ok(())
+    }
+
+    /// Query `FileBasicInformation` and `FileStandardInformation` to build `FileInfo`.
+    async fn query_file_info(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+    ) -> Result<FileInfo> {
+        // Query FileBasicInformation (timestamps + attributes).
+        let basic_req = QueryInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_BASIC_INFORMATION,
+            output_buffer_length: 40,
+            additional_information: 0,
+            flags: 0,
+            file_id,
+            input_buffer: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::QueryInfo, &basic_req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::QueryInfo,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let basic_resp = QueryInfoResponse::unpack(&mut cursor)?;
+        let basic_buf = &basic_resp.output_buffer;
+
+        if basic_buf.len() < 36 {
+            return Err(Error::invalid_data(format!(
+                "FileBasicInformation too short: {} bytes",
+                basic_buf.len()
+            )));
+        }
+
+        let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
+        let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
+        let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
+        let _change_time = u64::from_le_bytes(basic_buf[24..32].try_into().unwrap());
+        let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
+
+        // Query FileStandardInformation (size + is_directory).
+        let std_req = QueryInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_STANDARD_INFORMATION,
+            output_buffer_length: 24,
+            additional_information: 0,
+            flags: 0,
+            file_id,
+            input_buffer: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::QueryInfo, &std_req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::QueryInfo,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let std_resp = QueryInfoResponse::unpack(&mut cursor)?;
+        let std_buf = &std_resp.output_buffer;
+
+        if std_buf.len() < 22 {
+            return Err(Error::invalid_data(format!(
+                "FileStandardInformation too short: {} bytes",
+                std_buf.len()
+            )));
+        }
+
+        let _allocation_size = u64::from_le_bytes(std_buf[0..8].try_into().unwrap());
+        let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
+        let _number_of_links = u32::from_le_bytes(std_buf[16..20].try_into().unwrap());
+        let _delete_pending = std_buf[20];
+        let is_directory_byte = std_buf[21];
+
+        let is_directory = is_directory_byte != 0
+            || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+        Ok(FileInfo {
+            size: end_of_file,
+            is_directory,
+            created,
+            modified,
+            accessed,
+        })
+    }
+
+    /// Issue a SET_INFO with FileRenameInformation to rename a file.
+    async fn set_rename_info(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        new_name: &str,
+    ) -> Result<()> {
+        // Build FileRenameInformation (MS-FSCC 2.4.34.2):
+        // - ReplaceIfExists (1 byte)
+        // - Reserved (7 bytes)
+        // - RootDirectory (8 bytes, 0 = same volume)
+        // - FileNameLength (4 bytes)
+        // - FileName (variable, UTF-16LE)
+        let name_u16: Vec<u16> = new_name.encode_utf16().collect();
+        let name_byte_len = name_u16.len() * 2;
+
+        let mut buffer = Vec::with_capacity(20 + name_byte_len);
+        buffer.push(0); // ReplaceIfExists = false
+        buffer.extend_from_slice(&[0u8; 7]); // Reserved
+        buffer.extend_from_slice(&0u64.to_le_bytes()); // RootDirectory
+        buffer.extend_from_slice(&(name_byte_len as u32).to_le_bytes()); // FileNameLength
+        for &u in &name_u16 {
+            buffer.extend_from_slice(&u.to_le_bytes());
+        }
+
+        let req = SetInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_RENAME_INFORMATION,
+            additional_information: 0,
+            file_id,
+            buffer,
+        };
+
+        let (_, _) = conn
+            .send_request(Command::SetInfo, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, _, _) = conn.receive_response().await?;
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::SetInfo,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Write data to a file in chunks.
+    async fn write_loop(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        data: &[u8],
+    ) -> Result<u64> {
+        let max_write = conn
+            .params()
+            .map(|p| p.max_write_size)
+            .unwrap_or(65536);
+
+        let mut total_written = 0u64;
+        let mut offset = 0usize;
+
+        while offset < data.len() {
+            let remaining = data.len() - offset;
+            let chunk_size = remaining.min(max_write as usize);
+            let chunk = &data[offset..offset + chunk_size];
+
+            // DataOffset: header (64) + fixed write body (48) = 112 = 0x70
+            let req = WriteRequest {
+                data_offset: 0x70,
+                offset: offset as u64,
+                file_id,
+                channel: 0,
+                remaining_bytes: 0,
+                write_channel_info_offset: 0,
+                write_channel_info_length: 0,
+                flags: 0,
+                data: chunk.to_vec(),
+            };
+
+            let (_, _) = conn
+                .send_request(Command::Write, &req, Some(self.tree_id))
+                .await?;
+
+            let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+            if resp_header.status != NtStatus::SUCCESS {
+                return Err(Error::Protocol {
+                    status: resp_header.status,
+                    command: Command::Write,
+                });
+            }
+
+            let mut cursor = ReadCursor::new(&resp_body);
+            let resp = WriteResponse::unpack(&mut cursor)?;
+
+            total_written += resp.count as u64;
+            offset += chunk_size;
+        }
+
+        Ok(total_written)
     }
 }
 
@@ -861,5 +1440,285 @@ mod tests {
 
         tree.disconnect(&mut conn).await.unwrap();
         assert_eq!(mock.sent_count(), 1);
+    }
+
+    // ── Delete file tests ────────────────────────────────────────────
+
+    fn build_write_response(count: u32) -> Vec<u8> {
+        use crate::msg::write::WriteResponse;
+        let mut h = Header::new_request(Command::Write);
+        h.flags.set_response();
+        h.credits = 32;
+
+        let body = WriteResponse {
+            count,
+            remaining: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+        };
+
+        pack_message(&h, &body)
+    }
+
+    fn build_query_info_response(output_buffer: Vec<u8>) -> Vec<u8> {
+        use crate::msg::query_info::QueryInfoResponse;
+        let mut h = Header::new_request(Command::QueryInfo);
+        h.flags.set_response();
+        h.credits = 32;
+
+        let body = QueryInfoResponse { output_buffer };
+        pack_message(&h, &body)
+    }
+
+    fn build_set_info_response() -> Vec<u8> {
+        use crate::msg::set_info::SetInfoResponse;
+        let mut h = Header::new_request(Command::SetInfo);
+        h.flags.set_response();
+        h.credits = 32;
+
+        let body = SetInfoResponse;
+        pack_message(&h, &body)
+    }
+
+    /// Build a FileBasicInformation buffer (40 bytes).
+    fn build_file_basic_info(
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+        change_time: u64,
+        file_attributes: u32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&creation_time.to_le_bytes());
+        buf.extend_from_slice(&last_access_time.to_le_bytes());
+        buf.extend_from_slice(&last_write_time.to_le_bytes());
+        buf.extend_from_slice(&change_time.to_le_bytes());
+        buf.extend_from_slice(&file_attributes.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved/padding
+        buf
+    }
+
+    /// Build a FileStandardInformation buffer (24 bytes).
+    fn build_file_standard_info(
+        allocation_size: u64,
+        end_of_file: u64,
+        number_of_links: u32,
+        delete_pending: bool,
+        directory: bool,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&allocation_size.to_le_bytes());
+        buf.extend_from_slice(&end_of_file.to_le_bytes());
+        buf.extend_from_slice(&number_of_links.to_le_bytes());
+        buf.push(if delete_pending { 1 } else { 0 });
+        buf.push(if directory { 1 } else { 0 });
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        buf
+    }
+
+    #[tokio::test]
+    async fn delete_file_sends_create_and_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+
+        // DELETE = CREATE(DELETE_ON_CLOSE) + CLOSE
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        tree.delete_file(&mut conn, "remove.txt").await.unwrap();
+
+        // Should have sent CREATE and CLOSE
+        assert_eq!(mock.sent_count(), 2);
+
+        // Verify the CREATE request has DELETE access and DELETE_ON_CLOSE
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let req = CreateRequest::unpack(&mut cursor).unwrap();
+        assert!(req.desired_access.contains(FileAccessMask::DELETE));
+        assert_ne!(req.create_options & FILE_DELETE_ON_CLOSE, 0);
+    }
+
+    // ── Write file tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_file_sends_create_write_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xCC,
+            volatile: 0xDD,
+        };
+
+        // WRITE = CREATE + WRITE + CLOSE
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(5));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let written = tree.write_file(&mut conn, "out.txt", b"hello").await.unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    // ── Stat tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stat_returns_file_info() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xEE,
+            volatile: 0xFF,
+        };
+
+        // STAT = CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
+        mock.queue_response(build_create_response(file_id, 0));
+
+        let basic = build_file_basic_info(
+            132_000_000_000_000_000,
+            132_100_000_000_000_000,
+            133_000_000_000_000_000,
+            133_000_000_000_000_000,
+            0x20, // ARCHIVE
+        );
+        mock.queue_response(build_query_info_response(basic));
+
+        let std_info = build_file_standard_info(4096, 2048, 1, false, false);
+        mock.queue_response(build_query_info_response(std_info));
+
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let info = tree.stat(&mut conn, "doc.txt").await.unwrap();
+        assert_eq!(info.size, 2048);
+        assert!(!info.is_directory);
+        assert_eq!(info.created, FileTime(132_000_000_000_000_000));
+        assert_eq!(info.modified, FileTime(133_000_000_000_000_000));
+        assert_eq!(info.accessed, FileTime(132_100_000_000_000_000));
+        assert_eq!(mock.sent_count(), 4);
+    }
+
+    // ── Rename tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rename_sends_create_setinfo_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+
+        // RENAME = CREATE + SET_INFO + CLOSE
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_set_info_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        tree.rename(&mut conn, "old.txt", "new.txt").await.unwrap();
+        assert_eq!(mock.sent_count(), 3);
+
+        // Verify the CREATE has DELETE access (required for rename)
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let req = CreateRequest::unpack(&mut cursor).unwrap();
+        assert!(req.desired_access.contains(FileAccessMask::DELETE));
+    }
+
+    // ── Create directory tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_directory_sends_create_and_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x33,
+            volatile: 0x44,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        tree.create_directory(&mut conn, "new_dir").await.unwrap();
+        assert_eq!(mock.sent_count(), 2);
+
+        // Verify the CREATE has FILE_DIRECTORY_FILE option and FileCreate disposition
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let req = CreateRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(req.create_disposition, CreateDisposition::FileCreate);
+        assert_ne!(req.create_options & FILE_DIRECTORY_FILE, 0);
+    }
+
+    // ── Delete directory tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_directory_sends_create_and_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x55,
+            volatile: 0x66,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        tree.delete_directory(&mut conn, "old_dir").await.unwrap();
+        assert_eq!(mock.sent_count(), 2);
+
+        // Verify the CREATE has DELETE_ON_CLOSE and FILE_DIRECTORY_FILE
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let req = CreateRequest::unpack(&mut cursor).unwrap();
+        assert_ne!(req.create_options & FILE_DELETE_ON_CLOSE, 0);
+        assert_ne!(req.create_options & FILE_DIRECTORY_FILE, 0);
     }
 }
