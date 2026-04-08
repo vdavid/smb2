@@ -155,7 +155,6 @@ pub struct CreateRequest {
 }
 
 impl CreateRequest {
-    /// The structure size field is always 57.
     pub const STRUCTURE_SIZE: u16 = 57;
 }
 
@@ -350,7 +349,6 @@ pub struct CreateResponse {
 }
 
 impl CreateResponse {
-    /// The structure size field is always 89.
     pub const STRUCTURE_SIZE: u16 = 89;
 }
 

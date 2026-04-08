@@ -70,7 +70,6 @@ pub struct TreeConnectRequest {
 }
 
 impl TreeConnectRequest {
-    /// The structure size field is always 9.
     pub const STRUCTURE_SIZE: u16 = 9;
 }
 
@@ -146,7 +145,6 @@ pub struct TreeConnectResponse {
 }
 
 impl TreeConnectResponse {
-    /// The structure size field is always 16.
     pub const STRUCTURE_SIZE: u16 = 16;
 }
 

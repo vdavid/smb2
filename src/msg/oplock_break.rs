@@ -36,7 +36,6 @@ pub struct OplockBreak {
 }
 
 impl OplockBreak {
-    /// The StructureSize field is always 24.
     pub const STRUCTURE_SIZE: u16 = 24;
 }
 

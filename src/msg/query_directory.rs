@@ -86,7 +86,6 @@ pub struct QueryDirectoryRequest {
 }
 
 impl QueryDirectoryRequest {
-    /// The structure size field is always 33.
     pub const STRUCTURE_SIZE: u16 = 33;
 }
 
@@ -206,7 +205,6 @@ pub struct QueryDirectoryResponse {
 }
 
 impl QueryDirectoryResponse {
-    /// The structure size field is always 9.
     pub const STRUCTURE_SIZE: u16 = 9;
 }
 

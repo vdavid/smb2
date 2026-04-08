@@ -84,7 +84,6 @@ pub struct SessionSetupRequest {
 }
 
 impl SessionSetupRequest {
-    /// The structure size field is always 25.
     pub const STRUCTURE_SIZE: u16 = 25;
 }
 
@@ -172,7 +171,6 @@ pub struct SessionSetupResponse {
 }
 
 impl SessionSetupResponse {
-    /// The structure size field is always 9.
     pub const STRUCTURE_SIZE: u16 = 9;
 }
 

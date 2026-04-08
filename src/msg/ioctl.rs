@@ -70,7 +70,6 @@ pub struct IoctlRequest {
 }
 
 impl IoctlRequest {
-    /// The StructureSize field is always 57.
     pub const STRUCTURE_SIZE: u16 = 57;
 
     /// Fixed header size before the variable buffer (56 bytes).
@@ -194,7 +193,6 @@ pub struct IoctlResponse {
 }
 
 impl IoctlResponse {
-    /// The StructureSize field is always 49.
     pub const STRUCTURE_SIZE: u16 = 49;
 
     /// Fixed header size before the variable buffer (48 bytes).

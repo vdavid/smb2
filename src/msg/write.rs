@@ -52,7 +52,6 @@ pub struct WriteRequest {
 }
 
 impl WriteRequest {
-    /// The StructureSize field is always 49.
     pub const STRUCTURE_SIZE: u16 = 49;
 }
 
@@ -149,7 +148,6 @@ pub struct WriteResponse {
 }
 
 impl WriteResponse {
-    /// The StructureSize field is always 17.
     pub const STRUCTURE_SIZE: u16 = 17;
 }
 

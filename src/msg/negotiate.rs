@@ -313,7 +313,6 @@ pub struct NegotiateRequest {
 }
 
 impl NegotiateRequest {
-    /// The structure size field is always 36.
     pub const STRUCTURE_SIZE: u16 = 36;
 
     /// Returns `true` if the dialects list includes SMB 3.1.1.
@@ -480,7 +479,6 @@ pub struct NegotiateResponse {
 }
 
 impl NegotiateResponse {
-    /// The structure size field is always 65.
     pub const STRUCTURE_SIZE: u16 = 65;
 
     /// Returns `true` if the negotiated dialect is SMB 3.1.1.

@@ -89,7 +89,6 @@ pub struct LockRequest {
 }
 
 impl LockRequest {
-    /// The StructureSize field is always 48.
     pub const STRUCTURE_SIZE: u16 = 48;
 }
 
@@ -147,7 +146,6 @@ impl Unpack for LockRequest {
 pub struct LockResponse;
 
 impl LockResponse {
-    /// The StructureSize field is always 4.
     pub const STRUCTURE_SIZE: u16 = 4;
 }
 

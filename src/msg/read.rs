@@ -56,7 +56,6 @@ pub struct ReadRequest {
 }
 
 impl ReadRequest {
-    /// The StructureSize field is always 49.
     pub const STRUCTURE_SIZE: u16 = 49;
 }
 
@@ -173,7 +172,6 @@ pub struct ReadResponse {
 }
 
 impl ReadResponse {
-    /// The StructureSize field is always 17.
     pub const STRUCTURE_SIZE: u16 = 17;
 }
 

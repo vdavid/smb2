@@ -6,6 +6,9 @@
 //! Most users don't need this module directly -- use [`SmbClient`](crate::SmbClient)
 //! for high-level file operations.
 
+// Wire format internals, comments would be pretty redundant. Public API docs are enforced at the crate level.
+#![allow(missing_docs)]
+
 /// Generates a trivial 4-byte SMB2 stub message (StructureSize + Reserved).
 ///
 /// Many SMB2 commands (echo, cancel, logoff, tree_disconnect) have request
@@ -31,7 +34,6 @@ macro_rules! trivial_message {
         pub struct $name;
 
         impl $name {
-            /// The structure size field is always 4.
             pub const STRUCTURE_SIZE: u16 = 4;
         }
 

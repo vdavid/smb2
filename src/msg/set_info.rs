@@ -34,7 +34,6 @@ pub struct SetInfoRequest {
 }
 
 impl SetInfoRequest {
-    /// The structure size field is always 33.
     pub const STRUCTURE_SIZE: u16 = 33;
 }
 
@@ -139,7 +138,6 @@ impl Unpack for SetInfoRequest {
 pub struct SetInfoResponse;
 
 impl SetInfoResponse {
-    /// The structure size field is always 2.
     pub const STRUCTURE_SIZE: u16 = 2;
 }
 

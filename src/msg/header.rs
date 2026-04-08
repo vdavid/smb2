@@ -50,7 +50,6 @@ pub struct Header {
 }
 
 impl Header {
-    /// The structure size is always 64.
     pub const STRUCTURE_SIZE: u16 = 64;
 
     /// Total header size in bytes.
@@ -214,7 +213,6 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
-    /// The structure size field is always 9 per the spec.
     pub const STRUCTURE_SIZE: u16 = 9;
 }
 

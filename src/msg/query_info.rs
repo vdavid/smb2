@@ -68,7 +68,6 @@ pub struct QueryInfoRequest {
 }
 
 impl QueryInfoRequest {
-    /// The structure size field is always 41.
     pub const STRUCTURE_SIZE: u16 = 41;
 }
 
@@ -186,7 +185,6 @@ pub struct QueryInfoResponse {
 }
 
 impl QueryInfoResponse {
-    /// The structure size field is always 9.
     pub const STRUCTURE_SIZE: u16 = 9;
 }
 

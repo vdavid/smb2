@@ -77,7 +77,6 @@ pub struct ChangeNotifyRequest {
 }
 
 impl ChangeNotifyRequest {
-    /// The StructureSize field is always 32.
     pub const STRUCTURE_SIZE: u16 = 32;
 }
 
@@ -150,7 +149,6 @@ pub struct ChangeNotifyResponse {
 }
 
 impl ChangeNotifyResponse {
-    /// The StructureSize field is always 9.
     pub const STRUCTURE_SIZE: u16 = 9;
 
     /// Fixed header size before the variable buffer (8 bytes).

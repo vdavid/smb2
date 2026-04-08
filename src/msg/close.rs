@@ -29,7 +29,6 @@ pub struct CloseRequest {
 }
 
 impl CloseRequest {
-    /// The StructureSize field is always 24.
     pub const STRUCTURE_SIZE: u16 = 24;
 }
 
@@ -108,7 +107,6 @@ pub struct CloseResponse {
 }
 
 impl CloseResponse {
-    /// The StructureSize field is always 60.
     pub const STRUCTURE_SIZE: u16 = 60;
 }
 

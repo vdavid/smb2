@@ -26,7 +26,6 @@ pub struct FlushRequest {
 }
 
 impl FlushRequest {
-    /// The structure size field is always 24.
     pub const STRUCTURE_SIZE: u16 = 24;
 }
 
@@ -83,7 +82,6 @@ impl Unpack for FlushRequest {
 pub struct FlushResponse;
 
 impl FlushResponse {
-    /// The structure size field is always 4.
     pub const STRUCTURE_SIZE: u16 = 4;
 }
 
