@@ -29,11 +29,31 @@ services:
     ports:
       - "10449:445"
 
+  smb-flaky:
+    build:
+      context: smb-flaky
+    ports:
+      - "10450:445"
+
+  smb-slow:
+    build:
+      context: smb-slow
+    ports:
+      - "10451:445"
+    cap_add:
+      - NET_ADMIN
+
   smb-encryption:
     build:
       context: smb-encryption
     ports:
       - "10452:445"
+
+  smb-encryption-aes128:
+    build:
+      context: smb-encryption-aes128
+    ports:
+      - "10455:445"
 
   smb-50shares:
     build:

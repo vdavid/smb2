@@ -37,11 +37,37 @@ Connect to the real NAS, send a NegotiateRequest, capture the server's raw respo
 
 ## Docker integration tests (`tests/docker_integration.rs`)
 
-Tests against Docker-based Samba containers. Deterministic, no real hardware needed. Planned to run in CI on every PR. See `docs/specs/docker-test-infrastructure.md` for the full plan.
+Tests against 12 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR. See `docs/specs/docker-test-infrastructure.md` for the full plan.
 
-Containers live in `tests/docker/`. Start with `./tests/docker/start.sh`.
+Containers live in `tests/docker/internal/`.
 
-Currently covers: guest auth, NTLM auth, read/write/delete, compound, pipelined, streaming, share enumeration, disk space, file watching, reconnect after flaky disconnect.
+**Running Docker tests:**
+
+```sh
+# One command does everything (~28s locally, ~2-3 min in CI):
+just test-docker
+
+# For faster iteration, keep containers running between runs:
+./tests/docker/start.sh internal    # once (~10s)
+cargo test --test docker_integration -- --ignored   # repeat (~8s)
+./tests/docker/stop.sh              # when done (~10s)
+```
+
+**Containers and what they exercise:**
+
+| Container | Port | Focus |
+|-----------|------|-------|
+| smb-guest | 10445 | Guest auth, CRUD, compound, pipelined, streaming, progress, cancel, fs_info, reconnect, file watching |
+| smb-auth | 10446 | NTLM auth, wrong-password rejection |
+| smb-signing | 10447 | Mandatory signing: write/read, compound, pipelined 512 KB |
+| smb-readonly | 10448 | Read-only share: list/read/stat succeed, write/delete/mkdir fail cleanly |
+| smb-ancient | 10449 | SMB1-only server: negotiate fails cleanly (not hang) |
+| smb-flaky | 10450 | 5s up / 5s down: connect during up, get clean error when down |
+| smb-slow | 10451 | 200ms latency: operations still work, pipelining under delay |
+| smb-encryption | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1): write/read, pipelined, share listing |
+| smb-50shares | 10453 | 50 shares: RPC enumeration returns all 50 |
+| smb-maxreadsize | 10454 | 64 KB max read/write: pipelined 512 KB, streaming download chunk count |
+| smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2): different cipher family |
 
 ## How to run
 

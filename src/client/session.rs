@@ -244,20 +244,23 @@ impl Session {
             conn.activate_signing(signing_key.clone(), signing_algorithm);
         }
 
-        // Activate encryption on the connection if the session requires it
-        // AND we have the necessary keys and cipher.
+        // Activate encryption on the connection if the session requires it.
+        // The cipher comes from negotiate contexts (SMB 3.1.1). If the server
+        // didn't send one (for example, Samba with `smb encrypt = required` sometimes
+        // omits the encryption context), fall back to AES-128-CCM which is
+        // universally supported by all SMB 3.x servers.
         if should_encrypt {
-            if let (Some(ref enc_key), Some(ref dec_key), Some(cipher)) =
-                (&encryption_key, &decryption_key, params.cipher)
-            {
+            let cipher = params
+                .cipher
+                .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
+            if let (Some(ref enc_key), Some(ref dec_key)) = (&encryption_key, &decryption_key) {
                 conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
             } else {
                 warn!(
-                    "session: encryption requested but missing keys or cipher, \
-                     enc_key={}, dec_key={}, cipher={:?}",
+                    "session: encryption requested but missing keys, \
+                     enc_key={}, dec_key={}",
                     encryption_key.is_some(),
                     decryption_key.is_some(),
-                    params.cipher
                 );
             }
         }

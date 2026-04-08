@@ -143,14 +143,19 @@ impl SmbClient {
         let tree = Tree::connect(&mut self.conn, share_name).await?;
 
         // Activate encryption if the share requires it and it's not already active.
+        // Fall back to AES-128-CCM if the server didn't send an encryption
+        // negotiate context (same fallback as session-level encryption).
         if tree.encrypt_data && !self.conn.should_encrypt() {
             if let (Some(ref enc_key), Some(ref dec_key)) =
                 (&self.session.encryption_key, &self.session.decryption_key)
             {
-                if let Some(cipher) = self.conn.params().and_then(|p| p.cipher) {
-                    self.conn
-                        .activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
-                }
+                let cipher = self
+                    .conn
+                    .params()
+                    .and_then(|p| p.cipher)
+                    .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
+                self.conn
+                    .activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
             }
         }
 

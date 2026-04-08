@@ -86,7 +86,9 @@ tests/
   pack_roundtrip.rs       # Property-based tests for pack/unpack
   msg_wire_format.rs      # Test messages against known byte sequences
   protocol_flow.rs        # Negotiate -> session -> tree -> file flows (mock)
-  integration.rs          # Tests against real Samba server (Docker, ignored)
+  integration.rs          # Tests against real NAS/Pi (#[ignore])
+  docker_integration.rs   # Tests against Docker Samba containers (#[ignore])
+  docker/                 # Docker infrastructure (Dockerfiles, compose, scripts)
 
 examples/
   list_shares.rs          # Connect and enumerate shares
@@ -168,7 +170,31 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 - `cargo test` — unit tests (~555), no server needed
 - `just check` — fmt + clippy + tests + doc
 - `cargo test --test integration -- --ignored` — real NAS/Pi tests (needs `.env`)
-- `just test-docker` — Docker container tests (needs Docker)
+- `just test-docker` — Docker container tests (needs Docker, ~28s locally)
+
+### Docker test containers
+
+12 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+
+| Container | Port | What it tests |
+|-----------|------|---------------|
+| smb-guest | 10445 | Guest access, basic operations |
+| smb-auth | 10446 | NTLM authentication |
+| smb-signing | 10447 | Mandatory signing (server rejects unsigned) |
+| smb-readonly | 10448 | Write/delete return clean NTSTATUS errors |
+| smb-ancient | 10449 | SMB1 only, clean protocol rejection |
+| smb-flaky | 10450 | 5s up / 5s down, reconnect behavior |
+| smb-slow | 10451 | 200ms latency, pipelining under delay |
+| smb-encryption | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1) |
+| smb-50shares | 10453 | 50 shares, RPC enumeration at scale |
+| smb-maxreadsize | 10454 | 64 KB max read/write, chunking edge cases |
+| smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
+
+### Tested hardware
+
+Integration tests (`tests/integration.rs`) run against real hardware:
+- QNAP TS-464 NAS (SMB 3.1.1, NTLM auth, AES-GMAC signing)
+- Raspberry Pi 4 Model B (SMB 3.1.1, guest access)
 
 ## Module docs (CLAUDE.md files)
 
