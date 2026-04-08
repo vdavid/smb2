@@ -4,95 +4,28 @@
 //! Both request and response contain only a StructureSize field and a
 //! reserved field, for a total of 4 bytes each.
 
-use crate::error::Result;
-use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
-use crate::Error;
-
-/// SMB2 ECHO request (spec section 2.2.28).
-///
-/// Sent by the client to determine whether a server is processing requests.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EchoRequest;
-
-impl EchoRequest {
-    /// The structure size field is always 4.
-    pub const STRUCTURE_SIZE: u16 = 4;
+super::trivial_message! {
+    /// SMB2 ECHO request (spec section 2.2.28).
+    ///
+    /// Sent by the client to determine whether a server is processing requests.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct EchoRequest;
 }
 
-impl Pack for EchoRequest {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for EchoRequest {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid EchoRequest structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(EchoRequest)
-    }
-}
-
-/// SMB2 ECHO response (spec section 2.2.29).
-///
-/// Sent by the server to confirm that an ECHO request was processed.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EchoResponse;
-
-impl EchoResponse {
-    /// The structure size field is always 4.
-    pub const STRUCTURE_SIZE: u16 = 4;
-}
-
-impl Pack for EchoResponse {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for EchoResponse {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid EchoResponse structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(EchoResponse)
-    }
+super::trivial_message! {
+    /// SMB2 ECHO response (spec section 2.2.29).
+    ///
+    /// Sent by the server to confirm that an ECHO request was processed.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct EchoResponse;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 
-    // ── EchoRequest tests ──────────────────────────────────────────
+    // -- EchoRequest tests --
 
     #[test]
     fn echo_request_pack_produces_4_bytes() {
@@ -153,7 +86,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── EchoResponse tests ─────────────────────────────────────────
+    // -- EchoResponse tests --
 
     #[test]
     fn echo_response_pack_produces_4_bytes() {

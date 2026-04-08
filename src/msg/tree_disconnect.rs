@@ -4,96 +4,29 @@
 //! Both request and response contain only a StructureSize field and a
 //! reserved field, for a total of 4 bytes each.
 
-use crate::error::Result;
-use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
-use crate::Error;
-
-/// SMB2 TREE_DISCONNECT request (spec section 2.2.11).
-///
-/// Sent by the client to request that the tree connect specified in the
-/// TreeId within the SMB2 header be disconnected.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeDisconnectRequest;
-
-impl TreeDisconnectRequest {
-    /// The structure size field is always 4.
-    pub const STRUCTURE_SIZE: u16 = 4;
+super::trivial_message! {
+    /// SMB2 TREE_DISCONNECT request (spec section 2.2.11).
+    ///
+    /// Sent by the client to request that the tree connect specified in the
+    /// TreeId within the SMB2 header be disconnected.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct TreeDisconnectRequest;
 }
 
-impl Pack for TreeDisconnectRequest {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for TreeDisconnectRequest {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid TreeDisconnectRequest structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(TreeDisconnectRequest)
-    }
-}
-
-/// SMB2 TREE_DISCONNECT response (spec section 2.2.12).
-///
-/// Sent by the server to confirm that a TREE_DISCONNECT request was processed.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeDisconnectResponse;
-
-impl TreeDisconnectResponse {
-    /// The structure size field is always 4.
-    pub const STRUCTURE_SIZE: u16 = 4;
-}
-
-impl Pack for TreeDisconnectResponse {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for TreeDisconnectResponse {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid TreeDisconnectResponse structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(TreeDisconnectResponse)
-    }
+super::trivial_message! {
+    /// SMB2 TREE_DISCONNECT response (spec section 2.2.12).
+    ///
+    /// Sent by the server to confirm that a TREE_DISCONNECT request was processed.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct TreeDisconnectResponse;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 
-    // ── TreeDisconnectRequest tests ────────────────────────────────
+    // -- TreeDisconnectRequest tests --
 
     #[test]
     fn tree_disconnect_request_pack_produces_4_bytes() {
@@ -154,7 +87,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── TreeDisconnectResponse tests ───────────────────────────────
+    // -- TreeDisconnectResponse tests --
 
     #[test]
     fn tree_disconnect_response_pack_produces_4_bytes() {

@@ -2,6 +2,33 @@
 
 use std::fmt;
 
+/// Defines `NtStatus` associated constants and the `name()` match arms from
+/// a single table, so adding a new status code only requires one edit.
+macro_rules! nt_status_codes {
+    (
+        $(
+            $(#[$meta:meta])*
+            $name:ident = $value:expr, $display:expr;
+        )*
+    ) => {
+        impl NtStatus {
+            $(
+                $(#[$meta])*
+                pub const $name: Self = Self($value);
+            )*
+
+            /// Returns a human-readable name for known status codes,
+            /// or `None` for unknown codes.
+            fn name(&self) -> Option<&'static str> {
+                match self.0 {
+                    $( $value => Some($display), )*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
 /// NT status code returned in SMB2 response headers.
 ///
 /// The top two bits encode severity:
@@ -12,140 +39,142 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct NtStatus(pub u32);
 
-impl NtStatus {
-    // ── Success (severity 0b00) ──────────────────────────────────────
+nt_status_codes! {
+    // -- Success (severity 0b00) --
 
     /// The operation completed successfully.
-    pub const SUCCESS: Self = Self(0x0000_0000);
+    SUCCESS = 0x0000_0000, "STATUS_SUCCESS";
 
     /// The operation that was requested is pending completion.
-    pub const PENDING: Self = Self(0x0000_0103);
+    PENDING = 0x0000_0103, "STATUS_PENDING";
 
     /// Oplock break notification (informational).
-    pub const NOTIFY_ENUM_DIR: Self = Self(0x0000_010C);
+    NOTIFY_ENUM_DIR = 0x0000_010C, "STATUS_NOTIFY_ENUM_DIR";
 
-    // ── Informational (severity 0b00, facility-specific) ─────────────
+    // -- Informational (severity 0b00, facility-specific) --
 
-    /// The authentication exchange is not complete — send the next
+    /// The authentication exchange is not complete -- send the next
     /// SESSION_SETUP with the GSS token from this response.
     ///
     /// **Important:** The severity bits are 0b11 (error), so `is_error()`
-    /// returns `true`. But this is NOT a real error — it's a "keep going"
+    /// returns `true`. But this is NOT a real error -- it's a "keep going"
     /// signal during NTLM/SPNEGO auth. Auth code must check
     /// `is_more_processing_required()` before checking `is_error()`.
-    pub const MORE_PROCESSING_REQUIRED: Self = Self(0xC000_0016);
+    MORE_PROCESSING_REQUIRED = 0xC000_0016, "STATUS_MORE_PROCESSING_REQUIRED";
 
-    // ── Warnings (severity 0b10) ─────────────────────────────────────
+    // -- Warnings (severity 0b10) --
 
     /// The data was too large to fit into the specified buffer.
-    /// This is a warning — the response body contains valid partial data.
-    pub const BUFFER_OVERFLOW: Self = Self(0x8000_0005);
+    /// This is a warning -- the response body contains valid partial data.
+    BUFFER_OVERFLOW = 0x8000_0005, "STATUS_BUFFER_OVERFLOW";
 
     /// No more files were found which match the file specification.
-    pub const NO_MORE_FILES: Self = Self(0x8000_0006);
+    NO_MORE_FILES = 0x8000_0006, "STATUS_NO_MORE_FILES";
 
-    // ── Errors (severity 0b11) ───────────────────────────────────────
+    // -- Errors (severity 0b11) --
 
     /// The requested operation was unsuccessful.
-    pub const UNSUCCESSFUL: Self = Self(0xC000_0001);
+    UNSUCCESSFUL = 0xC000_0001, "STATUS_UNSUCCESSFUL";
 
     /// The requested operation is not implemented.
-    pub const NOT_IMPLEMENTED: Self = Self(0xC000_0002);
+    NOT_IMPLEMENTED = 0xC000_0002, "STATUS_NOT_IMPLEMENTED";
 
     /// An invalid parameter was passed to a service or function.
-    pub const INVALID_PARAMETER: Self = Self(0xC000_000D);
+    INVALID_PARAMETER = 0xC000_000D, "STATUS_INVALID_PARAMETER";
 
     /// A device that does not exist was specified.
-    pub const NO_SUCH_DEVICE: Self = Self(0xC000_000E);
+    NO_SUCH_DEVICE = 0xC000_000E, "STATUS_NO_SUCH_DEVICE";
 
     /// The file does not exist.
-    pub const NO_SUCH_FILE: Self = Self(0xC000_000F);
+    NO_SUCH_FILE = 0xC000_000F, "STATUS_NO_SUCH_FILE";
 
     /// The specified request is not a valid operation for the target device.
-    pub const INVALID_DEVICE_REQUEST: Self = Self(0xC000_0010);
+    INVALID_DEVICE_REQUEST = 0xC000_0010, "STATUS_INVALID_DEVICE_REQUEST";
 
     /// The end-of-file marker has been reached.
-    pub const END_OF_FILE: Self = Self(0xC000_0011);
+    END_OF_FILE = 0xC000_0011, "STATUS_END_OF_FILE";
 
     /// A process has requested access to an object but has not been
     /// granted those access rights.
-    pub const ACCESS_DENIED: Self = Self(0xC000_0022);
+    ACCESS_DENIED = 0xC000_0022, "STATUS_ACCESS_DENIED";
 
     /// The buffer is too small to contain the entry.
-    pub const BUFFER_TOO_SMALL: Self = Self(0xC000_0023);
+    BUFFER_TOO_SMALL = 0xC000_0023, "STATUS_BUFFER_TOO_SMALL";
 
     /// The object name is not found.
-    pub const OBJECT_NAME_NOT_FOUND: Self = Self(0xC000_0034);
+    OBJECT_NAME_NOT_FOUND = 0xC000_0034, "STATUS_OBJECT_NAME_NOT_FOUND";
 
     /// The object name already exists.
-    pub const OBJECT_NAME_COLLISION: Self = Self(0xC000_0035);
+    OBJECT_NAME_COLLISION = 0xC000_0035, "STATUS_OBJECT_NAME_COLLISION";
 
     /// The path does not exist.
-    pub const OBJECT_PATH_NOT_FOUND: Self = Self(0xC000_003A);
+    OBJECT_PATH_NOT_FOUND = 0xC000_003A, "STATUS_OBJECT_PATH_NOT_FOUND";
 
     /// A file cannot be opened because the share access flags
     /// are incompatible.
-    pub const SHARING_VIOLATION: Self = Self(0xC000_0043);
+    SHARING_VIOLATION = 0xC000_0043, "STATUS_SHARING_VIOLATION";
 
     /// A requested read/write cannot be granted due to a conflicting
     /// file lock.
-    pub const FILE_LOCK_CONFLICT: Self = Self(0xC000_0054);
+    FILE_LOCK_CONFLICT = 0xC000_0054, "STATUS_FILE_LOCK_CONFLICT";
 
     /// A non-close operation has been requested of a file object that
     /// has a delete pending.
-    pub const DELETE_PENDING: Self = Self(0xC000_0056);
+    DELETE_PENDING = 0xC000_0056, "STATUS_DELETE_PENDING";
 
     /// The attempted logon is invalid.
-    pub const LOGON_FAILURE: Self = Self(0xC000_006D);
+    LOGON_FAILURE = 0xC000_006D, "STATUS_LOGON_FAILURE";
 
     /// The referenced account is currently disabled.
-    pub const ACCOUNT_DISABLED: Self = Self(0xC000_0072);
+    ACCOUNT_DISABLED = 0xC000_0072, "STATUS_ACCOUNT_DISABLED";
 
     /// Insufficient system resources exist to complete the API.
-    pub const INSUFFICIENT_RESOURCES: Self = Self(0xC000_009A);
+    INSUFFICIENT_RESOURCES = 0xC000_009A, "STATUS_INSUFFICIENT_RESOURCES";
 
     /// The file that was specified as a target is a directory.
-    pub const FILE_IS_A_DIRECTORY: Self = Self(0xC000_00BA);
+    FILE_IS_A_DIRECTORY = 0xC000_00BA, "STATUS_FILE_IS_A_DIRECTORY";
 
     /// The network path cannot be located.
-    pub const BAD_NETWORK_PATH: Self = Self(0xC000_00BE);
+    BAD_NETWORK_PATH = 0xC000_00BE, "STATUS_BAD_NETWORK_PATH";
 
     /// The network name was deleted.
-    pub const NETWORK_NAME_DELETED: Self = Self(0xC000_00C9);
+    NETWORK_NAME_DELETED = 0xC000_00C9, "STATUS_NETWORK_NAME_DELETED";
 
     /// The specified share name cannot be found on the remote server.
-    pub const BAD_NETWORK_NAME: Self = Self(0xC000_00CC);
+    BAD_NETWORK_NAME = 0xC000_00CC, "STATUS_BAD_NETWORK_NAME";
 
     /// No more connections can be made to this remote computer at this time.
-    pub const REQUEST_NOT_ACCEPTED: Self = Self(0xC000_00D0);
+    REQUEST_NOT_ACCEPTED = 0xC000_00D0, "STATUS_REQUEST_NOT_ACCEPTED";
 
     /// A requested opened file is not a directory.
-    pub const NOT_A_DIRECTORY: Self = Self(0xC000_0103);
+    NOT_A_DIRECTORY = 0xC000_0103, "STATUS_NOT_A_DIRECTORY";
 
     /// The I/O request was canceled.
-    pub const CANCELLED: Self = Self(0xC000_0120);
+    CANCELLED = 0xC000_0120, "STATUS_CANCELLED";
 
     /// An I/O request other than close was attempted using a file object
     /// that had already been closed.
-    pub const FILE_CLOSED: Self = Self(0xC000_0128);
+    FILE_CLOSED = 0xC000_0128, "STATUS_FILE_CLOSED";
 
     /// The remote user session has been deleted.
-    pub const USER_SESSION_DELETED: Self = Self(0xC000_0203);
+    USER_SESSION_DELETED = 0xC000_0203, "STATUS_USER_SESSION_DELETED";
 
     /// Insufficient server resources exist to complete the request.
-    pub const INSUFF_SERVER_RESOURCES: Self = Self(0xC000_0205);
+    INSUFF_SERVER_RESOURCES = 0xC000_0205, "STATUS_INSUFF_SERVER_RESOURCES";
 
     /// The object was not found.
-    pub const NOT_FOUND: Self = Self(0xC000_0225);
+    NOT_FOUND = 0xC000_0225, "STATUS_NOT_FOUND";
 
     /// The contacted server does not support the indicated part
     /// of the DFS namespace.
-    pub const PATH_NOT_COVERED: Self = Self(0xC000_0257);
+    PATH_NOT_COVERED = 0xC000_0257, "STATUS_PATH_NOT_COVERED";
 
     /// The client session has expired; the client must re-authenticate.
-    pub const NETWORK_SESSION_EXPIRED: Self = Self(0xC000_035C);
+    NETWORK_SESSION_EXPIRED = 0xC000_035C, "STATUS_NETWORK_SESSION_EXPIRED";
+}
 
-    // ── Helper methods ───────────────────────────────────────────────
+impl NtStatus {
+    // -- Helper methods --
 
     /// Returns the severity bits (top 2 bits): 0 = success, 1 = info,
     /// 2 = warning, 3 = error.
@@ -180,56 +209,11 @@ impl NtStatus {
 
     /// Returns `true` if the server wants another SESSION_SETUP round-trip.
     ///
-    /// Check this BEFORE `is_error()` during authentication — it has
+    /// Check this BEFORE `is_error()` during authentication -- it has
     /// error severity bits but is not a real error.
     #[inline]
     pub fn is_more_processing_required(&self) -> bool {
         *self == Self::MORE_PROCESSING_REQUIRED
-    }
-
-    /// Returns a human-readable name for known status codes,
-    /// or `None` for unknown codes.
-    fn name(&self) -> Option<&'static str> {
-        match self.0 {
-            0x0000_0000 => Some("STATUS_SUCCESS"),
-            0x0000_0103 => Some("STATUS_PENDING"),
-            0x0000_010C => Some("STATUS_NOTIFY_ENUM_DIR"),
-            0xC000_0016 => Some("STATUS_MORE_PROCESSING_REQUIRED"),
-            0x8000_0005 => Some("STATUS_BUFFER_OVERFLOW"),
-            0x8000_0006 => Some("STATUS_NO_MORE_FILES"),
-            0xC000_0001 => Some("STATUS_UNSUCCESSFUL"),
-            0xC000_0002 => Some("STATUS_NOT_IMPLEMENTED"),
-            0xC000_000D => Some("STATUS_INVALID_PARAMETER"),
-            0xC000_000E => Some("STATUS_NO_SUCH_DEVICE"),
-            0xC000_000F => Some("STATUS_NO_SUCH_FILE"),
-            0xC000_0010 => Some("STATUS_INVALID_DEVICE_REQUEST"),
-            0xC000_0011 => Some("STATUS_END_OF_FILE"),
-            0xC000_0022 => Some("STATUS_ACCESS_DENIED"),
-            0xC000_0023 => Some("STATUS_BUFFER_TOO_SMALL"),
-            0xC000_0034 => Some("STATUS_OBJECT_NAME_NOT_FOUND"),
-            0xC000_0035 => Some("STATUS_OBJECT_NAME_COLLISION"),
-            0xC000_003A => Some("STATUS_OBJECT_PATH_NOT_FOUND"),
-            0xC000_0043 => Some("STATUS_SHARING_VIOLATION"),
-            0xC000_0054 => Some("STATUS_FILE_LOCK_CONFLICT"),
-            0xC000_0056 => Some("STATUS_DELETE_PENDING"),
-            0xC000_006D => Some("STATUS_LOGON_FAILURE"),
-            0xC000_0072 => Some("STATUS_ACCOUNT_DISABLED"),
-            0xC000_009A => Some("STATUS_INSUFFICIENT_RESOURCES"),
-            0xC000_00BA => Some("STATUS_FILE_IS_A_DIRECTORY"),
-            0xC000_00BE => Some("STATUS_BAD_NETWORK_PATH"),
-            0xC000_00C9 => Some("STATUS_NETWORK_NAME_DELETED"),
-            0xC000_00CC => Some("STATUS_BAD_NETWORK_NAME"),
-            0xC000_00D0 => Some("STATUS_REQUEST_NOT_ACCEPTED"),
-            0xC000_0103 => Some("STATUS_NOT_A_DIRECTORY"),
-            0xC000_0120 => Some("STATUS_CANCELLED"),
-            0xC000_0128 => Some("STATUS_FILE_CLOSED"),
-            0xC000_0203 => Some("STATUS_USER_SESSION_DELETED"),
-            0xC000_0205 => Some("STATUS_INSUFF_SERVER_RESOURCES"),
-            0xC000_0225 => Some("STATUS_NOT_FOUND"),
-            0xC000_0257 => Some("STATUS_PATH_NOT_COVERED"),
-            0xC000_035C => Some("STATUS_NETWORK_SESSION_EXPIRED"),
-            _ => None,
-        }
     }
 }
 

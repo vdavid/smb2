@@ -27,7 +27,6 @@ src/
     mod.rs                # SessionId, TreeId, FileId, MessageId, CreditCharge
     flags.rs              # Bitflag types (Capabilities, SecurityMode, etc.)
     status.rs             # NtStatus enum (from MS-ERREF)
-    security.rs           # SID, ACL types (from MS-DTYP)
 
   msg/                    # Wire format message structs
     mod.rs                # Command enum, Header, ErrorResponse

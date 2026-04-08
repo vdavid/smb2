@@ -32,7 +32,6 @@ all-features = true
 log = "0.4"
 
 # Async runtime agnostic
-futures = "0.3"
 async-trait = "0.1"
 
 # Error handling
@@ -40,9 +39,6 @@ thiserror = "2"
 
 # Enum conversion derives
 num_enum = "0.7"
-
-# Byte handling
-bytes = "1.5"
 
 # Async runtime — transport layer needs net, io-util, time, sync
 tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
@@ -60,7 +56,8 @@ digest = "0.10"
 md-5 = "0.10"
 md4 = "0.10"
 
-# Cryptographically secure random (already a transitive dep via aes-gcm)
+# Cryptographically secure random (direct dependency; transitive copies
+# at different major versions come in via aes-gcm and rand)
 getrandom = "0.3"
 
 # Compression

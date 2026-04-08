@@ -4,54 +4,19 @@
 //! previously sent message, and there is no corresponding response message.
 //! The MessageId of the request to cancel is set in the SMB2 header.
 
-use crate::error::Result;
-use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
-use crate::Error;
-
-/// SMB2 CANCEL request (spec section 2.2.30).
-///
-/// Sent by the client to cancel a previously sent message on the same
-/// transport connection. There is no response for this command.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelRequest;
-
-impl CancelRequest {
-    /// The structure size field is always 4.
-    pub const STRUCTURE_SIZE: u16 = 4;
-}
-
-impl Pack for CancelRequest {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for CancelRequest {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid CancelRequest structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(CancelRequest)
-    }
+super::trivial_message! {
+    /// SMB2 CANCEL request (spec section 2.2.30).
+    ///
+    /// Sent by the client to cancel a previously sent message on the same
+    /// transport connection. There is no response for this command.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct CancelRequest;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 
     #[test]
     fn cancel_request_pack_produces_4_bytes() {

@@ -4,95 +4,28 @@
 //! Both request and response contain only a StructureSize field and a
 //! reserved field, for a total of 4 bytes each.
 
-use crate::error::Result;
-use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
-use crate::Error;
-
-/// SMB2 LOGOFF request (spec section 2.2.7).
-///
-/// Sent by the client to request termination of a particular session.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogoffRequest;
-
-impl LogoffRequest {
-    /// The structure size field is always 4.
-    pub const STRUCTURE_SIZE: u16 = 4;
+super::trivial_message! {
+    /// SMB2 LOGOFF request (spec section 2.2.7).
+    ///
+    /// Sent by the client to request termination of a particular session.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct LogoffRequest;
 }
 
-impl Pack for LogoffRequest {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for LogoffRequest {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid LogoffRequest structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(LogoffRequest)
-    }
-}
-
-/// SMB2 LOGOFF response (spec section 2.2.8).
-///
-/// Sent by the server to confirm that a LOGOFF request was processed.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogoffResponse;
-
-impl LogoffResponse {
-    /// The structure size field is always 4.
-    pub const STRUCTURE_SIZE: u16 = 4;
-}
-
-impl Pack for LogoffResponse {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for LogoffResponse {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid LogoffResponse structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(LogoffResponse)
-    }
+super::trivial_message! {
+    /// SMB2 LOGOFF response (spec section 2.2.8).
+    ///
+    /// Sent by the server to confirm that a LOGOFF request was processed.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct LogoffResponse;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 
-    // ── LogoffRequest tests ────────────────────────────────────────
+    // -- LogoffRequest tests --
 
     #[test]
     fn logoff_request_pack_produces_4_bytes() {
@@ -153,7 +86,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── LogoffResponse tests ───────────────────────────────────────
+    // -- LogoffResponse tests --
 
     #[test]
     fn logoff_response_pack_produces_4_bytes() {
