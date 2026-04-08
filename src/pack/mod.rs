@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::Error;
 
 /// Trait for types that can serialize themselves into binary format.
-pub trait Pack {
+pub trait Pack: Send + Sync {
     /// Write this value into the cursor.
     fn pack(&self, cursor: &mut WriteCursor);
 }
