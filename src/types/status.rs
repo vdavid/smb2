@@ -122,6 +122,9 @@ nt_status_codes! {
     /// has a delete pending.
     DELETE_PENDING = 0xC000_0056, "STATUS_DELETE_PENDING";
 
+    /// The disk is full.
+    DISK_FULL = 0xC000_007F, "STATUS_DISK_FULL";
+
     /// The attempted logon is invalid.
     LOGON_FAILURE = 0xC000_006D, "STATUS_LOGON_FAILURE";
 

@@ -58,7 +58,7 @@ pub mod types;
 // ── Re-exports: the simple-case imports ────────────────────────────────
 
 // Error types
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
 
 // High-level client
 pub use client::{connect, ClientConfig, SmbClient};
