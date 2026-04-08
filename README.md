@@ -23,12 +23,17 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 ## What it does
 
 - Connect to SMB2/3 shares using NTLM authentication
-- List directories, read files, write files, delete, rename
-- Pipeline operations: push requests into one end, results stream out the other
-- Large file transfers chunked at the server's `MaxReadSize`/`MaxWriteSize`
-- Credit-window-based flow control (the server tells us how fast to go)
-- SMB 3.x signing, encryption, and LZ4 compression
-- Share enumeration (list shares on a server)
+- List directories, read files, write files, delete, rename, stat, create directories
+- Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds)
+- Pipelined I/O with sliding window for large file transfers
+- SMB 3.x signing (HMAC-SHA256, AES-CMAC, AES-GMAC) and encryption (AES-128/256-CCM/GCM)
+- LZ4 compression
+- Share enumeration (list shares on a server via IPC$ + srvsvc RPC)
+- Streaming downloads and uploads with progress reporting and cancellation
+- File watching (CHANGE_NOTIFY for live directory updates)
+- Disk space queries (total, free, used)
+- Reconnection after network failures
+- Auto-flush on writes (data safety for family photos and company docs)
 
 ## What it doesn't do (yet)
 
@@ -208,9 +213,13 @@ For when you want to do one thing and get the result:
 - `client.rename(&share, from, to)` -- rename a file
 - `client.create_directory(&share, path)` -- create a directory
 - `client.delete_directory(&share, path)` -- remove a directory
-- `client.download(&share, path)` -- streaming download (memory-efficient)
-- `client.write_file_with_progress(&share, path, data, callback)` -- upload with progress
-- `client.flush_file(&share, file_id)` -- flush file to persistent storage
+- `client.download(&share, path)` -- streaming download with progress (memory-efficient)
+- `client.upload(&share, path, data)` -- streaming upload with progress
+- `client.watch(&share, path, recursive)` -- watch for file changes (CHANGE_NOTIFY)
+- `client.fs_info(&share)` -- disk space (total, free, used)
+- `client.reconnect()` -- reconnect after network failure
+- `client.credits()` -- current available credits
+- `client.estimated_rtt()` -- round-trip time from negotiate
 - `client.disconnect_share(&share)` -- disconnect from a share
 
 ### Pipeline API

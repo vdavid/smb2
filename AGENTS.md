@@ -144,33 +144,22 @@ The pipeline is the reason this library exists. Without pipelining, SMB download
 | Testing | TDD with mock transport | Spec-driven tests first |
 | Primary reference | MS-SMB2 spec (~80%) | smb-rs as sanity check (~15%), mtp-rs as architecture template (~5%) |
 
-## Known protocol pitfalls
+## Protocol pitfalls (all handled)
 
-These are the top issues that WILL cause bugs if not handled correctly. Read the spec sections before implementing.
+These were identified during three adversarial review rounds and have all been addressed. They're documented here so you understand the reasoning behind certain code patterns.
 
-1. **Preauthentication integrity hash (SMB 3.1.1):** Key derivation requires hashing raw bytes of NEGOTIATE and SESSION_SETUP messages. Must capture wire bytes before parsing. Wrong hash = wrong keys = first signed message fails. (Spec 3.2.5.2, 3.2.5.3.1)
-
-2. **Compound partial failure:** When CREATE fails in a compound, the server cascades errors to all subsequent ops. If CREATE succeeds but READ fails, CLOSE also fails, and the client MUST issue a standalone CLOSE to avoid leaking the file handle. (Spec 3.3.5.2.7.2)
-
-3. **Consecutive MessageIds for multi-credit requests:** A request consuming N credits MUST use N consecutive MessageIds. Can't use IDs with gaps. Server terminates connection on violation. (Spec 3.2.4.1.5, 3.3.5.2.3)
-
-4. **Signing/encryption ordering:** When encrypting, zero the Signature field (AEAD provides auth). On receive, if decryption succeeded, skip signature verification. Build message -> sign OR zero signature -> encrypt. (Spec 3.2.4.1.1)
-
-5. **TCP framing is big-endian:** Transport header is 1 byte (must be 0x00) + 3 bytes length in big-endian (network byte order). Everything else in SMB is little-endian. (Spec 2.1)
-
-6. **STATUS_PENDING interim responses:** Carry credits in CreditResponse, but the request is NOT done. Store the AsyncId, keep waiting for the final response. Don't remove from in-flight. (Spec 3.3.4.3)
-
-7. **CANCEL has two modes:** Before interim response, use original MessageId. After STATUS_PENDING (have AsyncId), set `SMB2_FLAGS_ASYNC_COMMAND` and use AsyncId. CANCEL doesn't consume credits. (Spec 3.2.4.24)
-
-8. **Session reauthentication:** On STATUS_NETWORK_SESSION_EXPIRED, reauthenticate with same SessionId. MUST NOT regenerate SessionKey. Preserve existing signing/encryption keys. (Spec 3.2.5.1.6, 3.2.5.3.2)
-
-9. **Compound encryption wraps the entire chain:** One TRANSFORM_HEADER for the whole compound, not per sub-request. Sign each sub-request individually (or zero signatures if encrypting), then concatenate, then encrypt. (Spec 3.1.4.3)
-
-10. **STATUS_BUFFER_OVERFLOW is a WARNING, not an error:** Returns valid partial data. Don't discard the response body. Client may retry with a larger buffer. (Spec 3.3.4.4)
-
-11. **Oplock/lease break notifications:** Arrive with MessageId 0xFFFFFFFFFFFFFFFF. Need an `OpenTable: FileId -> (SessionId, TreeId)` to construct a valid ack. Lease breaks arrive with SessionId=0, TreeId=0, look up by LeaseKey. (Spec 3.2.5.19.1)
-
-12. **NTLM MIC:** Modern servers include `MsvAvTimestamp` in the challenge, triggering MIC validation. Must retain raw bytes of NEGOTIATE, CHALLENGE, and AUTHENTICATE for MIC computation. (MS-NLMP)
+1. **Preauth hash excludes success response** ✅ -- The final SESSION_SETUP response (STATUS_SUCCESS) is NOT included in the preauth hash. Including it produces wrong keys. See `session.rs`.
+2. **Compound partial failure** ✅ -- Standalone CLOSE issued when CREATE succeeds but a later op fails. See `tree.rs` compound methods.
+3. **Consecutive MessageIds** ✅ -- `send_request_with_credits()` advances MessageId by CreditCharge. See `connection.rs`.
+4. **Signing/encryption mutual exclusion** ✅ -- When encrypting, Signature is zeroed, AEAD provides auth. See `connection.rs` send/receive paths.
+5. **TCP framing is big-endian** ✅ -- 0x00 + 3-byte BE length. Only big-endian thing in SMB. See `transport/tcp.rs`.
+6. **STATUS_PENDING loop** ✅ -- `receive_response()` loops past interim responses, extracting credits. See `connection.rs`.
+7. **CANCEL two modes** ✅ -- `send_cancel()` handles sync (MessageId) and async (AsyncId + flag). See `connection.rs`.
+8. **Session expiry** ✅ -- `receive_response()` detects STATUS_NETWORK_SESSION_EXPIRED, returns `Error::SessionExpired`. Caller reconnects. See `connection.rs`.
+9. **Compound encryption wraps entire chain** ✅ -- One TRANSFORM_HEADER for concatenated compound. See `connection.rs` `send_compound()`.
+10. **STATUS_BUFFER_OVERFLOW** ✅ -- Accepted as partial success in QueryInfo responses via `is_success_or_partial()`. See `tree.rs`.
+11. **Oplock break notifications** ✅ -- Detected by MessageId 0xFFFF..., logged, skipped. See `connection.rs` receive loop.
+12. **NTLM MIC** ✅ -- Computed when MsvAvTimestamp present, using retained raw bytes. See `auth/ntlm.rs`.
 
 ## Testing
 
