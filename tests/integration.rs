@@ -961,3 +961,47 @@ async fn micro_benchmark_smb2_vs_native() {
     println!("└────────────┴────────────┴────────────┴──────────┘");
     println!("\nRatio < 1.0 means smb2 is faster than native.");
 }
+
+#[tokio::test]
+#[ignore]
+async fn compound_read_and_write_on_raspberry_pi() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect("192.168.1.150:445", Duration::from_secs(5))
+        .await
+        .expect("failed to connect to Pi");
+    conn.negotiate().await.expect("negotiate failed");
+
+    let session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+
+    println!("Pi: dialect={}, sign={}", 
+        conn.params().unwrap().dialect, session.should_sign);
+
+    let tree = smb2::Tree::connect(&mut conn, "PiHDD")
+        .await
+        .expect("tree connect failed");
+
+    // Compound write
+    let test_data = b"Pi compound test 1234567890";
+    let start = std::time::Instant::now();
+    tree.write_file_compound(&mut conn, "smb2_pi_compound.tmp", test_data)
+        .await
+        .expect("compound write failed");
+    println!("Pi compound write: {:?}", start.elapsed());
+
+    // Compound read
+    let start = std::time::Instant::now();
+    let read_back = tree.read_file_compound(&mut conn, "smb2_pi_compound.tmp")
+        .await
+        .expect("compound read failed");
+    println!("Pi compound read: {:?}", start.elapsed());
+
+    assert_eq!(read_back, test_data, "data mismatch on Pi");
+    println!("Pi compound read/write verified!");
+
+    // Cleanup (best-effort — Pi sometimes drops connection after compound)
+    let _ = tree.delete_file(&mut conn, "smb2_pi_compound.tmp").await;
+    let _ = tree.disconnect(&mut conn).await;
+}
