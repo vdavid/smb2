@@ -124,19 +124,33 @@ pub async fn download(
         .map(|e| e.name.clone())
         .collect();
 
+    // Use compound (CREATE+READ+CLOSE in 1 round-trip) for files that
+    // fit in MaxReadSize. Fall back to pipelined for larger files.
+    let max_read = client
+        .params()
+        .map(|p| p.max_read_size as usize)
+        .unwrap_or(65536);
+
     let start = Instant::now();
     let mut total_bytes = 0u64;
     for name in &file_names {
         let file_path = format!(r"{test_dir}\{name}");
-        let data = client
-            .read_file_pipelined(tree, &file_path)
-            .await
-            .expect("smb2 read_file_pipelined");
+        let data = match client.read_file_compound(tree, &file_path).await {
+            Ok(d) => d,
+            Err(_) => {
+                // Compound may fail for files > MaxReadSize; fall back.
+                client
+                    .read_file_pipelined(tree, &file_path)
+                    .await
+                    .expect("smb2 download fallback")
+            }
+        };
         let local_path = local_dest.join(name);
         let mut local_file = std::fs::File::create(&local_path).expect("create local file");
         local_file.write_all(&data).expect("write local");
         total_bytes += data.len() as u64;
     }
+    let _ = max_read; // suppress unused warning
     (total_bytes, start.elapsed())
 }
 
