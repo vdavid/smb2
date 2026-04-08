@@ -1,0 +1,8 @@
+# Ignored advisories for cargo-audit
+
+[advisories]
+ignore = [
+    # Marvin Attack timing sidechannel in `rsa` crate. No fix available.
+    # Only affects benchmarks/smb/ (via sspi -> rsa), not the smb2 crate itself.
+    "RUSTSEC-2023-0071",
+]
