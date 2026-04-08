@@ -1,13 +1,13 @@
-// Read a file from an SMB share and save it to disk.
+// Download a large file with progress reporting, without buffering everything in memory.
 //
 // Usage:
-//   SMB2_PASS=secret cargo run --example read_file
+//   SMB2_PASS=secret cargo run --example streaming_download
 //
 // Env vars: SMB2_HOST (default "192.168.1.100:445"), SMB2_USER (default "user"),
 //           SMB2_PASS (required), SMB2_SHARE (default "Documents").
 // Set RUST_LOG=smb2=debug for protocol-level logging.
 
-use std::time::Instant;
+use std::io::Write;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -21,36 +21,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user = env_or("SMB2_USER", "user");
     let pass = std::env::var("SMB2_PASS").unwrap_or_else(|_| {
         eprintln!("Set SMB2_PASS to your SMB password. Example:");
-        eprintln!("  SMB2_PASS=secret cargo run --example read_file");
+        eprintln!("  SMB2_PASS=secret cargo run --example streaming_download");
         std::process::exit(1);
     });
     let share_name = env_or("SMB2_SHARE", "Documents");
-    let remote_path = "report.pdf";
-    let local_path = "report.pdf";
+    let remote_path = "big_file.zip";
 
     let mut client = smb2::connect(&addr, &user, &pass).await?;
     let share = client.connect_share(&share_name).await?;
 
-    let start = Instant::now();
-    let data = client.read_file(&share, remote_path).await?;
-    let elapsed = start.elapsed();
+    let mut download = client.download(&share, remote_path).await?;
+    println!("Downloading {} bytes...", download.size());
 
-    std::fs::write(local_path, &data)?;
-
-    println!(
-        "Downloaded {} ({} bytes) in {:.2?}",
-        remote_path,
-        data.len(),
-        elapsed,
-    );
-    if elapsed.as_secs_f64() > 0.0 {
-        println!(
-            "  {:.1} MB/s",
-            data.len() as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
-        );
+    let mut file = std::fs::File::create(remote_path)?;
+    while let Some(chunk) = download.next_chunk().await {
+        let bytes = chunk?;
+        file.write_all(&bytes)?;
+        print!("\r{:.1}%", download.progress().percent());
     }
-
-    client.disconnect_share(&share).await?;
+    println!("\nDone!");
 
     Ok(())
 }

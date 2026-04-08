@@ -1,13 +1,11 @@
-// Read a file from an SMB share and save it to disk.
+// Show disk space for an SMB share.
 //
 // Usage:
-//   SMB2_PASS=secret cargo run --example read_file
+//   SMB2_PASS=secret cargo run --example disk_space
 //
 // Env vars: SMB2_HOST (default "192.168.1.100:445"), SMB2_USER (default "user"),
 //           SMB2_PASS (required), SMB2_SHARE (default "Documents").
 // Set RUST_LOG=smb2=debug for protocol-level logging.
-
-use std::time::Instant;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -21,34 +19,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user = env_or("SMB2_USER", "user");
     let pass = std::env::var("SMB2_PASS").unwrap_or_else(|_| {
         eprintln!("Set SMB2_PASS to your SMB password. Example:");
-        eprintln!("  SMB2_PASS=secret cargo run --example read_file");
+        eprintln!("  SMB2_PASS=secret cargo run --example disk_space");
         std::process::exit(1);
     });
     let share_name = env_or("SMB2_SHARE", "Documents");
-    let remote_path = "report.pdf";
-    let local_path = "report.pdf";
 
     let mut client = smb2::connect(&addr, &user, &pass).await?;
     let share = client.connect_share(&share_name).await?;
 
-    let start = Instant::now();
-    let data = client.read_file(&share, remote_path).await?;
-    let elapsed = start.elapsed();
-
-    std::fs::write(local_path, &data)?;
-
+    let info = client.fs_info(&share).await?;
+    println!("Share: {share_name}");
+    println!("Total: {:.1} GB", info.total_bytes as f64 / 1e9);
+    println!("Free:  {:.1} GB", info.free_bytes as f64 / 1e9);
     println!(
-        "Downloaded {} ({} bytes) in {:.2?}",
-        remote_path,
-        data.len(),
-        elapsed,
+        "Used:  {:.1}%",
+        (1.0 - info.free_bytes as f64 / info.total_bytes as f64) * 100.0
     );
-    if elapsed.as_secs_f64() > 0.0 {
-        println!(
-            "  {:.1} MB/s",
-            data.len() as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
-        );
-    }
 
     client.disconnect_share(&share).await?;
 
