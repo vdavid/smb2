@@ -54,7 +54,7 @@ pub enum Cipher {
 
 impl Cipher {
     /// Returns the number of nonce bytes actually used by this cipher.
-    fn nonce_len(self) -> usize {
+    pub fn nonce_len(self) -> usize {
         match self {
             Cipher::Aes128Ccm | Cipher::Aes256Ccm => 11,
             Cipher::Aes128Gcm | Cipher::Aes256Gcm => 12,

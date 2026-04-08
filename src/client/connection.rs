@@ -9,7 +9,7 @@ use std::time::Duration;
 use log::{debug, info, trace, warn};
 
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
-use crate::crypto::encryption::Cipher;
+use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
 use crate::crypto::signing::{self, SigningAlgorithm};
 use crate::error::Result;
@@ -20,8 +20,8 @@ use crate::msg::negotiate::{
     SIGNING_AES_CMAC, SIGNING_AES_GMAC, SIGNING_HMAC_SHA256,
 };
 use crate::msg::transform::{
-    CompressionTransformHeader, COMPRESSION_ALGORITHM_LZ4, COMPRESSION_PROTOCOL_ID,
-    SMB2_COMPRESSION_FLAG_NONE,
+    CompressionTransformHeader, TransformHeader, COMPRESSION_ALGORITHM_LZ4,
+    COMPRESSION_PROTOCOL_ID, SMB2_COMPRESSION_FLAG_NONE, TRANSFORM_PROTOCOL_ID,
 };
 use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
 use crate::transport::{TcpTransport, TransportReceive, TransportSend};
@@ -87,6 +87,16 @@ pub struct Connection {
     compression_enabled: bool,
     /// Whether the client wants compression (from config).
     compression_requested: bool,
+    /// Encryption key for outgoing messages (SMB 3.x).
+    encryption_key: Option<Vec<u8>>,
+    /// Decryption key for incoming messages (SMB 3.x).
+    decryption_key: Option<Vec<u8>>,
+    /// Negotiated encryption cipher.
+    encryption_cipher: Option<Cipher>,
+    /// Nonce generator for encryption.
+    nonce_gen: Option<NonceGenerator>,
+    /// Whether to encrypt outgoing messages.
+    should_encrypt: bool,
 }
 
 impl Connection {
@@ -111,6 +121,11 @@ impl Connection {
             estimated_rtt: None,
             compression_enabled: false,
             compression_requested: true,
+            encryption_key: None,
+            decryption_key: None,
+            encryption_cipher: None,
+            nonce_gen: None,
+            should_encrypt: false,
         }
     }
 
@@ -139,6 +154,11 @@ impl Connection {
             estimated_rtt: None,
             compression_enabled: false,
             compression_requested: true,
+            encryption_key: None,
+            decryption_key: None,
+            encryption_cipher: None,
+            nonce_gen: None,
+            should_encrypt: false,
         })
     }
 
@@ -367,7 +387,9 @@ impl Connection {
             header.tree_id = Some(tid);
         }
 
-        if self.should_sign {
+        // Signing and encryption are mutually exclusive (pitfall #4).
+        // When encrypting, we zero the Signature field; AEAD provides auth.
+        if self.should_sign && !self.should_encrypt {
             header.flags.set_signed();
         }
 
@@ -375,6 +397,17 @@ impl Connection {
         let msg_id = MessageId(self.next_message_id);
         // Multi-credit requests consume consecutive MessageIds.
         self.next_message_id += credit_charge as u64;
+
+        if self.should_encrypt {
+            // Encrypt: no signing, AEAD provides authentication.
+            let encrypted = self.encrypt_bytes(&msg_bytes)?;
+            self.sender.send(&encrypted).await?;
+            debug!(
+                "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, encrypted, len={} (plaintext {})",
+                command, msg_id.0, credit_charge, tree_id, encrypted.len(), msg_bytes.len()
+            );
+            return Ok((msg_id, msg_bytes));
+        }
 
         if self.should_sign {
             if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
@@ -427,6 +460,18 @@ impl Connection {
             let resp_bytes = self.receiver.receive().await?;
             trace!("recv: raw response {} bytes", resp_bytes.len());
 
+            // Check for encryption transform header and decrypt if needed.
+            // Per spec: decrypt first, then decompress, then verify signature.
+            // When encrypted, skip signature verification (AEAD provides auth).
+            let (resp_bytes, was_encrypted) =
+                if resp_bytes.len() >= 4 && resp_bytes[0..4] == TRANSFORM_PROTOCOL_ID {
+                    trace!("recv: detected encryption transform header, decrypting");
+                    let decrypted = self.decrypt_bytes(&resp_bytes)?;
+                    (decrypted, true)
+                } else {
+                    (resp_bytes, false)
+                };
+
             // Check for compression transform header and decompress if needed.
             // Per spec: decompress first, then verify signature.
             let resp_bytes = if resp_bytes.len() >= 4 && resp_bytes[0..4] == COMPRESSION_PROTOCOL_ID
@@ -440,9 +485,10 @@ impl Connection {
             // Verify signature if signing is active AND the response has the
             // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
             // interim responses and unsolicited oplock break notifications.
+            // Skip if the message was encrypted (AEAD already authenticated).
             // A valid SMB2 header is always 64 bytes. Guard on that so the
             // field accesses below (up to byte 32) are guaranteed in-bounds.
-            if self.should_sign && resp_bytes.len() >= Header::SIZE {
+            if self.should_sign && !was_encrypted && resp_bytes.len() >= Header::SIZE {
                 let flags = u32::from_le_bytes(resp_bytes[16..20].try_into().unwrap());
                 let is_signed = (flags & HeaderFlags::SIGNED) != 0;
 
@@ -570,6 +616,32 @@ impl Connection {
         self.should_sign = true;
     }
 
+    /// Activate encryption with the given keys and cipher.
+    ///
+    /// After activation, all outgoing messages are encrypted with a
+    /// TRANSFORM_HEADER and all incoming encrypted messages are decrypted.
+    /// Signing is mutually exclusive with encryption (pitfall #4):
+    /// when encrypting, the Signature field is zeroed and AEAD provides
+    /// authentication.
+    pub fn activate_encryption(&mut self, enc_key: Vec<u8>, dec_key: Vec<u8>, cipher: Cipher) {
+        debug!(
+            "encryption: activated, cipher={:?}, enc_key_len={}, dec_key_len={}",
+            cipher,
+            enc_key.len(),
+            dec_key.len()
+        );
+        self.encryption_key = Some(enc_key);
+        self.decryption_key = Some(dec_key);
+        self.encryption_cipher = Some(cipher);
+        self.nonce_gen = Some(NonceGenerator::new());
+        self.should_encrypt = true;
+    }
+
+    /// Whether encryption is active on this connection.
+    pub fn should_encrypt(&self) -> bool {
+        self.should_encrypt
+    }
+
     /// Get the current number of available credits.
     pub fn credits(&self) -> u16 {
         self.credits
@@ -640,7 +712,8 @@ impl Connection {
             }
 
             // Sign flag (actual signing happens after padding).
-            if self.should_sign {
+            // Signing and encryption are mutually exclusive (pitfall #4).
+            if self.should_sign && !self.should_encrypt {
                 header.flags.set_signed();
             }
 
@@ -672,7 +745,8 @@ impl Connection {
         // Last sub-request: NextCommand = 0 (already the default).
 
         // Step 4: Sign each sub-request individually (including padding).
-        if self.should_sign {
+        // Signing and encryption are mutually exclusive (pitfall #4).
+        if self.should_sign && !self.should_encrypt {
             if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
                 for (i, sub_req) in sub_requests.iter_mut().enumerate() {
                     signing::sign_message(sub_req, key, *algo, message_ids[i].0, false)?;
@@ -680,23 +754,38 @@ impl Connection {
             }
         }
 
-        // Step 5: Concatenate all sub-requests into one buffer and send.
+        // Step 5: Concatenate all sub-requests into one buffer.
         let total_len: usize = sub_requests.iter().map(|r| r.len()).sum();
         let mut compound_buf = Vec::with_capacity(total_len);
         for sub_req in &sub_requests {
             compound_buf.extend_from_slice(sub_req);
         }
 
-        self.sender.send(&compound_buf).await?;
-
-        debug!(
-            "send_compound: {} operations, total_len={}, msg_ids={:?}, tree_id={}, signed={}",
-            operations.len(),
-            compound_buf.len(),
-            message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
-            tree_id,
-            self.should_sign,
-        );
+        // Step 6: Encrypt the entire compound chain if encryption is active.
+        // Per pitfall #9: one TRANSFORM_HEADER wraps the whole compound,
+        // NOT per sub-request.
+        if self.should_encrypt {
+            let encrypted = self.encrypt_bytes(&compound_buf)?;
+            self.sender.send(&encrypted).await?;
+            debug!(
+                "send_compound: {} operations, encrypted, total_len={} (plaintext {}), msg_ids={:?}, tree_id={}",
+                operations.len(),
+                encrypted.len(),
+                compound_buf.len(),
+                message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
+                tree_id,
+            );
+        } else {
+            self.sender.send(&compound_buf).await?;
+            debug!(
+                "send_compound: {} operations, total_len={}, msg_ids={:?}, tree_id={}, signed={}",
+                operations.len(),
+                compound_buf.len(),
+                message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
+                tree_id,
+                self.should_sign,
+            );
+        }
 
         Ok(message_ids)
     }
@@ -708,9 +797,18 @@ impl Connection {
     pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>> {
         // Loop to skip unsolicited oplock/lease break notifications that
         // may arrive before the compound response we're waiting for.
-        let resp_bytes = loop {
+        let (resp_bytes, was_encrypted) = loop {
             let raw = self.receiver.receive().await?;
             trace!("recv_compound: raw response {} bytes", raw.len());
+
+            // Check for encryption transform header and decrypt if needed.
+            let (raw, was_encrypted) = if raw.len() >= 4 && raw[0..4] == TRANSFORM_PROTOCOL_ID {
+                trace!("recv_compound: detected encryption transform header, decrypting");
+                let decrypted = self.decrypt_bytes(&raw)?;
+                (decrypted, true)
+            } else {
+                (raw, false)
+            };
 
             // Check for compression transform header and decompress if needed.
             let decompressed = if raw.len() >= 4 && raw[0..4] == COMPRESSION_PROTOCOL_ID {
@@ -730,7 +828,7 @@ impl Connection {
                 }
             }
 
-            break decompressed;
+            break (decompressed, was_encrypted);
         };
 
         let mut results = Vec::new();
@@ -779,7 +877,8 @@ impl Connection {
             }
 
             // Verify signature on the sub-response slice if needed.
-            if self.should_sign {
+            // Skip if the message was encrypted (AEAD already authenticated).
+            if self.should_sign && !was_encrypted {
                 let sub_slice = &resp_bytes[sub_start..sub_end];
                 if sub_slice.len() >= 20 {
                     // Length already checked (>= 20), so these slices are always 4 bytes.
@@ -872,29 +971,98 @@ impl Connection {
             header.tree_id = None;
         }
 
-        if self.should_sign {
+        // Signing and encryption are mutually exclusive (pitfall #4).
+        if self.should_sign && !self.should_encrypt {
             header.flags.set_signed();
         }
 
         let body = CancelRequest;
         let mut msg_bytes = pack_message(&header, &body);
 
-        // Sign after packing, if signing is active.
-        if self.should_sign {
-            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
-                signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
+        if self.should_encrypt {
+            let encrypted = self.encrypt_bytes(&msg_bytes)?;
+            self.sender.send(&encrypted).await?;
+            debug!(
+                "send_cancel: msg_id={}, async_id={:?}, encrypted",
+                original_msg_id.0, async_id
+            );
+        } else {
+            // Sign after packing, if signing is active.
+            if self.should_sign {
+                if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+                    signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
+                }
             }
+
+            self.sender.send(&msg_bytes).await?;
+            debug!(
+                "send_cancel: msg_id={}, async_id={:?}, signed={}",
+                original_msg_id.0, async_id, self.should_sign
+            );
         }
-
-        self.sender.send(&msg_bytes).await?;
-
-        debug!(
-            "send_cancel: msg_id={}, async_id={:?}, signed={}",
-            original_msg_id.0, async_id, self.should_sign
-        );
 
         // CANCEL does NOT consume a credit and does NOT advance next_message_id.
         Ok(())
+    }
+
+    /// Encrypt plaintext into a TRANSFORM_HEADER + ciphertext frame.
+    fn encrypt_bytes(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let enc_key = self
+            .encryption_key
+            .as_ref()
+            .ok_or_else(|| Error::invalid_data("encryption active but no encryption key"))?;
+        let cipher = self
+            .encryption_cipher
+            .ok_or_else(|| Error::invalid_data("encryption active but no cipher"))?;
+        let nonce = self
+            .nonce_gen
+            .as_mut()
+            .ok_or_else(|| Error::invalid_data("encryption active but no nonce generator"))?
+            .next(cipher);
+
+        let (transform_header, ciphertext) =
+            encryption::encrypt_message(plaintext, enc_key, cipher, &nonce, self.session_id.0)?;
+
+        let mut encrypted = transform_header;
+        encrypted.extend_from_slice(&ciphertext);
+
+        trace!(
+            "encrypt: plaintext={} bytes, encrypted={} bytes, nonce={:02X?}",
+            plaintext.len(),
+            encrypted.len(),
+            &nonce[..cipher.nonce_len()]
+        );
+
+        Ok(encrypted)
+    }
+
+    /// Decrypt a TRANSFORM_HEADER + ciphertext frame into plaintext.
+    fn decrypt_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let dec_key = self.decryption_key.as_ref().ok_or_else(|| {
+            Error::invalid_data("received encrypted message but no decryption key")
+        })?;
+        let cipher = self
+            .encryption_cipher
+            .ok_or_else(|| Error::invalid_data("received encrypted message but no cipher"))?;
+
+        if data.len() < TransformHeader::SIZE {
+            return Err(Error::invalid_data(
+                "encrypted message too short for TransformHeader",
+            ));
+        }
+
+        let transform_header = &data[..TransformHeader::SIZE];
+        let ciphertext = &data[TransformHeader::SIZE..];
+
+        let plaintext = encryption::decrypt_message(transform_header, ciphertext, dec_key, cipher)?;
+
+        trace!(
+            "decrypt: ciphertext={} bytes, plaintext={} bytes",
+            ciphertext.len(),
+            plaintext.len()
+        );
+
+        Ok(plaintext)
     }
 
     #[cfg(test)]
@@ -2311,5 +2479,332 @@ mod tests {
 
         // Credits should have been updated: 3 + 10 (granted) - 1 (consumed) = 12.
         assert_eq!(conn.credits(), 12);
+    }
+
+    // ── Encryption tests ─────────────────────────────────────────────
+
+    /// Helper: set up a connection with encryption active.
+    fn setup_encrypted_connection(mock: &Arc<MockTransport>) -> Connection {
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_test_params(NegotiatedParams {
+            dialect: Dialect::Smb3_1_1,
+            max_read_size: 65536,
+            max_write_size: 65536,
+            max_transact_size: 65536,
+            server_guid: Guid::ZERO,
+            signing_required: false,
+            capabilities: Capabilities::default(),
+            gmac_negotiated: false,
+            cipher: Some(Cipher::Aes128Gcm),
+            compression_supported: false,
+        });
+        conn.set_session_id(SessionId(0xDEAD));
+        conn.credits = 10;
+
+        // 16-byte key for AES-128.
+        let enc_key = vec![0x42; 16];
+        let dec_key = vec![0x42; 16];
+        conn.activate_encryption(enc_key, dec_key, Cipher::Aes128Gcm);
+        conn
+    }
+
+    #[tokio::test]
+    async fn send_request_encrypts_when_active() {
+        use crate::msg::echo::EchoRequest;
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_encrypted_connection(&mock);
+
+        let (_msg_id, _plaintext) = conn
+            .send_request(Command::Echo, &EchoRequest, None)
+            .await
+            .unwrap();
+
+        // The sent bytes should start with the TRANSFORM_HEADER protocol ID.
+        let sent = mock.sent_message(0).unwrap();
+        assert_eq!(
+            &sent[..4],
+            &TRANSFORM_PROTOCOL_ID,
+            "sent message must start with 0xFD 'S' 'M' 'B'"
+        );
+
+        // The sent message should be longer than the transform header
+        // (52 bytes header + encrypted payload).
+        assert!(
+            sent.len() > TransformHeader::SIZE,
+            "sent message must contain ciphertext after transform header"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_request_encrypted_can_be_decrypted() {
+        use crate::msg::echo::EchoRequest;
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_encrypted_connection(&mock);
+
+        let (_msg_id, plaintext) = conn
+            .send_request(Command::Echo, &EchoRequest, None)
+            .await
+            .unwrap();
+
+        // Decrypt the sent message and verify it matches the plaintext.
+        let sent = mock.sent_message(0).unwrap();
+        let transform_header = &sent[..TransformHeader::SIZE];
+        let ciphertext = &sent[TransformHeader::SIZE..];
+
+        let dec_key = vec![0x42; 16];
+        let decrypted =
+            encryption::decrypt_message(transform_header, ciphertext, &dec_key, Cipher::Aes128Gcm)
+                .unwrap();
+        assert_eq!(
+            decrypted, plaintext,
+            "decrypted message must match plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_response_decrypts_encrypted_message() {
+        use crate::msg::echo::EchoResponse;
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_encrypted_connection(&mock);
+
+        // Build a normal response, then encrypt it.
+        let mut h = Header::new_request(Command::Echo);
+        h.flags.set_response();
+        h.credits = 10;
+        h.session_id = SessionId(0xDEAD);
+        let plaintext = pack_message(&h, &EchoResponse);
+
+        let enc_key = vec![0x42; 16];
+        let mut nonce_gen = encryption::NonceGenerator::new();
+        let nonce = nonce_gen.next(Cipher::Aes128Gcm);
+        let (transform_header, ciphertext) =
+            encryption::encrypt_message(&plaintext, &enc_key, Cipher::Aes128Gcm, &nonce, 0xDEAD)
+                .unwrap();
+
+        let mut encrypted_frame = transform_header;
+        encrypted_frame.extend_from_slice(&ciphertext);
+        mock.queue_response(encrypted_frame);
+
+        let (resp_header, _body, _raw) = conn.receive_response().await.unwrap();
+        assert_eq!(resp_header.command, Command::Echo);
+        assert!(resp_header.is_response());
+    }
+
+    #[tokio::test]
+    async fn signing_skipped_when_encryption_active() {
+        use crate::msg::echo::EchoRequest;
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_encrypted_connection(&mock);
+
+        // Also activate signing.
+        conn.activate_signing(vec![0xAA; 16], SigningAlgorithm::AesCmac);
+
+        let (_msg_id, plaintext) = conn
+            .send_request(Command::Echo, &EchoRequest, None)
+            .await
+            .unwrap();
+
+        // Decrypt the sent message.
+        let sent = mock.sent_message(0).unwrap();
+        let transform_header = &sent[..TransformHeader::SIZE];
+        let ciphertext = &sent[TransformHeader::SIZE..];
+        let dec_key = vec![0x42; 16];
+        let decrypted =
+            encryption::decrypt_message(transform_header, ciphertext, &dec_key, Cipher::Aes128Gcm)
+                .unwrap();
+
+        // The Signature field in the plaintext SMB2 header (bytes 48..64) should
+        // be all zeros (not signed). When encrypting, signature is zeroed because
+        // AEAD provides authentication.
+        let signature = &decrypted[48..64];
+        assert_eq!(
+            signature, &[0u8; 16],
+            "signature must be zeroed when encrypting (signing is mutually exclusive)"
+        );
+
+        // Also verify the SIGNED flag is NOT set in the header flags.
+        let flags = u32::from_le_bytes(decrypted[16..20].try_into().unwrap());
+        assert_eq!(
+            flags & HeaderFlags::SIGNED,
+            0,
+            "SIGNED flag must not be set when encrypting"
+        );
+
+        // The plaintext should match what pack_message produced (no signature applied).
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn compound_encryption_wraps_entire_chain() {
+        use crate::msg::echo::EchoRequest;
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_encrypted_connection(&mock);
+
+        let ops: Vec<(Command, &dyn Pack, CreditCharge)> = vec![
+            (Command::Echo, &EchoRequest, CreditCharge(1)),
+            (Command::Echo, &EchoRequest, CreditCharge(1)),
+        ];
+
+        let _msg_ids = conn.send_compound(TreeId(1), &ops).await.unwrap();
+
+        // Only one message should have been sent (the entire compound
+        // wrapped in a single TRANSFORM_HEADER).
+        assert_eq!(
+            mock.sent_count(),
+            1,
+            "compound must be sent as one encrypted message"
+        );
+
+        let sent = mock.sent_message(0).unwrap();
+        assert_eq!(
+            &sent[..4],
+            &TRANSFORM_PROTOCOL_ID,
+            "compound must start with TRANSFORM_HEADER"
+        );
+
+        // Decrypt and verify it contains two sub-requests.
+        let transform_header = &sent[..TransformHeader::SIZE];
+        let ciphertext = &sent[TransformHeader::SIZE..];
+        let dec_key = vec![0x42; 16];
+        let decrypted =
+            encryption::decrypt_message(transform_header, ciphertext, &dec_key, Cipher::Aes128Gcm)
+                .unwrap();
+
+        // The decrypted data should contain at least two SMB2 headers (64 bytes each).
+        assert!(
+            decrypted.len() >= Header::SIZE * 2,
+            "compound plaintext must contain at least two sub-requests, got {} bytes",
+            decrypted.len()
+        );
+
+        // First sub-request: NextCommand should be non-zero (pointing to second).
+        let next_cmd = u32::from_le_bytes(decrypted[20..24].try_into().unwrap());
+        assert!(
+            next_cmd > 0,
+            "first sub-request must have non-zero NextCommand"
+        );
+
+        // Second sub-request: verify it starts with SMB2 protocol ID.
+        let second_start = next_cmd as usize;
+        assert_eq!(
+            &decrypted[second_start..second_start + 4],
+            &[0xFE, b'S', b'M', b'B'],
+            "second sub-request must start with SMB2 protocol ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_encryption_when_not_activated() {
+        use crate::msg::echo::EchoRequest;
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_test_params(NegotiatedParams {
+            dialect: Dialect::Smb3_1_1,
+            max_read_size: 65536,
+            max_write_size: 65536,
+            max_transact_size: 65536,
+            server_guid: Guid::ZERO,
+            signing_required: false,
+            capabilities: Capabilities::default(),
+            gmac_negotiated: false,
+            cipher: Some(Cipher::Aes128Gcm),
+            compression_supported: false,
+        });
+        conn.set_session_id(SessionId(1));
+        conn.credits = 5;
+
+        let (_msg_id, _plaintext) = conn
+            .send_request(Command::Echo, &EchoRequest, None)
+            .await
+            .unwrap();
+
+        // Without encryption activated, the sent bytes should start with
+        // the normal SMB2 protocol ID (0xFE).
+        let sent = mock.sent_message(0).unwrap();
+        assert_eq!(
+            sent[0], 0xFE,
+            "without encryption, message must start with 0xFE"
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_encryption_sets_state() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        assert!(!conn.should_encrypt());
+
+        conn.activate_encryption(vec![0x42; 16], vec![0x42; 16], Cipher::Aes128Gcm);
+
+        assert!(conn.should_encrypt());
+    }
+
+    #[tokio::test]
+    async fn receive_compound_decrypts_encrypted_response() {
+        use crate::msg::echo::EchoResponse;
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_encrypted_connection(&mock);
+
+        // Build two sub-responses (compound).
+        let mut h1 = Header::new_request(Command::Echo);
+        h1.flags.set_response();
+        h1.credits = 5;
+        h1.session_id = SessionId(0xDEAD);
+        let sub1 = pack_message(&h1, &EchoResponse);
+
+        let mut h2 = Header::new_request(Command::Echo);
+        h2.flags.set_response();
+        h2.credits = 5;
+        h2.session_id = SessionId(0xDEAD);
+        let sub2 = pack_message(&h2, &EchoResponse);
+
+        // Pad first sub-response to 8-byte alignment and set NextCommand.
+        let mut padded_sub1 = sub1;
+        let remainder = padded_sub1.len() % 8;
+        if remainder != 0 {
+            padded_sub1.resize(padded_sub1.len() + (8 - remainder), 0);
+        }
+        let next_cmd = padded_sub1.len() as u32;
+        padded_sub1[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+
+        // Concatenate into compound.
+        let mut compound = padded_sub1;
+        compound.extend_from_slice(&sub2);
+
+        // Encrypt the whole compound.
+        let enc_key = vec![0x42; 16];
+        let mut nonce_gen = encryption::NonceGenerator::new();
+        let nonce = nonce_gen.next(Cipher::Aes128Gcm);
+        let (transform_header, ciphertext) =
+            encryption::encrypt_message(&compound, &enc_key, Cipher::Aes128Gcm, &nonce, 0xDEAD)
+                .unwrap();
+
+        let mut encrypted_frame = transform_header;
+        encrypted_frame.extend_from_slice(&ciphertext);
+        mock.queue_response(encrypted_frame);
+
+        let results = conn.receive_compound().await.unwrap();
+        assert_eq!(results.len(), 2, "compound must contain two responses");
+        assert_eq!(results[0].0.command, Command::Echo);
+        assert_eq!(results[1].0.command, Command::Echo);
     }
 }

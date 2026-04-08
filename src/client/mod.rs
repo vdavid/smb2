@@ -135,8 +135,26 @@ impl SmbClient {
     }
 
     /// Connect to a share on the server.
+    ///
+    /// If the share requires encryption (`SMB2_SHAREFLAG_ENCRYPT_DATA`)
+    /// and encryption is not already active, encryption is activated
+    /// using the session's keys.
     pub async fn connect_share(&mut self, share_name: &str) -> Result<Tree> {
-        Tree::connect(&mut self.conn, share_name).await
+        let tree = Tree::connect(&mut self.conn, share_name).await?;
+
+        // Activate encryption if the share requires it and it's not already active.
+        if tree.encrypt_data && !self.conn.should_encrypt() {
+            if let (Some(ref enc_key), Some(ref dec_key)) =
+                (&self.session.encryption_key, &self.session.decryption_key)
+            {
+                if let Some(cipher) = self.conn.params().and_then(|p| p.cipher) {
+                    self.conn
+                        .activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
+                }
+            }
+        }
+
+        Ok(tree)
     }
 
     /// Manually reconnect after a connection loss.

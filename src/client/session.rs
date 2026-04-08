@@ -3,7 +3,7 @@
 //! The [`Session`] type manages the multi-round-trip SESSION_SETUP exchange
 //! (NTLM authentication), key derivation, and signing activation.
 
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 
 use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
 use crate::client::connection::Connection;
@@ -242,6 +242,24 @@ impl Session {
         // Activate signing on the connection.
         if should_sign {
             conn.activate_signing(signing_key.clone(), signing_algorithm);
+        }
+
+        // Activate encryption on the connection if the session requires it
+        // AND we have the necessary keys and cipher.
+        if should_encrypt {
+            if let (Some(ref enc_key), Some(ref dec_key), Some(cipher)) =
+                (&encryption_key, &decryption_key, params.cipher)
+            {
+                conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
+            } else {
+                warn!(
+                    "session: encryption requested but missing keys or cipher, \
+                     enc_key={}, dec_key={}, cipher={:?}",
+                    encryption_key.is_some(),
+                    decryption_key.is_some(),
+                    params.cipher
+                );
+            }
         }
 
         info!(
