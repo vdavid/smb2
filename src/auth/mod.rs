@@ -6,5 +6,6 @@
 //! handles authentication during [`connect`](crate::connect).
 
 pub mod ntlm;
+pub mod spnego;
 
 pub use ntlm::{NtlmAuthenticator, NtlmCredentials};
