@@ -154,43 +154,22 @@ impl<'a> Pipeline<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::connection::{pack_message, Connection, NegotiatedParams};
+    use crate::client::connection::pack_message;
+    use crate::client::test_helpers::{
+        build_close_response, build_create_response, setup_connection,
+    };
     use crate::client::tree::Tree;
-    use crate::msg::close::CloseResponse;
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::{ErrorResponse, Header};
     use crate::msg::query_directory::QueryDirectoryResponse;
     use crate::msg::query_info::QueryInfoResponse;
     use crate::msg::read::ReadResponse;
     use crate::msg::write::WriteResponse;
-    use crate::pack::{FileTime, Guid};
+    use crate::pack::FileTime;
     use crate::transport::MockTransport;
-    use crate::types::flags::Capabilities;
     use crate::types::status::NtStatus;
-    use crate::types::{Command, Dialect, FileId, OplockLevel, SessionId, TreeId};
+    use crate::types::{Command, FileId, OplockLevel, TreeId};
     use std::sync::Arc;
-
-    fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
-        let mut conn = Connection::from_transport(
-            Box::new(mock.clone()),
-            Box::new(mock.clone()),
-            "test-server",
-        );
-        conn.set_test_params(NegotiatedParams {
-            dialect: Dialect::Smb2_0_2,
-            max_read_size: 65536,
-            max_write_size: 65536,
-            max_transact_size: 65536,
-            server_guid: Guid::ZERO,
-            signing_required: false,
-            capabilities: Capabilities::default(),
-            gmac_negotiated: false,
-            cipher: None,
-            compression_supported: false,
-        });
-        conn.set_session_id(SessionId(0x1234));
-        conn
-    }
 
     fn test_tree() -> Tree {
         Tree {
@@ -199,29 +178,6 @@ mod tests {
             is_dfs: false,
             encrypt_data: false,
         }
-    }
-
-    fn build_create_response(file_id: FileId, end_of_file: u64) -> Vec<u8> {
-        let mut h = Header::new_request(Command::Create);
-        h.flags.set_response();
-        h.credits = 32;
-
-        let body = CreateResponse {
-            oplock_level: OplockLevel::None,
-            flags: 0,
-            create_action: CreateAction::FileOpened,
-            creation_time: FileTime(132_000_000_000_000_000),
-            last_access_time: FileTime(132_000_000_000_000_000),
-            last_write_time: FileTime(133_000_000_000_000_000),
-            change_time: FileTime(133_000_000_000_000_000),
-            allocation_size: 0,
-            end_of_file,
-            file_attributes: 0x20, // ARCHIVE
-            file_id,
-            create_contexts: vec![],
-        };
-
-        pack_message(&h, &body)
     }
 
     fn build_create_response_directory(file_id: FileId) -> Vec<u8> {
@@ -242,25 +198,6 @@ mod tests {
             file_attributes: 0x10, // DIRECTORY
             file_id,
             create_contexts: vec![],
-        };
-
-        pack_message(&h, &body)
-    }
-
-    fn build_close_response() -> Vec<u8> {
-        let mut h = Header::new_request(Command::Close);
-        h.flags.set_response();
-        h.credits = 32;
-
-        let body = CloseResponse {
-            flags: 0,
-            creation_time: FileTime::ZERO,
-            last_access_time: FileTime::ZERO,
-            last_write_time: FileTime::ZERO,
-            change_time: FileTime::ZERO,
-            allocation_size: 0,
-            end_of_file: 0,
-            file_attributes: 0,
         };
 
         pack_message(&h, &body)

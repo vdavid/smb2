@@ -10,6 +10,8 @@ pub mod pipeline;
 pub mod session;
 pub mod shares;
 pub mod stream;
+#[cfg(test)]
+pub(crate) mod test_helpers;
 pub mod tree;
 pub mod watcher;
 
@@ -609,11 +611,10 @@ mod tests {
     use crate::msg::header::Header;
     use crate::msg::negotiate::{NegotiateContext, NegotiateResponse, HASH_ALGORITHM_SHA512};
     use crate::msg::session_setup::{SessionFlags, SessionSetupResponse};
-    use crate::msg::tree_connect::{ShareType, TreeConnectResponse};
-    use crate::msg::tree_disconnect::TreeDisconnectResponse;
+    use crate::msg::tree_connect::ShareType;
     use crate::pack::Guid;
     use crate::transport::MockTransport;
-    use crate::types::flags::{Capabilities, SecurityMode, ShareCapabilities, ShareFlags};
+    use crate::types::flags::{Capabilities, SecurityMode};
     use crate::types::status::NtStatus;
     use crate::types::{Command, Dialect, SessionId, TreeId};
     use std::sync::Arc;
@@ -755,32 +756,6 @@ mod tests {
         SmbClient::from_parts(config, conn, session)
     }
 
-    /// Build a tree connect response.
-    fn build_tree_connect_response(tree_id: TreeId) -> Vec<u8> {
-        let mut h = Header::new_request(Command::TreeConnect);
-        h.flags.set_response();
-        h.credits = 32;
-        h.tree_id = Some(tree_id);
-
-        let body = TreeConnectResponse {
-            share_type: ShareType::Disk,
-            share_flags: ShareFlags::default(),
-            capabilities: ShareCapabilities::default(),
-            maximal_access: 0x001F01FF,
-        };
-
-        pack_message(&h, &body)
-    }
-
-    /// Build a tree disconnect response.
-    #[allow(dead_code)]
-    fn build_tree_disconnect_response() -> Vec<u8> {
-        let mut h = Header::new_request(Command::TreeDisconnect);
-        h.flags.set_response();
-        h.credits = 32;
-        pack_message(&h, &TreeDisconnectResponse)
-    }
-
     #[tokio::test]
     async fn smb_client_connect_via_mock_negotiates_and_authenticates() {
         let mock = Arc::new(MockTransport::new());
@@ -810,7 +785,10 @@ mod tests {
         let mut client = make_mock_client(&mock, SessionId(1)).await;
 
         // Queue tree connect response.
-        mock.queue_response(build_tree_connect_response(TreeId(42)));
+        mock.queue_response(crate::client::test_helpers::build_tree_connect_response(
+            TreeId(42),
+            ShareType::Disk,
+        ));
 
         let tree = client.connect_share("TestShare").await.unwrap();
         assert_eq!(tree.tree_id, TreeId(42));

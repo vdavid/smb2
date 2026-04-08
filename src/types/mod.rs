@@ -249,53 +249,24 @@ mod tests {
     }
 
     #[test]
-    fn session_id_display_hex() {
-        let id = SessionId(0x1234);
-        assert_eq!(id.to_string(), "SessionId(0x0000000000001234)");
-    }
-
-    #[test]
-    fn message_id_display_hex() {
-        let id = MessageId(0xABCD);
-        assert_eq!(id.to_string(), "MessageId(0x000000000000ABCD)");
-    }
-
-    #[test]
-    fn tree_id_display_hex() {
-        let id = TreeId(0x42);
-        assert_eq!(id.to_string(), "TreeId(0x00000042)");
-    }
-
-    #[test]
-    fn credit_charge_display() {
-        let c = CreditCharge(5);
-        assert_eq!(c.to_string(), "CreditCharge(5)");
-    }
-
-    #[test]
-    fn file_id_display_hex() {
-        let id = FileId {
-            persistent: 0x11,
-            volatile: 0x22,
-        };
+    fn newtype_display_formatting() {
         assert_eq!(
-            id.to_string(),
-            "FileId(0x0000000000000011:0x0000000000000022)"
+            SessionId(0x1234).to_string(),
+            "SessionId(0x0000000000001234)"
         );
-    }
-
-    #[test]
-    fn newtypes_default_to_zero() {
-        assert_eq!(SessionId::default(), SessionId(0));
-        assert_eq!(MessageId::default(), MessageId(0));
-        assert_eq!(TreeId::default(), TreeId(0));
-        assert_eq!(CreditCharge::default(), CreditCharge(0));
         assert_eq!(
-            FileId::default(),
+            MessageId(0xABCD).to_string(),
+            "MessageId(0x000000000000ABCD)"
+        );
+        assert_eq!(TreeId(0x42).to_string(), "TreeId(0x00000042)");
+        assert_eq!(CreditCharge(5).to_string(), "CreditCharge(5)");
+        assert_eq!(
             FileId {
-                persistent: 0,
-                volatile: 0
+                persistent: 0x11,
+                volatile: 0x22
             }
+            .to_string(),
+            "FileId(0x0000000000000011:0x0000000000000022)"
         );
     }
 

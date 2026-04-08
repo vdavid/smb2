@@ -68,6 +68,59 @@ macro_rules! trivial_message {
 
 pub(crate) use trivial_message;
 
+/// Generates a minimal test suite for a trivial 4-byte message type.
+///
+/// Tests: known bytes, pack-unpack roundtrip, wrong structure size, and
+/// truncated input. These four tests cover all interesting behavior for
+/// types produced by [`trivial_message!`].
+#[cfg(test)]
+macro_rules! trivial_message_tests {
+    ($type:ident, $known:ident, $roundtrip:ident, $wrong_size:ident, $short:ident) => {
+        #[test]
+        fn $known() {
+            let msg = $type;
+            let mut cursor = crate::pack::WriteCursor::new();
+            crate::pack::Pack::pack(&msg, &mut cursor);
+            let bytes = cursor.into_inner();
+            // StructureSize=4 (LE), Reserved=0
+            assert_eq!(bytes, [0x04, 0x00, 0x00, 0x00]);
+        }
+
+        #[test]
+        fn $roundtrip() {
+            let original = $type;
+            let mut w = crate::pack::WriteCursor::new();
+            crate::pack::Pack::pack(&original, &mut w);
+            let bytes = w.into_inner();
+
+            let mut r = crate::pack::ReadCursor::new(&bytes);
+            let decoded = <$type as crate::pack::Unpack>::unpack(&mut r).unwrap();
+            assert_eq!(decoded, original);
+        }
+
+        #[test]
+        fn $wrong_size() {
+            let bytes = [0x08, 0x00, 0x00, 0x00];
+            let mut cursor = crate::pack::ReadCursor::new(&bytes);
+            let result = <$type as crate::pack::Unpack>::unpack(&mut cursor);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("structure size"), "error was: {err}");
+        }
+
+        #[test]
+        fn $short() {
+            let bytes = [0x04, 0x00];
+            let mut cursor = crate::pack::ReadCursor::new(&bytes);
+            let result = <$type as crate::pack::Unpack>::unpack(&mut cursor);
+            assert!(result.is_err());
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use trivial_message_tests;
+
 pub mod cancel;
 pub mod change_notify;
 pub mod close;

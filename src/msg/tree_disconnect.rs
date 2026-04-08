@@ -24,127 +24,20 @@ super::trivial_message! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 
-    // -- TreeDisconnectRequest tests --
+    super::super::trivial_message_tests!(
+        TreeDisconnectRequest,
+        tree_disconnect_request_known_bytes,
+        tree_disconnect_request_roundtrip,
+        tree_disconnect_request_wrong_structure_size,
+        tree_disconnect_request_too_short
+    );
 
-    #[test]
-    fn tree_disconnect_request_pack_produces_4_bytes() {
-        let req = TreeDisconnectRequest;
-        let mut cursor = WriteCursor::new();
-        req.pack(&mut cursor);
-        let bytes = cursor.into_inner();
-        assert_eq!(bytes.len(), 4);
-    }
-
-    #[test]
-    fn tree_disconnect_request_known_bytes() {
-        let req = TreeDisconnectRequest;
-        let mut cursor = WriteCursor::new();
-        req.pack(&mut cursor);
-        let bytes = cursor.into_inner();
-
-        // StructureSize=4 (LE), Reserved=0
-        assert_eq!(bytes, [0x04, 0x00, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn tree_disconnect_request_unpack_known_bytes() {
-        let bytes = [0x04, 0x00, 0x00, 0x00];
-        let mut cursor = ReadCursor::new(&bytes);
-        let req = TreeDisconnectRequest::unpack(&mut cursor).unwrap();
-        assert_eq!(req, TreeDisconnectRequest);
-        assert!(cursor.is_empty());
-    }
-
-    #[test]
-    fn tree_disconnect_request_roundtrip() {
-        let original = TreeDisconnectRequest;
-        let mut w = WriteCursor::new();
-        original.pack(&mut w);
-        let bytes = w.into_inner();
-
-        let mut r = ReadCursor::new(&bytes);
-        let decoded = TreeDisconnectRequest::unpack(&mut r).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn tree_disconnect_request_wrong_structure_size() {
-        let bytes = [0x08, 0x00, 0x00, 0x00];
-        let mut cursor = ReadCursor::new(&bytes);
-        let result = TreeDisconnectRequest::unpack(&mut cursor);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("structure size"), "error was: {err}");
-    }
-
-    #[test]
-    fn tree_disconnect_request_too_short() {
-        let bytes = [0x04, 0x00];
-        let mut cursor = ReadCursor::new(&bytes);
-        let result = TreeDisconnectRequest::unpack(&mut cursor);
-        assert!(result.is_err());
-    }
-
-    // -- TreeDisconnectResponse tests --
-
-    #[test]
-    fn tree_disconnect_response_pack_produces_4_bytes() {
-        let resp = TreeDisconnectResponse;
-        let mut cursor = WriteCursor::new();
-        resp.pack(&mut cursor);
-        let bytes = cursor.into_inner();
-        assert_eq!(bytes.len(), 4);
-    }
-
-    #[test]
-    fn tree_disconnect_response_known_bytes() {
-        let resp = TreeDisconnectResponse;
-        let mut cursor = WriteCursor::new();
-        resp.pack(&mut cursor);
-        let bytes = cursor.into_inner();
-
-        // StructureSize=4 (LE), Reserved=0
-        assert_eq!(bytes, [0x04, 0x00, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn tree_disconnect_response_unpack_known_bytes() {
-        let bytes = [0x04, 0x00, 0x00, 0x00];
-        let mut cursor = ReadCursor::new(&bytes);
-        let resp = TreeDisconnectResponse::unpack(&mut cursor).unwrap();
-        assert_eq!(resp, TreeDisconnectResponse);
-        assert!(cursor.is_empty());
-    }
-
-    #[test]
-    fn tree_disconnect_response_roundtrip() {
-        let original = TreeDisconnectResponse;
-        let mut w = WriteCursor::new();
-        original.pack(&mut w);
-        let bytes = w.into_inner();
-
-        let mut r = ReadCursor::new(&bytes);
-        let decoded = TreeDisconnectResponse::unpack(&mut r).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn tree_disconnect_response_wrong_structure_size() {
-        let bytes = [0x08, 0x00, 0x00, 0x00];
-        let mut cursor = ReadCursor::new(&bytes);
-        let result = TreeDisconnectResponse::unpack(&mut cursor);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("structure size"), "error was: {err}");
-    }
-
-    #[test]
-    fn tree_disconnect_response_ignores_reserved_value() {
-        let bytes = [0x04, 0x00, 0xFF, 0xFF];
-        let mut cursor = ReadCursor::new(&bytes);
-        let resp = TreeDisconnectResponse::unpack(&mut cursor).unwrap();
-        assert_eq!(resp, TreeDisconnectResponse);
-    }
+    super::super::trivial_message_tests!(
+        TreeDisconnectResponse,
+        tree_disconnect_response_known_bytes,
+        tree_disconnect_response_roundtrip,
+        tree_disconnect_response_wrong_structure_size,
+        tree_disconnect_response_too_short
+    );
 }

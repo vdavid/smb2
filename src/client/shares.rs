@@ -283,80 +283,20 @@ async fn tree_disconnect(conn: &mut Connection, tree_id: TreeId) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
     use crate::client::connection::{pack_message, NegotiatedParams};
-    use crate::msg::close::CloseResponse;
-    use crate::msg::create::{CreateAction, CreateResponse as CreateResp};
+    use crate::client::test_helpers::{
+        build_close_response, build_create_response, build_tree_connect_response, setup_connection,
+    };
     use crate::msg::header::Header;
     use crate::msg::read::ReadResponse as ReadResp;
-    use crate::msg::tree_connect::{ShareType, TreeConnectResponse as TreeConnResp};
+    use crate::msg::tree_connect::ShareType;
     use crate::msg::tree_disconnect::TreeDisconnectResponse;
     use crate::msg::write::WriteResponse as WriteResp;
-    use crate::pack::{FileTime, Guid};
+    use crate::pack::Guid;
     use crate::rpc::srvsvc::{STYPE_DISKTREE, STYPE_IPC, STYPE_SPECIAL};
     use crate::transport::MockTransport;
-    use crate::types::flags::{Capabilities, ShareCapabilities, ShareFlags};
+    use crate::types::flags::Capabilities;
     use crate::types::{Dialect, SessionId, TreeId};
     use std::sync::Arc;
-
-    fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
-        let mut conn = Connection::from_transport(
-            Box::new(mock.clone()),
-            Box::new(mock.clone()),
-            "test-server",
-        );
-        conn.set_test_params(NegotiatedParams {
-            dialect: Dialect::Smb2_0_2,
-            max_read_size: 65536,
-            max_write_size: 65536,
-            max_transact_size: 65536,
-            server_guid: Guid::ZERO,
-            signing_required: false,
-            capabilities: Capabilities::default(),
-            gmac_negotiated: false,
-            cipher: None,
-            compression_supported: false,
-        });
-        conn.set_session_id(SessionId(0x1234));
-        conn
-    }
-
-    fn build_tree_connect_response(tree_id: TreeId) -> Vec<u8> {
-        let mut h = Header::new_request(Command::TreeConnect);
-        h.flags.set_response();
-        h.credits = 32;
-        h.tree_id = Some(tree_id);
-
-        let body = TreeConnResp {
-            share_type: ShareType::Pipe,
-            share_flags: ShareFlags::default(),
-            capabilities: ShareCapabilities::default(),
-            maximal_access: 0x001F_01FF,
-        };
-
-        pack_message(&h, &body)
-    }
-
-    fn build_create_response(file_id: FileId) -> Vec<u8> {
-        let mut h = Header::new_request(Command::Create);
-        h.flags.set_response();
-        h.credits = 32;
-
-        let body = CreateResp {
-            oplock_level: OplockLevel::None,
-            flags: 0,
-            create_action: CreateAction::FileOpened,
-            creation_time: FileTime::ZERO,
-            last_access_time: FileTime::ZERO,
-            last_write_time: FileTime::ZERO,
-            change_time: FileTime::ZERO,
-            allocation_size: 0,
-            end_of_file: 0,
-            file_attributes: 0,
-            file_id,
-            create_contexts: vec![],
-        };
-
-        pack_message(&h, &body)
-    }
 
     fn build_write_response(count: u32) -> Vec<u8> {
         let mut h = Header::new_request(Command::Write);
@@ -383,25 +323,6 @@ pub(crate) mod tests {
             data_remaining: 0,
             flags: 0,
             data,
-        };
-
-        pack_message(&h, &body)
-    }
-
-    fn build_close_response() -> Vec<u8> {
-        let mut h = Header::new_request(Command::Close);
-        h.flags.set_response();
-        h.credits = 32;
-
-        let body = CloseResponse {
-            flags: 0,
-            creation_time: FileTime::ZERO,
-            last_access_time: FileTime::ZERO,
-            last_write_time: FileTime::ZERO,
-            change_time: FileTime::ZERO,
-            allocation_size: 0,
-            end_of_file: 0,
-            file_attributes: 0,
         };
 
         pack_message(&h, &body)
@@ -557,9 +478,9 @@ pub(crate) mod tests {
         };
 
         // 1. TREE_CONNECT response
-        mock.queue_response(build_tree_connect_response(tree_id));
+        mock.queue_response(build_tree_connect_response(tree_id, ShareType::Pipe));
         // 2. CREATE response (open srvsvc pipe)
-        mock.queue_response(build_create_response(file_id));
+        mock.queue_response(build_create_response(file_id, 0));
         // 3. WRITE response (RPC BIND)
         mock.queue_response(build_write_response(72));
         // 4. READ response (BIND_ACK)

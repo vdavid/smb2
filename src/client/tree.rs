@@ -2003,98 +2003,18 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::connection::{pack_message, Connection, NegotiatedParams};
-    use crate::msg::close::CloseResponse;
+    use crate::client::connection::pack_message;
+    use crate::client::test_helpers::{
+        build_close_response, build_create_response, build_tree_connect_response, setup_connection,
+    };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
     use crate::msg::query_directory::QueryDirectoryResponse;
-    use crate::msg::tree_connect::{ShareType, TreeConnectResponse};
-    use crate::pack::Guid;
+    use crate::msg::tree_connect::ShareType;
     use crate::transport::MockTransport;
-    use crate::types::flags::{Capabilities, ShareCapabilities, ShareFlags};
     use crate::types::status::NtStatus;
-    use crate::types::{Command, Dialect, SessionId, TreeId};
+    use crate::types::{Command, TreeId};
     use std::sync::Arc;
-
-    fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
-        let mut conn = Connection::from_transport(
-            Box::new(mock.clone()),
-            Box::new(mock.clone()),
-            "test-server",
-        );
-        conn.set_test_params(NegotiatedParams {
-            dialect: Dialect::Smb2_0_2,
-            max_read_size: 65536,
-            max_write_size: 65536,
-            max_transact_size: 65536,
-            server_guid: Guid::ZERO,
-            signing_required: false,
-            capabilities: Capabilities::default(),
-            gmac_negotiated: false,
-            cipher: None,
-            compression_supported: false,
-        });
-        conn.set_session_id(SessionId(0x1234));
-        conn
-    }
-
-    fn build_tree_connect_response(tree_id: TreeId) -> Vec<u8> {
-        let mut h = Header::new_request(Command::TreeConnect);
-        h.flags.set_response();
-        h.credits = 32;
-        h.tree_id = Some(tree_id);
-
-        let body = TreeConnectResponse {
-            share_type: ShareType::Disk,
-            share_flags: ShareFlags::default(),
-            capabilities: ShareCapabilities::default(),
-            maximal_access: 0x001F_01FF,
-        };
-
-        pack_message(&h, &body)
-    }
-
-    fn build_create_response(file_id: FileId, end_of_file: u64) -> Vec<u8> {
-        let mut h = Header::new_request(Command::Create);
-        h.flags.set_response();
-        h.credits = 32;
-
-        let body = CreateResponse {
-            oplock_level: OplockLevel::None,
-            flags: 0,
-            create_action: CreateAction::FileOpened,
-            creation_time: FileTime::ZERO,
-            last_access_time: FileTime::ZERO,
-            last_write_time: FileTime::ZERO,
-            change_time: FileTime::ZERO,
-            allocation_size: 0,
-            end_of_file,
-            file_attributes: 0,
-            file_id,
-            create_contexts: vec![],
-        };
-
-        pack_message(&h, &body)
-    }
-
-    fn build_close_response() -> Vec<u8> {
-        let mut h = Header::new_request(Command::Close);
-        h.flags.set_response();
-        h.credits = 32;
-
-        let body = CloseResponse {
-            flags: 0,
-            creation_time: FileTime::ZERO,
-            last_access_time: FileTime::ZERO,
-            last_write_time: FileTime::ZERO,
-            change_time: FileTime::ZERO,
-            allocation_size: 0,
-            end_of_file: 0,
-            file_attributes: 0,
-        };
-
-        pack_message(&h, &body)
-    }
 
     fn build_flush_response() -> Vec<u8> {
         let mut h = Header::new_request(Command::Flush);
@@ -2209,7 +2129,7 @@ mod tests {
     async fn tree_connect_stores_tree_id() {
         let mock = Arc::new(MockTransport::new());
         let tree_id = TreeId(42);
-        mock.queue_response(build_tree_connect_response(tree_id));
+        mock.queue_response(build_tree_connect_response(tree_id, ShareType::Disk));
 
         let mut conn = setup_connection(&mock);
         let tree = Tree::connect(&mut conn, "naspi").await.unwrap();
@@ -2220,7 +2140,7 @@ mod tests {
     #[tokio::test]
     async fn tree_connect_sends_unc_path() {
         let mock = Arc::new(MockTransport::new());
-        mock.queue_response(build_tree_connect_response(TreeId(1)));
+        mock.queue_response(build_tree_connect_response(TreeId(1), ShareType::Disk));
 
         let mut conn = setup_connection(&mock);
         let _tree = Tree::connect(&mut conn, "myshare").await.unwrap();
@@ -3189,7 +3109,7 @@ mod tests {
         let mut conn = setup_connection(&mock);
 
         // Set up tree.
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         // Build compound response frame: CREATE + READ + CLOSE.
@@ -3221,7 +3141,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         let file_id = FileId {
@@ -3252,7 +3172,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         // Build compound response where CREATE fails with OBJECT_NAME_NOT_FOUND.
@@ -3308,7 +3228,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         let file_id = FileId {
@@ -3366,7 +3286,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         let file_id = FileId {
@@ -3424,7 +3344,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         let file_id = FileId {
@@ -3457,7 +3377,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         let file_id = FileId {
@@ -3487,7 +3407,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         // Build compound response where CREATE fails.
@@ -3558,7 +3478,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         let file_id = FileId {
@@ -3632,7 +3552,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         let file_id = FileId {
