@@ -514,6 +514,18 @@ impl Connection {
                 warn!("recv: zero credits remaining -- credit starvation");
             }
 
+            // STATUS_NETWORK_SESSION_EXPIRED: the session timed out on the
+            // server side. The caller should reconnect (SmbClient::reconnect).
+            // Reference: MS-SMB2 section 3.2.5.1.6.
+            if header.status == NtStatus::NETWORK_SESSION_EXPIRED {
+                warn!(
+                    "recv: session expired (STATUS_NETWORK_SESSION_EXPIRED), \
+                     cmd={:?}, msg_id={} -- caller should reconnect",
+                    header.command, header.message_id.0
+                );
+                return Err(Error::SessionExpired);
+            }
+
             // Return the body bytes (everything after the header).
             let body_bytes = resp_bytes[Header::SIZE..].to_vec();
 
@@ -825,6 +837,64 @@ impl Connection {
         }
 
         Ok(results)
+    }
+
+    /// Send a CANCEL request for an outstanding operation.
+    ///
+    /// CANCEL is best-effort -- the server may or may not honor it.
+    /// It does NOT consume a credit or allocate a new MessageId.
+    ///
+    /// If `async_id` is `Some`, the request has received STATUS_PENDING
+    /// and CANCEL uses the async header format (with `SMB2_FLAGS_ASYNC_COMMAND`
+    /// and the AsyncId). Otherwise it uses the original MessageId in a
+    /// sync header.
+    ///
+    /// CANCEL does not expect a response -- the canceled operation's response
+    /// (which may already be in flight) serves as the implicit response.
+    ///
+    /// Reference: MS-SMB2 section 3.2.4.24.
+    pub async fn send_cancel(
+        &mut self,
+        original_msg_id: MessageId,
+        async_id: Option<u64>,
+    ) -> Result<()> {
+        use crate::msg::cancel::CancelRequest;
+
+        let mut header = Header::new_request(Command::Cancel);
+        header.message_id = original_msg_id;
+        header.credit_charge = CreditCharge(0);
+        header.credits = 0; // Don't request credits on CANCEL.
+        header.session_id = self.session_id;
+
+        if let Some(aid) = async_id {
+            header.flags.set_async();
+            header.async_id = Some(aid);
+            header.tree_id = None;
+        }
+
+        if self.should_sign {
+            header.flags.set_signed();
+        }
+
+        let body = CancelRequest;
+        let mut msg_bytes = pack_message(&header, &body);
+
+        // Sign after packing, if signing is active.
+        if self.should_sign {
+            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+                signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
+            }
+        }
+
+        self.sender.send(&msg_bytes).await?;
+
+        debug!(
+            "send_cancel: msg_id={}, async_id={:?}, signed={}",
+            original_msg_id.0, async_id, self.should_sign
+        );
+
+        // CANCEL does NOT consume a credit and does NOT advance next_message_id.
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2073,5 +2143,173 @@ mod tests {
 
         // Both frames should have been received from the mock.
         assert_eq!(mock.received_count(), 2);
+    }
+
+    // ── CANCEL tests (pitfall #7) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_cancel_does_not_consume_credit_or_advance_message_id() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.next_message_id = 10;
+        conn.credits = 5;
+
+        conn.send_cancel(MessageId(7), None).await.unwrap();
+
+        // MessageId should NOT have advanced.
+        assert_eq!(conn.next_message_id(), 10);
+        // Credits should NOT have been consumed.
+        assert_eq!(conn.credits(), 5);
+    }
+
+    #[tokio::test]
+    async fn send_cancel_sync_uses_original_message_id() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.session_id = SessionId(0xAAAA);
+
+        conn.send_cancel(MessageId(42), None).await.unwrap();
+
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let header = Header::unpack(&mut cursor).unwrap();
+
+        assert_eq!(header.command, Command::Cancel);
+        assert_eq!(header.message_id, MessageId(42));
+        assert_eq!(header.credit_charge, CreditCharge(0));
+        assert_eq!(header.credits, 0);
+        assert_eq!(header.session_id, SessionId(0xAAAA));
+        assert!(!header.flags.is_async());
+
+        // Body should be CancelRequest: StructureSize=4, Reserved=0.
+        assert_eq!(sent.len(), Header::SIZE + 4);
+        let body_structure_size = u16::from_le_bytes(sent[64..66].try_into().unwrap());
+        assert_eq!(body_structure_size, 4);
+    }
+
+    #[tokio::test]
+    async fn send_cancel_async_sets_async_flag_and_async_id() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.session_id = SessionId(0xBBBB);
+
+        let async_id = 0x1234_5678_9ABC_DEF0u64;
+        conn.send_cancel(MessageId(99), Some(async_id))
+            .await
+            .unwrap();
+
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let header = Header::unpack(&mut cursor).unwrap();
+
+        assert_eq!(header.command, Command::Cancel);
+        assert_eq!(header.message_id, MessageId(99));
+        assert!(header.flags.is_async());
+        assert_eq!(header.async_id, Some(async_id));
+        assert_eq!(header.tree_id, None);
+        assert_eq!(header.credit_charge, CreditCharge(0));
+        assert_eq!(header.credits, 0);
+    }
+
+    #[tokio::test]
+    async fn send_cancel_signs_message_when_signing_active() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        let key = vec![0xCC; 16];
+        conn.activate_signing(key, SigningAlgorithm::HmacSha256);
+        conn.session_id = SessionId(0xDDDD);
+
+        conn.send_cancel(MessageId(50), None).await.unwrap();
+
+        let sent = mock.sent_message(0).unwrap();
+
+        // Verify the signed flag is set.
+        let flags = u32::from_le_bytes(sent[16..20].try_into().unwrap());
+        assert!(flags & HeaderFlags::SIGNED != 0, "CANCEL should be signed");
+
+        // Verify the signature is non-zero.
+        let sig = &sent[48..64];
+        assert_ne!(sig, &[0u8; 16], "signature should not be all zeros");
+    }
+
+    // ── Session expiry tests (pitfall #8) ─────────────────────────────
+
+    /// Build a response with a given status and command.
+    fn build_status_response(status: NtStatus, command: Command) -> Vec<u8> {
+        let mut h = Header::new_request(command);
+        h.flags.set_response();
+        h.credits = 10;
+        h.status = status;
+
+        // Minimal error response body: StructureSize=9, ErrorContextCount=0, Reserved=0, ByteCount=0.
+        let body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: Vec::new(),
+        };
+
+        pack_message(&h, &body)
+    }
+
+    #[tokio::test]
+    async fn receive_response_returns_session_expired_on_network_session_expired() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_status_response(
+            NtStatus::NETWORK_SESSION_EXPIRED,
+            Command::Read,
+        ));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let result = conn.receive_response().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::SessionExpired),
+            "expected SessionExpired, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_response_session_expired_still_updates_credits() {
+        let mock = Arc::new(MockTransport::new());
+        // Response grants 10 credits.
+        mock.queue_response(build_status_response(
+            NtStatus::NETWORK_SESSION_EXPIRED,
+            Command::Write,
+        ));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 3;
+
+        let _ = conn.receive_response().await;
+
+        // Credits should have been updated: 3 + 10 (granted) - 1 (consumed) = 12.
+        assert_eq!(conn.credits(), 12);
     }
 }
