@@ -59,6 +59,11 @@ pub struct ClientConfig {
     /// implemented alongside the concurrent pipeline. For now this flag
     /// is stored so the API is ready.
     pub auto_reconnect: bool,
+    /// Enable LZ4 compression for SMB 3.1.1 connections.
+    /// When enabled, messages are compressed if it reduces their size.
+    /// Incompressible data (photos, videos) is sent uncompressed automatically.
+    /// Default: true.
+    pub compression: bool,
 }
 
 /// High-level SMB2 client with reconnection support.
@@ -83,6 +88,7 @@ impl SmbClient {
         info!("smb_client: connecting to {}", config.addr);
 
         let mut conn = Connection::connect(&config.addr, config.timeout).await?;
+        conn.set_compression_requested(config.compression);
         conn.negotiate().await?;
 
         let session = Session::setup(
@@ -94,8 +100,9 @@ impl SmbClient {
         .await?;
 
         info!(
-            "smb_client: connected and authenticated, session_id={}",
-            session.session_id
+            "smb_client: connected and authenticated, session_id={}, compression={}",
+            session.session_id,
+            conn.compression_enabled()
         );
 
         Ok(SmbClient {
@@ -148,6 +155,7 @@ impl SmbClient {
     /// credentials. This is the core reconnection logic, separated from
     /// TCP connect so it can be tested with mock transports.
     async fn reconnect_with(&mut self, mut conn: Connection) -> Result<()> {
+        conn.set_compression_requested(self.config.compression);
         conn.negotiate().await?;
 
         let session = Session::setup(
@@ -589,6 +597,7 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
         password: password.to_string(),
         domain: String::new(),
         auto_reconnect: false,
+        compression: true,
     })
     .await
 }
@@ -740,6 +749,7 @@ mod tests {
             password: "pass".to_string(),
             domain: String::new(),
             auto_reconnect: false,
+            compression: true,
         };
 
         SmbClient::from_parts(config, conn, session)
@@ -879,6 +889,7 @@ mod tests {
             password: "pass".to_string(),
             domain: String::new(),
             auto_reconnect: true,
+            compression: true,
         };
 
         let client = SmbClient::from_parts(config, conn, session);

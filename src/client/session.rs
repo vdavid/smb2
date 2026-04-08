@@ -504,6 +504,7 @@ mod tests {
             capabilities: Capabilities::default(),
             gmac_negotiated: false,
             cipher: None,
+            compression_supported: false,
         });
     }
 }

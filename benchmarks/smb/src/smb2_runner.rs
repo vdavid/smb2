@@ -24,6 +24,7 @@ pub async fn connect(target: &Target) -> Result<(SmbClient, Tree), String> {
         password,
         domain: String::new(),
         auto_reconnect: false,
+        compression: true,
     };
 
     let mut client = SmbClient::connect(config)

@@ -46,6 +46,7 @@ let mut client = smb2::SmbClient::connect(smb2::ClientConfig {
     password: "pass".to_string(),
     domain: String::new(),
     auto_reconnect: false,
+    compression: true,
 }).await?;
 ```
 

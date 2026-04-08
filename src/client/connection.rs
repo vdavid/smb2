@@ -8,14 +8,19 @@ use std::time::Duration;
 
 use log::{debug, info, trace, warn};
 
+use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::kdf::PreauthHasher;
 use crate::crypto::signing::{self, SigningAlgorithm};
 use crate::error::Result;
 use crate::msg::header::Header;
 use crate::msg::negotiate::{
     NegotiateContext, NegotiateRequest, NegotiateResponse, CIPHER_AES_128_CCM, CIPHER_AES_128_GCM,
-    CIPHER_AES_256_CCM, CIPHER_AES_256_GCM, HASH_ALGORITHM_SHA512, SIGNING_AES_CMAC,
-    SIGNING_AES_GMAC, SIGNING_HMAC_SHA256,
+    CIPHER_AES_256_CCM, CIPHER_AES_256_GCM, COMPRESSION_LZ4, HASH_ALGORITHM_SHA512,
+    SIGNING_AES_CMAC, SIGNING_AES_GMAC, SIGNING_HMAC_SHA256,
+};
+use crate::msg::transform::{
+    CompressionTransformHeader, COMPRESSION_ALGORITHM_LZ4, COMPRESSION_PROTOCOL_ID,
+    SMB2_COMPRESSION_FLAG_NONE,
 };
 use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
 use crate::transport::{TcpTransport, TransportReceive, TransportSend};
@@ -58,6 +63,8 @@ pub struct NegotiatedParams {
     pub gmac_negotiated: bool,
     /// The cipher negotiated for encryption (SMB 3.x).
     pub cipher: Option<Cipher>,
+    /// Whether compression was negotiated with the server.
+    pub compression_supported: bool,
 }
 
 /// Low-level connection that handles sequential message exchange.
@@ -88,6 +95,10 @@ pub struct Connection {
     server_name: String,
     /// Estimated round-trip time, measured during negotiate.
     estimated_rtt: Option<Duration>,
+    /// Whether to attempt compression on outgoing messages.
+    compression_enabled: bool,
+    /// Whether the client wants compression (from config).
+    compression_requested: bool,
 }
 
 impl Connection {
@@ -110,6 +121,8 @@ impl Connection {
             session_id: SessionId::NONE,
             server_name: server_name.into(),
             estimated_rtt: None,
+            compression_enabled: false,
+            compression_requested: true,
         }
     }
 
@@ -136,6 +149,8 @@ impl Connection {
             session_id: SessionId::NONE,
             server_name,
             estimated_rtt: None,
+            compression_enabled: false,
+            compression_requested: true,
         })
     }
 
@@ -148,6 +163,31 @@ impl Connection {
         debug!("negotiate: sending request, dialects={:?}", Dialect::ALL);
         let client_guid = generate_guid();
 
+        let mut negotiate_contexts = vec![
+            NegotiateContext::PreauthIntegrity {
+                hash_algorithms: vec![HASH_ALGORITHM_SHA512],
+                salt: generate_salt(),
+            },
+            NegotiateContext::Encryption {
+                ciphers: vec![
+                    CIPHER_AES_128_GCM,
+                    CIPHER_AES_128_CCM,
+                    CIPHER_AES_256_GCM,
+                    CIPHER_AES_256_CCM,
+                ],
+            },
+            NegotiateContext::Signing {
+                algorithms: vec![SIGNING_AES_GMAC, SIGNING_AES_CMAC, SIGNING_HMAC_SHA256],
+            },
+        ];
+
+        if self.compression_requested {
+            negotiate_contexts.push(NegotiateContext::Compression {
+                flags: 0, // unchained
+                algorithms: vec![COMPRESSION_LZ4],
+            });
+        }
+
         let request = NegotiateRequest {
             security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
             capabilities: Capabilities::new(
@@ -155,23 +195,7 @@ impl Connection {
             ),
             client_guid,
             dialects: Dialect::ALL.to_vec(),
-            negotiate_contexts: vec![
-                NegotiateContext::PreauthIntegrity {
-                    hash_algorithms: vec![HASH_ALGORITHM_SHA512],
-                    salt: generate_salt(),
-                },
-                NegotiateContext::Encryption {
-                    ciphers: vec![
-                        CIPHER_AES_128_GCM,
-                        CIPHER_AES_128_CCM,
-                        CIPHER_AES_256_GCM,
-                        CIPHER_AES_256_CCM,
-                    ],
-                },
-                NegotiateContext::Signing {
-                    algorithms: vec![SIGNING_AES_GMAC, SIGNING_AES_CMAC, SIGNING_HMAC_SHA256],
-                },
-            ],
+            negotiate_contexts,
         };
 
         // Pack header + body to get the raw wire bytes.
@@ -256,9 +280,10 @@ impl Connection {
             )));
         }
 
-        // Determine signing and encryption from negotiate contexts.
+        // Determine signing, encryption, and compression from negotiate contexts.
         let mut gmac_negotiated = false;
         let mut cipher = None;
+        let mut compression_supported = false;
 
         for ctx in &resp.negotiate_contexts {
             match ctx {
@@ -279,11 +304,19 @@ impl Connection {
                         };
                     }
                 }
+                NegotiateContext::Compression { algorithms, .. } => {
+                    if algorithms.contains(&COMPRESSION_LZ4) {
+                        compression_supported = true;
+                    }
+                }
                 _ => {}
             }
         }
 
         let signing_required = resp.security_mode.signing_required();
+
+        // Enable compression if both client and server support it.
+        self.compression_enabled = self.compression_requested && compression_supported;
 
         self.params = Some(NegotiatedParams {
             dialect: resp.dialect_revision,
@@ -295,6 +328,7 @@ impl Connection {
             capabilities: resp.capabilities,
             gmac_negotiated,
             cipher,
+            compression_supported,
         });
 
         info!(
@@ -302,9 +336,9 @@ impl Connection {
             resp.dialect_revision, signing_required, resp.capabilities
         );
         debug!(
-            "negotiate: max_read={}, max_write={}, max_transact={}, server_guid={:?}, cipher={:?}, gmac={}",
+            "negotiate: max_read={}, max_write={}, max_transact={}, server_guid={:?}, cipher={:?}, gmac={}, compression={}",
             resp.max_read_size, resp.max_write_size, resp.max_transact_size,
-            resp.server_guid, cipher, gmac_negotiated
+            resp.server_guid, cipher, gmac_negotiated, self.compression_enabled
         );
 
         Ok(())
@@ -341,6 +375,24 @@ impl Connection {
         if self.should_sign {
             if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
                 signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)?;
+            }
+        }
+
+        // Try to compress after signing (per spec: sign then compress).
+        if self.compression_enabled && msg_bytes.len() > Header::SIZE {
+            if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
+                let framed = build_compressed_frame(&compressed);
+                self.sender.send(&framed).await?;
+                debug!(
+                    "send: cmd={:?}, msg_id={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
+                    command,
+                    msg_id.0,
+                    tree_id,
+                    self.should_sign,
+                    msg_bytes.len(),
+                    framed.len()
+                );
+                return Ok((msg_id, msg_bytes));
             }
         }
 
@@ -392,6 +444,20 @@ impl Connection {
             }
         }
 
+        // Try to compress after signing (per spec: sign then compress).
+        if self.compression_enabled && msg_bytes.len() > Header::SIZE {
+            if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
+                let framed = build_compressed_frame(&compressed);
+                self.sender.send(&framed).await?;
+                debug!(
+                    "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
+                    command, msg_id.0, credit_charge, tree_id, self.should_sign,
+                    msg_bytes.len(), framed.len()
+                );
+                return Ok((msg_id, msg_bytes));
+            }
+        }
+
         self.sender.send(&msg_bytes).await?;
         debug!(
             "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, len={}",
@@ -417,6 +483,15 @@ impl Connection {
     pub async fn receive_response(&mut self) -> Result<(Header, Vec<u8>, Vec<u8>)> {
         let resp_bytes = self.receiver.receive().await?;
         trace!("recv: raw response {} bytes", resp_bytes.len());
+
+        // Check for compression transform header and decompress if needed.
+        // Per spec: decompress first, then verify signature.
+        let resp_bytes = if resp_bytes.len() >= 4 && resp_bytes[0..4] == COMPRESSION_PROTOCOL_ID {
+            trace!("recv: detected compression transform header, decompressing");
+            decompress_response(&resp_bytes)?
+        } else {
+            resp_bytes
+        };
 
         // Verify signature if signing is active AND the response has the
         // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
@@ -534,6 +609,18 @@ impl Connection {
         &self.server_name
     }
 
+    /// Set whether the client wants compression.
+    ///
+    /// Must be called before [`negotiate`](Self::negotiate) to have effect.
+    pub fn set_compression_requested(&mut self, requested: bool) {
+        self.compression_requested = requested;
+    }
+
+    /// Whether compression is active on this connection.
+    pub fn compression_enabled(&self) -> bool {
+        self.compression_enabled
+    }
+
     /// Set negotiated params directly (for testing).
     /// Send a related compound request (multiple operations chained).
     ///
@@ -645,6 +732,14 @@ impl Connection {
     pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>> {
         let resp_bytes = self.receiver.receive().await?;
         trace!("recv_compound: raw response {} bytes", resp_bytes.len());
+
+        // Check for compression transform header and decompress if needed.
+        let resp_bytes = if resp_bytes.len() >= 4 && resp_bytes[0..4] == COMPRESSION_PROTOCOL_ID {
+            trace!("recv_compound: detected compression transform header, decompressing");
+            decompress_response(&resp_bytes)?
+        } else {
+            resp_bytes
+        };
 
         let mut results = Vec::new();
         let mut offset = 0usize;
@@ -790,6 +885,75 @@ fn generate_salt() -> Vec<u8> {
     let mut salt = vec![0u8; 32];
     getrandom::fill(&mut salt).expect("failed to generate random salt");
     salt
+}
+
+/// Build a compressed frame: CompressionTransformHeader + uncompressed prefix + compressed data.
+///
+/// The header is 16 bytes (unchained mode). The offset field tells the receiver
+/// how many uncompressed bytes precede the compressed data.
+fn build_compressed_frame(compressed: &CompressedMessage) -> Vec<u8> {
+    let header = CompressionTransformHeader {
+        original_compressed_segment_size: compressed.original_size,
+        compression_algorithm: COMPRESSION_ALGORITHM_LZ4,
+        flags: SMB2_COMPRESSION_FLAG_NONE,
+        offset_or_length: compressed.offset,
+    };
+
+    let mut cursor = WriteCursor::new();
+    header.pack(&mut cursor);
+    let mut frame = cursor.into_inner();
+    frame.extend_from_slice(&compressed.uncompressed_prefix);
+    frame.extend_from_slice(&compressed.compressed_data);
+    frame
+}
+
+/// Decompress a response that starts with a CompressionTransformHeader.
+///
+/// Parses the 16-byte unchained header, extracts the uncompressed prefix and
+/// compressed data, decompresses, and returns the reconstructed full message.
+fn decompress_response(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < CompressionTransformHeader::SIZE {
+        return Err(Error::invalid_data(
+            "compressed response too short for CompressionTransformHeader",
+        ));
+    }
+
+    let mut cursor = ReadCursor::new(data);
+    let header = CompressionTransformHeader::unpack(&mut cursor)?;
+
+    if header.compression_algorithm != COMPRESSION_ALGORITHM_LZ4 {
+        return Err(Error::invalid_data(format!(
+            "unsupported compression algorithm 0x{:04X}, only LZ4 (0x{:04X}) is supported",
+            header.compression_algorithm, COMPRESSION_ALGORITHM_LZ4
+        )));
+    }
+
+    if header.flags != SMB2_COMPRESSION_FLAG_NONE {
+        return Err(Error::invalid_data(format!(
+            "unsupported compression flags 0x{:04X}, only unchained (0x0000) is supported",
+            header.flags
+        )));
+    }
+
+    let offset = header.offset_or_length as usize;
+    let remaining = &data[CompressionTransformHeader::SIZE..];
+
+    if offset > remaining.len() {
+        return Err(Error::invalid_data(format!(
+            "compression offset {} exceeds remaining data length {}",
+            offset,
+            remaining.len()
+        )));
+    }
+
+    let uncompressed_prefix = &remaining[..offset];
+    let compressed_data = &remaining[offset..];
+
+    decompress_message(
+        uncompressed_prefix,
+        compressed_data,
+        header.original_compressed_segment_size,
+    )
 }
 
 // We need Arc-based TransportSend/TransportReceive for TcpTransport sharing.
@@ -1421,5 +1585,399 @@ mod tests {
         // After resp3: 23 + 10 - 0 = 33
         // (new_request sets credit_charge to CreditCharge(0))
         assert!(conn.credits() > 3);
+    }
+
+    // ── Compression tests ────────────────────────────────────────────
+
+    use crate::msg::negotiate::COMPRESSION_LZ4;
+    use crate::msg::transform::{
+        CompressionTransformHeader, COMPRESSION_ALGORITHM_LZ4, COMPRESSION_PROTOCOL_ID,
+        SMB2_COMPRESSION_FLAG_NONE,
+    };
+
+    /// Build a negotiate response that includes a compression context with LZ4.
+    fn build_negotiate_response_with_compression(dialect: Dialect) -> Vec<u8> {
+        let resp_header = {
+            let mut h = Header::new_request(Command::Negotiate);
+            h.flags.set_response();
+            h.credits = 32;
+            h
+        };
+        let resp_body = NegotiateResponse {
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
+            dialect_revision: dialect,
+            server_guid: Guid::ZERO,
+            capabilities: Capabilities::new(Capabilities::DFS | Capabilities::LEASING),
+            max_transact_size: 65536,
+            max_read_size: 65536,
+            max_write_size: 65536,
+            system_time: 132_000_000_000_000_000,
+            server_start_time: 131_000_000_000_000_000,
+            security_buffer: vec![0x60, 0x00],
+            negotiate_contexts: vec![
+                NegotiateContext::PreauthIntegrity {
+                    hash_algorithms: vec![HASH_ALGORITHM_SHA512],
+                    salt: vec![0xBB; 32],
+                },
+                NegotiateContext::Compression {
+                    flags: 0,
+                    algorithms: vec![COMPRESSION_LZ4],
+                },
+            ],
+        };
+        pack_message(&resp_header, &resp_body)
+    }
+
+    #[tokio::test]
+    async fn negotiate_detects_compression_support() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_negotiate_response_with_compression(Dialect::Smb3_1_1));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.negotiate().await.unwrap();
+
+        let params = conn.params().unwrap();
+        assert!(params.compression_supported);
+        assert!(conn.compression_enabled());
+    }
+
+    #[tokio::test]
+    async fn negotiate_without_compression_context_disables_compression() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_negotiate_response(Dialect::Smb3_1_1));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.negotiate().await.unwrap();
+
+        let params = conn.params().unwrap();
+        assert!(!params.compression_supported);
+        assert!(!conn.compression_enabled());
+    }
+
+    #[tokio::test]
+    async fn compression_disabled_when_client_config_says_no() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_negotiate_response_with_compression(Dialect::Smb3_1_1));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_compression_requested(false);
+        conn.negotiate().await.unwrap();
+
+        // Server supports it, but client disabled it.
+        let params = conn.params().unwrap();
+        assert!(params.compression_supported);
+        assert!(!conn.compression_enabled());
+    }
+
+    #[tokio::test]
+    async fn negotiate_offers_compression_context_when_requested() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_negotiate_response_with_compression(Dialect::Smb3_1_1));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        // compression_requested defaults to true.
+        conn.negotiate().await.unwrap();
+
+        // Parse the sent negotiate request and check for compression context.
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let req = NegotiateRequest::unpack(&mut cursor).unwrap();
+
+        let has_compression = req.negotiate_contexts.iter().any(|ctx| {
+            matches!(ctx, NegotiateContext::Compression { algorithms, .. }
+                if algorithms.contains(&COMPRESSION_LZ4))
+        });
+        assert!(
+            has_compression,
+            "negotiate request should include compression context with LZ4"
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_does_not_offer_compression_when_disabled() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_negotiate_response(Dialect::Smb3_1_1));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_compression_requested(false);
+        conn.negotiate().await.unwrap();
+
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let req = NegotiateRequest::unpack(&mut cursor).unwrap();
+
+        let has_compression = req
+            .negotiate_contexts
+            .iter()
+            .any(|ctx| matches!(ctx, NegotiateContext::Compression { .. }));
+        assert!(
+            !has_compression,
+            "negotiate request should not include compression context"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_request_compresses_compressible_data() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+        conn.compression_enabled = true;
+
+        // Build a request with highly compressible payload.
+        // We need a body that produces bytes larger than Header::SIZE.
+        use crate::msg::write::WriteRequest;
+        let compressible_data: Vec<u8> = b"AAAA".iter().copied().cycle().take(4096).collect();
+        let write_req = WriteRequest {
+            data_offset: 0x70,
+            offset: 0,
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data: compressible_data,
+        };
+
+        let (_msg_id, _original_bytes) = conn
+            .send_request(Command::Write, &write_req, Some(TreeId(1)))
+            .await
+            .unwrap();
+
+        // Check that the sent data starts with a compression transform header.
+        let sent = mock.sent_message(0).unwrap();
+        assert_eq!(
+            &sent[0..4],
+            &COMPRESSION_PROTOCOL_ID,
+            "compressible message should be sent with compression transform header"
+        );
+
+        // Parse the header and verify it's valid.
+        let mut cursor = ReadCursor::new(&sent);
+        let comp_header = CompressionTransformHeader::unpack(&mut cursor).unwrap();
+        assert_eq!(comp_header.compression_algorithm, COMPRESSION_ALGORITHM_LZ4);
+        assert_eq!(comp_header.flags, SMB2_COMPRESSION_FLAG_NONE);
+
+        // The compressed frame should be smaller than the original.
+        assert!(
+            sent.len() < _original_bytes.len(),
+            "compressed frame ({}) should be smaller than original ({})",
+            sent.len(),
+            _original_bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_request_does_not_compress_when_disabled() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+        conn.compression_enabled = false; // Compression disabled.
+
+        // Build a request with compressible payload.
+        use crate::msg::write::WriteRequest;
+        let compressible_data: Vec<u8> = b"AAAA".iter().copied().cycle().take(4096).collect();
+        let write_req = WriteRequest {
+            data_offset: 0x70,
+            offset: 0,
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data: compressible_data,
+        };
+
+        let (_msg_id, _original_bytes) = conn
+            .send_request(Command::Write, &write_req, Some(TreeId(1)))
+            .await
+            .unwrap();
+
+        // Check that the sent data starts with the normal SMB2 protocol ID, not compression.
+        let sent = mock.sent_message(0).unwrap();
+        assert_eq!(
+            &sent[0..4],
+            &crate::msg::header::PROTOCOL_ID,
+            "message should be sent uncompressed when compression is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_response_decompresses_compressed_data() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Build a READ response with a compressible payload (repeated pattern).
+        let compressible_data: Vec<u8> = b"DECOMPRESS_TEST_"
+            .iter()
+            .copied()
+            .cycle()
+            .take(4096)
+            .collect();
+        let mut resp_header = Header::new_request(Command::Read);
+        resp_header.flags.set_response();
+        resp_header.credits = 10;
+        resp_header.message_id = MessageId(0);
+        let resp_body = ReadResponse {
+            data_offset: 0x50,
+            data_remaining: 0,
+            flags: 0,
+            data: compressible_data,
+        };
+        let original_resp = pack_message(&resp_header, &resp_body);
+
+        // Compress it using our compress function.
+        let compressed = compress_message(&original_resp, Header::SIZE)
+            .expect("large read response should compress");
+
+        // Build the compressed frame.
+        let framed = build_compressed_frame(&compressed);
+
+        // Queue it as a response.
+        mock.queue_response(framed);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let (header, body, raw) = conn.receive_response().await.unwrap();
+        assert_eq!(header.command, Command::Read);
+        assert!(header.is_response());
+        // The raw bytes should be the decompressed message.
+        assert_eq!(raw, original_resp);
+
+        // Verify the body contains the read data.
+        let mut cursor = ReadCursor::new(&body);
+        let read_body = ReadResponse::unpack(&mut cursor).unwrap();
+        assert_eq!(read_body.data.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn receive_response_handles_uncompressed_data() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Build a normal (uncompressed) SMB2 response.
+        let mut resp_header = Header::new_request(Command::Echo);
+        resp_header.flags.set_response();
+        resp_header.credits = 10;
+        let resp_body = crate::msg::echo::EchoResponse;
+        let original_resp = pack_message(&resp_header, &resp_body);
+
+        mock.queue_response(original_resp.clone());
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let (header, _body, raw) = conn.receive_response().await.unwrap();
+        assert_eq!(header.command, Command::Echo);
+        assert_eq!(raw, original_resp);
+    }
+
+    #[test]
+    fn build_compressed_frame_roundtrip() {
+        // Create a message with a compressible payload.
+        let mut message = vec![0xFE; Header::SIZE]; // header-like prefix
+        let payload: Vec<u8> = b"COMPRESS_ME_".iter().copied().cycle().take(2048).collect();
+        message.extend_from_slice(&payload);
+
+        let compressed = compress_message(&message, Header::SIZE).expect("should compress");
+        let framed = build_compressed_frame(&compressed);
+
+        // Verify the frame starts with compression protocol ID.
+        assert_eq!(&framed[0..4], &COMPRESSION_PROTOCOL_ID);
+
+        // Decompress and verify roundtrip.
+        let decompressed = decompress_response(&framed).expect("should decompress");
+        assert_eq!(decompressed, message);
+    }
+
+    #[test]
+    fn decompress_response_rejects_unsupported_algorithm() {
+        // Build a compression transform header with an unsupported algorithm.
+        let header = CompressionTransformHeader {
+            original_compressed_segment_size: 100,
+            compression_algorithm: 0x0001, // LZNT1, not LZ4
+            flags: SMB2_COMPRESSION_FLAG_NONE,
+            offset_or_length: 0,
+        };
+        let mut cursor = WriteCursor::new();
+        header.pack(&mut cursor);
+        let mut frame = cursor.into_inner();
+        frame.extend_from_slice(&[0u8; 10]); // bogus data
+
+        let result = decompress_response(&frame);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported compression algorithm"));
+    }
+
+    #[test]
+    fn decompress_response_rejects_chained_compression() {
+        let header = CompressionTransformHeader {
+            original_compressed_segment_size: 100,
+            compression_algorithm: COMPRESSION_ALGORITHM_LZ4,
+            flags: 0x0001, // chained
+            offset_or_length: 0,
+        };
+        let mut cursor = WriteCursor::new();
+        header.pack(&mut cursor);
+        let mut frame = cursor.into_inner();
+        frame.extend_from_slice(&[0u8; 10]);
+
+        let result = decompress_response(&frame);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unchained"));
+    }
+
+    #[test]
+    fn decompress_response_rejects_too_short_data() {
+        let result = decompress_response(&[0xFC, b'S', b'M']);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
     }
 }

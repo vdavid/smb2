@@ -313,6 +313,7 @@ pub(crate) mod tests {
             capabilities: Capabilities::default(),
             gmac_negotiated: false,
             cipher: None,
+            compression_supported: false,
         });
         conn.set_session_id(SessionId(0x1234));
         conn
@@ -657,6 +658,7 @@ pub(crate) mod tests {
             capabilities: Capabilities::default(),
             gmac_negotiated: false,
             cipher: None,
+            compression_supported: false,
         });
         conn.set_session_id(SessionId(0x1234));
 

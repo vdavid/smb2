@@ -20,7 +20,13 @@ fn load_dotenv() {
             if let Some((key, value)) = line.split_once('=') {
                 // Only set if not already in the environment (env var takes precedence).
                 if std::env::var(key.trim()).is_err() {
-                    std::env::set_var(key.trim(), value.trim());
+                    // Strip surrounding quotes if present.
+                    let value = value.trim();
+                    let value = value
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"'))
+                        .unwrap_or(value);
+                    std::env::set_var(key.trim(), value);
                 }
             }
         }
@@ -390,6 +396,7 @@ async fn connect_client_to_nas() -> SmbClient {
         password: nas_password(),
         domain: String::new(),
         auto_reconnect: false,
+        compression: true,
     })
     .await
     .expect("SmbClient::connect failed")
@@ -829,6 +836,7 @@ async fn debug_rapid_pipelined_writes() {
         password: nas_password(),
         domain: String::new(),
         auto_reconnect: false,
+        compression: true,
     };
 
     let mut client = SmbClient::connect(config).await.expect("connect failed");
@@ -888,6 +896,7 @@ async fn micro_benchmark_smb2_vs_native() {
         password: nas_password(),
         domain: String::new(),
         auto_reconnect: false,
+        compression: true,
     };
     let mut client = SmbClient::connect(config).await.expect("connect");
     let share = client.connect_share("naspi").await.expect("tree");
@@ -1233,6 +1242,7 @@ async fn connect_client_to_pi() -> SmbClient {
         password: String::new(),
         domain: String::new(),
         auto_reconnect: false,
+        compression: true,
     })
     .await
     .expect("SmbClient::connect to Pi failed")
