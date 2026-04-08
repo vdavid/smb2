@@ -261,7 +261,7 @@ impl<'a> FileDownload<'a> {
     }
 }
 
-impl<'a> Drop for FileDownload<'a> {
+impl Drop for FileDownload<'_> {
     fn drop(&mut self) {
         if !self.done {
             debug!(
@@ -471,7 +471,7 @@ impl<'a> FileUpload<'a> {
     }
 }
 
-impl<'a> Drop for FileUpload<'a> {
+impl Drop for FileUpload<'_> {
     fn drop(&mut self) {
         if !self.done {
             debug!(
