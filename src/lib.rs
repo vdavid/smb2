@@ -81,3 +81,6 @@ pub use client::watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Share enumeration
 pub use rpc::srvsvc::ShareInfo;
+
+// Kerberos authentication
+pub use auth::kerberos::{KerberosAuthenticator, KerberosCredentials};

@@ -1,13 +1,19 @@
-# Auth -- NTLM authentication
+# Auth -- NTLM and Kerberos authentication
 
-NTLMv2 authentication for SMB2 session setup. Kerberos is not implemented (deferred).
+NTLMv2 and Kerberos authentication for SMB2 session setup.
 
 ## Key files
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `Auth` trait definition |
+| `mod.rs` | Module exports |
 | `ntlm.rs` | `NtlmAuthenticator` -- 3-message NTLM exchange |
+| `spnego.rs` | SPNEGO NegTokenInit/NegTokenResp wrapping |
+| `kerberos/mod.rs` | Kerberos module root, re-exports authenticator |
+| `kerberos/authenticator.rs` | `KerberosAuthenticator` -- full AS + TGS + AP-REQ flow |
+| `kerberos/crypto.rs` | AES-CTS, RC4-HMAC, string-to-key, key derivation |
+| `kerberos/messages.rs` | ASN.1/DER encoding/decoding for Kerberos messages |
+| `kerberos/kdc.rs` | KDC transport client (UDP/TCP with fallback) |
 
 ## NTLM exchange
 
@@ -17,7 +23,39 @@ NTLMv2 authentication for SMB2 session setup. Kerberos is not implemented (defer
 
 Only NTLMv2 is supported. NTLMv1 is insecure and not implemented.
 
-## Key derivation flow
+## Kerberos exchange
+
+`KerberosAuthenticator` performs the full Kerberos flow in three steps:
+
+1. **AS exchange** (client -> KDC): derive user key from password, build PA-ENC-TIMESTAMP + PA-PAC-REQUEST, send AS-REQ, parse AS-REP, decrypt enc-part with user key to get TGT + AS session key.
+2. **TGS exchange** (client -> KDC): build AP-REQ wrapping TGT + authenticator (encrypted with AS session key), send TGS-REQ for `cifs/hostname`, parse TGS-REP, decrypt enc-part with AS session key to get service ticket + TGS session key.
+3. **AP-REQ construction**: build Authenticator with subkey, encrypt with TGS session key, build AP-REQ with service ticket, wrap in SPNEGO NegTokenInit.
+
+The flow differs from NTLM: Kerberos contacts the KDC directly (async, network I/O), then produces a single token for SESSION_SETUP (usually 1 round-trip with the SMB server).
+
+### Key usage numbers (RFC 4120 section 7.5.1)
+
+- 1: PA-ENC-TIMESTAMP encryption
+- 3: AS-REP EncKDCRepPart decryption
+- 7: AP-REQ Authenticator encryption
+- 8: TGS-REP EncKDCRepPart decryption (tries 8 first, falls back to 9)
+
+### Encryption types supported
+
+- AES-256-CTS-HMAC-SHA1-96 (etype 18) -- preferred
+- AES-128-CTS-HMAC-SHA1-96 (etype 17)
+- RC4-HMAC (etype 23) -- legacy
+
+### Kerberos wire encryption format (AES)
+
+1. Derive Ke (encryption) and Ki (integrity) keys from base key + usage
+2. Generate 16-byte random confounder
+3. plaintext' = confounder || plaintext
+4. ciphertext = AES-CTS(Ke, iv=0, plaintext')
+5. hmac = HMAC-SHA1-96(Ki, plaintext') -- 12 bytes
+6. output = ciphertext || hmac
+
+## NTLM key derivation flow
 
 1. `NTOWFv2`: `HMAC-MD5(MD4(password_utf16), uppercase(username) + domain)`
 2. `NTProofStr`: `HMAC-MD5(NTOWFv2, server_challenge + client_blob)`
@@ -37,13 +75,18 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 
 ## Key decisions
 
-- **`getrandom` for random values**: Client challenge and random session key use `getrandom` (OS CSPRNG), not time-seeded LCG.
+- **`getrandom` for random values**: Client challenge, random session key, nonces, and confounders use `getrandom` (OS CSPRNG).
 - **`test_random_session_key` override**: Tests can inject a deterministic session key for reproducibility. Never used in production.
+- **Subkey in AP-REQ Authenticator**: The Kerberos authenticator includes a random subkey, which becomes the SMB session key. This provides forward secrecy.
+- **No full `authenticate()` unit tests**: The full flow requires a real KDC. Unit tests cover individual steps (encrypt/decrypt roundtrip, message encoding, etype parsing). Integration tests with Docker are planned.
 
 ## Gotchas
 
-- **Retain raw challenge bytes for MIC**: The MIC is computed over the exact wire bytes of all three messages. Parsing and re-serializing would produce different bytes. `NtlmAuthenticator` stores the raw challenge.
-- **RC4 for key exchange is inline**: ~15 lines of RC4 implementation. Too small to justify a dependency, and the `rc4` crate has inconsistent API versions.
-- **MsvAvTimestamp presence changes behavior**: Without it, no MIC is computed. With it, MIC is mandatory. Missing MIC when required causes auth failure on modern servers.
-- **NTLMv1 not supported**: No fallback. If the server only accepts NTLMv1, auth fails.
-- **Target info modification**: The client modifies the server's target info (adds MsvAvFlags, resets MsvAvEOL position) before including it in the client blob.
+- **Retain raw challenge bytes for MIC (NTLM)**: The MIC is computed over the exact wire bytes of all three messages.
+- **RC4 for key exchange is inline (NTLM)**: ~15 lines of RC4 implementation.
+- **MsvAvTimestamp presence changes behavior (NTLM)**: Without it, no MIC is computed. With it, MIC is mandatory.
+- **NTLMv1 not supported**: No fallback.
+- **Target info modification (NTLM)**: The client modifies the server's target info before including it in the client blob.
+- **TGS-REP key usage ambiguity (Kerberos)**: RFC 4120 says key usage 8 for TGS-REP encrypted with session key, but some KDCs use 9. The authenticator tries 8 first, falls back to 9.
+- **KDC_ERR_PREAUTH_REQUIRED handling (Kerberos)**: First AS-REQ without pre-auth gets error 25. The authenticator extracts supported etypes from the e-data (ETYPE-INFO2) and retries with pre-authentication.
+- **DER parsing duplicated (Kerberos)**: `authenticator.rs` has its own minimal DER helpers to avoid depending on `messages.rs` internals. Some duplication, but keeps the module self-contained.
