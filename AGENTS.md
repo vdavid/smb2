@@ -181,7 +181,10 @@ These are the top issues that WILL cause bugs if not handled correctly. Read the
 
 ## Module docs (CLAUDE.md files)
 
-Each module has a colocated `CLAUDE.md` with architecture, decisions, and gotchas. These are auto-discovered by Claude Code. Read the relevant CLAUDE.md before modifying a module.
+Each module has a colocated `CLAUDE.md` with architecture, decisions, and gotchas. These are auto-discovered by Claude Code.
+
+**Before modifying a module:** Read its CLAUDE.md.
+**After modifying a module:** Update its CLAUDE.md if you changed architecture, added decisions, or discovered new gotchas. Keep them current.
 
 ```
 src/client/CLAUDE.md    # SmbClient, Connection, compound, pipelining

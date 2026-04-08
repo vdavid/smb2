@@ -53,6 +53,17 @@ For large files, `read_file_pipelined` / `write_file_pipelined` send multiple RE
 4. Receive STATUS_SUCCESS (do NOT include in preauth hash)
 5. Derive signing/encryption keys via SP800-108 KDF
 6. Activate signing on the connection
+7. If session or share requires encryption, activate encryption (TRANSFORM_HEADER wrapping with AEAD)
+
+## Encryption
+
+Encryption is activated when the session flags include `ENCRYPT_DATA` or a share has `SMB2_SHAREFLAG_ENCRYPT_DATA`. When active:
+- Outgoing messages are wrapped in TRANSFORM_HEADER (protocol ID 0xFD) with a monotonic nonce
+- Incoming messages with 0xFD are decrypted before processing
+- Signing is skipped (AEAD provides authentication)
+- Compound chains are encrypted as one unit (pitfall #9)
+
+Tree-level encryption: `connect_share()` checks the share's encrypt flag and activates encryption on the connection if needed, even if the session didn't require it.
 
 ## Reconnection
 
