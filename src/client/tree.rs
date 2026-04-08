@@ -506,11 +506,23 @@ impl Tree {
             return Ok(Vec::new());
         }
 
-        // Always use 64 KB chunks for pipelined reads: CreditCharge=1,
-        // maximizes concurrency. With the sliding window, more smaller
-        // chunks keeps the pipe fuller.
-        let chunk_size = 65536_u32;
-        let credit_charge = 1_u16;
+        // Balance chunk size for pipelining: small enough to keep many
+        // in flight (sliding window benefit), large enough to minimize
+        // per-chunk overhead (headers, signing).
+        //
+        // For files that fit in one read: use file size (no chunking).
+        // For larger files: use 512 KB — gives ~20 chunks per 10 MB
+        // (enough for pipelining) with 8 credits per chunk (manageable).
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        let pipeline_chunk = 512 * 1024_u32; // 512 KB
+        let chunk_size = if file_size <= max_read as u64 {
+            // File fits in one read — no pipelining needed.
+            (file_size as u32).min(max_read)
+        } else {
+            // Use pipeline chunk size, capped to MaxReadSize.
+            pipeline_chunk.min(max_read)
+        };
+        let credit_charge = chunk_size.div_ceil(65536) as u16;
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         debug!(
             "tree: read_file_pipelined path={}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",

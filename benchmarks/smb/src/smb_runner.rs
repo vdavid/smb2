@@ -1,4 +1,4 @@
-//! Direct SMB operations — uses the `smb` crate to talk SMB2/3 directly, bypassing the OS mount.
+//! SMB crate operations — uses the `smb` crate to talk SMB2/3 directly, bypassing the OS mount.
 
 use crate::config::Target;
 use futures_util::StreamExt;
@@ -11,7 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Negotiated chunk sizes for direct SMB transfers.
+/// Negotiated chunk sizes for smb crate transfers.
 pub struct ChunkSizes {
     pub read: usize,
     pub write: usize,
@@ -90,9 +90,9 @@ pub async fn connect(target: &Target) -> Result<(Client, UncPath, ChunkSizes), S
     Ok((client, unc_path, chunk_sizes))
 }
 
-/// Create the test directory on the share via direct SMB.
+/// Create the test directory on the share via the smb crate.
 pub async fn setup(client: &Client, unc_path: &UncPath, cycle_id: &str) -> Result<String, String> {
-    let base = Target::direct_test_base();
+    let base = Target::smb_test_base();
     let test_dir = format!(r"{base}\{cycle_id}");
 
     // Try to delete existing test dir first (best-effort)
@@ -122,7 +122,7 @@ pub async fn setup(client: &Client, unc_path: &UncPath, cycle_id: &str) -> Resul
     Ok(test_dir)
 }
 
-/// Upload `count` files of `size` bytes each via direct SMB. Returns elapsed time.
+/// Upload `count` files of `size` bytes each via the smb crate. Returns elapsed time.
 pub async fn upload(
     client: &Client,
     unc_path: &UncPath,
@@ -158,7 +158,7 @@ pub async fn upload(
     start.elapsed()
 }
 
-/// List the test directory via direct SMB. Returns (count, elapsed).
+/// List the test directory via the smb crate. Returns (count, elapsed).
 pub async fn list(client: &Client, unc_path: &UncPath, test_dir: &str) -> (usize, Duration) {
     let tree = client.get_tree(unc_path).await.expect("get_tree");
 
@@ -184,7 +184,7 @@ pub async fn list(client: &Client, unc_path: &UncPath, test_dir: &str) -> (usize
     (count, elapsed)
 }
 
-/// Download all files to a local temp dir via direct SMB. Returns (bytes, elapsed).
+/// Download all files to a local temp dir via the smb crate. Returns (bytes, elapsed).
 pub async fn download(
     client: &Client,
     unc_path: &UncPath,
@@ -242,7 +242,7 @@ pub async fn download(
     (total_bytes, start.elapsed())
 }
 
-/// Delete all files in the test directory and then the directory itself via direct SMB.
+/// Delete all files in the test directory and then the directory itself via the smb crate.
 pub async fn delete(client: &Client, unc_path: &UncPath, test_dir: &str) -> Duration {
     let start = Instant::now();
     delete_dir_recursive(client, unc_path, test_dir)
@@ -333,12 +333,12 @@ async fn collect_dir_entries(
 pub async fn cleanup(target: &Target) {
     match connect(target).await {
         Ok((client, unc_path, _chunks)) => {
-            let base = Target::direct_test_base();
+            let base = Target::smb_test_base();
             match delete_dir_recursive(&client, &unc_path, base).await {
-                Ok(()) => println!("  Removed {base} (direct)"),
-                Err(e) => println!("  Direct cleanup: {e} (may not exist)"),
+                Ok(()) => println!("  Removed {base} (smb)"),
+                Err(e) => println!("  smb cleanup: {e} (may not exist)"),
             }
         }
-        Err(e) => println!("  Can't connect for direct cleanup: {e}"),
+        Err(e) => println!("  Can't connect for smb cleanup: {e}"),
     }
 }

@@ -46,6 +46,10 @@ pub fn list(dir: &PathBuf) -> (usize, Duration) {
 
 /// Download all files to a local temp dir. Returns (bytes, elapsed).
 pub fn download(dir: &PathBuf, local_dest: &PathBuf) -> (u64, Duration) {
+    use std::io::Read;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::io::AsRawFd;
+
     fs::create_dir_all(local_dest).expect("create local dest");
     let start = Instant::now();
     let mut total_bytes = 0u64;
@@ -53,8 +57,26 @@ pub fn download(dir: &PathBuf, local_dest: &PathBuf) -> (u64, Duration) {
         let entry = entry.expect("dir entry");
         let src = entry.path();
         let dst = local_dest.join(entry.file_name());
-        let bytes = fs::copy(&src, &dst).expect("copy file");
-        total_bytes += bytes;
+
+        // Open with F_NOCACHE to bypass macOS kernel page cache.
+        // Without this, warm reads hit the cache and show artificially
+        // fast times that no userspace SMB client can match.
+        let mut src_file = fs::File::open(&src).expect("open src");
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::fcntl(src_file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
+
+        let mut dst_file = fs::File::create(&dst).expect("create dst");
+        let mut buf = vec![0u8; 1024 * 1024]; // 1 MB read buffer
+        loop {
+            let n = src_file.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            dst_file.write_all(&buf[..n]).expect("write");
+            total_bytes += n as u64;
+        }
     }
     (total_bytes, start.elapsed())
 }

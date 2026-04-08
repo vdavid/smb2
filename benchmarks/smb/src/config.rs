@@ -29,9 +29,9 @@ impl Target {
         PathBuf::from(&self.native_mount).join("_test-native")
     }
 
-    /// Base SMB path (relative to share root) for direct benchmark files.
-    pub fn direct_test_base() -> &'static str {
-        "_test-direct"
+    /// Base SMB path (relative to share root) for smb crate benchmark files.
+    pub fn smb_test_base() -> &'static str {
+        "_test-smb"
     }
 
     /// Base SMB path (relative to share root) for smb2 benchmark files.

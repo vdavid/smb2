@@ -11,11 +11,12 @@ password = "your-password"
 # Where the share is mounted on macOS (for native comparison)
 native_mount = "/Volumes/naspi"
 
-[[targets]]
-name = "pi"
-host = "192.168.1.150"
-share = "PiHDD"
-guest = true
-native_mount = "/Volumes/PiHDD"
-# Override max chunk size in KB (default: 1024). Pi's Samba hangs on 1MB.
-max_chunk_kb = 64
+# Example second target (Raspberry Pi with guest access):
+# [[targets]]
+# name = "pi"
+# host = "192.168.1.150"
+# share = "PiHDD"
+# guest = true
+# native_mount = "/Volumes/PiHDD"
+# # Override max chunk size in KB (default: 1024). Pi's Samba hangs on 1MB.
+# max_chunk_kb = 64

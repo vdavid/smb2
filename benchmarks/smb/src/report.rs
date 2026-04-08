@@ -1,6 +1,6 @@
 //! Output formatting: terminal table and JSON file.
 
-use crate::runner::AllResults;
+use crate::runner::{AllResults, TIMED_OUT};
 use std::path::PathBuf;
 
 pub fn print_table(results: &AllResults) {
@@ -20,29 +20,54 @@ pub fn print_table(results: &AllResults) {
             total_mb,
         );
         println!("┌──────────────┬──────────────┬──────────────┬──────────────┬──────────┬──────────┐");
-        println!("│ operation    │ native       │ smb (direct) │ smb2         │ smb2/nat │ smb2/smb │");
+        println!("│ operation    │ native       │ smb          │ smb2         │ smb2/nat │ smb2/smb │");
         println!("├──────────────┼──────────────┼──────────────┼──────────────┼──────────┼──────────┤");
 
         for op in &suite.operations {
-            let native_ms = op.native_median().as_secs_f64() * 1000.0;
-            let direct_ms = op.direct_median().as_secs_f64() * 1000.0;
-            let smb2_ms = op.smb2_median().as_secs_f64() * 1000.0;
-            let vs_native = op.smb2_vs_native();
-            let vs_direct = op.smb2_vs_direct();
+            let native_str = format_time_or_status(&op.native_times);
+            let smb_str = if suite.smb_skipped {
+                "N/A".to_string()
+            } else {
+                format_time_or_status(&op.smb_times)
+            };
+            let smb2_str = format_time_or_status(&op.smb2_times);
+
+            let vs_native_str = if op.native_timed_out() || op.smb2_timed_out() {
+                "N/A".to_string()
+            } else {
+                format_ratio(op.smb2_vs_native())
+            };
+
+            let vs_smb_str = if suite.smb_skipped || op.smb_skipped() || op.smb_timed_out() || op.smb2_timed_out() {
+                "N/A".to_string()
+            } else {
+                format_ratio(op.smb2_vs_smb())
+            };
+
             println!(
                 "│ {:<12} │ {:>10} │ {:>10} │ {:>10} │ {:>7} │ {:>7} │",
                 op.name,
-                format_duration_ms(native_ms),
-                format_duration_ms(direct_ms),
-                format_duration_ms(smb2_ms),
-                format_ratio(vs_native),
-                format_ratio(vs_direct),
+                native_str,
+                smb_str,
+                smb2_str,
+                vs_native_str,
+                vs_smb_str,
             );
         }
         println!("└──────────────┴──────────────┴──────────────┴──────────────┴──────────┴──────────┘\n");
     }
 
     println!("Ratios: smb2/native and smb2/smb — values < 1.0 mean smb2 is faster.\n");
+}
+
+/// Format a list of durations as a median time string, or "TIMEOUT" / "N/A" as appropriate.
+fn format_time_or_status(times: &[std::time::Duration]) -> String {
+    if times.iter().any(|&t| t == TIMED_OUT) {
+        "TIMEOUT".to_string()
+    } else {
+        let median = crate::runner::median_pub(times);
+        format_duration_ms(median.as_secs_f64() * 1000.0)
+    }
 }
 
 pub fn save_json(results: &AllResults) {
@@ -60,21 +85,34 @@ fn build_json(results: &AllResults) -> String {
     let mut out = String::from("{\n  \"suites\": [\n");
     for (si, suite) in results.suites.iter().enumerate() {
         out.push_str(&format!(
-            "    {{\n      \"target\": \"{}\",\n      \"suite\": \"{}\",\n      \"file_count\": {},\n      \"file_size_bytes\": {},\n      \"operations\": [\n",
-            suite.target_name, suite.suite_name, suite.file_count, suite.file_size_bytes
+            "    {{\n      \"target\": \"{}\",\n      \"suite\": \"{}\",\n      \"file_count\": {},\n      \"file_size_bytes\": {},\n      \"smb_skipped\": {},\n      \"operations\": [\n",
+            suite.target_name, suite.suite_name, suite.file_count, suite.file_size_bytes, suite.smb_skipped
         ));
         for (oi, op) in suite.operations.iter().enumerate() {
+            let smb_median_ms = if suite.smb_skipped || op.smb_timed_out() {
+                "null".to_string()
+            } else {
+                format!("{:.2}", op.smb_median().as_secs_f64() * 1000.0)
+            };
+            let native_median_ms = if op.native_timed_out() {
+                "null".to_string()
+            } else {
+                format!("{:.2}", op.native_median().as_secs_f64() * 1000.0)
+            };
+            let smb2_median_ms = if op.smb2_timed_out() {
+                "null".to_string()
+            } else {
+                format!("{:.2}", op.smb2_median().as_secs_f64() * 1000.0)
+            };
+
             out.push_str(&format!(
-                "        {{\n          \"name\": \"{}\",\n          \"native_ms\": [{native}],\n          \"direct_ms\": [{direct}],\n          \"smb2_ms\": [{smb2}],\n          \"native_median_ms\": {:.2},\n          \"direct_median_ms\": {:.2},\n          \"smb2_median_ms\": {:.2},\n          \"smb2_vs_native\": {:.3},\n          \"smb2_vs_direct\": {:.3}\n        }}",
+                "        {{\n          \"name\": \"{}\",\n          \"native_ms\": [{native}],\n          \"smb_ms\": [{smb}],\n          \"smb2_ms\": [{smb2}],\n          \"native_median_ms\": {native_median_ms},\n          \"smb_median_ms\": {smb_median_ms},\n          \"smb2_median_ms\": {smb2_median_ms},\n          \"smb2_vs_native\": {vs_native},\n          \"smb2_vs_smb\": {vs_smb}\n        }}",
                 op.name,
-                op.native_median().as_secs_f64() * 1000.0,
-                op.direct_median().as_secs_f64() * 1000.0,
-                op.smb2_median().as_secs_f64() * 1000.0,
-                op.smb2_vs_native(),
-                op.smb2_vs_direct(),
-                native = op.native_times.iter().map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0)).collect::<Vec<_>>().join(", "),
-                direct = op.direct_times.iter().map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0)).collect::<Vec<_>>().join(", "),
-                smb2 = op.smb2_times.iter().map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0)).collect::<Vec<_>>().join(", "),
+                vs_native = if op.native_timed_out() || op.smb2_timed_out() { "null".to_string() } else { format!("{:.3}", op.smb2_vs_native()) },
+                vs_smb = if suite.smb_skipped || op.smb_timed_out() || op.smb2_timed_out() { "null".to_string() } else { format!("{:.3}", op.smb2_vs_smb()) },
+                native = format_times_json(&op.native_times),
+                smb = format_times_json(&op.smb_times),
+                smb2 = format_times_json(&op.smb2_times),
             ));
             if oi < suite.operations.len() - 1 {
                 out.push(',');
@@ -89,6 +127,20 @@ fn build_json(results: &AllResults) -> String {
     }
     out.push_str("  ]\n}\n");
     out
+}
+
+fn format_times_json(times: &[std::time::Duration]) -> String {
+    times
+        .iter()
+        .map(|d| {
+            if *d == TIMED_OUT {
+                "null".to_string()
+            } else {
+                format!("{:.2}", d.as_secs_f64() * 1000.0)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_duration_ms(ms: f64) -> String {
