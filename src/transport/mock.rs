@@ -25,6 +25,8 @@ pub struct MockTransport {
     responses: Mutex<VecDeque<Vec<u8>>>,
     /// Messages that were sent, for assertions.
     sent: Mutex<Vec<Vec<u8>>>,
+    /// How many times `receive()` was called (including those returning Disconnected).
+    receive_count: Mutex<usize>,
 }
 
 impl MockTransport {
@@ -33,6 +35,7 @@ impl MockTransport {
         Self {
             responses: Mutex::new(VecDeque::new()),
             sent: Mutex::new(Vec::new()),
+            receive_count: Mutex::new(0),
         }
     }
 
@@ -68,6 +71,11 @@ impl MockTransport {
     pub fn clear_sent(&self) {
         self.sent.lock().unwrap().clear();
     }
+
+    /// How many times `receive()` was called successfully (returned Ok).
+    pub fn received_count(&self) -> usize {
+        *self.receive_count.lock().unwrap()
+    }
 }
 
 impl Default for MockTransport {
@@ -87,11 +95,16 @@ impl TransportSend for MockTransport {
 #[async_trait]
 impl TransportReceive for MockTransport {
     async fn receive(&self) -> Result<Vec<u8>> {
-        self.responses
+        let result = self
+            .responses
             .lock()
             .unwrap()
             .pop_front()
-            .ok_or(Error::Disconnected)
+            .ok_or(Error::Disconnected);
+        if result.is_ok() {
+            *self.receive_count.lock().unwrap() += 1;
+        }
+        result
     }
 }
 

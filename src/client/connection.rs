@@ -471,6 +471,19 @@ impl Connection {
                 self.credits = self.credits.saturating_add(header.credits);
             }
 
+            // Unsolicited oplock/lease break notification: arrives with
+            // MessageId = 0xFFFFFFFFFFFFFFFF (MS-SMB2 3.2.5.19).
+            // We don't cache, so we skip the notification without sending
+            // an acknowledgment. The server will time out and forcibly
+            // break the oplock after ~35 seconds, which is safe.
+            if header.message_id == MessageId::UNSOLICITED {
+                debug!(
+                    "recv: skipping unsolicited oplock break notification, cmd={:?}",
+                    header.command,
+                );
+                continue;
+            }
+
             // STATUS_PENDING is an interim response: collect credits and
             // keep waiting for the final response (MS-SMB2 3.3.4.3).
             if header.status.is_pending() {
@@ -681,15 +694,31 @@ impl Connection {
     /// Splits the response by `NextCommand` offsets and returns each
     /// sub-response as `(Header, body_bytes)`.
     pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>> {
-        let resp_bytes = self.receiver.receive().await?;
-        trace!("recv_compound: raw response {} bytes", resp_bytes.len());
+        // Loop to skip unsolicited oplock/lease break notifications that
+        // may arrive before the compound response we're waiting for.
+        let resp_bytes = loop {
+            let raw = self.receiver.receive().await?;
+            trace!("recv_compound: raw response {} bytes", raw.len());
 
-        // Check for compression transform header and decompress if needed.
-        let resp_bytes = if resp_bytes.len() >= 4 && resp_bytes[0..4] == COMPRESSION_PROTOCOL_ID {
-            trace!("recv_compound: detected compression transform header, decompressing");
-            decompress_response(&resp_bytes)?
-        } else {
-            resp_bytes
+            // Check for compression transform header and decompress if needed.
+            let decompressed = if raw.len() >= 4 && raw[0..4] == COMPRESSION_PROTOCOL_ID {
+                trace!("recv_compound: detected compression transform header, decompressing");
+                decompress_response(&raw)?
+            } else {
+                raw
+            };
+
+            // Check if this is an unsolicited oplock break (MessageId = 0xFFFF...).
+            // Parse the MessageId from the raw header bytes (offset 24..32).
+            if decompressed.len() >= Header::SIZE {
+                let msg_id = u64::from_le_bytes(decompressed[24..32].try_into().unwrap());
+                if msg_id == MessageId::UNSOLICITED.0 {
+                    debug!("recv_compound: skipping unsolicited oplock break notification");
+                    continue;
+                }
+            }
+
+            break decompressed;
         };
 
         let mut results = Vec::new();
@@ -1925,5 +1954,124 @@ mod tests {
         let result = decompress_response(&[0xFC, b'S', b'M']);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    // ── Unsolicited oplock break tests ─────────────────────────────
+
+    use crate::msg::oplock_break::OplockBreak;
+
+    /// Build an unsolicited oplock break notification frame.
+    fn build_oplock_break_notification() -> Vec<u8> {
+        let mut h = Header::new_request(Command::OplockBreak);
+        h.message_id = MessageId::UNSOLICITED;
+        h.flags.set_response();
+        h.credits = 0;
+
+        let body = OplockBreak {
+            oplock_level: OplockLevel::LevelII,
+            file_id: FileId {
+                persistent: 0x1234,
+                volatile: 0x5678,
+            },
+        };
+
+        pack_message(&h, &body)
+    }
+
+    /// Build a simple Echo response for use as the "real" response
+    /// after oplock break notifications.
+    fn build_echo_response() -> Vec<u8> {
+        let mut h = Header::new_request(Command::Echo);
+        h.flags.set_response();
+        h.credits = 10;
+        h.message_id = MessageId(42);
+
+        let body = crate::msg::echo::EchoResponse;
+        pack_message(&h, &body)
+    }
+
+    #[tokio::test]
+    async fn receive_response_skips_unsolicited_oplock_break() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Queue an oplock break notification followed by a normal response.
+        mock.queue_response(build_oplock_break_notification());
+        mock.queue_response(build_echo_response());
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let (header, _body, _raw) = conn.receive_response().await.unwrap();
+
+        // Should have skipped the oplock break and returned the Echo response.
+        assert_eq!(header.command, Command::Echo);
+        assert_eq!(header.message_id, MessageId(42));
+
+        // Both messages should have been received from the mock.
+        assert_eq!(mock.received_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn receive_response_skips_multiple_oplock_breaks() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Queue 3 oplock break notifications then a normal response.
+        mock.queue_response(build_oplock_break_notification());
+        mock.queue_response(build_oplock_break_notification());
+        mock.queue_response(build_oplock_break_notification());
+        mock.queue_response(build_echo_response());
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let (header, _body, _raw) = conn.receive_response().await.unwrap();
+
+        assert_eq!(header.command, Command::Echo);
+        assert_eq!(header.message_id, MessageId(42));
+
+        // All 4 messages should have been received from the mock.
+        assert_eq!(mock.received_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_skips_unsolicited_oplock_break() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Queue an oplock break notification before the compound response.
+        mock.queue_response(build_oplock_break_notification());
+
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        let create_resp = build_test_create_response(file_id, 100);
+        let close_resp = build_test_close_response();
+        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let responses = conn.receive_compound().await.unwrap();
+
+        // Should have skipped the oplock break and returned the compound.
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].0.command, Command::Create);
+        assert_eq!(responses[1].0.command, Command::Close);
+
+        // Both frames should have been received from the mock.
+        assert_eq!(mock.received_count(), 2);
     }
 }
