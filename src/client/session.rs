@@ -211,8 +211,8 @@ impl Session {
                 // Key length: 256 bits only for AES-256 ciphers. GMAC signing
                 // uses AES-128-GCM internally, so it needs 128-bit (16-byte) keys.
                 let key_len_bits = match params.cipher {
-                    Some(super::connection::Cipher::Aes256Ccm)
-                    | Some(super::connection::Cipher::Aes256Gcm) => 256,
+                    Some(crate::crypto::encryption::Cipher::Aes256Ccm)
+                    | Some(crate::crypto::encryption::Cipher::Aes256Gcm) => 256,
                     _ => 128,
                 };
                 let keys = derive_session_keys(

@@ -213,6 +213,16 @@ pub fn decrypt_message(
 
 // ── Raw encrypt/decrypt helpers ──────────────────────────────────────
 
+/// Copy a generic-array auth tag into a fixed-size `[u8; 16]` array.
+fn tag_to_array<N>(tag: GenericArray<u8, N>) -> [u8; 16]
+where
+    N: aes_gcm::aead::generic_array::ArrayLength<u8>,
+{
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&tag);
+    arr
+}
+
 /// Encrypt `buffer` in place and return the 16-byte auth tag.
 fn encrypt_raw(
     cipher: Cipher,
@@ -223,54 +233,38 @@ fn encrypt_raw(
 ) -> Result<[u8; 16], Error> {
     let map_err = |_| Error::invalid_data("encryption failed");
 
-    let tag_ga = match cipher {
+    let tag = match cipher {
         Cipher::Aes128Ccm => {
             let c = Aes128Ccm::new(GenericArray::from_slice(key));
             let n = GenericArray::from_slice(nonce);
             c.encrypt_in_place_detached(n, aad, buffer)
-                .map(|t| {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(&t);
-                    arr
-                })
+                .map(tag_to_array)
                 .map_err(map_err)?
         }
         Cipher::Aes128Gcm => {
             let c = aes_gcm::Aes128Gcm::new(GenericArray::from_slice(key));
             let n: &GenericArray<u8, U12> = GenericArray::from_slice(nonce);
             c.encrypt_in_place_detached(n, aad, buffer)
-                .map(|t| {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(&t);
-                    arr
-                })
+                .map(tag_to_array)
                 .map_err(map_err)?
         }
         Cipher::Aes256Ccm => {
             let c = Aes256Ccm::new(GenericArray::from_slice(key));
             let n = GenericArray::from_slice(nonce);
             c.encrypt_in_place_detached(n, aad, buffer)
-                .map(|t| {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(&t);
-                    arr
-                })
+                .map(tag_to_array)
                 .map_err(map_err)?
         }
         Cipher::Aes256Gcm => {
             let c = aes_gcm::Aes256Gcm::new(GenericArray::from_slice(key));
             let n: &GenericArray<u8, U12> = GenericArray::from_slice(nonce);
             c.encrypt_in_place_detached(n, aad, buffer)
-                .map(|t| {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(&t);
-                    arr
-                })
+                .map(tag_to_array)
                 .map_err(map_err)?
         }
     };
 
-    Ok(tag_ga)
+    Ok(tag)
 }
 
 /// Decrypt `buffer` in place, verifying the 16-byte auth tag.

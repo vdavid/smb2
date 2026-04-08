@@ -9,6 +9,7 @@ use std::time::Duration;
 use log::{debug, info, trace, warn};
 
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
+use crate::crypto::encryption::Cipher;
 use crate::crypto::kdf::PreauthHasher;
 use crate::crypto::signing::{self, SigningAlgorithm};
 use crate::error::Result;
@@ -28,19 +29,6 @@ use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, Dialect, MessageId, SessionId, TreeId};
 use crate::Error;
-
-/// Negotiated cipher for SMB 3.x encryption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cipher {
-    /// AES-128-CCM.
-    Aes128Ccm,
-    /// AES-128-GCM.
-    Aes128Gcm,
-    /// AES-256-CCM.
-    Aes256Ccm,
-    /// AES-256-GCM.
-    Aes256Gcm,
-}
 
 /// Parameters established during negotiate.
 #[derive(Debug, Clone)]
@@ -496,24 +484,16 @@ impl Connection {
         // Verify signature if signing is active AND the response has the
         // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
         // interim responses and unsolicited oplock break notifications.
-        if self.should_sign && resp_bytes.len() >= 20 {
-            let flags = u32::from_le_bytes(
-                resp_bytes[16..20]
-                    .try_into()
-                    .map_err(|_| Error::invalid_data("response too short for flags"))?,
-            );
+        // A valid SMB2 header is always 64 bytes. Guard on that so the
+        // field accesses below (up to byte 32) are guaranteed in-bounds.
+        if self.should_sign && resp_bytes.len() >= Header::SIZE {
+            let flags = u32::from_le_bytes(resp_bytes[16..20].try_into().unwrap());
             let is_signed = (flags & HeaderFlags::SIGNED) != 0;
 
             // Also check for STATUS_PENDING (skip verification) and
             // unsolicited messages (MessageId 0xFFFFFFFFFFFFFFFF).
-            let status = u32::from_le_bytes(
-                resp_bytes[8..12]
-                    .try_into()
-                    .map_err(|_| Error::invalid_data("response too short for status"))?,
-            );
-            let msg_id_bytes: [u8; 8] = resp_bytes[24..32]
-                .try_into()
-                .map_err(|_| Error::invalid_data("response too short for message ID"))?;
+            let status = u32::from_le_bytes(resp_bytes[8..12].try_into().unwrap());
+            let msg_id_bytes: [u8; 8] = resp_bytes[24..32].try_into().unwrap();
             let msg_id = u64::from_le_bytes(msg_id_bytes);
             let is_pending = status == NtStatus::PENDING.0;
             let is_unsolicited = msg_id == 0xFFFF_FFFF_FFFF_FFFF;
