@@ -5,3 +5,5 @@
 //! RC4-HMAC encryption, and checksum computation.
 
 pub mod crypto;
+pub mod kdc;
+pub mod messages;
