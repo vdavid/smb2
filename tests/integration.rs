@@ -8,12 +8,30 @@ use std::time::Duration;
 
 use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tree};
 
-/// Get the NAS password from the SMB2_TEST_NAS_PASSWORD env var.
-/// Set it before running integration tests:
-///   export SMB2_TEST_NAS_PASSWORD="your_password"
+/// Load .env file if present (no extra dependencies).
+fn load_dotenv() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                // Only set if not already in the environment (env var takes precedence).
+                if std::env::var(key.trim()).is_err() {
+                    std::env::set_var(key.trim(), value.trim());
+                }
+            }
+        }
+    }
+}
+
+/// Get the NAS password from SMB2_TEST_NAS_PASSWORD (env var or .env file).
 fn nas_password() -> String {
+    load_dotenv();
     std::env::var("SMB2_TEST_NAS_PASSWORD")
-        .expect("SMB2_TEST_NAS_PASSWORD env var required for integration tests")
+        .expect("SMB2_TEST_NAS_PASSWORD not set. Copy .env.example to .env and fill in your password.")
 }
 
 #[tokio::test]

@@ -379,6 +379,40 @@ impl Tree {
         Ok(())
     }
 
+    /// Start watching a directory for changes.
+    ///
+    /// Opens the directory and returns a [`Watcher`](crate::client::watcher::Watcher) that yields change
+    /// events via [`next_events()`](crate::client::watcher::Watcher::next_events).
+    /// The server holds each request until changes occur, making this a
+    /// long-poll operation.
+    ///
+    /// Set `recursive` to `true` to watch the entire subtree.
+    ///
+    /// The returned `Watcher` borrows the connection mutably, so no other
+    /// operations can run on it while watching. Use a separate connection
+    /// (a second `SmbClient`) if you need to perform operations while watching.
+    pub async fn watch<'a>(
+        &'a self,
+        conn: &'a mut Connection,
+        path: &str,
+        recursive: bool,
+    ) -> Result<crate::client::watcher::Watcher<'a>> {
+        let normalized = normalize_path(path);
+        debug!(
+            "tree: watch path={}, recursive={}, tree_id={}",
+            normalized, recursive, self.tree_id
+        );
+
+        // Open the directory with FILE_LIST_DIRECTORY access (same as
+        // FILE_READ_DATA = 0x0001). We need the handle to stay open for
+        // the lifetime of the watcher.
+        let file_id = self.open_directory(conn, &normalized).await?;
+
+        Ok(crate::client::watcher::Watcher::new(
+            self, conn, file_id, recursive,
+        ))
+    }
+
     /// Delete a file.
     ///
     /// Opens the file with `DELETE_ON_CLOSE`, then closes the handle.

@@ -2,3 +2,4 @@
 related-repos/
 target/
 .DS_Store
+.env

@@ -76,5 +76,8 @@ pub use client::pipeline::{Op, OpResult, Pipeline};
 pub use client::connection::NegotiatedParams;
 pub use client::session::Session;
 
+// File watching
+pub use client::watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
+
 // Share enumeration
 pub use rpc::srvsvc::ShareInfo;

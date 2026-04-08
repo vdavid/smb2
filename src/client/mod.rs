@@ -11,6 +11,7 @@ pub mod session;
 pub mod shares;
 pub mod stream;
 pub mod tree;
+pub mod watcher;
 
 pub use connection::{Cipher, Connection, NegotiatedParams};
 pub use pipeline::{Op, OpResult, Pipeline};
@@ -18,6 +19,7 @@ pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, Progress};
 pub use tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
+pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
 // (SmbClient, ClientConfig, and connect are defined below in this file.)
@@ -571,6 +573,25 @@ impl SmbClient {
         file_id: FileId,
     ) -> Result<()> {
         tree.flush_handle(&mut self.conn, file_id).await
+    }
+
+    /// Watch a directory for changes.
+    ///
+    /// Opens the directory and returns a [`Watcher`] that yields change
+    /// events. The server holds each request until changes occur (long poll).
+    ///
+    /// Set `recursive` to `true` to watch the entire subtree.
+    ///
+    /// The returned `Watcher` borrows the connection mutably, so no other
+    /// operations can run on this client while watching. Use a separate
+    /// `SmbClient` (second TCP connection) to perform operations during a watch.
+    pub async fn watch<'a>(
+        &'a mut self,
+        tree: &'a Tree,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Watcher<'a>> {
+        tree.watch(&mut self.conn, path, recursive).await
     }
 
     /// Disconnect from a share.
