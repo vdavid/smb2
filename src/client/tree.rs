@@ -4,7 +4,7 @@
 //! It provides methods for directory listing, file reading/writing, deletion,
 //! renaming, stat, and directory creation.
 
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 
 use crate::client::connection::Connection;
 use crate::error::Result;
@@ -596,7 +596,7 @@ impl Tree {
         }
 
         // Check QUERY_INFO response.
-        if query_header.status != NtStatus::SUCCESS {
+        if !query_header.status.is_success_or_partial() {
             // QUERY_INFO failed. Issue standalone CLOSE to clean up.
             let mut cursor = ReadCursor::new(&responses[0].1);
             let create_resp = CreateResponse::unpack(&mut cursor)?;
@@ -609,6 +609,9 @@ impl Tree {
                 status: query_header.status,
                 command: Command::QueryInfo,
             });
+        }
+        if query_header.status == NtStatus::BUFFER_OVERFLOW {
+            warn!("recv: STATUS_BUFFER_OVERFLOW on FileFsFullSizeInformation, response data may be truncated");
         }
 
         // Parse the FileFsFullSizeInformation response.
@@ -1745,11 +1748,14 @@ impl Tree {
             .await?;
 
         let (resp_header, resp_body, _) = conn.receive_response().await?;
-        if resp_header.status != NtStatus::SUCCESS {
+        if !resp_header.status.is_success_or_partial() {
             return Err(Error::Protocol {
                 status: resp_header.status,
                 command: Command::QueryInfo,
             });
+        }
+        if resp_header.status == NtStatus::BUFFER_OVERFLOW {
+            warn!("recv: STATUS_BUFFER_OVERFLOW on FileBasicInformation, response data may be truncated");
         }
 
         let mut cursor = ReadCursor::new(&resp_body);
@@ -1785,11 +1791,14 @@ impl Tree {
             .await?;
 
         let (resp_header, resp_body, _) = conn.receive_response().await?;
-        if resp_header.status != NtStatus::SUCCESS {
+        if !resp_header.status.is_success_or_partial() {
             return Err(Error::Protocol {
                 status: resp_header.status,
                 command: Command::QueryInfo,
             });
+        }
+        if resp_header.status == NtStatus::BUFFER_OVERFLOW {
+            warn!("recv: STATUS_BUFFER_OVERFLOW on FileStandardInformation, response data may be truncated");
         }
 
         let mut cursor = ReadCursor::new(&resp_body);
@@ -2290,10 +2299,15 @@ mod tests {
     }
 
     fn build_query_info_response(output_buffer: Vec<u8>) -> Vec<u8> {
+        build_query_info_response_with_status(NtStatus::SUCCESS, output_buffer)
+    }
+
+    fn build_query_info_response_with_status(status: NtStatus, output_buffer: Vec<u8>) -> Vec<u8> {
         use crate::msg::query_info::QueryInfoResponse;
         let mut h = Header::new_request(Command::QueryInfo);
         h.flags.set_response();
         h.credits = 32;
+        h.status = status;
 
         let body = QueryInfoResponse { output_buffer };
         pack_message(&h, &body)
@@ -3615,5 +3629,56 @@ mod tests {
         // Verify CLOSE uses sentinel FileId.
         let close_parsed = CloseRequest::unpack(&mut cursor4).unwrap();
         assert_eq!(close_parsed.file_id, FileId::SENTINEL);
+    }
+
+    // ── BUFFER_OVERFLOW tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn stat_accepts_buffer_overflow_as_partial_data() {
+        // STATUS_BUFFER_OVERFLOW is a warning, not an error. The response
+        // body contains valid partial data and should be parsed.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xCC,
+            volatile: 0xDD,
+        };
+
+        // STAT = CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
+        mock.queue_response(build_create_response(file_id, 0));
+
+        // Return BUFFER_OVERFLOW for the basic info query (simulating truncated data
+        // that still contains the minimum required fields).
+        let basic = build_file_basic_info(
+            132_000_000_000_000_000,
+            132_100_000_000_000_000,
+            133_000_000_000_000_000,
+            133_000_000_000_000_000,
+            0x20, // ARCHIVE
+        );
+        mock.queue_response(build_query_info_response_with_status(
+            NtStatus::BUFFER_OVERFLOW,
+            basic,
+        ));
+
+        // Standard info returns SUCCESS.
+        let std_info = build_file_standard_info(4096, 1024, 1, false, false);
+        mock.queue_response(build_query_info_response(std_info));
+
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        // Should succeed despite BUFFER_OVERFLOW on the basic info query.
+        let info = tree.stat(&mut conn, "partial.txt").await.unwrap();
+        assert_eq!(info.size, 1024);
+        assert!(!info.is_directory);
+        assert_eq!(info.created, FileTime(132_000_000_000_000_000));
+        assert_eq!(mock.sent_count(), 4);
     }
 }

@@ -207,6 +207,15 @@ impl NtStatus {
         *self == Self::PENDING
     }
 
+    /// Returns `true` if this status indicates the operation produced usable data.
+    ///
+    /// This includes `SUCCESS` and warnings like `BUFFER_OVERFLOW` where partial
+    /// data is valid and should be parsed.
+    #[inline]
+    pub fn is_success_or_partial(&self) -> bool {
+        self.is_success() || *self == Self::BUFFER_OVERFLOW
+    }
+
     /// Returns `true` if the server wants another SESSION_SETUP round-trip.
     ///
     /// Check this BEFORE `is_error()` during authentication -- it has
@@ -309,6 +318,21 @@ mod tests {
     #[test]
     fn default_is_success() {
         assert_eq!(NtStatus::default(), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn is_success_or_partial() {
+        // SUCCESS is usable
+        assert!(NtStatus::SUCCESS.is_success_or_partial());
+        // BUFFER_OVERFLOW is a warning with valid partial data
+        assert!(NtStatus::BUFFER_OVERFLOW.is_success_or_partial());
+        // Errors are not usable
+        assert!(!NtStatus::ACCESS_DENIED.is_success_or_partial());
+        // PENDING has success severity (0b00) so is_success() is true,
+        // but callers handle PENDING separately before reaching status checks.
+        assert!(NtStatus::PENDING.is_success_or_partial());
+        // Other warnings (not BUFFER_OVERFLOW) are not usable
+        assert!(!NtStatus::NO_MORE_FILES.is_success_or_partial());
     }
 
     #[test]
