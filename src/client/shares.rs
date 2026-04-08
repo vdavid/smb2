@@ -9,7 +9,9 @@ use log::{debug, info};
 use crate::client::connection::Connection;
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
-use crate::msg::create::{CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess};
+use crate::msg::create::{
+    CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
+};
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::msg::tree_connect::{TreeConnectRequest, TreeConnectRequestFlags, TreeConnectResponse};
 use crate::msg::tree_disconnect::TreeDisconnectRequest;
@@ -89,10 +91,7 @@ async fn tree_connect_ipc(conn: &mut Connection) -> Result<TreeId> {
 }
 
 /// Open the srvsvc pipe, perform the RPC bind and request, then close.
-async fn pipe_rpc_exchange(
-    conn: &mut Connection,
-    tree_id: TreeId,
-) -> Result<Vec<ShareInfo>> {
+async fn pipe_rpc_exchange(conn: &mut Connection, tree_id: TreeId) -> Result<Vec<ShareInfo>> {
     // 2. Create \pipe\srvsvc
     let file_id = open_srvsvc_pipe(conn, tree_id).await?;
 
@@ -125,7 +124,10 @@ async fn rpc_bind_and_request(
     let server_name = format!(r"\\{}", conn.server_name());
     let request_data = srvsvc::build_net_share_enum_all(2, &server_name);
     write_pipe(conn, tree_id, file_id, &request_data).await?;
-    debug!("shares: sent NetShareEnumAll request ({} bytes)", request_data.len());
+    debug!(
+        "shares: sent NetShareEnumAll request ({} bytes)",
+        request_data.len()
+    );
 
     // 6. Read RPC RESPONSE
     let response_data = read_pipe(conn, tree_id, file_id).await?;
@@ -144,16 +146,16 @@ async fn open_srvsvc_pipe(conn: &mut Connection, tree_id: TreeId) -> Result<File
             FileAccessMask::FILE_READ_DATA | FileAccessMask::FILE_WRITE_DATA,
         ),
         file_attributes: 0,
-        share_access: ShareAccess(
-            ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE,
-        ),
+        share_access: ShareAccess(ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE),
         create_disposition: CreateDisposition::FileOpen,
         create_options: 0,
         name: r"srvsvc".to_string(),
         create_contexts: vec![],
     };
 
-    let (_, _) = conn.send_request(Command::Create, &req, Some(tree_id)).await?;
+    let (_, _) = conn
+        .send_request(Command::Create, &req, Some(tree_id))
+        .await?;
     let (resp_header, resp_body, _) = conn.receive_response().await?;
 
     if resp_header.status != NtStatus::SUCCESS {
@@ -189,7 +191,9 @@ async fn write_pipe(
         data: data.to_vec(),
     };
 
-    let (_, _) = conn.send_request(Command::Write, &req, Some(tree_id)).await?;
+    let (_, _) = conn
+        .send_request(Command::Write, &req, Some(tree_id))
+        .await?;
     let (resp_header, resp_body, _) = conn.receive_response().await?;
 
     if resp_header.status != NtStatus::SUCCESS {
@@ -206,11 +210,7 @@ async fn write_pipe(
 }
 
 /// Read data from the pipe.
-async fn read_pipe(
-    conn: &mut Connection,
-    tree_id: TreeId,
-    file_id: FileId,
-) -> Result<Vec<u8>> {
+async fn read_pipe(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> Result<Vec<u8>> {
     let req = ReadRequest {
         padding: 0x50,
         flags: 0,
@@ -223,7 +223,9 @@ async fn read_pipe(
         read_channel_info: vec![],
     };
 
-    let (_, _) = conn.send_request(Command::Read, &req, Some(tree_id)).await?;
+    let (_, _) = conn
+        .send_request(Command::Read, &req, Some(tree_id))
+        .await?;
     let (resp_header, resp_body, _) = conn.receive_response().await?;
 
     if resp_header.status != NtStatus::SUCCESS {
@@ -240,17 +242,12 @@ async fn read_pipe(
 }
 
 /// Close a file handle.
-async fn close_handle(
-    conn: &mut Connection,
-    tree_id: TreeId,
-    file_id: FileId,
-) -> Result<()> {
-    let req = CloseRequest {
-        flags: 0,
-        file_id,
-    };
+async fn close_handle(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> Result<()> {
+    let req = CloseRequest { flags: 0, file_id };
 
-    let (_, _) = conn.send_request(Command::Close, &req, Some(tree_id)).await?;
+    let (_, _) = conn
+        .send_request(Command::Close, &req, Some(tree_id))
+        .await?;
     let (resp_header, _, _) = conn.receive_response().await?;
 
     if resp_header.status != NtStatus::SUCCESS {
@@ -266,7 +263,9 @@ async fn close_handle(
 /// Disconnect from a tree.
 async fn tree_disconnect(conn: &mut Connection, tree_id: TreeId) -> Result<()> {
     let body = TreeDisconnectRequest;
-    let (_, _) = conn.send_request(Command::TreeDisconnect, &body, Some(tree_id)).await?;
+    let (_, _) = conn
+        .send_request(Command::TreeDisconnect, &body, Some(tree_id))
+        .await?;
     let (resp_header, _, _) = conn.receive_response().await?;
 
     if resp_header.status != NtStatus::SUCCESS {
@@ -604,10 +603,7 @@ pub(crate) mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
 
-        queue_share_listing_responses(
-            &mock,
-            &[("TestShare", STYPE_DISKTREE, "A test share")],
-        );
+        queue_share_listing_responses(&mock, &[("TestShare", STYPE_DISKTREE, "A test share")]);
 
         let _shares = list_shares(&mut conn).await.unwrap();
 
@@ -649,11 +645,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn list_shares_uses_correct_server_name() {
         let mock = Arc::new(MockTransport::new());
-        let mut conn = Connection::from_transport(
-            Box::new(mock.clone()),
-            Box::new(mock.clone()),
-            "my-nas",
-        );
+        let mut conn =
+            Connection::from_transport(Box::new(mock.clone()), Box::new(mock.clone()), "my-nas");
         conn.set_test_params(NegotiatedParams {
             dialect: Dialect::Smb2_0_2,
             max_read_size: 65536,
@@ -667,10 +660,7 @@ pub(crate) mod tests {
         });
         conn.set_session_id(SessionId(0x1234));
 
-        queue_share_listing_responses(
-            &mock,
-            &[("share1", STYPE_DISKTREE, "")],
-        );
+        queue_share_listing_responses(&mock, &[("share1", STYPE_DISKTREE, "")]);
 
         let shares = list_shares(&mut conn).await.unwrap();
         assert_eq!(shares.len(), 1);
@@ -682,9 +672,7 @@ pub(crate) mod tests {
         let unc_utf8 = String::from_utf8_lossy(tree_connect_bytes);
         // Verify the server name appears somewhere in the raw bytes
         assert!(
-            tree_connect_bytes
-                .windows(2)
-                .any(|w| w == b"m\0"), // 'm' in UTF-16LE from "my-nas"
+            tree_connect_bytes.windows(2).any(|w| w == b"m\0"), // 'm' in UTF-16LE from "my-nas"
             "TREE_CONNECT should reference the server name"
         );
         drop(unc_utf8);

@@ -499,9 +499,7 @@ mod tests {
                 FileAccessMask::GENERIC_READ | FileAccessMask::FILE_READ_ATTRIBUTES,
             ),
             file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
-            share_access: ShareAccess(
-                ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE,
-            ),
+            share_access: ShareAccess(ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE),
             create_disposition: CreateDisposition::FileOpenIf,
             create_options: 0,
             name: "test\\file.txt".to_string(),
@@ -515,7 +513,10 @@ mod tests {
         let mut r = ReadCursor::new(&bytes);
         let decoded = CreateRequest::unpack(&mut r).unwrap();
 
-        assert_eq!(decoded.requested_oplock_level, original.requested_oplock_level);
+        assert_eq!(
+            decoded.requested_oplock_level,
+            original.requested_oplock_level
+        );
         assert_eq!(decoded.impersonation_level, original.impersonation_level);
         assert_eq!(decoded.desired_access, original.desired_access);
         assert_eq!(decoded.file_attributes, original.file_attributes);

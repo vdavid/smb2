@@ -112,11 +112,7 @@ mod tests {
     #[tokio::test]
     async fn queue_multiple_responses_received_in_order() {
         let mock = MockTransport::new();
-        mock.queue_responses(vec![
-            vec![0x01],
-            vec![0x02, 0x03],
-            vec![0x04, 0x05, 0x06],
-        ]);
+        mock.queue_responses(vec![vec![0x01], vec![0x02, 0x03], vec![0x04, 0x05, 0x06]]);
 
         assert_eq!(mock.receive().await.unwrap(), vec![0x01]);
         assert_eq!(mock.receive().await.unwrap(), vec![0x02, 0x03]);

@@ -123,10 +123,7 @@ mod tests {
             data3: 0x11D1,
             data4: [0x80, 0xB4, 0x00, 0xC0, 0x4F, 0xD4, 0x30, 0xC8],
         };
-        assert_eq!(
-            guid.to_string(),
-            "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}"
-        );
+        assert_eq!(guid.to_string(), "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}");
     }
 
     #[test]

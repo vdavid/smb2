@@ -208,11 +208,7 @@ impl SmbClient {
     ///
     /// This is a convenience wrapper around [`Tree::list_directory`] that
     /// saves you from threading `connection_mut()` through every call.
-    pub async fn list_directory(
-        &mut self,
-        tree: &Tree,
-        path: &str,
-    ) -> Result<Vec<DirectoryEntry>> {
+    pub async fn list_directory(&mut self, tree: &Tree, path: &str) -> Result<Vec<DirectoryEntry>> {
         tree.list_directory(&mut self.conn, path).await
     }
 
@@ -236,12 +232,7 @@ impl SmbClient {
     }
 
     /// Write data to a file on the given share (create or overwrite).
-    pub async fn write_file(
-        &mut self,
-        tree: &Tree,
-        path: &str,
-        data: &[u8],
-    ) -> Result<u64> {
+    pub async fn write_file(&mut self, tree: &Tree, path: &str, data: &[u8]) -> Result<u64> {
         tree.write_file(&mut self.conn, path, data).await
     }
 
@@ -408,9 +399,7 @@ impl SmbClient {
             ))
         } else {
             // Large file: open the file, let the caller drive chunks.
-            let file_id = tree
-                .open_file_for_write(&mut self.conn, normalized)
-                .await?;
+            let file_id = tree.open_file_for_write(&mut self.conn, normalized).await?;
             let chunk_size = max_write as u32;
             Ok(stream::FileUpload::new(
                 tree,
@@ -461,11 +450,7 @@ impl SmbClient {
 
         let (_, _) = self
             .conn
-            .send_request(
-                crate::types::Command::Create,
-                &req,
-                Some(tree.tree_id),
-            )
+            .send_request(crate::types::Command::Create, &req, Some(tree.tree_id))
             .await?;
 
         let (resp_header, resp_body, _) = self.conn.receive_response().await?;
@@ -510,11 +495,7 @@ impl SmbClient {
 
             let (_, _) = self
                 .conn
-                .send_request(
-                    crate::types::Command::Write,
-                    &write_req,
-                    Some(tree.tree_id),
-                )
+                .send_request(crate::types::Command::Write, &write_req, Some(tree.tree_id))
                 .await?;
 
             let (resp_header, resp_body, _) = self.conn.receive_response().await?;
@@ -567,11 +548,7 @@ impl SmbClient {
     /// `write_file_with_progress`) flush automatically before closing.
     /// Use this if you need to flush a handle obtained through the
     /// low-level API.
-    pub async fn flush_file(
-        &mut self,
-        tree: &Tree,
-        file_id: FileId,
-    ) -> Result<()> {
+    pub async fn flush_file(&mut self, tree: &Tree, file_id: FileId) -> Result<()> {
         tree.flush_handle(&mut self.conn, file_id).await
     }
 
@@ -928,7 +905,11 @@ mod tests {
         queue_share_listing_responses(
             &mock,
             &[
-                ("Documents", crate::rpc::srvsvc::STYPE_DISKTREE, "Shared docs"),
+                (
+                    "Documents",
+                    crate::rpc::srvsvc::STYPE_DISKTREE,
+                    "Shared docs",
+                ),
                 (
                     "IPC$",
                     crate::rpc::srvsvc::STYPE_IPC | crate::rpc::srvsvc::STYPE_SPECIAL,

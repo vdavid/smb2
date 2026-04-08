@@ -96,16 +96,13 @@ impl TransportReceive for TcpTransport {
 
         // Read the 4-byte framing header.
         let mut frame_header = [0u8; 4];
-        reader
-            .read_exact(&mut frame_header)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    Error::Disconnected
-                } else {
-                    Error::Io(e)
-                }
-            })?;
+        reader.read_exact(&mut frame_header).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::Disconnected
+            } else {
+                Error::Io(e)
+            }
+        })?;
 
         // Validate the first byte is 0x00.
         if frame_header[0] != 0x00 {
@@ -213,9 +210,7 @@ mod tests {
     /// A helper that creates a pair of connected streams via a TCP listener
     /// on localhost, then writes data to one side and reads from the other.
     async fn receive_from_bytes(data: &[u8]) -> Result<Vec<u8>> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let data = data.to_vec();
@@ -345,9 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_and_receive_roundtrip() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_task = tokio::spawn(async move {
@@ -377,9 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_and_receive_multiple_messages() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_task = tokio::spawn(async move {
@@ -420,9 +411,7 @@ mod tests {
         // While we can't force byte-at-a-time delivery reliably, we
         // verify correctness with a larger payload that's more likely
         // to arrive in multiple reads.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let payload: Vec<u8> = (0..=255).cycle().take(8192).collect();
@@ -456,9 +445,7 @@ mod tests {
     #[tokio::test]
     async fn connect_with_timeout() {
         // Connect to localhost listener with a generous timeout.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let transport = TcpTransport::connect(addr, Duration::from_secs(5))
@@ -486,8 +473,7 @@ mod tests {
     async fn connect_timeout_fires() {
         // Try to connect to a non-routable address. This should time out.
         // 192.0.2.1 is a TEST-NET address (RFC 5737) that should be unreachable.
-        let result =
-            TcpTransport::connect("192.0.2.1:445", Duration::from_millis(100)).await;
+        let result = TcpTransport::connect("192.0.2.1:445", Duration::from_millis(100)).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         // Could be Timeout or Io depending on OS behavior.

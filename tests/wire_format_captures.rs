@@ -100,9 +100,9 @@ fn build_negotiate_request() -> (Header, NegotiateRequest) {
             NegotiateContext::PreauthIntegrity {
                 hash_algorithms: vec![HASH_ALGORITHM_SHA512],
                 salt: vec![
-                    0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-                    0x77, 0x88, 0x99, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
-                    0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01,
+                    0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                    0x88, 0x99, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0,
+                    0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01,
                 ],
             },
             NegotiateContext::Encryption {
@@ -147,7 +147,11 @@ async fn negotiate_request_is_accepted_by_real_server() {
     let msg = pack_message(&header, &request);
 
     // Verify our packed message starts with the SMB2 protocol ID.
-    assert_eq!(&msg[0..4], &PROTOCOL_ID, "packed message should start with SMB2 magic");
+    assert_eq!(
+        &msg[0..4],
+        &PROTOCOL_ID,
+        "packed message should start with SMB2 magic"
+    );
 
     // Send with NetBIOS framing.
     let frame = netbios_frame(&msg);
@@ -160,10 +164,7 @@ async fn negotiate_request_is_accepted_by_real_server() {
     let resp_bytes = read_smb2_message(&mut stream).await;
 
     // Print raw bytes for future use as offline test vectors.
-    println!(
-        "--- Negotiate response ({} bytes) ---",
-        resp_bytes.len()
-    );
+    println!("--- Negotiate response ({} bytes) ---", resp_bytes.len());
     println!("Raw hex: {:02x?}", &resp_bytes);
 
     // Parse the response header.
@@ -249,10 +250,7 @@ async fn negotiate_request_is_accepted_by_real_server() {
     );
 
     // System time should be non-zero (it's a FILETIME of the current time).
-    assert!(
-        resp_body.system_time > 0,
-        "system_time should be non-zero"
-    );
+    assert!(resp_body.system_time > 0, "system_time should be non-zero");
 
     // If SMB 3.1.1 was negotiated, verify negotiate contexts.
     if resp_body.dialect_revision == Dialect::Smb3_1_1 {
@@ -262,9 +260,10 @@ async fn negotiate_request_is_accepted_by_real_server() {
         );
 
         // Should have at least a PreauthIntegrity context.
-        let has_preauth = resp_body.negotiate_contexts.iter().any(|ctx| {
-            matches!(ctx, NegotiateContext::PreauthIntegrity { .. })
-        });
+        let has_preauth = resp_body
+            .negotiate_contexts
+            .iter()
+            .any(|ctx| matches!(ctx, NegotiateContext::PreauthIntegrity { .. }));
         assert!(
             has_preauth,
             "SMB 3.1.1 response should include PreauthIntegrity context"
@@ -285,10 +284,7 @@ async fn negotiate_request_is_accepted_by_real_server() {
                         hash_algorithms.contains(&HASH_ALGORITHM_SHA512),
                         "server should select SHA-512 for preauth integrity"
                     );
-                    assert!(
-                        !salt.is_empty(),
-                        "server preauth salt should be non-empty"
-                    );
+                    assert!(!salt.is_empty(), "server preauth salt should be non-empty");
                 }
                 NegotiateContext::Encryption { ciphers } => {
                     println!("  Encryption: ciphers={:?}", ciphers);
@@ -345,10 +341,7 @@ async fn negotiate_request_roundtrips_through_pack_unpack() {
         rt_request.security_mode.bits(),
         request.security_mode.bits()
     );
-    assert_eq!(
-        rt_request.capabilities.bits(),
-        request.capabilities.bits()
-    );
+    assert_eq!(rt_request.capabilities.bits(), request.capabilities.bits());
     assert_eq!(rt_request.client_guid, request.client_guid);
     assert_eq!(
         rt_request.negotiate_contexts.len(),
@@ -402,10 +395,7 @@ async fn negotiate_response_repacks_to_same_bytes() {
         }
     }
 
-    println!(
-        "Repack test passed: {} bytes match perfectly",
-        compare_len
-    );
+    println!("Repack test passed: {} bytes match perfectly", compare_len);
 }
 
 #[tokio::test]
@@ -520,7 +510,10 @@ async fn packed_header_bytes_match_protocol_spec() {
     assert_eq!(&msg[48..64], &[0u8; 16]);
 
     // Total header size is 64.
-    assert!(msg.len() >= 64, "message should be at least 64 bytes (header)");
+    assert!(
+        msg.len() >= 64,
+        "message should be at least 64 bytes (header)"
+    );
 
     // Byte 64-65: NegotiateRequest StructureSize = 36 (LE)
     assert_eq!(&msg[64..66], &36u16.to_le_bytes());

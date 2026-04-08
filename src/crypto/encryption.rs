@@ -10,9 +10,7 @@ use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{AeadInPlace, KeyInit};
 use ccm::consts::{U11, U16};
 
-use crate::msg::transform::{
-    TransformHeader, SMB2_TRANSFORM_HEADER_FLAG_ENCRYPTED,
-};
+use crate::msg::transform::{TransformHeader, SMB2_TRANSFORM_HEADER_FLAG_ENCRYPTED};
 use crate::pack::{Pack, WriteCursor};
 use crate::types::SessionId;
 use crate::Error;
@@ -27,7 +25,6 @@ const AAD_OFFSET: usize = 20;
 
 /// Total size of the TRANSFORM_HEADER in bytes.
 const HEADER_SIZE: usize = TransformHeader::SIZE; // 52
-
 
 // ── CCM type aliases ─────────────────────────────────────────────────
 
@@ -103,10 +100,7 @@ impl NonceGenerator {
     /// can never happen (2^64 messages at line speed would take millennia).
     pub fn next(&mut self, _cipher: Cipher) -> [u8; 16] {
         let count = self.counter;
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .expect("nonce counter overflow");
+        self.counter = self.counter.checked_add(1).expect("nonce counter overflow");
         let mut nonce = [0u8; 16];
         nonce[..8].copy_from_slice(&count.to_le_bytes());
         nonce
@@ -436,7 +430,11 @@ mod tests {
         // Bytes 8..11: zeros (padding to 11-byte CCM nonce).
         assert_eq!(nonce[8..11], [0, 0, 0], "CCM nonce padding (8..11)");
         // Bytes 11..16: zeros (unused portion of the 16-byte field).
-        assert_eq!(nonce[11..16], [0, 0, 0, 0, 0], "unused nonce bytes (11..16)");
+        assert_eq!(
+            nonce[11..16],
+            [0, 0, 0, 0, 0],
+            "unused nonce bytes (11..16)"
+        );
     }
 
     // ── Tampered ciphertext fails decryption ─────────────────────────
@@ -492,7 +490,11 @@ mod tests {
     fn aad_is_correct_header_region() {
         // Verify the AAD constants match the spec.
         assert_eq!(AAD_OFFSET, 20, "AAD starts at byte 20");
-        assert_eq!(HEADER_SIZE - AAD_OFFSET, 32, "AAD is 32 bytes (Nonce + OrigMsgSize + Reserved + Flags + SessionId)");
+        assert_eq!(
+            HEADER_SIZE - AAD_OFFSET,
+            32,
+            "AAD is 32 bytes (Nonce + OrigMsgSize + Reserved + Flags + SessionId)"
+        );
         assert_eq!(HEADER_SIZE, 52, "TRANSFORM_HEADER is 52 bytes");
 
         // Build a header and verify the AAD region contains the expected fields.
@@ -556,8 +558,7 @@ mod tests {
         let mut gen = NonceGenerator::new();
         let nonce = gen.next(cipher);
 
-        let (header, _) =
-            encrypt_message(plaintext, &key, cipher, &nonce, session_id).unwrap();
+        let (header, _) = encrypt_message(plaintext, &key, cipher, &nonce, session_id).unwrap();
 
         // First 4 bytes must be 0xFD 'S' 'M' 'B'.
         assert_eq!(&header[..4], &TRANSFORM_PROTOCOL_ID);
@@ -579,16 +580,14 @@ mod tests {
         let mut gen = NonceGenerator::new();
         let nonce = gen.next(cipher);
 
-        let (header, _) =
-            encrypt_message(plaintext, &key, cipher, &nonce, session_id).unwrap();
+        let (header, _) = encrypt_message(plaintext, &key, cipher, &nonce, session_id).unwrap();
 
         // The signature (auth tag) lives at bytes 4..20.
         let signature = &header[4..20];
 
         // It should NOT be all zeros (that would mean we forgot to write it).
         assert_ne!(
-            signature,
-            &[0u8; 16],
+            signature, &[0u8; 16],
             "signature must not be all zeros after encryption"
         );
 
@@ -601,8 +600,7 @@ mod tests {
         // Instead, let's verify the tag by a proper roundtrip.
         drop(decrypted);
 
-        let (header2, ct2) =
-            encrypt_message(plaintext, &key, cipher, &nonce, session_id).unwrap();
+        let (header2, ct2) = encrypt_message(plaintext, &key, cipher, &nonce, session_id).unwrap();
         let result = decrypt_message(&header2, &ct2, &key, cipher).unwrap();
         assert_eq!(result, plaintext);
     }

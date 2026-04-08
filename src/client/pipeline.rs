@@ -13,7 +13,6 @@ use log::debug;
 use crate::client::connection::Connection;
 use crate::client::tree::Tree;
 
-
 /// An operation to execute through the pipeline.
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -114,10 +113,7 @@ impl<'a> Pipeline<'a> {
                 debug!("pipeline: read_file path={}", path);
                 match self.tree.read_file(self.conn, &path).await {
                     Ok(data) => OpResult::FileData { path, data },
-                    Err(e) => OpResult::Error {
-                        path,
-                        error: e,
-                    },
+                    Err(e) => OpResult::Error { path, error: e },
                 }
             }
             Op::WriteFile(path, data) => {
@@ -127,40 +123,28 @@ impl<'a> Pipeline<'a> {
                         path,
                         bytes_written,
                     },
-                    Err(e) => OpResult::Error {
-                        path,
-                        error: e,
-                    },
+                    Err(e) => OpResult::Error { path, error: e },
                 }
             }
             Op::Delete(path) => {
                 debug!("pipeline: delete path={}", path);
                 match self.tree.delete_file(self.conn, &path).await {
                     Ok(()) => OpResult::Deleted { path },
-                    Err(e) => OpResult::Error {
-                        path,
-                        error: e,
-                    },
+                    Err(e) => OpResult::Error { path, error: e },
                 }
             }
             Op::ListDirectory(path) => {
                 debug!("pipeline: list_directory path={}", path);
                 match self.tree.list_directory(self.conn, &path).await {
                     Ok(entries) => OpResult::DirEntries { path, entries },
-                    Err(e) => OpResult::Error {
-                        path,
-                        error: e,
-                    },
+                    Err(e) => OpResult::Error { path, error: e },
                 }
             }
             Op::Stat(path) => {
                 debug!("pipeline: stat path={}", path);
                 match self.tree.stat(self.conn, &path).await {
                     Ok(info) => OpResult::Stat { path, info },
-                    Err(e) => OpResult::Error {
-                        path,
-                        error: e,
-                    },
+                    Err(e) => OpResult::Error { path, error: e },
                 }
             }
         }
@@ -457,7 +441,10 @@ mod tests {
     async fn pipeline_batch_of_three_reads() {
         let mock = Arc::new(MockTransport::new());
 
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         // Three read operations, each needs a compound CREATE + READ + CLOSE frame.
         for i in 0..3 {
@@ -469,11 +456,13 @@ mod tests {
         let tree = test_tree();
         let mut pipeline = Pipeline::new(&mut conn, &tree);
 
-        let results = pipeline.execute(vec![
-            Op::ReadFile("file1.txt".to_string()),
-            Op::ReadFile("file2.txt".to_string()),
-            Op::ReadFile("file3.txt".to_string()),
-        ]).await;
+        let results = pipeline
+            .execute(vec![
+                Op::ReadFile("file1.txt".to_string()),
+                Op::ReadFile("file2.txt".to_string()),
+                Op::ReadFile("file3.txt".to_string()),
+            ])
+            .await;
 
         assert_eq!(results.len(), 3);
         for (i, result) in results.into_iter().enumerate() {
@@ -491,7 +480,10 @@ mod tests {
     async fn pipeline_mixed_ops() {
         let mock = Arc::new(MockTransport::new());
 
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         // Op 1: ReadFile — compound CREATE + READ + CLOSE
         mock.queue_response(build_compound_read_response(file_id, b"hello".to_vec()));
@@ -504,18 +496,23 @@ mod tests {
         mock.queue_response(build_create_response_directory(file_id));
         let entry = build_file_both_dir_info("test.txt", 100, false, 0);
         mock.queue_response(build_query_directory_response(NtStatus::SUCCESS, entry));
-        mock.queue_response(build_query_directory_response(NtStatus::NO_MORE_FILES, vec![]));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
         mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
         let tree = test_tree();
         let mut pipeline = Pipeline::new(&mut conn, &tree);
 
-        let results = pipeline.execute(vec![
-            Op::ReadFile("data.bin".to_string()),
-            Op::Delete("old.txt".to_string()),
-            Op::ListDirectory("docs".to_string()),
-        ]).await;
+        let results = pipeline
+            .execute(vec![
+                Op::ReadFile("data.bin".to_string()),
+                Op::Delete("old.txt".to_string()),
+                Op::ListDirectory("docs".to_string()),
+            ])
+            .await;
 
         assert_eq!(results.len(), 3);
 
@@ -541,7 +538,10 @@ mod tests {
     #[tokio::test]
     async fn pipeline_delete_file() {
         let mock = Arc::new(MockTransport::new());
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         // DELETE = CREATE(DELETE_ON_CLOSE) + CLOSE
         mock.queue_response(build_create_response(file_id, 0));
@@ -551,9 +551,9 @@ mod tests {
         let tree = test_tree();
         let mut pipeline = Pipeline::new(&mut conn, &tree);
 
-        let results = pipeline.execute(vec![
-            Op::Delete("remove_me.txt".to_string()),
-        ]).await;
+        let results = pipeline
+            .execute(vec![Op::Delete("remove_me.txt".to_string())])
+            .await;
 
         assert_eq!(results.len(), 1);
         match &results[0] {
@@ -569,7 +569,10 @@ mod tests {
     #[tokio::test]
     async fn pipeline_write_file() {
         let mock = Arc::new(MockTransport::new());
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         // WRITE uses compound: CREATE+WRITE+FLUSH+CLOSE in one frame.
         let create_resp = build_create_response(file_id, 0);
@@ -584,13 +587,19 @@ mod tests {
         let tree = test_tree();
         let mut pipeline = Pipeline::new(&mut conn, &tree);
 
-        let results = pipeline.execute(vec![
-            Op::WriteFile("output.txt".to_string(), b"hello world".to_vec()),
-        ]).await;
+        let results = pipeline
+            .execute(vec![Op::WriteFile(
+                "output.txt".to_string(),
+                b"hello world".to_vec(),
+            )])
+            .await;
 
         assert_eq!(results.len(), 1);
         match &results[0] {
-            OpResult::Written { path, bytes_written } => {
+            OpResult::Written {
+                path,
+                bytes_written,
+            } => {
                 assert_eq!(path, "output.txt");
                 assert_eq!(*bytes_written, 11);
             }
@@ -601,7 +610,10 @@ mod tests {
     #[tokio::test]
     async fn pipeline_stat() {
         let mock = Arc::new(MockTransport::new());
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         // STAT = CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
         mock.queue_response(build_create_response(file_id, 0));
@@ -618,11 +630,11 @@ mod tests {
 
         // FileStandardInformation response
         let std_info = build_file_standard_info(
-            4096,   // allocation_size
-            2048,   // end_of_file (actual size)
-            1,      // number_of_links
-            false,  // delete_pending
-            false,  // directory
+            4096,  // allocation_size
+            2048,  // end_of_file (actual size)
+            1,     // number_of_links
+            false, // delete_pending
+            false, // directory
         );
         mock.queue_response(build_query_info_response(std_info));
 
@@ -632,9 +644,9 @@ mod tests {
         let tree = test_tree();
         let mut pipeline = Pipeline::new(&mut conn, &tree);
 
-        let results = pipeline.execute(vec![
-            Op::Stat("info.txt".to_string()),
-        ]).await;
+        let results = pipeline
+            .execute(vec![Op::Stat("info.txt".to_string())])
+            .await;
 
         assert_eq!(results.len(), 1);
         match &results[0] {
@@ -652,7 +664,10 @@ mod tests {
     #[tokio::test]
     async fn pipeline_error_does_not_abort_batch() {
         let mock = Arc::new(MockTransport::new());
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         // Op 1: ReadFile that fails at CREATE — compound frame with cascaded errors.
         let error_body = ErrorResponse {
@@ -678,7 +693,9 @@ mod tests {
         h3.status = NtStatus::OBJECT_NAME_NOT_FOUND;
         let close_err = pack_message(&h3, &error_body);
 
-        mock.queue_response(build_compound_response_frame(&[create_err, read_err, close_err]));
+        mock.queue_response(build_compound_response_frame(&[
+            create_err, read_err, close_err,
+        ]));
 
         // Op 2: ReadFile that succeeds — compound frame.
         mock.queue_response(build_compound_read_response(file_id, b"abc".to_vec()));
@@ -687,10 +704,12 @@ mod tests {
         let tree = test_tree();
         let mut pipeline = Pipeline::new(&mut conn, &tree);
 
-        let results = pipeline.execute(vec![
-            Op::ReadFile("missing.txt".to_string()),
-            Op::ReadFile("exists.txt".to_string()),
-        ]).await;
+        let results = pipeline
+            .execute(vec![
+                Op::ReadFile("missing.txt".to_string()),
+                Op::ReadFile("exists.txt".to_string()),
+            ])
+            .await;
 
         assert_eq!(results.len(), 2);
         match &results[0] {

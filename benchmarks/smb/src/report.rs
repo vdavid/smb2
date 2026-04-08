@@ -4,13 +4,18 @@ use crate::runner::{AllResults, TIMED_OUT};
 use std::path::PathBuf;
 
 pub fn print_table(results: &AllResults) {
-    println!("\n\n╔══════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                              SMB BENCHMARK RESULTS                                 ║");
-    println!("╚══════════════════════════════════════════════════════════════════════════════════════╝\n");
+    println!(
+        "\n\n╔══════════════════════════════════════════════════════════════════════════════════════╗"
+    );
+    println!(
+        "║                              SMB BENCHMARK RESULTS                                 ║"
+    );
+    println!(
+        "╚══════════════════════════════════════════════════════════════════════════════════════╝\n"
+    );
 
     for suite in &results.suites {
-        let total_mb =
-            (suite.file_count as f64 * suite.file_size_bytes as f64) / (1024.0 * 1024.0);
+        let total_mb = (suite.file_count as f64 * suite.file_size_bytes as f64) / (1024.0 * 1024.0);
         println!(
             "Target: {} | Suite: {} — {} files x {} KB ({:.1} MB total)",
             suite.target_name,
@@ -19,9 +24,15 @@ pub fn print_table(results: &AllResults) {
             suite.file_size_bytes / 1024,
             total_mb,
         );
-        println!("┌──────────────┬──────────────┬──────────────┬──────────────┬──────────┬──────────┐");
-        println!("│ operation    │ native       │ smb          │ smb2         │ smb2/nat │ smb2/smb │");
-        println!("├──────────────┼──────────────┼──────────────┼──────────────┼──────────┼──────────┤");
+        println!(
+            "┌──────────────┬──────────────┬──────────────┬──────────────┬──────────┬──────────┐"
+        );
+        println!(
+            "│ operation    │ native       │ smb          │ smb2         │ smb2/nat │ smb2/smb │"
+        );
+        println!(
+            "├──────────────┼──────────────┼──────────────┼──────────────┼──────────┼──────────┤"
+        );
 
         for op in &suite.operations {
             let native_str = format_time_or_status(&op.native_times);
@@ -38,7 +49,11 @@ pub fn print_table(results: &AllResults) {
                 format_ratio(op.smb2_vs_native())
             };
 
-            let vs_smb_str = if suite.smb_skipped || op.smb_skipped() || op.smb_timed_out() || op.smb2_timed_out() {
+            let vs_smb_str = if suite.smb_skipped
+                || op.smb_skipped()
+                || op.smb_timed_out()
+                || op.smb2_timed_out()
+            {
                 "N/A".to_string()
             } else {
                 format_ratio(op.smb2_vs_smb())
@@ -46,15 +61,12 @@ pub fn print_table(results: &AllResults) {
 
             println!(
                 "│ {:<12} │ {:>10} │ {:>10} │ {:>10} │ {:>7} │ {:>7} │",
-                op.name,
-                native_str,
-                smb_str,
-                smb2_str,
-                vs_native_str,
-                vs_smb_str,
+                op.name, native_str, smb_str, smb2_str, vs_native_str, vs_smb_str,
             );
         }
-        println!("└──────────────┴──────────────┴──────────────┴──────────────┴──────────┴──────────┘\n");
+        println!(
+            "└──────────────┴──────────────┴──────────────┴──────────────┴──────────┴──────────┘\n"
+        );
     }
 
     println!("Ratios: smb2/native and smb2/smb — values < 1.0 mean smb2 is faster.\n");

@@ -1,7 +1,7 @@
 //! Orchestrates benchmark runs: warmup, iterations, median calculation.
 
 use crate::config::{BenchConfig, Target};
-use crate::{native, smb2_runner, smb_runner, Suite};
+use crate::{Suite, native, smb_runner, smb2_runner};
 use rand::Rng;
 use smb2::{SmbClient, Tree};
 use std::path::PathBuf;
@@ -158,22 +158,42 @@ async fn run_suite(
 
     // Connect for smb crate operations (unless skipped)
     let smb_conn = if skip_smb {
-        println!("  {} {}/{}: smb crate skipped (--skip-smb)", elapsed_tag(bench_start), target.name, suite.name);
+        println!(
+            "  {} {}/{}: smb crate skipped (--skip-smb)",
+            elapsed_tag(bench_start),
+            target.name,
+            suite.name
+        );
         None
     } else {
-        print!("  {} {}/{}: smb crate connecting...", elapsed_tag(bench_start), target.name, suite.name);
+        print!(
+            "  {} {}/{}: smb crate connecting...",
+            elapsed_tag(bench_start),
+            target.name,
+            suite.name
+        );
         let conn = smb_runner::connect(target).await?;
         println!("done");
         Some(conn)
     };
 
     // Connect for smb2 operations
-    print!("  {} {}/{}: smb2 connecting...", elapsed_tag(bench_start), target.name, suite.name);
+    print!(
+        "  {} {}/{}: smb2 connecting...",
+        elapsed_tag(bench_start),
+        target.name,
+        suite.name
+    );
     let (mut smb2_client, smb2_tree) = smb2_runner::connect(target).await?;
     println!("done");
 
     // Warmup run (not counted) — primes NAS caches
-    println!("  {} {}/{}: warmup run...", elapsed_tag(bench_start), target.name, suite.name);
+    println!(
+        "  {} {}/{}: warmup run...",
+        elapsed_tag(bench_start),
+        target.name,
+        suite.name
+    );
     run_one_cycle(
         target,
         smb_conn.as_ref(),
@@ -236,8 +256,9 @@ async fn run_suite(
         for &method in &order {
             match method {
                 0 => {
-                    n_result =
-                        Some(run_native_cycle(target, suite, &data, &tmp_base, &n_id, bench_start).await);
+                    n_result = Some(
+                        run_native_cycle(target, suite, &data, &tmp_base, &n_id, bench_start).await,
+                    );
                 }
                 1 => {
                     let (client, unc_path, chunks) = smb_conn.as_ref().unwrap();
@@ -345,27 +366,44 @@ async fn run_native_cycle(
     let dir = native::setup(target, cycle_id).expect("native setup");
 
     // Upload
-    print!("  {} {}: native upload...", elapsed_tag(bench_start), prefix);
+    print!(
+        "  {} {}: native upload...",
+        elapsed_tag(bench_start),
+        prefix
+    );
     let upload_time = {
         let dir = dir.clone();
         let count = suite.file_count;
         let size = suite.file_size_bytes;
         let data = data.to_vec();
-        match tokio::time::timeout(OP_TIMEOUT, tokio::task::spawn_blocking(move || {
-            native::upload(&dir, count, size, &data)
-        })).await {
-            Ok(Ok(d)) => { println!("done ({:.2}s)", d.as_secs_f64()); d }
-            Ok(Err(e)) => { println!("FAILED: {e}"); TIMED_OUT }
-            Err(_) => { println!("TIMEOUT"); TIMED_OUT }
+        match tokio::time::timeout(
+            OP_TIMEOUT,
+            tokio::task::spawn_blocking(move || native::upload(&dir, count, size, &data)),
+        )
+        .await
+        {
+            Ok(Ok(d)) => {
+                println!("done ({:.2}s)", d.as_secs_f64());
+                d
+            }
+            Ok(Err(e)) => {
+                println!("FAILED: {e}");
+                TIMED_OUT
+            }
+            Err(_) => {
+                println!("TIMEOUT");
+                TIMED_OUT
+            }
         }
     };
 
     // List
     print!("  {} {}: native list...", elapsed_tag(bench_start), prefix);
-    let list_time = {
-        let dir = dir.clone();
-        let expected = suite.file_count;
-        match tokio::time::timeout(OP_TIMEOUT, tokio::task::spawn_blocking(move || {
+    let list_time =
+        {
+            let dir = dir.clone();
+            let expected = suite.file_count;
+            match tokio::time::timeout(OP_TIMEOUT, tokio::task::spawn_blocking(move || {
             let (count, elapsed) = native::list(&dir);
             if count != expected {
                 log::warn!(
@@ -379,34 +417,69 @@ async fn run_native_cycle(
             Ok(Err(e)) => { println!("FAILED: {e}"); TIMED_OUT }
             Err(_) => { println!("TIMEOUT"); TIMED_OUT }
         }
-    };
+        };
 
     // Download
-    print!("  {} {}: native download...", elapsed_tag(bench_start), prefix);
+    print!(
+        "  {} {}: native download...",
+        elapsed_tag(bench_start),
+        prefix
+    );
     let download_time = {
         let dir = dir.clone();
         let dl_dir = tmp_base.join(format!("native-dl-{cycle_id}"));
         let dl_dir2 = dl_dir.clone();
-        match tokio::time::timeout(OP_TIMEOUT, tokio::task::spawn_blocking(move || {
-            let (_, elapsed) = native::download(&dir, &dl_dir2);
-            elapsed
-        })).await {
-            Ok(Ok(d)) => { println!("done ({:.2}s)", d.as_secs_f64()); let _ = std::fs::remove_dir_all(&dl_dir); d }
-            Ok(Err(e)) => { println!("FAILED: {e}"); TIMED_OUT }
-            Err(_) => { println!("TIMEOUT"); TIMED_OUT }
+        match tokio::time::timeout(
+            OP_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let (_, elapsed) = native::download(&dir, &dl_dir2);
+                elapsed
+            }),
+        )
+        .await
+        {
+            Ok(Ok(d)) => {
+                println!("done ({:.2}s)", d.as_secs_f64());
+                let _ = std::fs::remove_dir_all(&dl_dir);
+                d
+            }
+            Ok(Err(e)) => {
+                println!("FAILED: {e}");
+                TIMED_OUT
+            }
+            Err(_) => {
+                println!("TIMEOUT");
+                TIMED_OUT
+            }
         }
     };
 
     // Delete
-    print!("  {} {}: native delete...", elapsed_tag(bench_start), prefix);
+    print!(
+        "  {} {}: native delete...",
+        elapsed_tag(bench_start),
+        prefix
+    );
     let delete_time = {
         let dir = dir.clone();
-        match tokio::time::timeout(OP_TIMEOUT, tokio::task::spawn_blocking(move || {
-            native::delete(&dir)
-        })).await {
-            Ok(Ok(d)) => { println!("done ({:.2}s)", d.as_secs_f64()); d }
-            Ok(Err(e)) => { println!("FAILED: {e}"); TIMED_OUT }
-            Err(_) => { println!("TIMEOUT"); TIMED_OUT }
+        match tokio::time::timeout(
+            OP_TIMEOUT,
+            tokio::task::spawn_blocking(move || native::delete(&dir)),
+        )
+        .await
+        {
+            Ok(Ok(d)) => {
+                println!("done ({:.2}s)", d.as_secs_f64());
+                d
+            }
+            Ok(Err(e)) => {
+                println!("FAILED: {e}");
+                TIMED_OUT
+            }
+            Err(_) => {
+                println!("TIMEOUT");
+                TIMED_OUT
+            }
         }
     };
 
@@ -436,30 +509,49 @@ async fn run_smb_cycle(
     print!("  {} {}: smb upload...", elapsed_tag(bench_start), prefix);
     let upload_time = match tokio::time::timeout(
         OP_TIMEOUT,
-        smb_runner::upload(client, unc_path, &test_dir, suite.file_count, suite.file_size_bytes, data, chunks.write),
-    ).await {
-        Ok(d) => { println!("done ({:.2}s)", d.as_secs_f64()); d }
-        Err(_) => { println!("TIMEOUT"); TIMED_OUT }
+        smb_runner::upload(
+            client,
+            unc_path,
+            &test_dir,
+            suite.file_count,
+            suite.file_size_bytes,
+            data,
+            chunks.write,
+        ),
+    )
+    .await
+    {
+        Ok(d) => {
+            println!("done ({:.2}s)", d.as_secs_f64());
+            d
+        }
+        Err(_) => {
+            println!("TIMEOUT");
+            TIMED_OUT
+        }
     };
 
     // List
     print!("  {} {}: smb list...", elapsed_tag(bench_start), prefix);
-    let list_time = match tokio::time::timeout(
-        OP_TIMEOUT,
-        smb_runner::list(client, unc_path, &test_dir),
-    ).await {
-        Ok((count, d)) => {
-            if count != suite.file_count {
-                log::warn!(
-                    "smb list count mismatch: got {} expected {} (stale directory?)",
-                    count, suite.file_count
-                );
+    let list_time =
+        match tokio::time::timeout(OP_TIMEOUT, smb_runner::list(client, unc_path, &test_dir)).await
+        {
+            Ok((count, d)) => {
+                if count != suite.file_count {
+                    log::warn!(
+                        "smb list count mismatch: got {} expected {} (stale directory?)",
+                        count,
+                        suite.file_count
+                    );
+                }
+                println!("done ({:.2}s)", d.as_secs_f64());
+                d
             }
-            println!("done ({:.2}s)", d.as_secs_f64());
-            d
-        }
-        Err(_) => { println!("TIMEOUT"); TIMED_OUT }
-    };
+            Err(_) => {
+                println!("TIMEOUT");
+                TIMED_OUT
+            }
+        };
 
     // Download
     print!("  {} {}: smb download...", elapsed_tag(bench_start), prefix);
@@ -467,20 +559,36 @@ async fn run_smb_cycle(
     let download_time = match tokio::time::timeout(
         OP_TIMEOUT,
         smb_runner::download(client, unc_path, &test_dir, &dl_dir, chunks.read),
-    ).await {
-        Ok((_, d)) => { println!("done ({:.2}s)", d.as_secs_f64()); let _ = std::fs::remove_dir_all(&dl_dir); d }
-        Err(_) => { println!("TIMEOUT"); let _ = std::fs::remove_dir_all(&dl_dir); TIMED_OUT }
+    )
+    .await
+    {
+        Ok((_, d)) => {
+            println!("done ({:.2}s)", d.as_secs_f64());
+            let _ = std::fs::remove_dir_all(&dl_dir);
+            d
+        }
+        Err(_) => {
+            println!("TIMEOUT");
+            let _ = std::fs::remove_dir_all(&dl_dir);
+            TIMED_OUT
+        }
     };
 
     // Delete
     print!("  {} {}: smb delete...", elapsed_tag(bench_start), prefix);
-    let delete_time = match tokio::time::timeout(
-        OP_TIMEOUT,
-        smb_runner::delete(client, unc_path, &test_dir),
-    ).await {
-        Ok(d) => { println!("done ({:.2}s)", d.as_secs_f64()); d }
-        Err(_) => { println!("TIMEOUT"); TIMED_OUT }
-    };
+    let delete_time =
+        match tokio::time::timeout(OP_TIMEOUT, smb_runner::delete(client, unc_path, &test_dir))
+            .await
+        {
+            Ok(d) => {
+                println!("done ({:.2}s)", d.as_secs_f64());
+                d
+            }
+            Err(_) => {
+                println!("TIMEOUT");
+                TIMED_OUT
+            }
+        };
 
     (upload_time, list_time, download_time, delete_time)
 }
@@ -507,40 +615,71 @@ async fn run_smb2_cycle(
     print!("  {} {}: smb2 upload...", elapsed_tag(bench_start), prefix);
     let upload_time = match tokio::time::timeout(
         OP_TIMEOUT,
-        smb2_runner::upload(client, tree, &test_dir, suite.file_count, suite.file_size_bytes, data),
-    ).await {
-        Ok(d) => { println!("done ({:.2}s)", d.as_secs_f64()); d }
-        Err(_) => { println!("TIMEOUT"); TIMED_OUT }
+        smb2_runner::upload(
+            client,
+            tree,
+            &test_dir,
+            suite.file_count,
+            suite.file_size_bytes,
+            data,
+        ),
+    )
+    .await
+    {
+        Ok(d) => {
+            println!("done ({:.2}s)", d.as_secs_f64());
+            d
+        }
+        Err(_) => {
+            println!("TIMEOUT");
+            TIMED_OUT
+        }
     };
 
     // List
     print!("  {} {}: smb2 list...", elapsed_tag(bench_start), prefix);
-    let list_time = match tokio::time::timeout(
-        OP_TIMEOUT,
-        smb2_runner::list(client, tree, &test_dir),
-    ).await {
-        Ok((count, d)) => {
-            if count != suite.file_count {
-                log::warn!(
-                    "smb2 list count mismatch: got {} expected {} (stale directory?)",
-                    count, suite.file_count
-                );
+    let list_time =
+        match tokio::time::timeout(OP_TIMEOUT, smb2_runner::list(client, tree, &test_dir)).await {
+            Ok((count, d)) => {
+                if count != suite.file_count {
+                    log::warn!(
+                        "smb2 list count mismatch: got {} expected {} (stale directory?)",
+                        count,
+                        suite.file_count
+                    );
+                }
+                println!("done ({:.2}s)", d.as_secs_f64());
+                d
             }
-            println!("done ({:.2}s)", d.as_secs_f64());
-            d
-        }
-        Err(_) => { println!("TIMEOUT"); TIMED_OUT }
-    };
+            Err(_) => {
+                println!("TIMEOUT");
+                TIMED_OUT
+            }
+        };
 
     // Download
-    print!("  {} {}: smb2 download...", elapsed_tag(bench_start), prefix);
+    print!(
+        "  {} {}: smb2 download...",
+        elapsed_tag(bench_start),
+        prefix
+    );
     let dl_dir = tmp_base.join(format!("smb2-dl-{cycle_id}"));
     let download_time = match tokio::time::timeout(
         OP_TIMEOUT,
         smb2_runner::download(client, tree, &test_dir, &dl_dir),
-    ).await {
-        Ok((_, d)) => { println!("done ({:.2}s)", d.as_secs_f64()); let _ = std::fs::remove_dir_all(&dl_dir); d }
-        Err(_) => { println!("TIMEOUT"); let _ = std::fs::remove_dir_all(&dl_dir); TIMED_OUT }
+    )
+    .await
+    {
+        Ok((_, d)) => {
+            println!("done ({:.2}s)", d.as_secs_f64());
+            let _ = std::fs::remove_dir_all(&dl_dir);
+            d
+        }
+        Err(_) => {
+            println!("TIMEOUT");
+            let _ = std::fs::remove_dir_all(&dl_dir);
+            TIMED_OUT
+        }
     };
 
     // Delete
@@ -548,9 +687,17 @@ async fn run_smb2_cycle(
     let delete_time = match tokio::time::timeout(
         OP_TIMEOUT,
         smb2_runner::delete(client, tree, &test_dir),
-    ).await {
-        Ok(d) => { println!("done ({:.2}s)", d.as_secs_f64()); d }
-        Err(_) => { println!("TIMEOUT"); TIMED_OUT }
+    )
+    .await
+    {
+        Ok(d) => {
+            println!("done ({:.2}s)", d.as_secs_f64());
+            d
+        }
+        Err(_) => {
+            println!("TIMEOUT");
+            TIMED_OUT
+        }
     };
 
     (upload_time, list_time, download_time, delete_time)
@@ -569,9 +716,30 @@ async fn run_one_cycle(
 ) {
     let _ = run_native_cycle(target, suite, data, tmp_base, "warmup-n", bench_start).await;
     if let Some((client, unc_path, chunks)) = smb_conn {
-        let _ = run_smb_cycle(client, unc_path, chunks, suite, data, tmp_base, "warmup-d", target, bench_start).await;
+        let _ = run_smb_cycle(
+            client,
+            unc_path,
+            chunks,
+            suite,
+            data,
+            tmp_base,
+            "warmup-d",
+            target,
+            bench_start,
+        )
+        .await;
     }
-    let _ = run_smb2_cycle(smb2_client, smb2_tree, suite, data, tmp_base, "warmup-s", target, bench_start).await;
+    let _ = run_smb2_cycle(
+        smb2_client,
+        smb2_tree,
+        suite,
+        data,
+        tmp_base,
+        "warmup-s",
+        target,
+        bench_start,
+    )
+    .await;
 }
 
 fn generate_data(size: usize) -> Vec<u8> {

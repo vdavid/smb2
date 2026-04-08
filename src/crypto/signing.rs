@@ -141,7 +141,12 @@ pub fn verify_signature(
 
     trace!(
         "signing: verified msg_id={}, algo={:?}, sig={:02x}{:02x}{:02x}{:02x}...",
-        message_id, algorithm, received_sig[0], received_sig[1], received_sig[2], received_sig[3]
+        message_id,
+        algorithm,
+        received_sig[0],
+        received_sig[1],
+        received_sig[2],
+        received_sig[3]
     );
     Ok(())
 }
@@ -279,7 +284,7 @@ mod tests {
         // Fill some fields so the message isn't all zeros
         msg[12..14].copy_from_slice(&0x0008u16.to_le_bytes()); // Command = Read
         msg[24..32].copy_from_slice(&42u64.to_le_bytes()); // MessageId = 42
-        // Append body
+                                                           // Append body
         msg[64..].copy_from_slice(body_extra);
         msg
     }
@@ -428,9 +433,10 @@ mod tests {
 
         let result = verify_signature(&msg, &key, SigningAlgorithm::HmacSha256, 0, false);
         assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("verification failed"),
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("verification failed"),);
     }
 
     #[test]
@@ -650,7 +656,10 @@ mod tests {
             .try_into()
             .unwrap();
 
-        assert_ne!(sig1, sig2, "different MessageIds must produce different signatures");
+        assert_ne!(
+            sig1, sig2,
+            "different MessageIds must produce different signatures"
+        );
     }
 
     #[test]

@@ -17,8 +17,8 @@ pub mod tcp;
 pub use mock::MockTransport;
 pub use tcp::TcpTransport;
 
-use async_trait::async_trait;
 use crate::error::Result;
+use async_trait::async_trait;
 
 /// Send half of a transport connection.
 #[async_trait]
@@ -162,10 +162,9 @@ mod tests {
     async fn negotiate_via_tcp_transport() {
         use std::time::Duration;
 
-        let transport =
-            TcpTransport::connect("192.168.1.111:445", Duration::from_secs(5))
-                .await
-                .expect("failed to connect to NAS");
+        let transport = TcpTransport::connect("192.168.1.111:445", Duration::from_secs(5))
+            .await
+            .expect("failed to connect to NAS");
 
         // Build a negotiate request.
         let header = Header::new_request(Command::Negotiate);

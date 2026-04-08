@@ -19,9 +19,21 @@ use config::BenchConfig;
 /// Test file counts and sizes — turn these down during development, up for real benchmarks.
 /// Each suite is run independently against all three methods.
 const SUITES: &[Suite] = &[
-    Suite { name: "small", file_count: 100, file_size_bytes: 100 * 1024 },       // 100 x 100 KB
-    Suite { name: "medium", file_count: 10, file_size_bytes: 10 * 1024 * 1024 }, // 10 x 10 MB
-    Suite { name: "large", file_count: 3, file_size_bytes: 50 * 1024 * 1024 },   // 3 x 50 MB
+    Suite {
+        name: "small",
+        file_count: 100,
+        file_size_bytes: 100 * 1024,
+    }, // 100 x 100 KB
+    Suite {
+        name: "medium",
+        file_count: 10,
+        file_size_bytes: 10 * 1024 * 1024,
+    }, // 10 x 10 MB
+    Suite {
+        name: "large",
+        file_count: 3,
+        file_size_bytes: 50 * 1024 * 1024,
+    }, // 3 x 50 MB
 ];
 
 /// How many times to repeat each operation (after one warmup run).
@@ -62,7 +74,10 @@ async fn main() {
 
     if args.iter().any(|a| a == "--cleanup-only") {
         for target in &config.targets {
-            println!("Cleaning up test dirs on {} ({})...", target.name, target.host);
+            println!(
+                "Cleaning up test dirs on {} ({})...",
+                target.name, target.host
+            );
             native::cleanup(target).await;
             if !skip_smb {
                 smb_runner::cleanup(target).await;

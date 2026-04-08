@@ -116,7 +116,10 @@ impl Session {
         }
 
         // The server assigned a session ID — use it for subsequent requests.
-        debug!("session: round 1 complete, status={:?}, session_id={}", resp1_header.status, resp1_header.session_id);
+        debug!(
+            "session: round 1 complete, status={:?}, session_id={}",
+            resp1_header.status, resp1_header.session_id
+        );
         conn.set_session_id(resp1_header.session_id);
 
         // Parse the challenge response.
@@ -185,14 +188,24 @@ impl Session {
         // Determine signing algorithm.
         let gmac_negotiated = params.gmac_negotiated;
         let signing_algorithm = algorithm_for_dialect(params.dialect, gmac_negotiated);
-        debug!("session: signing_algo={:?}, dialect={}", signing_algorithm, params.dialect);
+        debug!(
+            "session: signing_algo={:?}, dialect={}",
+            signing_algorithm, params.dialect
+        );
 
         // Derive keys for SMB 3.x, or use session key directly for SMB 2.x.
-        trace!("session: deriving keys, session_key_len={}", session_key.len());
+        trace!(
+            "session: deriving keys, session_key_len={}",
+            session_key.len()
+        );
         let (signing_key, encryption_key, decryption_key) = match params.dialect {
             Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
                 let keys = derive_session_keys(&session_key, params.dialect, None, 128);
-                (keys.signing_key, Some(keys.encryption_key), Some(keys.decryption_key))
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
             }
             Dialect::Smb3_1_1 => {
                 // Key length: 256 bits only for AES-256 ciphers. GMAC signing
@@ -208,7 +221,11 @@ impl Session {
                     Some(session_hasher.value()),
                     key_len_bits,
                 );
-                (keys.signing_key, Some(keys.encryption_key), Some(keys.decryption_key))
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
             }
             _ => {
                 // SMB 2.x: use session key directly for signing.
@@ -218,8 +235,7 @@ impl Session {
 
         // Determine if we should sign.
         let should_sign = params.signing_required
-            || !setup_resp2.session_flags.is_guest()
-                && !setup_resp2.session_flags.is_null();
+            || !setup_resp2.session_flags.is_guest() && !setup_resp2.session_flags.is_null();
 
         let should_encrypt = setup_resp2.session_flags.encrypt_data();
 
@@ -293,7 +309,7 @@ mod tests {
         buf.extend_from_slice(&0u16.to_le_bytes()); // Len
         buf.extend_from_slice(&0u16.to_le_bytes()); // MaxLen
         buf.extend_from_slice(&56u32.to_le_bytes()); // Offset
-        // NegotiateFlags
+                                                     // NegotiateFlags
         let flags: u32 = 0x0000_0001 // UNICODE
             | 0x0000_0200  // NTLM
             | 0x0008_0000  // EXTENDED_SESSIONSECURITY

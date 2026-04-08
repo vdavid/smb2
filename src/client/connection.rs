@@ -116,11 +116,7 @@ impl Connection {
     /// Connect to an SMB server over TCP.
     pub async fn connect(addr: &str, timeout: Duration) -> Result<Self> {
         // Extract the server name (host part) from addr.
-        let server_name = addr
-            .split(':')
-            .next()
-            .unwrap_or(addr)
-            .to_string();
+        let server_name = addr.split(':').next().unwrap_or(addr).to_string();
 
         let transport = TcpTransport::connect(addr, timeout).await?;
         info!("connection: connected to {}", addr);
@@ -188,7 +184,10 @@ impl Connection {
 
         // Update preauth hash with request bytes.
         self.preauth_hasher.update(&req_bytes);
-        trace!("negotiate: preauth hash updated with request ({} bytes)", req_bytes.len());
+        trace!(
+            "negotiate: preauth hash updated with request ({} bytes)",
+            req_bytes.len()
+        );
 
         // Send and measure RTT.
         let rtt_start = std::time::Instant::now();
@@ -211,9 +210,7 @@ impl Connection {
         let resp_header = Header::unpack(&mut cursor)?;
 
         if !resp_header.is_response() {
-            return Err(Error::invalid_data(
-                "expected a response but got a request",
-            ));
+            return Err(Error::invalid_data("expected a response but got a request"));
         }
 
         if resp_header.command != Command::Negotiate {
@@ -350,7 +347,11 @@ impl Connection {
         self.sender.send(&msg_bytes).await?;
         debug!(
             "send: cmd={:?}, msg_id={}, tree_id={:?}, signed={}, len={}",
-            command, msg_id.0, tree_id, self.should_sign, msg_bytes.len()
+            command,
+            msg_id.0,
+            tree_id,
+            self.should_sign,
+            msg_bytes.len()
         );
         Ok((msg_id, msg_bytes))
     }
@@ -394,7 +395,12 @@ impl Connection {
         self.sender.send(&msg_bytes).await?;
         debug!(
             "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, len={}",
-            command, msg_id.0, credit_charge, tree_id, self.should_sign, msg_bytes.len()
+            command,
+            msg_id.0,
+            credit_charge,
+            tree_id,
+            self.should_sign,
+            msg_bytes.len()
         );
         Ok((msg_id, msg_bytes))
     }
@@ -459,8 +465,12 @@ impl Connection {
 
         debug!(
             "recv: cmd={:?}, status={:?}, msg_id={}, credits={} (was {}, granted {})",
-            header.command, header.status, header.message_id.0,
-            self.credits, prev_credits, header.credits
+            header.command,
+            header.status,
+            header.message_id.0,
+            self.credits,
+            prev_credits,
+            header.credits
         );
         if self.credits == 0 {
             warn!("recv: zero credits remaining — credit starvation");
@@ -499,7 +509,11 @@ impl Connection {
 
     /// Activate signing with the given key and algorithm.
     pub fn activate_signing(&mut self, key: Vec<u8>, algorithm: SigningAlgorithm) {
-        debug!("signing: activated, algo={:?}, key_len={}", algorithm, key.len());
+        debug!(
+            "signing: activated, algo={:?}, key_len={}",
+            algorithm,
+            key.len()
+        );
         self.signing_key = Some(key);
         self.signing_algorithm = Some(algorithm);
         self.should_sign = true;
@@ -540,7 +554,9 @@ impl Connection {
         operations: &[(Command, &dyn Pack, CreditCharge)],
     ) -> Result<Vec<MessageId>> {
         if operations.is_empty() {
-            return Err(Error::invalid_data("compound request must have at least one operation"));
+            return Err(Error::invalid_data(
+                "compound request must have at least one operation",
+            ));
         }
 
         let mut message_ids = Vec::with_capacity(operations.len());
@@ -669,7 +685,9 @@ impl Connection {
             if sub_end > resp_bytes.len() {
                 return Err(Error::invalid_data(format!(
                     "compound NextCommand offset {} at position {} exceeds response length {}",
-                    next_command, offset, resp_bytes.len(),
+                    next_command,
+                    offset,
+                    resp_bytes.len(),
                 )));
             }
 
@@ -677,22 +695,28 @@ impl Connection {
             if self.should_sign {
                 let sub_slice = &resp_bytes[sub_start..sub_end];
                 if sub_slice.len() >= 20 {
-                    let flags = u32::from_le_bytes(
-                        sub_slice[16..20]
-                            .try_into()
-                            .map_err(|_| Error::invalid_data("sub-response too short for flags"))?,
-                    );
+                    let flags =
+                        u32::from_le_bytes(sub_slice[16..20].try_into().map_err(|_| {
+                            Error::invalid_data("sub-response too short for flags")
+                        })?);
                     let is_signed = (flags & HeaderFlags::SIGNED) != 0;
-                    let status = u32::from_le_bytes(
-                        sub_slice[8..12]
-                            .try_into()
-                            .map_err(|_| Error::invalid_data("sub-response too short for status"))?,
-                    );
+                    let status =
+                        u32::from_le_bytes(sub_slice[8..12].try_into().map_err(|_| {
+                            Error::invalid_data("sub-response too short for status")
+                        })?);
                     let is_pending = status == NtStatus::PENDING.0;
 
                     if is_signed && !is_pending {
-                        if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
-                            signing::verify_signature(sub_slice, key, *algo, header.message_id.0, false)?;
+                        if let (Some(key), Some(algo)) =
+                            (&self.signing_key, &self.signing_algorithm)
+                        {
+                            signing::verify_signature(
+                                sub_slice,
+                                key,
+                                *algo,
+                                header.message_id.0,
+                                false,
+                            )?;
                         }
                     }
                 }
@@ -1021,15 +1045,15 @@ mod tests {
     // ── Compound tests ──────────────────────────────────────────────
 
     use crate::msg::close::CloseRequest;
-    use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
+    use crate::msg::close::CloseResponse;
     use crate::msg::create::{
         CreateAction, CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel,
         ShareAccess,
     };
-    use crate::msg::close::CloseResponse;
+    use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
     use crate::pack::FileTime;
-    use crate::types::{CreditCharge, FileId, OplockLevel, TreeId};
     use crate::types::flags::FileAccessMask;
+    use crate::types::{CreditCharge, FileId, OplockLevel, TreeId};
 
     /// Build a compound response frame with proper NextCommand offsets.
     fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
@@ -1160,10 +1184,7 @@ mod tests {
             (Command::Close, &close_req, CreditCharge(1)),
         ];
 
-        let msg_ids = conn
-            .send_compound(TreeId(42), &operations)
-            .await
-            .unwrap();
+        let msg_ids = conn.send_compound(TreeId(42), &operations).await.unwrap();
 
         // Should get 3 consecutive message IDs.
         assert_eq!(msg_ids.len(), 3);
@@ -1190,7 +1211,10 @@ mod tests {
         let mut cursor2 = ReadCursor::new(&sent[offset2..]);
         let h2 = Header::unpack(&mut cursor2).unwrap();
         assert_eq!(h2.command, Command::Read);
-        assert!(h2.flags.is_related(), "second request must have RELATED_OPERATIONS");
+        assert!(
+            h2.flags.is_related(),
+            "second request must have RELATED_OPERATIONS"
+        );
         assert!(h2.next_command > 0, "second NextCommand should be non-zero");
         assert_eq!(h2.next_command % 8, 0, "NextCommand must be 8-byte aligned");
 
@@ -1199,7 +1223,10 @@ mod tests {
         let mut cursor3 = ReadCursor::new(&sent[offset3..]);
         let h3 = Header::unpack(&mut cursor3).unwrap();
         assert_eq!(h3.command, Command::Close);
-        assert!(h3.flags.is_related(), "third request must have RELATED_OPERATIONS");
+        assert!(
+            h3.flags.is_related(),
+            "third request must have RELATED_OPERATIONS"
+        );
         assert_eq!(h3.next_command, 0, "last NextCommand must be 0");
     }
 
@@ -1276,7 +1303,10 @@ mod tests {
     async fn receive_compound_splits_three_responses() {
         let mock = Arc::new(MockTransport::new());
 
-        let file_id = FileId { persistent: 0x11, volatile: 0x22 };
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
         let file_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
 
         let create_resp = build_test_create_response(file_id, file_data.len() as u64);
@@ -1364,7 +1394,10 @@ mod tests {
     async fn receive_compound_updates_credits() {
         let mock = Arc::new(MockTransport::new());
 
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
         let create_resp = build_test_create_response(file_id, 0);
         let read_resp = build_test_read_response(vec![]);
         let close_resp = build_test_close_response();

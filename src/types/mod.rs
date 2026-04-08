@@ -125,14 +125,7 @@ impl fmt::Display for FileId {
 
 /// SMB2 command codes from MS-SMB2 section 2.2.1.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    num_enum::TryFromPrimitive,
-    num_enum::IntoPrimitive,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive, num_enum::IntoPrimitive,
 )]
 #[repr(u16)]
 pub enum Command {
@@ -297,7 +290,13 @@ mod tests {
         assert_eq!(MessageId::default(), MessageId(0));
         assert_eq!(TreeId::default(), TreeId(0));
         assert_eq!(CreditCharge::default(), CreditCharge(0));
-        assert_eq!(FileId::default(), FileId { persistent: 0, volatile: 0 });
+        assert_eq!(
+            FileId::default(),
+            FileId {
+                persistent: 0,
+                volatile: 0
+            }
+        );
     }
 
     // ── Command tests ───────────────────────────────────────────────

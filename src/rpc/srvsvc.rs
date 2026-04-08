@@ -43,7 +43,10 @@ pub fn build_net_share_enum_all_stub(server_name: &str) -> Vec<u8> {
     w.write_u32_le(0x0002_0000); // referent ID
 
     // Encode the server name as a conformant+varying NDR string
-    let name_utf16: Vec<u16> = server_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let name_utf16: Vec<u16> = server_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let char_count = name_utf16.len() as u32;
 
     // MaxCount
@@ -375,9 +378,11 @@ mod tests {
 
     #[test]
     fn parse_share_with_unicode_name() {
-        let response_pdu = build_test_enum_response(&[
-            ("\u{00C4}rchive", STYPE_DISKTREE, "Archiv f\u{00FC}r Dateien"),
-        ]);
+        let response_pdu = build_test_enum_response(&[(
+            "\u{00C4}rchive",
+            STYPE_DISKTREE,
+            "Archiv f\u{00FC}r Dateien",
+        )]);
 
         let shares = parse_net_share_enum_all_response(&response_pdu).unwrap();
         assert_eq!(shares.len(), 1);
@@ -387,13 +392,19 @@ mod tests {
 
     #[test]
     fn parse_share_with_cjk_characters() {
-        let response_pdu =
-            build_test_enum_response(&[("\u{5171}\u{6709}", STYPE_DISKTREE, "\u{5171}\u{6709}\u{30D5}\u{30A9}\u{30EB}\u{30C0}")]);
+        let response_pdu = build_test_enum_response(&[(
+            "\u{5171}\u{6709}",
+            STYPE_DISKTREE,
+            "\u{5171}\u{6709}\u{30D5}\u{30A9}\u{30EB}\u{30C0}",
+        )]);
 
         let shares = parse_net_share_enum_all_response(&response_pdu).unwrap();
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].name, "\u{5171}\u{6709}");
-        assert_eq!(shares[0].comment, "\u{5171}\u{6709}\u{30D5}\u{30A9}\u{30EB}\u{30C0}");
+        assert_eq!(
+            shares[0].comment,
+            "\u{5171}\u{6709}\u{30D5}\u{30A9}\u{30EB}\u{30C0}"
+        );
     }
 
     #[test]

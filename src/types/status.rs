@@ -296,10 +296,7 @@ mod tests {
 
     #[test]
     fn display_known_code() {
-        assert_eq!(
-            NtStatus::ACCESS_DENIED.to_string(),
-            "STATUS_ACCESS_DENIED"
-        );
+        assert_eq!(NtStatus::ACCESS_DENIED.to_string(), "STATUS_ACCESS_DENIED");
     }
 
     #[test]

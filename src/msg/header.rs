@@ -351,8 +351,8 @@ mod tests {
             async_id: None,
             session_id: SessionId(0xDEAD_BEEF),
             signature: [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-                0x0E, 0x0F, 0x10,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10,
             ],
         };
 
@@ -402,10 +402,7 @@ mod tests {
         let result = Header::unpack(&mut cursor);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("structure size"),
-            "error was: {err}"
-        );
+        assert!(err.contains("structure size"), "error was: {err}");
     }
 
     #[test]

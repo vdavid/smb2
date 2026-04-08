@@ -345,11 +345,7 @@ impl<'a> FileUpload<'a> {
 
     /// Create a "done" upload for small files that were already written
     /// via compound in the constructor.
-    pub(crate) fn new_done(
-        tree: &'a Tree,
-        conn: &'a mut Connection,
-        total_bytes: u64,
-    ) -> Self {
+    pub(crate) fn new_done(tree: &'a Tree, conn: &'a mut Connection, total_bytes: u64) -> Self {
         Self {
             tree,
             conn,
@@ -499,8 +495,8 @@ mod tests {
             (50, Some(100), 50.0, 0.5),
             (100, Some(100), 100.0, 1.0),
             (25, Some(100), 25.0, 0.25),
-            (0, Some(0), 100.0, 1.0),  // Empty file
-            (50, None, 0.0, 0.0),      // Unknown total
+            (0, Some(0), 100.0, 1.0), // Empty file
+            (50, None, 0.0, 0.0),     // Unknown total
         ];
         for (transferred, total, expected_pct, expected_frac) in cases {
             let p = Progress {

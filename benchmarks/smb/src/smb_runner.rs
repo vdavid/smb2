@@ -67,9 +67,7 @@ pub async fn connect(target: &Target) -> Result<(Client, UncPath, ChunkSizes), S
         .get_connection(&target.host)
         .await
         .map_err(|e| format!("get_connection: {e}"))?;
-    let conn_info = conn
-        .conn_info()
-        .ok_or("Connection not yet negotiated")?;
+    let conn_info = conn.conn_info().ok_or("Connection not yet negotiated")?;
     let neg = &conn_info.negotiation;
 
     let cap = target
@@ -197,7 +195,10 @@ pub async fn download(
 
     // First, list files to know what to download
     let access = FileAccessMask::new().with_generic_read(true);
-    let resource = tree.open_existing(test_dir, access).await.expect("open test dir");
+    let resource = tree
+        .open_existing(test_dir, access)
+        .await
+        .expect("open test dir");
     let dir = Arc::new(resource.unwrap_dir());
     let entries = collect_dir_entries(&dir, "*").await;
     let file_names: Vec<String> = entries
@@ -323,10 +324,7 @@ async fn collect_dir_entries(
         .await
         .expect("query directory");
     let results: Vec<Result<FileBothDirectoryInformation, _>> = stream.collect().await;
-    results
-        .into_iter()
-        .map(|r| r.expect("dir entry"))
-        .collect()
+    results.into_iter().map(|r| r.expect("dir entry")).collect()
 }
 
 /// Remove test base directory if it exists (for --cleanup-only).

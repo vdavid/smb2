@@ -122,10 +122,7 @@ impl Tree {
     ///
     /// Sends a TREE_CONNECT request with the UNC path `\\server\share`
     /// encoded in UTF-16LE.
-    pub async fn connect(
-        conn: &mut Connection,
-        share_name: &str,
-    ) -> Result<Tree> {
+    pub async fn connect(conn: &mut Connection, share_name: &str) -> Result<Tree> {
         let server = conn.server_name().to_string();
         let unc_path = format!(r"\\{}\{}", server, share_name);
 
@@ -134,9 +131,7 @@ impl Tree {
             path: unc_path,
         };
 
-        let (_, _req_raw) = conn
-            .send_request(Command::TreeConnect, &req, None)
-            .await?;
+        let (_, _req_raw) = conn.send_request(Command::TreeConnect, &req, None).await?;
 
         let (resp_header, resp_body, _resp_raw) = conn.receive_response().await?;
 
@@ -162,16 +157,23 @@ impl Tree {
             .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
 
         info!("tree: connected share={}, tree_id={}", share_name, tree_id);
-        debug!("tree: is_dfs={}, encrypt_data={}",
-            resp.capabilities.contains(crate::types::flags::ShareCapabilities::DFS),
-            resp.share_flags.contains(crate::types::flags::ShareFlags::ENCRYPT_DATA),
+        debug!(
+            "tree: is_dfs={}, encrypt_data={}",
+            resp.capabilities
+                .contains(crate::types::flags::ShareCapabilities::DFS),
+            resp.share_flags
+                .contains(crate::types::flags::ShareFlags::ENCRYPT_DATA),
         );
 
         Ok(Tree {
             tree_id,
             share_name: share_name.to_string(),
-            is_dfs: resp.capabilities.contains(crate::types::flags::ShareCapabilities::DFS),
-            encrypt_data: resp.share_flags.contains(crate::types::flags::ShareFlags::ENCRYPT_DATA),
+            is_dfs: resp
+                .capabilities
+                .contains(crate::types::flags::ShareCapabilities::DFS),
+            encrypt_data: resp
+                .share_flags
+                .contains(crate::types::flags::ShareFlags::ENCRYPT_DATA),
         })
     }
 
@@ -210,14 +212,13 @@ impl Tree {
     /// READ (up to MaxReadSize).
     ///
     /// For files larger than MaxReadSize, use `read_file_pipelined` instead.
-    pub async fn read_file_compound(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<Vec<u8>> {
+    pub async fn read_file_compound(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
         let normalized = normalize_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
-        debug!("tree: read_file_compound path={}, max_read={}", normalized, max_read);
+        debug!(
+            "tree: read_file_compound path={}, max_read={}",
+            normalized, max_read
+        );
 
         // Build CREATE request (same params as open_file).
         let create_req = CreateRequest {
@@ -298,9 +299,7 @@ impl Tree {
         let file_id = create_resp.file_id;
 
         // Check READ response.
-        if read_header.status != NtStatus::SUCCESS
-            && read_header.status != NtStatus::END_OF_FILE
-        {
+        if read_header.status != NtStatus::SUCCESS && read_header.status != NtStatus::END_OF_FILE {
             // READ failed. CLOSE also failed in the compound (cascaded).
             // Issue a standalone CLOSE to clean up the handle.
             debug!(
@@ -347,20 +346,16 @@ impl Tree {
     /// For files larger than MaxReadSize, the compound returns only the
     /// first chunk. In that case, use [`read_file_pipelined`](Self::read_file_pipelined)
     /// for concurrent chunked reads.
-    pub async fn read_file(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<Vec<u8>> {
+    pub async fn read_file(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
         self.read_file_compound(conn, path).await
     }
 
     /// Disconnect from the share.
-    pub async fn disconnect(
-        &self,
-        conn: &mut Connection,
-    ) -> Result<()> {
-        debug!("tree: disconnecting share={}, tree_id={}", self.share_name, self.tree_id);
+    pub async fn disconnect(&self, conn: &mut Connection) -> Result<()> {
+        debug!(
+            "tree: disconnecting share={}, tree_id={}",
+            self.share_name, self.tree_id
+        );
         let body = TreeDisconnectRequest;
         let (_, _) = conn
             .send_request(Command::TreeDisconnect, &body, Some(self.tree_id))
@@ -375,7 +370,10 @@ impl Tree {
             });
         }
 
-        info!("tree: disconnected share={}, tree_id={}", self.share_name, self.tree_id);
+        info!(
+            "tree: disconnected share={}, tree_id={}",
+            self.share_name, self.tree_id
+        );
         Ok(())
     }
 
@@ -417,11 +415,7 @@ impl Tree {
     ///
     /// Opens the file with `DELETE_ON_CLOSE`, then closes the handle.
     /// The server deletes the file when the last handle is closed.
-    pub async fn delete_file(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<()> {
+    pub async fn delete_file(&self, conn: &mut Connection, path: &str) -> Result<()> {
         let normalized = normalize_path(path);
         debug!("tree: delete_file path={}", normalized);
 
@@ -471,11 +465,7 @@ impl Tree {
     ///
     /// Opens the file, queries `FileBasicInformation` and
     /// `FileStandardInformation`, then closes the handle.
-    pub async fn stat(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<FileInfo> {
+    pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
         let normalized = normalize_path(path);
         debug!("tree: stat path={}", normalized);
 
@@ -523,7 +513,10 @@ impl Tree {
 
         let info = result?;
         close_result?;
-        debug!("tree: stat done, size={}, is_dir={}", info.size, info.is_directory);
+        debug!(
+            "tree: stat done, size={}, is_dir={}",
+            info.size, info.is_directory
+        );
         Ok(info)
     }
 
@@ -630,16 +623,11 @@ impl Tree {
             )));
         }
 
-        let total_allocation_units =
-            i64::from_le_bytes(buf[0..8].try_into().unwrap()) as u64;
-        let caller_available_units =
-            i64::from_le_bytes(buf[8..16].try_into().unwrap()) as u64;
-        let actual_available_units =
-            i64::from_le_bytes(buf[16..24].try_into().unwrap()) as u64;
-        let sectors_per_unit =
-            u32::from_le_bytes(buf[24..28].try_into().unwrap());
-        let bytes_per_sector =
-            u32::from_le_bytes(buf[28..32].try_into().unwrap());
+        let total_allocation_units = i64::from_le_bytes(buf[0..8].try_into().unwrap()) as u64;
+        let caller_available_units = i64::from_le_bytes(buf[8..16].try_into().unwrap()) as u64;
+        let actual_available_units = i64::from_le_bytes(buf[16..24].try_into().unwrap()) as u64;
+        let sectors_per_unit = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+        let bytes_per_sector = u32::from_le_bytes(buf[28..32].try_into().unwrap());
 
         let bytes_per_unit = sectors_per_unit as u64 * bytes_per_sector as u64;
         let total_bytes = total_allocation_units * bytes_per_unit;
@@ -671,12 +659,7 @@ impl Tree {
     ///
     /// Opens the source file, issues a SET_INFO with
     /// `FileRenameInformation`, then closes the handle.
-    pub async fn rename(
-        &self,
-        conn: &mut Connection,
-        from: &str,
-        to: &str,
-    ) -> Result<()> {
+    pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
         let from_normalized = normalize_path(from);
         let to_normalized = normalize_path(to);
         debug!("tree: rename from={} to={}", from_normalized, to_normalized);
@@ -718,16 +701,17 @@ impl Tree {
         let file_id = create_resp.file_id;
 
         // Build FileRenameInformation buffer.
-        let rename_result = self
-            .set_rename_info(conn, file_id, &to_normalized)
-            .await;
+        let rename_result = self.set_rename_info(conn, file_id, &to_normalized).await;
 
         // Close regardless.
         let close_result = self.close_handle(conn, file_id).await;
 
         rename_result?;
         close_result?;
-        info!("tree: renamed from={} to={}", from_normalized, to_normalized);
+        info!(
+            "tree: renamed from={} to={}",
+            from_normalized, to_normalized
+        );
         Ok(())
     }
 
@@ -886,12 +870,7 @@ impl Tree {
     /// data, falls back to the pipelined write path.
     ///
     /// Returns the total number of bytes written.
-    pub async fn write_file(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-        data: &[u8],
-    ) -> Result<u64> {
+    pub async fn write_file(&self, conn: &mut Connection, path: &str, data: &[u8]) -> Result<u64> {
         let max_write = conn
             .params()
             .map(|p| p.max_write_size as usize)
@@ -912,18 +891,17 @@ impl Tree {
     ///
     /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
     /// The window is capped at 32 in-flight requests (2 MB).
-    pub async fn read_file_pipelined(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<Vec<u8>> {
+    pub async fn read_file_pipelined(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
         let normalized = normalize_path(path);
 
         // Open the file.
         let (file_id, file_size) = self.open_file(conn, &normalized).await?;
 
         if file_size == 0 {
-            debug!("tree: read_file_pipelined path={}, size=0 (empty file)", normalized);
+            debug!(
+                "tree: read_file_pipelined path={}, size=0 (empty file)",
+                normalized
+            );
             self.close_handle(conn, file_id).await?;
             return Ok(Vec::new());
         }
@@ -953,7 +931,14 @@ impl Tree {
 
         let start = std::time::Instant::now();
         let result = self
-            .read_pipelined_loop(conn, file_id, file_size, chunk_size, credit_charge, total_chunks)
+            .read_pipelined_loop(
+                conn,
+                file_id,
+                file_size,
+                chunk_size,
+                credit_charge,
+                total_chunks,
+            )
             .await;
 
         // Close the handle regardless of read result.
@@ -996,7 +981,10 @@ impl Tree {
         let normalized = normalize_path(path);
 
         if data.is_empty() {
-            debug!("tree: write_file_pipelined path={}, len=0 (empty write)", normalized);
+            debug!(
+                "tree: write_file_pipelined path={}, len=0 (empty write)",
+                normalized
+            );
             // Still create the file (to match write_file behavior).
             return self.write_file_compound(conn, path, data).await;
         }
@@ -1081,11 +1069,7 @@ impl Tree {
     ///
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
     /// option, then immediately closes the handle.
-    pub async fn create_directory(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<()> {
+    pub async fn create_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
         let normalized = normalize_path(path);
         debug!("tree: create_directory path={}", normalized);
 
@@ -1134,11 +1118,7 @@ impl Tree {
     ///
     /// Opens the directory with `DELETE_ON_CLOSE`, then closes the handle.
     /// The directory must be empty.
-    pub async fn delete_directory(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<()> {
+    pub async fn delete_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
         let normalized = normalize_path(path);
         debug!("tree: delete_directory path={}", normalized);
 
@@ -1185,11 +1165,7 @@ impl Tree {
     // ── Private helpers ──────────────────────────────────────────────
 
     /// Open a directory handle.
-    async fn open_directory(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<FileId> {
+    async fn open_directory(&self, conn: &mut Connection, path: &str) -> Result<FileId> {
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -1371,7 +1347,12 @@ impl Tree {
             // Parse FileBothDirectoryInformation entries from the output buffer.
             let entries = parse_file_both_directory_info(&resp.output_buffer)?;
             for e in &entries {
-                trace!("tree: dir_entry name={}, size={}, is_dir={}", e.name, e.size, e.is_directory);
+                trace!(
+                    "tree: dir_entry name={}, size={}, is_dir={}",
+                    e.name,
+                    e.size,
+                    e.is_directory
+                );
             }
             all_entries.extend(entries);
         }
@@ -1387,10 +1368,7 @@ impl Tree {
         file_id: FileId,
         file_size: u64,
     ) -> Result<Vec<u8>> {
-        let max_read = conn
-            .params()
-            .map(|p| p.max_read_size)
-            .unwrap_or(65536);
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
         let mut data = Vec::with_capacity(file_size as usize);
         let mut offset = 0u64;
@@ -1468,9 +1446,7 @@ impl Tree {
 
         // Initial fill: send up to window_size reads.
         let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
-        let initial_window = total_chunks
-            .min(max_from_credits)
-            .min(MAX_PIPELINE_WINDOW);
+        let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
 
         if initial_window == 0 {
             return Err(Error::invalid_data(
@@ -1480,7 +1456,9 @@ impl Tree {
 
         debug!(
             "tree: pipeline read sliding window: initial_window={}, total_chunks={}, credits={}",
-            initial_window, total_chunks, conn.credits()
+            initial_window,
+            total_chunks,
+            conn.credits()
         );
 
         for _ in 0..initial_window {
@@ -1504,12 +1482,7 @@ impl Tree {
             };
 
             let (msg_id, _) = conn
-                .send_request_with_credits(
-                    Command::Read,
-                    &req,
-                    Some(self.tree_id),
-                    credit_charge,
-                )
+                .send_request_with_credits(Command::Read, &req, Some(self.tree_id), credit_charge)
                 .await?;
 
             in_flight.push((msg_id, chunks_sent));
@@ -1555,8 +1528,7 @@ impl Tree {
                 let dest_offset = chunk_index as u64 * chunk_size as u64;
                 let dest_end = (dest_offset as usize + resp.data.len()).min(data.len());
                 let src_len = dest_end - dest_offset as usize;
-                data[dest_offset as usize..dest_end]
-                    .copy_from_slice(&resp.data[..src_len]);
+                data[dest_offset as usize..dest_end].copy_from_slice(&resp.data[..src_len]);
             }
 
             // Immediately send the next chunk if available and credits allow.
@@ -1619,9 +1591,7 @@ impl Tree {
 
         // Initial fill: send up to window_size writes.
         let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
-        let initial_window = total_chunks
-            .min(max_from_credits)
-            .min(MAX_PIPELINE_WINDOW);
+        let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
 
         if initial_window == 0 {
             return Err(Error::invalid_data(
@@ -1631,7 +1601,9 @@ impl Tree {
 
         debug!(
             "tree: pipeline write sliding window: initial_window={}, total_chunks={}, credits={}",
-            initial_window, total_chunks, conn.credits()
+            initial_window,
+            total_chunks,
+            conn.credits()
         );
 
         for _ in 0..initial_window {
@@ -1652,12 +1624,7 @@ impl Tree {
             };
 
             let (_, _) = conn
-                .send_request_with_credits(
-                    Command::Write,
-                    &req,
-                    Some(self.tree_id),
-                    credit_charge,
-                )
+                .send_request_with_credits(Command::Write, &req, Some(self.tree_id), credit_charge)
                 .await?;
 
             chunks_sent += 1;
@@ -1720,11 +1687,7 @@ impl Tree {
     ///
     /// Sends an SMB2 FLUSH request and waits for the server to confirm
     /// that all cached data has been written to persistent storage.
-    pub(crate) async fn flush_handle(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-    ) -> Result<()> {
+    pub(crate) async fn flush_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
         debug!("tree: flushing file handle");
         let req = FlushRequest { file_id };
 
@@ -1745,15 +1708,8 @@ impl Tree {
     }
 
     /// Close a file handle.
-    pub(crate) async fn close_handle(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-    ) -> Result<()> {
-        let req = CloseRequest {
-            flags: 0,
-            file_id,
-        };
+    pub(crate) async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
+        let req = CloseRequest { flags: 0, file_id };
 
         let (_, _) = conn
             .send_request(Command::Close, &req, Some(self.tree_id))
@@ -1772,11 +1728,7 @@ impl Tree {
     }
 
     /// Query `FileBasicInformation` and `FileStandardInformation` to build `FileInfo`.
-    async fn query_file_info(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-    ) -> Result<FileInfo> {
+    async fn query_file_info(&self, conn: &mut Connection, file_id: FileId) -> Result<FileInfo> {
         // Query FileBasicInformation (timestamps + attributes).
         let basic_req = QueryInfoRequest {
             info_type: InfoType::File,
@@ -1857,8 +1809,8 @@ impl Tree {
         let _delete_pending = std_buf[20];
         let is_directory_byte = std_buf[21];
 
-        let is_directory = is_directory_byte != 0
-            || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        let is_directory =
+            is_directory_byte != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
         Ok(FileInfo {
             size: end_of_file,
@@ -1922,16 +1874,8 @@ impl Tree {
     /// Kept for potential future use by callers that need per-chunk control
     /// without pipelining or compounding.
     #[allow(dead_code)]
-    async fn write_loop(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-        data: &[u8],
-    ) -> Result<u64> {
-        let max_write = conn
-            .params()
-            .map(|p| p.max_write_size)
-            .unwrap_or(65536);
+    async fn write_loop(&self, conn: &mut Connection, file_id: FileId, data: &[u8]) -> Result<u64> {
+        let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
         let mut total_written = 0u64;
         let mut offset = 0usize;
@@ -2300,7 +2244,8 @@ mod tests {
         // Build two directory entries.
         let entry1 = build_file_both_dir_info("file1.txt", 1024, false, 0);
         let total_entry_len = entry1.len();
-        let entry1_with_next = build_file_both_dir_info("file1.txt", 1024, false, total_entry_len as u32);
+        let entry1_with_next =
+            build_file_both_dir_info("file1.txt", 1024, false, total_entry_len as u32);
         let entry2 = build_file_both_dir_info("subdir", 0, true, 0);
 
         let mut entries_data = entry1_with_next;
@@ -2541,7 +2486,10 @@ mod tests {
             encrypt_data: false,
         };
 
-        let written = tree.write_file(&mut conn, "out.txt", b"hello").await.unwrap();
+        let written = tree
+            .write_file(&mut conn, "out.txt", b"hello")
+            .await
+            .unwrap();
         assert_eq!(written, 5);
         // One compound frame sent.
         assert_eq!(mock.sent_count(), 1);
@@ -2723,10 +2671,7 @@ mod tests {
         pack_message(&h, &body)
     }
 
-    fn build_write_response_with_msg_id(
-        msg_id: MessageId,
-        count: u32,
-    ) -> Vec<u8> {
+    fn build_write_response_with_msg_id(msg_id: MessageId, count: u32) -> Vec<u8> {
         use crate::msg::write::WriteResponse;
         let mut h = Header::new_request(Command::Write);
         h.flags.set_response();
@@ -3141,10 +3086,7 @@ mod tests {
 
         // 4 WRITE responses.
         for i in 0u64..4 {
-            mock.queue_response(build_write_response_with_msg_id(
-                MessageId(i + 1),
-                65536,
-            ));
+            mock.queue_response(build_write_response_with_msg_id(MessageId(i + 1), 65536));
         }
 
         // FLUSH + CLOSE responses.
@@ -3191,14 +3133,8 @@ mod tests {
         let data_to_write = vec![0x55u8; 100 * 1024];
 
         mock.queue_response(build_create_response(file_id, 0));
-        mock.queue_response(build_write_response_with_msg_id(
-            MessageId(1),
-            65536,
-        ));
-        mock.queue_response(build_write_response_with_msg_id(
-            MessageId(2),
-            36 * 1024,
-        ));
+        mock.queue_response(build_write_response_with_msg_id(MessageId(1), 65536));
+        mock.queue_response(build_write_response_with_msg_id(MessageId(2), 36 * 1024));
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
@@ -3256,7 +3192,10 @@ mod tests {
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
         // Build compound response frame: CREATE + READ + CLOSE.
-        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+        let file_id = FileId {
+            persistent: 0x42,
+            volatile: 0x99,
+        };
         let file_data = b"Hello, compound!".to_vec();
 
         let create_resp = build_create_response(file_id, file_data.len() as u64);
@@ -3266,7 +3205,10 @@ mod tests {
         let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
         mock.queue_response(frame);
 
-        let data = tree.read_file_compound(&mut conn, "test.txt").await.unwrap();
+        let data = tree
+            .read_file_compound(&mut conn, "test.txt")
+            .await
+            .unwrap();
 
         assert_eq!(data, b"Hello, compound!");
         // Should have sent one compound frame (plus the tree connect).
@@ -3281,7 +3223,10 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(7)));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         // Build compound response: CREATE ok, READ returns END_OF_FILE, CLOSE ok.
         let create_resp = build_create_response(file_id, 0);
@@ -3293,7 +3238,10 @@ mod tests {
         let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
         mock.queue_response(frame);
 
-        let data = tree.read_file_compound(&mut conn, "empty.txt").await.unwrap();
+        let data = tree
+            .read_file_compound(&mut conn, "empty.txt")
+            .await
+            .unwrap();
 
         assert!(data.is_empty());
     }
@@ -3362,7 +3310,10 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(7)));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
-        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+        let file_id = FileId {
+            persistent: 0x42,
+            volatile: 0x99,
+        };
 
         // CREATE succeeds.
         let create_resp = build_create_response(file_id, 1024);
@@ -3417,14 +3368,19 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(7)));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
         let create_resp = build_create_response(file_id, 5);
         let read_resp = build_read_response(NtStatus::SUCCESS, vec![1, 2, 3, 4, 5]);
         let close_resp = build_close_response();
         let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
         mock.queue_response(frame);
 
-        tree.read_file_compound(&mut conn, "verify.txt").await.unwrap();
+        tree.read_file_compound(&mut conn, "verify.txt")
+            .await
+            .unwrap();
 
         // The second sent message is the compound request.
         let compound = mock.sent_message(1).unwrap();
@@ -3470,7 +3426,10 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(7)));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
-        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+        let file_id = FileId {
+            persistent: 0x42,
+            volatile: 0x99,
+        };
         let file_data = b"Hello, compound write!";
 
         let create_resp = build_create_response(file_id, 0);
@@ -3500,7 +3459,10 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(7)));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
 
         let create_resp = build_create_response(file_id, 0);
         let write_resp = build_write_response(0);
@@ -3598,7 +3560,10 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(7)));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
-        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+        let file_id = FileId {
+            persistent: 0x42,
+            volatile: 0x99,
+        };
 
         // CREATE succeeds.
         let create_resp = build_create_response(file_id, 0);
@@ -3669,7 +3634,10 @@ mod tests {
         mock.queue_response(build_tree_connect_response(TreeId(7)));
         let tree = Tree::connect(&mut conn, "share").await.unwrap();
 
-        let file_id = FileId { persistent: 1, volatile: 2 };
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
         let create_resp = build_create_response(file_id, 0);
         let write_resp = build_write_response(5);
         let flush_resp = build_flush_response();

@@ -21,7 +21,13 @@ async fn main() -> Result<(), smb2::Error> {
 
     let entries = client.list_directory(&share, directory).await?;
 
-    println!("{} entries in \\\\{}\\{}\\{}:", entries.len(), addr, share_name, directory);
+    println!(
+        "{} entries in \\\\{}\\{}\\{}:",
+        entries.len(),
+        addr,
+        share_name,
+        directory
+    );
     for entry in &entries {
         let kind = if entry.is_directory { "DIR " } else { "    " };
         println!("  {} {:>12} bytes  {}", kind, entry.size, entry.name);

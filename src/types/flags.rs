@@ -389,9 +389,7 @@ mod tests {
 
     #[test]
     fn security_mode_signing_required() {
-        let m = SecurityMode::new(
-            SecurityMode::SIGNING_ENABLED | SecurityMode::SIGNING_REQUIRED,
-        );
+        let m = SecurityMode::new(SecurityMode::SIGNING_ENABLED | SecurityMode::SIGNING_REQUIRED);
         assert!(m.signing_enabled());
         assert!(m.signing_required());
     }
@@ -447,9 +445,8 @@ mod tests {
 
     #[test]
     fn file_access_mask_combine() {
-        let m = FileAccessMask::new(
-            FileAccessMask::FILE_READ_DATA | FileAccessMask::FILE_WRITE_DATA,
-        );
+        let m =
+            FileAccessMask::new(FileAccessMask::FILE_READ_DATA | FileAccessMask::FILE_WRITE_DATA);
         assert!(m.contains(FileAccessMask::FILE_READ_DATA));
         assert!(m.contains(FileAccessMask::FILE_WRITE_DATA));
         assert!(!m.contains(FileAccessMask::DELETE));

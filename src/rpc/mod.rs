@@ -353,7 +353,10 @@ mod tests {
         let ack = build_test_bind_ack(2); // result = 2 = provider_rejection
         let err = parse_bind_ack(&ack).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("rejected"), "error should mention rejection: {msg}");
+        assert!(
+            msg.contains("rejected"),
+            "error should mention rejection: {msg}"
+        );
     }
 
     #[test]
@@ -463,7 +466,7 @@ mod tests {
         // Result entry
         w.write_u16_le(result); // Result
         w.write_u16_le(0); // Reason
-        // Transfer syntax (16 bytes UUID + 4 bytes version)
+                           // Transfer syntax (16 bytes UUID + 4 bytes version)
         NDR_UUID.pack(&mut w);
         w.write_u32_le(NDR_VERSION);
 

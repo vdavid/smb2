@@ -280,8 +280,7 @@ mod tests {
     fn decompress_preserves_prefix_in_output() {
         let prefix = b"PREFIX_DATA";
         let payload: Vec<u8> = vec![0x42; 2048];
-        let compressed_payload =
-            compress_message(&payload, 0).expect("should compress payload");
+        let compressed_payload = compress_message(&payload, 0).expect("should compress payload");
 
         let result = decompress_message(
             prefix,

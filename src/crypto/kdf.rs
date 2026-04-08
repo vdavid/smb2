@@ -32,8 +32,7 @@ pub fn sp800_108_kdf(key: &[u8], label: &[u8], context: &[u8], key_length_bits: 
     let mut result = Vec::with_capacity((iterations * 32) as usize);
 
     for i in 1..=iterations {
-        let mut mac =
-            HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
 
         // counter (32-bit big-endian)
         mac.update(&i.to_be_bytes());
@@ -93,9 +92,8 @@ pub fn derive_session_keys(
     let (dec_label, dec_context): (&[u8], &[u8]);
 
     if dialect == Dialect::Smb3_1_1 {
-        let hash = preauth_hash.expect(
-            "SMB 3.1.1 requires a preauthentication integrity hash for key derivation",
-        );
+        let hash = preauth_hash
+            .expect("SMB 3.1.1 requires a preauthentication integrity hash for key derivation");
         // SMB 3.1.1 labels include null terminator (matches smb-rs and
         // the MS-SMB2 spec's Label field definitions)
         signing_label = b"SMBSigningKey\0";
@@ -153,8 +151,7 @@ impl PreauthHasher {
         let mut hasher = Sha512::new();
         hasher.update(self.hash);
         hasher.update(message_bytes);
-        self.hash
-            .copy_from_slice(&hasher.finalize());
+        self.hash.copy_from_slice(&hasher.finalize());
     }
 
     /// Get the current hash value (64 bytes).
@@ -246,8 +243,7 @@ mod tests {
         let context = b"SmbSign\0";
 
         // Manually compute the expected value.
-        let mut mac =
-            HmacSha256::new_from_slice(&key).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
         mac.update(&1u32.to_be_bytes()); // counter = 1
         mac.update(label); // label
         mac.update(&[0x00]); // separator
@@ -268,8 +264,7 @@ mod tests {
         let context = b"TestCtx\0";
 
         // Compute iteration 1
-        let mut mac1 =
-            HmacSha256::new_from_slice(&key).unwrap();
+        let mut mac1 = HmacSha256::new_from_slice(&key).unwrap();
         mac1.update(&1u32.to_be_bytes());
         mac1.update(label);
         mac1.update(&[0x00]);
@@ -333,8 +328,7 @@ mod tests {
     fn derive_keys_smb3_1_1_uses_new_labels_with_preauth_hash() {
         let session_key = [0x42; 16];
         let preauth_hash = [0xAB; 64];
-        let keys =
-            derive_session_keys(&session_key, Dialect::Smb3_1_1, Some(&preauth_hash), 128);
+        let keys = derive_session_keys(&session_key, Dialect::Smb3_1_1, Some(&preauth_hash), 128);
 
         assert_eq!(
             keys.signing_key,
@@ -354,8 +348,7 @@ mod tests {
     fn derive_keys_smb3_1_1_256_bit() {
         let session_key = [0x42; 16];
         let preauth_hash = [0xCD; 64];
-        let keys =
-            derive_session_keys(&session_key, Dialect::Smb3_1_1, Some(&preauth_hash), 256);
+        let keys = derive_session_keys(&session_key, Dialect::Smb3_1_1, Some(&preauth_hash), 256);
 
         assert_eq!(keys.signing_key.len(), 32);
         assert_eq!(keys.encryption_key.len(), 32);

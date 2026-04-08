@@ -30,8 +30,9 @@ fn load_dotenv() {
 /// Get the NAS password from SMB2_TEST_NAS_PASSWORD (env var or .env file).
 fn nas_password() -> String {
     load_dotenv();
-    std::env::var("SMB2_TEST_NAS_PASSWORD")
-        .expect("SMB2_TEST_NAS_PASSWORD not set. Copy .env.example to .env and fill in your password.")
+    std::env::var("SMB2_TEST_NAS_PASSWORD").expect(
+        "SMB2_TEST_NAS_PASSWORD not set. Copy .env.example to .env and fill in your password.",
+    )
 }
 
 #[tokio::test]
@@ -45,9 +46,7 @@ async fn connect_and_list_directory_on_real_nas() {
         .expect("failed to connect to NAS");
 
     // Negotiate.
-    conn.negotiate()
-        .await
-        .expect("negotiate failed");
+    conn.negotiate().await.expect("negotiate failed");
 
     let params = conn.params().unwrap();
     println!("Negotiated dialect: {}", params.dialect);
@@ -55,14 +54,9 @@ async fn connect_and_list_directory_on_real_nas() {
     println!("Signing required: {}", params.signing_required);
 
     // Authenticate.
-    let session = Session::setup(
-        &mut conn,
-        "david",
-        &nas_password(),
-        "",
-    )
-    .await
-    .expect("session setup failed");
+    let session = Session::setup(&mut conn, "david", &nas_password(), "")
+        .await
+        .expect("session setup failed");
 
     println!("Session ID: {}", session.session_id);
 
@@ -107,9 +101,7 @@ async fn connect_and_list_directory_on_raspberry_pi() {
         .expect("failed to connect to Raspberry Pi");
 
     // Negotiate (may negotiate SMB 2.x or 3.0 depending on Pi config).
-    conn.negotiate()
-        .await
-        .expect("negotiate failed");
+    conn.negotiate().await.expect("negotiate failed");
 
     let params = conn.params().unwrap();
     println!("Negotiated dialect: {}", params.dialect);
@@ -118,14 +110,9 @@ async fn connect_and_list_directory_on_raspberry_pi() {
     println!("Signing required: {}", params.signing_required);
 
     // Authenticate as guest (empty username and password).
-    let session = Session::setup(
-        &mut conn,
-        "",
-        "",
-        "",
-    )
-    .await
-    .expect("session setup failed");
+    let session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
 
     println!("Session ID: {}", session.session_id);
 
@@ -286,12 +273,12 @@ async fn stat_file_on_nas() {
         .await
         .expect("write_file failed");
 
-    let info = tree
-        .stat(&mut conn, test_path)
-        .await
-        .expect("stat failed");
+    let info = tree.stat(&mut conn, test_path).await.expect("stat failed");
 
-    println!("Stat {}: size={}, is_dir={}", test_path, info.size, info.is_directory);
+    println!(
+        "Stat {}: size={}, is_dir={}",
+        test_path, info.size, info.is_directory
+    );
     assert_eq!(info.size, test_data.len() as u64);
     assert!(!info.is_directory);
 
@@ -319,10 +306,7 @@ async fn create_and_delete_directory_on_nas() {
     println!("Created directory {}", dir_path);
 
     // Verify it exists by statting it.
-    let info = tree
-        .stat(&mut conn, dir_path)
-        .await
-        .expect("stat failed");
+    let info = tree.stat(&mut conn, dir_path).await.expect("stat failed");
     assert!(info.is_directory, "expected a directory");
 
     // Delete the directory.
@@ -353,7 +337,10 @@ async fn list_shares_on_nas() {
 
     println!("Shares ({} total):", shares.len());
     for share in &shares {
-        println!("  {} (type=0x{:08X}) - {}", share.name, share.share_type, share.comment);
+        println!(
+            "  {} (type=0x{:08X}) - {}",
+            share.name, share.share_type, share.comment
+        );
     }
 
     // Verify that "naspi" is in the list.
@@ -383,7 +370,10 @@ async fn list_shares_on_raspberry_pi() {
 
     println!("Shares on Pi ({} total):", shares.len());
     for share in &shares {
-        println!("  {} (type=0x{:08X}) - {}", share.name, share.share_type, share.comment);
+        println!(
+            "  {} (type=0x{:08X}) - {}",
+            share.name, share.share_type, share.comment
+        );
     }
 
     assert!(!shares.is_empty(), "expected at least one share");
@@ -417,7 +407,10 @@ async fn smb_client_connect_and_list_directory() {
     println!("Session ID: {}", client.session().session_id);
 
     // Connect to the "naspi" share.
-    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed");
     println!("Tree ID: {}", tree.tree_id);
 
     // List root directory.
@@ -434,7 +427,9 @@ async fn smb_client_connect_and_list_directory() {
 
     assert!(!entries.is_empty(), "expected at least one entry");
 
-    tree.disconnect(client.connection_mut()).await.expect("disconnect failed");
+    tree.disconnect(client.connection_mut())
+        .await
+        .expect("disconnect failed");
 }
 
 #[tokio::test]
@@ -567,28 +562,42 @@ async fn reconnect_after_disconnect() {
     let mut client = connect_client_to_nas().await;
 
     // Verify it works: list a directory.
-    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed");
     let entries = tree
         .list_directory(client.connection_mut(), "")
         .await
         .expect("list_directory failed");
     println!("Before reconnect: {} entries", entries.len());
     assert!(!entries.is_empty());
-    tree.disconnect(client.connection_mut()).await.expect("disconnect failed");
+    tree.disconnect(client.connection_mut())
+        .await
+        .expect("disconnect failed");
 
     // Reconnect.
     client.reconnect().await.expect("reconnect failed");
-    println!("Reconnected, new session_id={}", client.session().session_id);
+    println!(
+        "Reconnected, new session_id={}",
+        client.session().session_id
+    );
 
     // Verify it works again: list the same directory.
-    let tree2 = client.connect_share("naspi").await.expect("connect_share failed after reconnect");
+    let tree2 = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed after reconnect");
     let entries2 = tree2
         .list_directory(client.connection_mut(), "")
         .await
         .expect("list_directory failed after reconnect");
     println!("After reconnect: {} entries", entries2.len());
     assert!(!entries2.is_empty());
-    tree2.disconnect(client.connection_mut()).await.expect("disconnect failed");
+    tree2
+        .disconnect(client.connection_mut())
+        .await
+        .expect("disconnect failed");
 }
 
 #[tokio::test]
@@ -597,7 +606,10 @@ async fn streaming_download_large_file() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed");
 
     // Write a 1 MB test file.
     let test_path = "smb2_test_streaming_download.tmp";
@@ -610,7 +622,10 @@ async fn streaming_download_large_file() {
     println!("Setup: wrote {} bytes", test_data.len());
 
     // Download it with the streaming API.
-    let mut download = client.download(&tree, test_path).await.expect("download failed");
+    let mut download = client
+        .download(&tree, test_path)
+        .await
+        .expect("download failed");
     assert_eq!(download.size(), test_data.len() as u64);
     println!("Downloading {} bytes...", download.size());
 
@@ -670,7 +685,10 @@ async fn write_with_progress_and_cancel() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed");
 
     // Write a file with progress callback, verifying progress updates.
     let test_path = "smb2_test_write_progress.tmp";
@@ -702,7 +720,10 @@ async fn write_with_progress_and_cancel() {
         .read_file(&tree, test_path)
         .await
         .expect("read_file failed");
-    assert_eq!(readback, test_data, "content mismatch after write_with_progress");
+    assert_eq!(
+        readback, test_data,
+        "content mismatch after write_with_progress"
+    );
 
     // Clean up the first file.
     client
@@ -830,7 +851,10 @@ async fn debug_rapid_pipelined_writes() {
         match result {
             Ok(Ok(n)) => eprintln!(
                 "  [{}] wrote {} bytes in {:?}, credits={}",
-                i, n, start.elapsed(), client.credits()
+                i,
+                n,
+                start.elapsed(),
+                client.credits()
             ),
             Ok(Err(e)) => {
                 eprintln!("  [{}] WRITE ERROR: {}", i, e);
@@ -878,27 +902,44 @@ async fn micro_benchmark_smb2_vs_native() {
     let start = std::time::Instant::now();
     for i in 0..file_count {
         let path = format!("_test/smb2_bench/f_{}.bin", i);
-        client.write_file_pipelined(&share, &path, &data).await.expect("write");
+        client
+            .write_file_pipelined(&share, &path, &data)
+            .await
+            .expect("write");
     }
     let smb2_upload = start.elapsed();
 
     // --- LIST (smb2) ---
     let start = std::time::Instant::now();
-    let entries = client.list_directory(&share, "_test/smb2_bench").await.expect("list");
+    let entries = client
+        .list_directory(&share, "_test/smb2_bench")
+        .await
+        .expect("list");
     let smb2_list = start.elapsed();
-    assert!(entries.len() >= file_count, "expected {} entries, got {}", file_count, entries.len());
+    assert!(
+        entries.len() >= file_count,
+        "expected {} entries, got {}",
+        file_count,
+        entries.len()
+    );
 
     // --- DOWNLOAD (smb2) ---
     // Use sequential read for files that fit in one MaxReadSize chunk,
     // pipelined for larger files.
-    let max_read = client.params().map(|p| p.max_read_size as usize).unwrap_or(65536);
+    let max_read = client
+        .params()
+        .map(|p| p.max_read_size as usize)
+        .unwrap_or(65536);
     let start = std::time::Instant::now();
     for i in 0..file_count {
         let path = format!("_test/smb2_bench/f_{}.bin", i);
         let d = if file_size <= max_read {
             client.read_file(&share, &path).await.expect("read")
         } else {
-            client.read_file_pipelined(&share, &path).await.expect("read")
+            client
+                .read_file_pipelined(&share, &path)
+                .await
+                .expect("read")
         };
         assert_eq!(d.len(), file_size);
     }
@@ -950,7 +991,12 @@ async fn micro_benchmark_smb2_vs_native() {
         (nu, nl, nd, ndel)
     } else {
         eprintln!("WARNING: /Volumes/naspi not mounted, skipping native comparison");
-        (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO)
+        (
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
     };
 
     // Cleanup
@@ -960,7 +1006,12 @@ async fn micro_benchmark_smb2_vs_native() {
     // Results
     let total_mb = (file_count * file_size) as f64 / (1024.0 * 1024.0);
     println!("\n╔══════════════════════════════════════════════════════════╗");
-    println!("║  MICRO BENCHMARK: {} × {} KB = {:.1} MB          ║", file_count, file_size / 1024, total_mb);
+    println!(
+        "║  MICRO BENCHMARK: {} × {} KB = {:.1} MB          ║",
+        file_count,
+        file_size / 1024,
+        total_mb
+    );
     println!("╚══════════════════════════════════════════════════════════╝\n");
     println!("┌────────────┬────────────┬────────────┬──────────┐");
     println!("│ operation  │ native     │ smb2       │ ratio    │");
@@ -1002,8 +1053,11 @@ async fn compound_read_and_write_on_raspberry_pi() {
         .await
         .expect("session setup failed");
 
-    println!("Pi: dialect={}, sign={}", 
-        conn.params().unwrap().dialect, session.should_sign);
+    println!(
+        "Pi: dialect={}, sign={}",
+        conn.params().unwrap().dialect,
+        session.should_sign
+    );
 
     let tree = smb2::Tree::connect(&mut conn, "PiHDD")
         .await
@@ -1019,7 +1073,8 @@ async fn compound_read_and_write_on_raspberry_pi() {
 
     // Compound read
     let start = std::time::Instant::now();
-    let read_back = tree.read_file_compound(&mut conn, "smb2_pi_compound.tmp")
+    let read_back = tree
+        .read_file_compound(&mut conn, "smb2_pi_compound.tmp")
         .await
         .expect("compound read failed");
     println!("Pi compound read: {:?}", start.elapsed());
@@ -1040,7 +1095,10 @@ async fn streaming_upload_large_file() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed");
 
     // Write a 2 MB file via streaming upload (must exceed MaxWriteSize=1MB
     // to trigger chunked path instead of compound).
@@ -1055,7 +1113,11 @@ async fn streaming_upload_large_file() {
     println!("Uploading {} bytes...", upload.total_bytes());
 
     let mut chunk_count = 0u32;
-    while upload.write_next_chunk().await.expect("write_next_chunk failed") {
+    while upload
+        .write_next_chunk()
+        .await
+        .expect("write_next_chunk failed")
+    {
         chunk_count += 1;
         println!(
             "  chunk {}: progress={:.1}%",
@@ -1108,7 +1170,10 @@ async fn streaming_upload_small_file_uses_compound() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed");
 
     let test_path = "smb2_test_streaming_upload_small.tmp";
     let test_data = b"small file via streaming upload API";
@@ -1179,7 +1244,10 @@ async fn streaming_upload_and_download_on_pi() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_pi().await;
-    let tree = client.connect_share("PiHDD").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("PiHDD")
+        .await
+        .expect("connect_share failed");
 
     let test_path = "smb2_test_stream_roundtrip.tmp";
     let test_data = b"streaming roundtrip test on Pi 1234567890";
@@ -1190,7 +1258,11 @@ async fn streaming_upload_and_download_on_pi() {
         .await
         .expect("upload failed");
 
-    while upload.write_next_chunk().await.expect("write_next_chunk failed") {
+    while upload
+        .write_next_chunk()
+        .await
+        .expect("write_next_chunk failed")
+    {
         println!("  upload progress: {:.1}%", upload.progress().percent());
     }
     println!(
@@ -1210,7 +1282,11 @@ async fn streaming_upload_and_download_on_pi() {
         .expect("read_file failed");
 
     // Verify contents match.
-    assert_eq!(received, test_data.as_slice(), "content mismatch after roundtrip");
+    assert_eq!(
+        received,
+        test_data.as_slice(),
+        "content mismatch after roundtrip"
+    );
     println!("Roundtrip verified: {} bytes match", received.len());
 
     // Clean up (best-effort).
@@ -1224,16 +1300,31 @@ async fn fs_info_on_nas() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("naspi")
+        .await
+        .expect("connect_share failed");
 
     let info = client.fs_info(&tree).await.expect("fs_info failed");
 
     assert!(info.total_bytes > 0, "total_bytes should be positive");
     assert!(info.free_bytes > 0, "free_bytes should be positive");
-    assert!(info.free_bytes <= info.total_bytes, "free_bytes should not exceed total_bytes");
-    assert!(info.total_free_bytes > 0, "total_free_bytes should be positive");
-    assert!(info.bytes_per_sector > 0, "bytes_per_sector should be positive");
-    assert!(info.sectors_per_unit > 0, "sectors_per_unit should be positive");
+    assert!(
+        info.free_bytes <= info.total_bytes,
+        "free_bytes should not exceed total_bytes"
+    );
+    assert!(
+        info.total_free_bytes > 0,
+        "total_free_bytes should be positive"
+    );
+    assert!(
+        info.bytes_per_sector > 0,
+        "bytes_per_sector should be positive"
+    );
+    assert!(
+        info.sectors_per_unit > 0,
+        "sectors_per_unit should be positive"
+    );
 
     let total_gb = info.total_bytes as f64 / 1_000_000_000.0;
     let free_gb = info.free_bytes as f64 / 1_000_000_000.0;
@@ -1257,16 +1348,31 @@ async fn fs_info_on_pi() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_pi().await;
-    let tree = client.connect_share("PiHDD").await.expect("connect_share failed");
+    let tree = client
+        .connect_share("PiHDD")
+        .await
+        .expect("connect_share failed");
 
     let info = client.fs_info(&tree).await.expect("fs_info failed");
 
     assert!(info.total_bytes > 0, "total_bytes should be positive");
     assert!(info.free_bytes > 0, "free_bytes should be positive");
-    assert!(info.free_bytes <= info.total_bytes, "free_bytes should not exceed total_bytes");
-    assert!(info.total_free_bytes > 0, "total_free_bytes should be positive");
-    assert!(info.bytes_per_sector > 0, "bytes_per_sector should be positive");
-    assert!(info.sectors_per_unit > 0, "sectors_per_unit should be positive");
+    assert!(
+        info.free_bytes <= info.total_bytes,
+        "free_bytes should not exceed total_bytes"
+    );
+    assert!(
+        info.total_free_bytes > 0,
+        "total_free_bytes should be positive"
+    );
+    assert!(
+        info.bytes_per_sector > 0,
+        "bytes_per_sector should be positive"
+    );
+    assert!(
+        info.sectors_per_unit > 0,
+        "sectors_per_unit should be positive"
+    );
 
     let total_gb = info.total_bytes as f64 / 1_000_000_000.0;
     let free_gb = info.free_bytes as f64 / 1_000_000_000.0;
@@ -1337,11 +1443,10 @@ async fn watch_directory_on_nas() {
             });
 
             // Wait for the notification (with a timeout so we don't hang).
-            let events =
-                tokio::time::timeout(Duration::from_secs(10), watcher.next_events())
-                    .await
-                    .expect("timed out waiting for change notification")
-                    .expect("next_events failed");
+            let events = tokio::time::timeout(Duration::from_secs(10), watcher.next_events())
+                .await
+                .expect("timed out waiting for change notification")
+                .expect("next_events failed");
 
             println!("Received {} event(s):", events.len());
             for event in &events {
@@ -1351,9 +1456,7 @@ async fn watch_directory_on_nas() {
             assert!(!events.is_empty(), "expected at least one event");
 
             // We should see an Added event for our test file.
-            let added = events
-                .iter()
-                .find(|e| e.action == FileNotifyAction::Added);
+            let added = events.iter().find(|e| e.action == FileNotifyAction::Added);
             assert!(
                 added.is_some(),
                 "expected an Added event, got: {:?}",

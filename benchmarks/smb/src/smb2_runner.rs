@@ -47,11 +47,7 @@ pub async fn connect(target: &Target) -> Result<(SmbClient, Tree), String> {
 }
 
 /// Create the test directory on the share via smb2.
-pub async fn setup(
-    client: &mut SmbClient,
-    tree: &Tree,
-    cycle_id: &str,
-) -> Result<String, String> {
+pub async fn setup(client: &mut SmbClient, tree: &Tree, cycle_id: &str) -> Result<String, String> {
     let base = Target::smb2_test_base();
     let test_dir = format!(r"{base}\{cycle_id}");
 

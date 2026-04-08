@@ -175,7 +175,11 @@ impl NtlmAuthenticator {
 
         // Parse the CHALLENGE_MESSAGE
         let challenge = parse_challenge_message(challenge_bytes)?;
-        trace!("ntlm: challenge flags=0x{:08x}, target_info_len={}", challenge.negotiate_flags, challenge.target_info.len());
+        trace!(
+            "ntlm: challenge flags=0x{:08x}, target_info_len={}",
+            challenge.negotiate_flags,
+            challenge.target_info.len()
+        );
 
         // Compute NTLMv2 response
         let nt_hash = compute_nt_hash(&self.credentials.password);
@@ -195,8 +199,7 @@ impl NtlmAuthenticator {
         let has_timestamp = find_av_pair(&challenge.target_info, MSV_AV_TIMESTAMP).is_some();
 
         // Build the modified target info for the authenticate message
-        let auth_target_info =
-            build_auth_target_info(&challenge.target_info, has_timestamp);
+        let auth_target_info = build_auth_target_info(&challenge.target_info, has_timestamp);
 
         // Build temp blob (section 3.3.2)
         let temp = build_temp(timestamp, &client_challenge, &auth_target_info);
@@ -264,12 +267,16 @@ impl NtlmAuthenticator {
 
         // If MIC is required, compute it and patch it in
         let final_msg = if has_timestamp {
-            let negotiate_bytes = self
-                .negotiate_bytes
-                .as_ref()
-                .ok_or_else(|| Error::invalid_data("negotiate() must be called before authenticate()"))?;
+            let negotiate_bytes = self.negotiate_bytes.as_ref().ok_or_else(|| {
+                Error::invalid_data("negotiate() must be called before authenticate()")
+            })?;
 
-            let mic = compute_mic(&exported_session_key, negotiate_bytes, challenge_bytes, &auth_msg);
+            let mic = compute_mic(
+                &exported_session_key,
+                negotiate_bytes,
+                challenge_bytes,
+                &auth_msg,
+            );
 
             let mut patched = auth_msg;
             // MIC is at offset 72 (after signature(8) + type(4) + 6 fields * 8 + flags(4) + version(8))
@@ -281,7 +288,11 @@ impl NtlmAuthenticator {
         };
 
         self.session_key = Some(exported_session_key);
-        debug!("ntlm: authenticate message built, len={}, mic={}", final_msg.len(), has_timestamp);
+        debug!(
+            "ntlm: authenticate message built, len={}, mic={}",
+            final_msg.len(),
+            has_timestamp
+        );
         Ok(final_msg)
     }
 
@@ -309,8 +320,7 @@ impl NtlmAuthenticator {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         // UNIX epoch is 11644473600 seconds after FILETIME epoch
-        (now.as_secs() + 11_644_473_600) * 10_000_000
-            + u64::from(now.subsec_nanos()) / 100
+        (now.as_secs() + 11_644_473_600) * 10_000_000 + u64::from(now.subsec_nanos()) / 100
     }
 
     /// Get the client challenge (random 8 bytes, or test override).
@@ -364,7 +374,9 @@ fn parse_challenge_message(data: &[u8]) -> Result<ChallengeMessage, Error> {
 
     // Verify signature
     if &data[0..8] != NTLM_SIGNATURE {
-        return Err(Error::invalid_data("invalid NTLM signature in CHALLENGE_MESSAGE"));
+        return Err(Error::invalid_data(
+            "invalid NTLM signature in CHALLENGE_MESSAGE",
+        ));
     }
 
     // Verify message type
@@ -418,7 +430,8 @@ fn find_av_pair(target_info: &[u8], av_id: u16) -> Option<Vec<u8>> {
     let mut offset = 0;
     while offset + 4 <= target_info.len() {
         let id = u16::from_le_bytes(target_info[offset..offset + 2].try_into().unwrap());
-        let len = u16::from_le_bytes(target_info[offset + 2..offset + 4].try_into().unwrap()) as usize;
+        let len =
+            u16::from_le_bytes(target_info[offset + 2..offset + 4].try_into().unwrap()) as usize;
 
         if id == av_id {
             if offset + 4 + len <= target_info.len() {
@@ -443,7 +456,8 @@ fn parse_av_pairs(target_info: &[u8]) -> Vec<(u16, Vec<u8>)> {
     let mut offset = 0;
     while offset + 4 <= target_info.len() {
         let id = u16::from_le_bytes(target_info[offset..offset + 2].try_into().unwrap());
-        let len = u16::from_le_bytes(target_info[offset + 2..offset + 4].try_into().unwrap()) as usize;
+        let len =
+            u16::from_le_bytes(target_info[offset + 2..offset + 4].try_into().unwrap()) as usize;
 
         if id == MSV_AV_EOL {
             pairs.push((id, Vec::new()));
@@ -567,9 +581,7 @@ fn rc4_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut s: Vec<u8> = (0..=255).collect();
     let mut j: u8 = 0;
     for i in 0..256 {
-        j = j
-            .wrapping_add(s[i])
-            .wrapping_add(key[i % key.len()]);
+        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
         s.swap(i, j as usize);
     }
     let mut i: u8 = 0;
@@ -774,8 +786,7 @@ mod tests {
         let target_info = build_test_target_info();
         let temp = build_temp(TEST_TIME, &TEST_CLIENT_CHALLENGE, &target_info);
 
-        let mut mac =
-            HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
+        let mut mac = HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
         mac.update(&TEST_SERVER_CHALLENGE);
         mac.update(&temp);
         let nt_proof_str = mac.finalize().into_bytes().to_vec();
@@ -799,15 +810,13 @@ mod tests {
         let temp = build_temp(TEST_TIME, &TEST_CLIENT_CHALLENGE, &target_info);
 
         // NTProofStr
-        let mut mac =
-            HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
+        let mut mac = HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
         mac.update(&TEST_SERVER_CHALLENGE);
         mac.update(&temp);
         let nt_proof_str = mac.finalize().into_bytes().to_vec();
 
         // SessionBaseKey = HMAC_MD5(ntlmv2_hash, NTProofStr)
-        let mut mac =
-            HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
+        let mut mac = HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
         mac.update(&nt_proof_str);
         let session_base_key = mac.finalize().into_bytes().to_vec();
 
@@ -1062,7 +1071,10 @@ mod tests {
 
         // MIC field at offset 72 should NOT be all zeros (it was patched)
         let mic = &authenticate[72..88];
-        assert_ne!(mic, &[0u8; 16], "MIC should be non-zero when timestamp is present");
+        assert_ne!(
+            mic, &[0u8; 16],
+            "MIC should be non-zero when timestamp is present"
+        );
 
         // Session key should be available
         assert!(auth.session_key().is_some());
@@ -1172,8 +1184,7 @@ mod tests {
         // Should contain MsvAvFlags with bit 0x2 set
         let flags_pair = pairs.iter().find(|(id, _)| *id == MSV_AV_FLAGS);
         assert!(flags_pair.is_some(), "MsvAvFlags should be present");
-        let flags_value =
-            u32::from_le_bytes(flags_pair.unwrap().1[..4].try_into().unwrap());
+        let flags_value = u32::from_le_bytes(flags_pair.unwrap().1[..4].try_into().unwrap());
         assert_ne!(flags_value & 0x2, 0, "MIC bit should be set in MsvAvFlags");
     }
 
@@ -1205,8 +1216,7 @@ mod tests {
 
         // Parse LmChallengeResponseFields from the authenticate message
         let lm_len = u16::from_le_bytes(authenticate[12..14].try_into().unwrap()) as usize;
-        let lm_offset =
-            u32::from_le_bytes(authenticate[16..20].try_into().unwrap()) as usize;
+        let lm_offset = u32::from_le_bytes(authenticate[16..20].try_into().unwrap()) as usize;
 
         // LM response should be 24 bytes of zeros
         assert_eq!(lm_len, 24);
@@ -1231,8 +1241,7 @@ mod tests {
 
         // DomainNameFields at offset 28
         let domain_len = u16::from_le_bytes(authenticate[28..30].try_into().unwrap()) as usize;
-        let domain_offset =
-            u32::from_le_bytes(authenticate[32..36].try_into().unwrap()) as usize;
+        let domain_offset = u32::from_le_bytes(authenticate[32..36].try_into().unwrap()) as usize;
         let domain_bytes = &authenticate[domain_offset..domain_offset + domain_len];
         let domain = String::from_utf16(
             &domain_bytes
@@ -1245,8 +1254,7 @@ mod tests {
 
         // UserNameFields at offset 36
         let user_len = u16::from_le_bytes(authenticate[36..38].try_into().unwrap()) as usize;
-        let user_offset =
-            u32::from_le_bytes(authenticate[40..44].try_into().unwrap()) as usize;
+        let user_offset = u32::from_le_bytes(authenticate[40..44].try_into().unwrap()) as usize;
         let user_bytes = &authenticate[user_offset..user_offset + user_len];
         let user = String::from_utf16(
             &user_bytes
@@ -1274,8 +1282,7 @@ mod tests {
         let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, TEST_USER, TEST_DOMAIN);
 
         // LMv2: HMAC_MD5(ntlmv2_hash, server_challenge + client_challenge) + client_challenge
-        let mut mac =
-            HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
+        let mut mac = HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
         mac.update(&TEST_SERVER_CHALLENGE);
         mac.update(&TEST_CLIENT_CHALLENGE);
         let proof = mac.finalize().into_bytes();

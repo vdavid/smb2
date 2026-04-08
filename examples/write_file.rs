@@ -27,7 +27,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Use pipelined write for large files (much faster).
     let start = Instant::now();
-    let written = client.write_file_pipelined(&share, remote_path, &data).await?;
+    let written = client
+        .write_file_pipelined(&share, remote_path, &data)
+        .await?;
     let elapsed = start.elapsed();
 
     println!(

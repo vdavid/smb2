@@ -343,7 +343,7 @@ impl Pack for NegotiateRequest {
             // NegotiateContextOffset (4) -- will be backpatched
             let ctx_offset_pos = cursor.position();
             cursor.write_u32_le(0); // placeholder
-            // NegotiateContextCount (2)
+                                    // NegotiateContextCount (2)
             cursor.write_u16_le(self.negotiate_contexts.len() as u16);
             // Reserved2 (2)
             cursor.write_u16_le(0);
@@ -413,17 +413,17 @@ impl Unpack for NegotiateRequest {
         let mut dialects = Vec::with_capacity(dialect_count);
         for _ in 0..dialect_count {
             let d = cursor.read_u16_le()?;
-            dialects.push(Dialect::try_from(d).map_err(|_| {
-                Error::invalid_data(format!("invalid dialect: 0x{:04X}", d))
-            })?);
+            dialects.push(
+                Dialect::try_from(d)
+                    .map_err(|_| Error::invalid_data(format!("invalid dialect: 0x{:04X}", d)))?,
+            );
         }
 
         let has_311 = dialects.contains(&Dialect::Smb3_1_1);
 
         let negotiate_contexts = if has_311 {
             // Parse the 8-byte field as (offset, count, reserved2)
-            let ctx_offset =
-                u32::from_le_bytes([raw_8[0], raw_8[1], raw_8[2], raw_8[3]]) as usize;
+            let ctx_offset = u32::from_le_bytes([raw_8[0], raw_8[1], raw_8[2], raw_8[3]]) as usize;
             let ctx_count = u16::from_le_bytes([raw_8[4], raw_8[5]]) as usize;
 
             // Skip padding to reach the negotiate context list.
@@ -605,18 +605,17 @@ impl Unpack for NegotiateResponse {
         };
 
         // Negotiate contexts (only for 3.1.1)
-        let negotiate_contexts = if dialect_revision == Dialect::Smb3_1_1
-            && negotiate_context_count > 0
-        {
-            // Skip padding to reach the context list
-            let current_abs = Header::SIZE + (cursor.position() - start);
-            if negotiate_context_offset > current_abs {
-                cursor.skip(negotiate_context_offset - current_abs)?;
-            }
-            unpack_negotiate_contexts(cursor, negotiate_context_count)?
-        } else {
-            Vec::new()
-        };
+        let negotiate_contexts =
+            if dialect_revision == Dialect::Smb3_1_1 && negotiate_context_count > 0 {
+                // Skip padding to reach the context list
+                let current_abs = Header::SIZE + (cursor.position() - start);
+                if negotiate_context_offset > current_abs {
+                    cursor.skip(negotiate_context_offset - current_abs)?;
+                }
+                unpack_negotiate_contexts(cursor, negotiate_context_count)?
+            } else {
+                Vec::new()
+            };
 
         Ok(NegotiateResponse {
             security_mode,
@@ -798,7 +797,10 @@ mod tests {
 
         assert_eq!(decoded.dialects, vec![Dialect::Smb3_1_1]);
         assert_eq!(decoded.negotiate_contexts.len(), 1);
-        assert_eq!(decoded.negotiate_contexts[0], original.negotiate_contexts[0]);
+        assert_eq!(
+            decoded.negotiate_contexts[0],
+            original.negotiate_contexts[0]
+        );
     }
 
     // ── NegotiateResponse tests ────────────────────────────────────

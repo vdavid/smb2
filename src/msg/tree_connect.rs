@@ -290,9 +290,7 @@ mod tests {
     fn tree_connect_response_roundtrip_disk() {
         let original = TreeConnectResponse {
             share_type: ShareType::Disk,
-            share_flags: ShareFlags::new(
-                ShareFlags::DFS | ShareFlags::ACCESS_BASED_DIRECTORY_ENUM,
-            ),
+            share_flags: ShareFlags::new(ShareFlags::DFS | ShareFlags::ACCESS_BASED_DIRECTORY_ENUM),
             capabilities: ShareCapabilities::new(ShareCapabilities::DFS),
             maximal_access: 0x001F_01FF,
         };
@@ -353,9 +351,7 @@ mod tests {
         assert!(decoded
             .capabilities
             .contains(ShareCapabilities::CONTINUOUS_AVAILABILITY));
-        assert!(decoded
-            .capabilities
-            .contains(ShareCapabilities::CLUSTER));
+        assert!(decoded.capabilities.contains(ShareCapabilities::CLUSTER));
     }
 
     #[test]
