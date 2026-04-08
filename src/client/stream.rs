@@ -157,9 +157,10 @@ impl<'a> FileDownload<'a> {
             read_channel_info: vec![],
         };
 
+        let credit_charge = (this_chunk as u64).div_ceil(65536).max(1) as u16;
         let send_result = self
             .conn
-            .send_request(Command::Read, &req, Some(self.tree.tree_id))
+            .send_request_with_credits(Command::Read, &req, Some(self.tree.tree_id), credit_charge)
             .await;
 
         if let Err(e) = send_result {
@@ -415,9 +416,15 @@ impl<'a> FileUpload<'a> {
             data: chunk.to_vec(),
         };
 
+        let credit_charge = (this_chunk as u64).div_ceil(65536).max(1) as u16;
         let send_result = self
             .conn
-            .send_request(Command::Write, &write_req, Some(self.tree.tree_id))
+            .send_request_with_credits(
+                Command::Write,
+                &write_req,
+                Some(self.tree.tree_id),
+                credit_charge,
+            )
             .await;
 
         if let Err(e) = send_result {

@@ -504,9 +504,15 @@ impl SmbClient {
                 data: chunk.to_vec(),
             };
 
+            let credit_charge = (chunk_size as u64).div_ceil(65536).max(1) as u16;
             let (_, _) = self
                 .conn
-                .send_request(crate::types::Command::Write, &write_req, Some(tree.tree_id))
+                .send_request_with_credits(
+                    crate::types::Command::Write,
+                    &write_req,
+                    Some(tree.tree_id),
+                    credit_charge,
+                )
                 .await?;
 
             let (resp_header, resp_body, _) = self.conn.receive_response().await?;

@@ -64,6 +64,15 @@ test-integration:
     @cargo test --test integration -- --ignored --quiet
     @echo "[+] Integration tests passed"
 
+# Run Docker integration tests (starts/stops containers automatically)
+test-docker:
+    @echo "[*] Starting Docker containers..."
+    @./tests/docker/start.sh internal
+    @echo "[*] Running Docker integration tests..."
+    @cargo test --test docker_integration -- --ignored --quiet && \
+        (echo "[*] Stopping Docker containers..." && ./tests/docker/stop.sh && echo "[+] Docker integration tests passed") || \
+        (echo "[*] Stopping Docker containers..." && ./tests/docker/stop.sh && exit 1)
+
 # Build documentation
 doc:
     @echo "[*] Building docs..."

@@ -416,75 +416,96 @@ impl Connection {
 
     /// Receive a response, verify signature if needed, and update credits.
     ///
+    /// Automatically loops past `STATUS_PENDING` interim responses
+    /// (MS-SMB2 3.3.4.3): collects their credits and keeps waiting
+    /// for the final response.
+    ///
     /// Returns the parsed header, the raw body bytes, and the full raw
     /// response bytes (needed for preauth hash updates).
     pub async fn receive_response(&mut self) -> Result<(Header, Vec<u8>, Vec<u8>)> {
-        let resp_bytes = self.receiver.receive().await?;
-        trace!("recv: raw response {} bytes", resp_bytes.len());
+        loop {
+            let resp_bytes = self.receiver.receive().await?;
+            trace!("recv: raw response {} bytes", resp_bytes.len());
 
-        // Check for compression transform header and decompress if needed.
-        // Per spec: decompress first, then verify signature.
-        let resp_bytes = if resp_bytes.len() >= 4 && resp_bytes[0..4] == COMPRESSION_PROTOCOL_ID {
-            trace!("recv: detected compression transform header, decompressing");
-            decompress_response(&resp_bytes)?
-        } else {
-            resp_bytes
-        };
+            // Check for compression transform header and decompress if needed.
+            // Per spec: decompress first, then verify signature.
+            let resp_bytes = if resp_bytes.len() >= 4 && resp_bytes[0..4] == COMPRESSION_PROTOCOL_ID
+            {
+                trace!("recv: detected compression transform header, decompressing");
+                decompress_response(&resp_bytes)?
+            } else {
+                resp_bytes
+            };
 
-        // Verify signature if signing is active AND the response has the
-        // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
-        // interim responses and unsolicited oplock break notifications.
-        // A valid SMB2 header is always 64 bytes. Guard on that so the
-        // field accesses below (up to byte 32) are guaranteed in-bounds.
-        if self.should_sign && resp_bytes.len() >= Header::SIZE {
-            let flags = u32::from_le_bytes(resp_bytes[16..20].try_into().unwrap());
-            let is_signed = (flags & HeaderFlags::SIGNED) != 0;
+            // Verify signature if signing is active AND the response has the
+            // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
+            // interim responses and unsolicited oplock break notifications.
+            // A valid SMB2 header is always 64 bytes. Guard on that so the
+            // field accesses below (up to byte 32) are guaranteed in-bounds.
+            if self.should_sign && resp_bytes.len() >= Header::SIZE {
+                let flags = u32::from_le_bytes(resp_bytes[16..20].try_into().unwrap());
+                let is_signed = (flags & HeaderFlags::SIGNED) != 0;
 
-            // Also check for STATUS_PENDING (skip verification) and
-            // unsolicited messages (MessageId 0xFFFFFFFFFFFFFFFF).
-            let status = u32::from_le_bytes(resp_bytes[8..12].try_into().unwrap());
-            let msg_id_bytes: [u8; 8] = resp_bytes[24..32].try_into().unwrap();
-            let msg_id = u64::from_le_bytes(msg_id_bytes);
-            let is_pending = status == NtStatus::PENDING.0;
-            let is_unsolicited = msg_id == 0xFFFF_FFFF_FFFF_FFFF;
+                // Also check for STATUS_PENDING (skip verification) and
+                // unsolicited messages (MessageId 0xFFFFFFFFFFFFFFFF).
+                let status = u32::from_le_bytes(resp_bytes[8..12].try_into().unwrap());
+                let msg_id_bytes: [u8; 8] = resp_bytes[24..32].try_into().unwrap();
+                let msg_id = u64::from_le_bytes(msg_id_bytes);
+                let is_pending = status == NtStatus::PENDING.0;
+                let is_unsolicited = msg_id == 0xFFFF_FFFF_FFFF_FFFF;
 
-            if is_signed && !is_pending && !is_unsolicited {
-                if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
-                    signing::verify_signature(&resp_bytes, key, *algo, msg_id, false)?;
+                if is_signed && !is_pending && !is_unsolicited {
+                    if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+                        signing::verify_signature(&resp_bytes, key, *algo, msg_id, false)?;
+                    }
                 }
             }
+
+            // Parse header.
+            let mut cursor = ReadCursor::new(&resp_bytes);
+            let header = Header::unpack(&mut cursor)?;
+
+            // Update credits (interim responses carry credits too).
+            let prev_credits = self.credits;
+            if header.credits > 0 {
+                self.credits = self.credits.saturating_add(header.credits);
+            }
+
+            // STATUS_PENDING is an interim response: collect credits and
+            // keep waiting for the final response (MS-SMB2 3.3.4.3).
+            if header.status.is_pending() {
+                debug!(
+                    "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}, credits={} (was {}, granted {})",
+                    header.command,
+                    header.message_id.0,
+                    self.credits,
+                    prev_credits,
+                    header.credits
+                );
+                continue;
+            }
+
+            // Consume one credit for the request that generated this response.
+            self.credits = self.credits.saturating_sub(1);
+
+            debug!(
+                "recv: cmd={:?}, status={:?}, msg_id={}, credits={} (was {}, granted {})",
+                header.command,
+                header.status,
+                header.message_id.0,
+                self.credits,
+                prev_credits,
+                header.credits
+            );
+            if self.credits == 0 {
+                warn!("recv: zero credits remaining -- credit starvation");
+            }
+
+            // Return the body bytes (everything after the header).
+            let body_bytes = resp_bytes[Header::SIZE..].to_vec();
+
+            return Ok((header, body_bytes, resp_bytes));
         }
-
-        // Parse header.
-        let mut cursor = ReadCursor::new(&resp_bytes);
-        let header = Header::unpack(&mut cursor)?;
-
-        // Update credits.
-        let prev_credits = self.credits;
-        if header.credits > 0 {
-            self.credits = self.credits.saturating_add(header.credits);
-        }
-
-        // Consume one credit for the request that generated this response.
-        self.credits = self.credits.saturating_sub(1);
-
-        debug!(
-            "recv: cmd={:?}, status={:?}, msg_id={}, credits={} (was {}, granted {})",
-            header.command,
-            header.status,
-            header.message_id.0,
-            self.credits,
-            prev_credits,
-            header.credits
-        );
-        if self.credits == 0 {
-            warn!("recv: zero credits remaining -- credit starvation");
-        }
-
-        // Return the body bytes (everything after the header).
-        let body_bytes = resp_bytes[Header::SIZE..].to_vec();
-
-        Ok((header, body_bytes, resp_bytes))
     }
 
     /// Get the negotiated parameters.

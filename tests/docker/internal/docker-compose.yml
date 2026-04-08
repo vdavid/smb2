@@ -1,0 +1,12 @@
+services:
+  smb-guest:
+    build:
+      context: smb-guest
+    ports:
+      - "10445:445"
+
+  smb-auth:
+    build:
+      context: smb-auth
+    ports:
+      - "10446:445"
