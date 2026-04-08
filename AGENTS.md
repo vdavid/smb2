@@ -146,7 +146,7 @@ The pipeline is the reason this library exists. Without pipelining, SMB download
 
 ## Protocol pitfalls (all handled)
 
-These were identified during three adversarial review rounds and have all been addressed. They're documented here so you understand the reasoning behind certain code patterns.
+Cross-module protocol concerns that span multiple files. Each is handled, but documented here so you understand non-obvious code patterns. Module-specific gotchas go in the relevant `CLAUDE.md`; cross-cutting ones go here. If you discover a new pitfall that involves 2+ modules, add it to this list.
 
 1. **Preauth hash excludes success response** ✅ -- The final SESSION_SETUP response (STATUS_SUCCESS) is NOT included in the preauth hash. Including it produces wrong keys. See `session.rs`.
 2. **Compound partial failure** ✅ -- Standalone CLOSE issued when CREATE succeeds but a later op fails. See `tree.rs` compound methods.
