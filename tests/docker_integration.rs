@@ -14,6 +14,12 @@ use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tr
 
 const GUEST_ADDR: &str = "127.0.0.1:10445";
 const AUTH_ADDR: &str = "127.0.0.1:10446";
+const SIGNING_ADDR: &str = "127.0.0.1:10447";
+const READONLY_ADDR: &str = "127.0.0.1:10448";
+const ANCIENT_ADDR: &str = "127.0.0.1:10449";
+const ENCRYPTION_ADDR: &str = "127.0.0.1:10452";
+const SHARES50_ADDR: &str = "127.0.0.1:10453";
+const MAXREAD_ADDR: &str = "127.0.0.1:10454";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -771,4 +777,561 @@ async fn guest_watch_directory() {
                 .await;
         })
         .await;
+}
+
+// ── Mandatory signing (smb-signing) ──────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn signing_negotiated_as_required() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(SIGNING_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+
+    let params = conn.params().unwrap();
+    assert!(
+        params.signing_required,
+        "expected signing_required=true from smb-signing server"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn signing_write_read_roundtrip() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(SIGNING_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "testuser", "testpass", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "private")
+        .await
+        .expect("tree connect failed");
+
+    let test_path = "docker_test_signing.tmp";
+    let test_data = b"signed write test data 1234567890";
+
+    let written = tree
+        .write_file(&mut conn, test_path, test_data)
+        .await
+        .expect("write_file failed (signing)");
+    assert_eq!(written, test_data.len() as u64);
+
+    let data = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect("read_file failed (signing)");
+    assert_eq!(data, test_data);
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn signing_compound_operations() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(SIGNING_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "testuser", "testpass", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "private")
+        .await
+        .expect("tree connect failed");
+
+    let test_path = "docker_test_signing_compound.tmp";
+    let test_data = b"compound over signed transport";
+
+    tree.write_file_compound(&mut conn, test_path, test_data)
+        .await
+        .expect("write_file_compound failed (signing)");
+
+    let data = tree
+        .read_file_compound(&mut conn, test_path)
+        .await
+        .expect("read_file_compound failed (signing)");
+    assert_eq!(data, test_data);
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn signing_pipelined_large_file() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(SIGNING_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "testuser", "testpass", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "private")
+        .await
+        .expect("tree connect failed");
+
+    let test_path = "docker_test_signing_pipelined.tmp";
+    let test_data: Vec<u8> = (0..524_288).map(|i| (i % 251) as u8).collect();
+
+    tree.write_file_pipelined(&mut conn, test_path, &test_data)
+        .await
+        .expect("write_file_pipelined failed (signing)");
+
+    let data = tree
+        .read_file_pipelined(&mut conn, test_path)
+        .await
+        .expect("read_file_pipelined failed (signing)");
+    assert_eq!(data, test_data);
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+// ── Read-only share (smb-readonly) ───────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn readonly_list_and_read_succeed() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(READONLY_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "readonly")
+        .await
+        .expect("tree connect failed");
+
+    // List directory succeeds.
+    let entries = tree
+        .list_directory(&mut conn, "")
+        .await
+        .expect("list_directory failed");
+    assert!(
+        entries.iter().any(|e| e.name == "sample.txt"),
+        "expected sample.txt in readonly share"
+    );
+
+    // Read file succeeds.
+    let data = tree
+        .read_file(&mut conn, "sample.txt")
+        .await
+        .expect("read_file failed on readonly share");
+    assert!(!data.is_empty());
+
+    // Stat file succeeds.
+    let info = tree
+        .stat(&mut conn, "sample.txt")
+        .await
+        .expect("stat failed on readonly share");
+    assert!(!info.is_directory);
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn readonly_write_returns_error() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(READONLY_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "readonly")
+        .await
+        .expect("tree connect failed");
+
+    let result = tree.write_file(&mut conn, "should_fail.tmp", b"nope").await;
+
+    assert!(result.is_err(), "expected write to fail on readonly share");
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn readonly_delete_returns_error() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(READONLY_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "readonly")
+        .await
+        .expect("tree connect failed");
+
+    let result = tree.delete_file(&mut conn, "sample.txt").await;
+    assert!(result.is_err(), "expected delete to fail on readonly share");
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn readonly_create_directory_returns_error() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(READONLY_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "readonly")
+        .await
+        .expect("tree connect failed");
+
+    let result = tree.create_directory(&mut conn, "should_fail_dir").await;
+    assert!(
+        result.is_err(),
+        "expected create_directory to fail on readonly share"
+    );
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+// ── SMB1-only server (smb-ancient) ───────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn ancient_smb1_rejected_cleanly() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(ANCIENT_ADDR, TIMEOUT)
+        .await
+        .expect("TCP connect should succeed even to SMB1 server");
+
+    // Negotiate should fail: server only speaks SMB1, we only speak SMB2+.
+    let result = conn.negotiate().await;
+    assert!(
+        result.is_err(),
+        "expected negotiate to fail against SMB1-only server"
+    );
+}
+
+// ── Mandatory encryption (smb-encryption) ────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn encryption_connect_and_operate() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(ENCRYPTION_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+
+    let params = conn.params().unwrap();
+    // With smb encrypt = desired, server advertises encryption support.
+    // Verify we negotiated SMB3+ (required for encryption).
+    assert!(
+        params.dialect as u16 >= 0x0300,
+        "expected SMB 3.x dialect for encryption server, got {}",
+        params.dialect
+    );
+
+    let _session = Session::setup(&mut conn, "testuser", "testpass", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "private")
+        .await
+        .expect("tree connect failed");
+
+    // Write, read, verify data integrity. With smb encrypt = desired,
+    // the transport may or may not be encrypted (our lib doesn't yet
+    // wrap messages in TRANSFORM_HEADER), but operations should work.
+    let test_path = "docker_test_encrypted.tmp";
+    let test_data = b"encryption-capable server test data 1234567890";
+
+    let written = tree
+        .write_file(&mut conn, test_path, test_data)
+        .await
+        .expect("write_file failed (encrypted)");
+    assert_eq!(written, test_data.len() as u64);
+
+    let data = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect("read_file failed (encrypted)");
+    assert_eq!(data, test_data);
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn encryption_pipelined_large_file() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(ENCRYPTION_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "testuser", "testpass", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "private")
+        .await
+        .expect("tree connect failed");
+
+    let test_path = "docker_test_encrypted_pipelined.tmp";
+    let test_data: Vec<u8> = (0..524_288).map(|i| (i % 199) as u8).collect();
+
+    tree.write_file_pipelined(&mut conn, test_path, &test_data)
+        .await
+        .expect("write_file_pipelined failed (encrypted)");
+
+    let data = tree
+        .read_file_pipelined(&mut conn, test_path)
+        .await
+        .expect("read_file_pipelined failed (encrypted)");
+    assert_eq!(data, test_data);
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn encryption_list_shares() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(ENCRYPTION_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "testuser", "testpass", "")
+        .await
+        .expect("session setup failed");
+
+    let shares = list_shares(&mut conn).await.expect("list_shares failed");
+    assert!(
+        shares.iter().any(|s| s.name == "private"),
+        "expected 'private' share, got: {:?}",
+        shares.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+// ── 50-share server (smb-50shares) ───────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn shares50_list_all() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(SHARES50_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+
+    let shares = list_shares(&mut conn).await.expect("list_shares failed");
+
+    // Filter out IPC$ and other admin shares.
+    let user_shares: Vec<_> = shares.iter().filter(|s| !s.name.ends_with('$')).collect();
+
+    assert_eq!(
+        user_shares.len(),
+        50,
+        "expected 50 user shares, got {} (total including admin: {})",
+        user_shares.len(),
+        shares.len()
+    );
+
+    // Verify naming pattern.
+    assert!(user_shares.iter().any(|s| s.name == "share_01"));
+    assert!(user_shares.iter().any(|s| s.name == "share_50"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn shares50_connect_to_first_and_last() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(SHARES50_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+
+    // Connect to first share.
+    let tree1 = Tree::connect(&mut conn, "share_01")
+        .await
+        .expect("tree connect to share_01 failed");
+    tree1
+        .disconnect(&mut conn)
+        .await
+        .expect("disconnect failed");
+
+    // Connect to last share.
+    let tree50 = Tree::connect(&mut conn, "share_50")
+        .await
+        .expect("tree connect to share_50 failed");
+    tree50
+        .disconnect(&mut conn)
+        .await
+        .expect("disconnect failed");
+}
+
+// ── Tiny MaxReadSize (smb-maxreadsize) ───────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn maxread_negotiated_small() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(MAXREAD_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+
+    let params = conn.params().unwrap();
+    assert!(
+        params.max_read_size <= 65536,
+        "expected max_read_size <= 64KB, got {}",
+        params.max_read_size
+    );
+    assert!(
+        params.max_write_size <= 65536,
+        "expected max_write_size <= 64KB, got {}",
+        params.max_write_size
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn maxread_large_file_still_works() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(MAXREAD_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "public")
+        .await
+        .expect("tree connect failed");
+
+    // 512 KB file with 64 KB max read/write -> many chunks.
+    let test_path = "docker_test_maxread.tmp";
+    let test_data: Vec<u8> = (0..524_288).map(|i| (i % 199) as u8).collect();
+
+    tree.write_file_pipelined(&mut conn, test_path, &test_data)
+        .await
+        .expect("write_file_pipelined failed (maxreadsize)");
+
+    let data = tree
+        .read_file_pipelined(&mut conn, test_path)
+        .await
+        .expect("read_file_pipelined failed (maxreadsize)");
+    assert_eq!(data.len(), test_data.len(), "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn maxread_streaming_download() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: MAXREAD_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+    })
+    .await
+    .expect("connect failed");
+
+    let tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "docker_test_maxread_stream.tmp";
+    let test_data: Vec<u8> = (0..262_144).map(|i| (i % 251) as u8).collect();
+
+    client
+        .write_file(&tree, test_path, &test_data)
+        .await
+        .expect("write_file failed");
+
+    let mut download = client
+        .download(&tree, test_path)
+        .await
+        .expect("download failed");
+
+    let mut received = Vec::new();
+    let mut chunk_count = 0u32;
+    while let Some(chunk) = download.next_chunk().await {
+        let bytes = chunk.expect("next_chunk failed");
+        received.extend_from_slice(&bytes);
+        chunk_count += 1;
+    }
+
+    assert_eq!(received, test_data);
+    // With 64KB max read and 256KB file, we should get at least 4 chunks.
+    assert!(
+        chunk_count >= 4,
+        "expected at least 4 chunks, got {}",
+        chunk_count
+    );
+
+    drop(download);
+    client
+        .delete_file(&tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
 }

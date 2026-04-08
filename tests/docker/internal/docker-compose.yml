@@ -10,3 +10,39 @@ services:
       context: smb-auth
     ports:
       - "10446:445"
+
+  smb-signing:
+    build:
+      context: smb-signing
+    ports:
+      - "10447:445"
+
+  smb-readonly:
+    build:
+      context: smb-readonly
+    ports:
+      - "10448:445"
+
+  smb-ancient:
+    build:
+      context: smb-ancient
+    ports:
+      - "10449:445"
+
+  smb-encryption:
+    build:
+      context: smb-encryption
+    ports:
+      - "10452:445"
+
+  smb-50shares:
+    build:
+      context: smb-50shares
+    ports:
+      - "10453:445"
+
+  smb-maxreadsize:
+    build:
+      context: smb-maxreadsize
+    ports:
+      - "10454:445"
