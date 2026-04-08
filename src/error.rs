@@ -101,5 +101,5 @@ impl Error {
     }
 }
 
-/// A `Result` type alias using [`Error`].
+/// A `Result` type alias using the crate's [`Error`](enum@Error) type.
 pub type Result<T> = std::result::Result<T, Error>;
