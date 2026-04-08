@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -44,13 +44,39 @@ jobs:
       - name: Build documentation
         run: cargo doc --no-deps
 
+  docker-tests:
+    name: Docker integration tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start SMB containers
+        run: ./tests/docker/start.sh internal
+
+      - name: Run Docker integration tests
+        run: cargo test --test docker_integration -- --ignored
+        env:
+          RUST_LOG: smb2=info
+
+      - name: Stop containers
+        if: always()
+        run: ./tests/docker/stop.sh
+
   msrv:
     name: Verify MSRV (1.85)
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust toolchain (MSRV)
         uses: dtolnay/rust-toolchain@master
@@ -64,3 +90,21 @@ jobs:
         run: cargo check
         env:
           RUSTFLAGS: "-D warnings"
+
+  ci-ok:
+    name: CI OK
+    runs-on: ubuntu-latest
+    needs: [check, docker-tests, msrv]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "Some jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "Some jobs were cancelled"
+            exit 1
+          fi
+          echo "All jobs passed"
