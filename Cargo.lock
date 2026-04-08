@@ -1715,13 +1715,23 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac 0.12.1",
+]
+
+[[package]]
+name = "pbkdf2"
 version = "0.13.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca3fc18bb4460ac250ba6b75dfa7cf9d0b2273e3e623f660bd6ce2c3e902342e"
 dependencies = [
  "digest 0.11.0-rc.3",
  "hmac 0.13.0-rc.2",
- "sha1",
+ "sha1 0.11.0-rc.2",
 ]
 
 [[package]]
@@ -1782,7 +1792,7 @@ dependencies = [
  "rsa",
  "sec1",
  "serde",
- "sha1",
+ "sha1 0.11.0-rc.2",
  "sha2 0.11.0-rc.2",
  "sha3",
  "signature",
@@ -1851,13 +1861,13 @@ dependencies = [
  "hmac 0.13.0-rc.2",
  "inout 0.2.0-rc.6",
  "oid",
- "pbkdf2",
+ "pbkdf2 0.13.0-rc.1",
  "picky-asn1",
  "picky-asn1-der",
  "picky-asn1-x509",
  "rand 0.9.2",
  "serde",
- "sha1",
+ "sha1 0.11.0-rc.2",
  "thiserror",
  "uuid",
 ]
@@ -2287,7 +2297,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.9.5",
- "sha1",
+ "sha1 0.11.0-rc.2",
  "signature",
  "spki",
  "subtle",
@@ -2529,6 +2539,17 @@ checksum = "9af4a3e75ebd5599b30d4de5768e00b5095d518a79fefc3ecbaf77e665d1ec06"
 dependencies = [
  "base16ct 1.0.0",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -2780,7 +2801,9 @@ dependencies = [
  "md-5 0.10.6",
  "md4",
  "num_enum",
+ "pbkdf2 0.12.2",
  "proptest",
+ "sha1 0.10.6",
  "sha2 0.10.9",
  "thiserror",
  "tokio",
@@ -2854,7 +2877,7 @@ dependencies = [
  "rsa",
  "rustls",
  "serde",
- "sha1",
+ "sha1 0.11.0-rc.2",
  "sha2 0.11.0-rc.2",
  "signature",
  "spki",

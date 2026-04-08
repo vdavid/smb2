@@ -5,6 +5,7 @@
 //! Most users don't need this module directly -- [`SmbClient`](crate::SmbClient)
 //! handles authentication during [`connect`](crate::connect).
 
+pub mod kerberos;
 pub mod ntlm;
 pub mod spnego;
 
