@@ -7,7 +7,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A pure-Rust SMB2/3 client library with pipelined I/O.
-No C dependencies, no FFI. Downloads are ~10-25x faster than sequential SMB clients, and directory listings are ~2x faster than native macOS SMB.
+No C dependencies, no FFI. Faster than native macOS SMB across all operations — 1.3-5x faster on uploads, downloads, listings, and deletes.
 
 I built this because I needed fast SMB access for [Cmdr](https://github.com/vdavid/cmdr) (my file manager), and the existing Rust SMB options weren't cutting it. The `smb` crate works fine for listing files but downloads are painfully slow because it sends one read at a time. Native OS SMB clients pipeline their reads, and so does this library.
 
@@ -116,7 +116,7 @@ For large file I/O, use the pipelined variants which fill the credit window:
 
 ```rust
 # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
-// ~10-25x faster than sequential for large files
+// Pipelined I/O with sliding window for large files
 let data = client.read_file_pipelined(&share, "big_file.iso").await?;
 client.write_file_pipelined(&share, "copy.iso", &data).await?;
 # Ok(())
@@ -220,15 +220,40 @@ For advanced use cases, the underlying types are available:
 
 ## Performance
 
-SMB2/3 servers advertise `MaxReadSize` (typically 1-8 MB) and grant credits that allow multiple outstanding requests. Sequential clients ignore this and send one request at a time, leaving the TCP pipe idle most of the time.
+Benchmarked against native macOS SMB (with F_NOCACHE to disable kernel page cache) and the `smb` crate on a QNAP NAS over Gigabit LAN, SMB 3.1.1:
 
-This library fills the pipe. Based on testing against Samba:
+### Small files (100 × 100 KB)
 
-- **Downloads:** ~10-25x faster than sequential (the `smb` crate's approach)
-- **Directory listings:** ~2x faster than native macOS SMB (Finder/`ls`)
-- **Mixed operations:** Pipeline handles reads, writes, deletes, and listings concurrently
+| Operation | native | smb2 | Speedup |
+|---|---|---|---|
+| Upload | 3.69s | 1.91s | **1.9x faster** |
+| List | 47ms | 21ms | **2.2x faster** |
+| Download | 3.10s | 617ms | **5.0x faster** |
+| Delete | 3.08s | 1.03s | **3.0x faster** |
 
-The exact speedup depends on network latency and server configuration. Higher latency = bigger win from pipelining.
+### Medium files (10 × 10 MB)
+
+| Operation | native | smb2 | Speedup |
+|---|---|---|---|
+| Upload | 1.66s | 1.23s | **1.3x faster** |
+| List | 27ms | 19ms | **1.4x faster** |
+| Download | 4.00s | 2.93s | **1.4x faster** |
+| Delete | 301ms | 128ms | **2.4x faster** |
+
+### Large files (3 × 50 MB)
+
+| Operation | native | smb2 | Speedup |
+|---|---|---|---|
+| Upload | 1.69s | 1.56s | ~parity |
+| List | 27ms | 18ms | **1.5x faster** |
+| Download | 5.62s | 1.11s | **5.1x faster** |
+| Delete | 117ms | 54ms | **2.1x faster** |
+
+Key optimizations: compound requests (CREATE+READ+CLOSE in 1 round-trip), pipelined I/O with sliding window and adaptive chunk sizing, and 256-credit request for wide pipeline windows.
+
+**Note:** Native macOS download benchmarks use F_NOCACHE to bypass the kernel page cache. Without this, cached native reads appear ~20x faster because they skip the network entirely. F_NOCACHE gives a fair comparison of actual network I/O performance.
+
+The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-benchmark --release`.
 
 ## Known limitations
 
@@ -249,7 +274,7 @@ The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 o
 
 But for the common case (connect to a NAS, move files around), `smb2` is a better fit:
 
-- **Pipelined I/O** -- `smb` sends one request at a time, making downloads ~10x slower
+- **Compound + pipelined I/O** -- `smb` sends one request at a time; smb2 uses compound requests and pipelined reads with sliding window
 - **Auto-reconnect with durable handles** -- survives Wi-Fi drops without restarting transfers
 - **Comprehensive test suite** -- `smb` has almost no tests
 - **MIT OR Apache-2.0** -- `smb` is MIT-only
