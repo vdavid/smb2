@@ -420,18 +420,49 @@ mod tests {
         buf
     }
 
+    /// Build a compound response frame with proper NextCommand offsets and padding.
+    fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
+        let mut padded: Vec<Vec<u8>> = Vec::new();
+        for (i, resp) in responses.iter().enumerate() {
+            let mut r = resp.clone();
+            let is_last = i == responses.len() - 1;
+            if !is_last {
+                // Pad to 8-byte alignment.
+                let remainder = r.len() % 8;
+                if remainder != 0 {
+                    r.resize(r.len() + (8 - remainder), 0);
+                }
+                // Set NextCommand.
+                let next_cmd = r.len() as u32;
+                r[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+            }
+            padded.push(r);
+        }
+        let mut frame = Vec::new();
+        for r in &padded {
+            frame.extend_from_slice(r);
+        }
+        frame
+    }
+
+    /// Build a compound read response frame (CREATE + READ + CLOSE) for pipeline tests.
+    fn build_compound_read_response(file_id: FileId, data: Vec<u8>) -> Vec<u8> {
+        let create_resp = build_create_response(file_id, data.len() as u64);
+        let read_resp = build_read_response(data);
+        let close_resp = build_close_response();
+        build_compound_response_frame(&[create_resp, read_resp, close_resp])
+    }
+
     #[tokio::test]
     async fn pipeline_batch_of_three_reads() {
         let mock = Arc::new(MockTransport::new());
 
         let file_id = FileId { persistent: 1, volatile: 2 };
 
-        // Three read operations, each needs: CREATE + READ + CLOSE
+        // Three read operations, each needs a compound CREATE + READ + CLOSE frame.
         for i in 0..3 {
             let data = format!("content_{}", i);
-            mock.queue_response(build_create_response(file_id, data.len() as u64));
-            mock.queue_response(build_read_response(data.into_bytes()));
-            mock.queue_response(build_close_response());
+            mock.queue_response(build_compound_read_response(file_id, data.into_bytes()));
         }
 
         let mut conn = setup_connection(&mock);
@@ -462,10 +493,8 @@ mod tests {
 
         let file_id = FileId { persistent: 1, volatile: 2 };
 
-        // Op 1: ReadFile — CREATE + READ + CLOSE
-        mock.queue_response(build_create_response(file_id, 5));
-        mock.queue_response(build_read_response(b"hello".to_vec()));
-        mock.queue_response(build_close_response());
+        // Op 1: ReadFile — compound CREATE + READ + CLOSE
+        mock.queue_response(build_compound_read_response(file_id, b"hello".to_vec()));
 
         // Op 2: Delete — CREATE (with DELETE_ON_CLOSE) + CLOSE
         mock.queue_response(build_create_response(file_id, 0));
@@ -622,21 +651,34 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId { persistent: 1, volatile: 2 };
 
-        // Op 1: ReadFile that fails at CREATE
-        let mut h = Header::new_request(Command::Create);
-        h.flags.set_response();
-        h.credits = 32;
-        h.status = NtStatus::OBJECT_NAME_NOT_FOUND;
-        let body = ErrorResponse {
+        // Op 1: ReadFile that fails at CREATE — compound frame with cascaded errors.
+        let error_body = ErrorResponse {
             error_context_count: 0,
             error_data: vec![],
         };
-        mock.queue_response(pack_message(&h, &body));
 
-        // Op 2: ReadFile that succeeds
-        mock.queue_response(build_create_response(file_id, 3));
-        mock.queue_response(build_read_response(b"abc".to_vec()));
-        mock.queue_response(build_close_response());
+        let mut h1 = Header::new_request(Command::Create);
+        h1.flags.set_response();
+        h1.credits = 32;
+        h1.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_err = pack_message(&h1, &error_body);
+
+        let mut h2 = Header::new_request(Command::Read);
+        h2.flags.set_response();
+        h2.credits = 32;
+        h2.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let read_err = pack_message(&h2, &error_body);
+
+        let mut h3 = Header::new_request(Command::Close);
+        h3.flags.set_response();
+        h3.credits = 32;
+        h3.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_err = pack_message(&h3, &error_body);
+
+        mock.queue_response(build_compound_response_frame(&[create_err, read_err, close_err]));
+
+        // Op 2: ReadFile that succeeds — compound frame.
+        mock.queue_response(build_compound_read_response(file_id, b"abc".to_vec()));
 
         let mut conn = setup_connection(&mock);
         let tree = test_tree();

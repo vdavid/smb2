@@ -319,33 +319,21 @@ impl Tree {
         Ok(data)
     }
 
-    /// Read a file's contents.
+    /// Read a file's contents using a compound request (1 round-trip).
     ///
-    /// Opens the file with CREATE, reads in chunks up to max_read_size,
-    /// then closes the handle.
+    /// Sends CREATE+READ+CLOSE as a single compound message. For files
+    /// that fit in MaxReadSize (typically 8 MB), this is the fastest
+    /// path — 1 round-trip instead of 3+.
+    ///
+    /// For files larger than MaxReadSize, the compound returns only the
+    /// first chunk. In that case, use [`read_file_pipelined`](Self::read_file_pipelined)
+    /// for concurrent chunked reads.
     pub async fn read_file(
         &self,
         conn: &mut Connection,
         path: &str,
     ) -> Result<Vec<u8>> {
-        let normalized = normalize_path(path);
-
-        // Open the file.
-        let (file_id, file_size) = self.open_file(conn, &normalized).await?;
-        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
-        let chunks = file_size.div_ceil(max_read as u64);
-        debug!("tree: read_file path={}, size={}, chunks={}", normalized, file_size, chunks);
-
-        // Read the file in chunks.
-        let result = self.read_loop(conn, file_id, file_size).await;
-
-        // Close the handle.
-        let close_result = self.close_handle(conn, file_id).await;
-
-        let data = result?;
-        close_result?;
-        debug!("tree: read_file done, read {} bytes", data.len());
-        Ok(data)
+        self.read_file_compound(conn, path).await
     }
 
     /// Disconnect from the share.
@@ -1050,6 +1038,7 @@ impl Tree {
     }
 
     /// Read file data in chunks.
+    #[allow(dead_code)] // Will be used by read_file_pipelined for large-file chunked reads.
     async fn read_loop(
         &self,
         conn: &mut Connection,
@@ -2010,13 +1999,12 @@ mod tests {
         };
         let file_data = b"Hello, SMB world!";
 
-        // Queue: CREATE response, READ response, CLOSE response.
-        mock.queue_response(build_create_response(file_id, file_data.len() as u64));
-        mock.queue_response(build_read_response(
-            NtStatus::SUCCESS,
-            file_data.to_vec(),
-        ));
-        mock.queue_response(build_close_response());
+        // Queue a single compound response frame: CREATE + READ + CLOSE.
+        let create_resp = build_create_response(file_id, file_data.len() as u64);
+        let read_resp = build_read_response(NtStatus::SUCCESS, file_data.to_vec());
+        let close_resp = build_close_response();
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
