@@ -172,12 +172,14 @@ These are the top issues that WILL cause bugs if not handled correctly. Read the
 
 12. **NTLM MIC:** Modern servers include `MsvAvTimestamp` in the challenge, triggering MIC validation. Must retain raw bytes of NEGOTIATE, CHALLENGE, and AUTHENTICATE for MIC computation. (MS-NLMP)
 
-## Testing approach
+## Testing
 
-- **Unit tests:** `cargo test` uses mock transport, no server needed
-- **Property tests:** `cargo test` includes proptest for pack/unpack roundtrips
-- **Integration tests:** `cargo test --test integration -- --ignored` requires Docker Samba
-- **Wire format tests:** Known byte sequences from spec and Wireshark captures
+See `tests/CLAUDE.md` for the full testing guide. Quick reference:
+
+- `cargo test` — unit tests (~555), no server needed
+- `just check` — fmt + clippy + tests + doc
+- `cargo test --test integration -- --ignored` — real NAS/Pi tests (needs `.env`)
+- `just test-docker` — Docker container tests (needs Docker)
 
 ## Module docs (CLAUDE.md files)
 
@@ -195,6 +197,7 @@ src/auth/CLAUDE.md      # NTLM, MIC, session key derivation
 src/rpc/CLAUDE.md       # RPC-over-pipes, NDR, share enumeration
 src/pack/CLAUDE.md      # Cursors, GUID, FileTime, MAX_UNPACK_BUFFER
 src/types/CLAUDE.md     # Newtypes, enums, bitflags, NtStatus
+tests/CLAUDE.md         # Test categories, how to run, writing new tests
 ```
 
 ## Code style
