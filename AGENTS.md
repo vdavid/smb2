@@ -6,7 +6,8 @@ Pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. S
 
 | Command                | Description                                          |
 |------------------------|------------------------------------------------------|
-| `just`                 | Run all checks: format, lint, test, doc              |
+| `just`                 | Fast checks: format, lint, test, doc (~2s)           |
+| `just check-live`      | Fast checks + integration tests on real servers (~6s)|
 | `just fix`             | Auto-fix formatting and clippy warnings              |
 | `just check-all`       | Include MSRV check, security audit, and license check|
 | `cargo test`           | Run unit tests (mock transport, no server needed)    |

@@ -58,6 +58,12 @@ test:
     @cargo test --quiet
     @echo "[+] Tests passed"
 
+# Run integration tests against real SMB servers (requires NAS + Pi on LAN)
+test-integration:
+    @echo "[*] Running integration tests..."
+    @cargo test --test integration -- --ignored --quiet
+    @echo "[+] Integration tests passed"
+
 # Build documentation
 doc:
     @echo "[*] Building docs..."
@@ -116,6 +122,11 @@ udeps:
 check: fmt-check clippy test doc
     @echo ""
     @echo "[+] All fast checks passed!"
+
+# Run fast checks + integration tests against real servers
+check-live: check test-integration
+    @echo ""
+    @echo "[+] All checks + integration tests passed!"
 
 # Run all checks including slow ones: check + msrv + audit + deny
 check-all: check msrv audit deny
