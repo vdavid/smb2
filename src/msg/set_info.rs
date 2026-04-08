@@ -49,7 +49,7 @@ impl Pack for SetInfoRequest {
         cursor.write_u8(self.file_info_class);
         // BufferLength (4 bytes)
         cursor.write_u32_le(self.buffer.len() as u32);
-        // BufferOffset (2 bytes) — placeholder
+        // BufferOffset (2 bytes) -- placeholder
         let offset_pos = cursor.position();
         cursor.write_u16_le(0);
         // Reserved (2 bytes)

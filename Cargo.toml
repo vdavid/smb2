@@ -28,7 +28,7 @@ exclude = [
 all-features = true
 
 [dependencies]
-# Logging facade — application picks the backend (env_logger, tracing, etc.)
+# Logging facade -- application picks the backend (env_logger, tracing, etc.)
 log = "0.4"
 
 # Async runtime agnostic
@@ -40,10 +40,10 @@ thiserror = "2"
 # Enum conversion derives
 num_enum = "0.7"
 
-# Async runtime — transport layer needs net, io-util, time, sync
+# Async runtime -- transport layer needs net, io-util, time, sync
 tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
 
-# Crypto — signing, encryption, key derivation
+# Crypto -- signing, encryption, key derivation
 hmac = "0.12"
 sha2 = "0.10"
 aes = "0.8"

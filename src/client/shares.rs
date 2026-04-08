@@ -32,7 +32,7 @@ const PIPE_READ_BUFFER_SIZE: u32 = 65536;
 /// Connects to the IPC$ share, opens the srvsvc named pipe, performs
 /// the RPC exchange, and returns filtered disk shares.
 ///
-/// This is a self-contained operation — it opens and closes its own
+/// This is a self-contained operation -- it opens and closes its own
 /// tree connection to IPC$.
 pub async fn list_shares(conn: &mut Connection) -> Result<Vec<ShareInfo>> {
     // 1. Tree connect to IPC$
@@ -41,7 +41,7 @@ pub async fn list_shares(conn: &mut Connection) -> Result<Vec<ShareInfo>> {
     // Run the pipe operations, then clean up regardless of outcome
     let result = pipe_rpc_exchange(conn, tree_id).await;
 
-    // 8. Tree disconnect (best-effort — don't mask the real error)
+    // 8. Tree disconnect (best-effort -- don't mask the real error)
     let _ = tree_disconnect(conn, tree_id).await;
 
     let all_shares = result?;

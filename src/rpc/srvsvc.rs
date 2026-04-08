@@ -110,7 +110,7 @@ pub fn parse_net_share_enum_all_response(data: &[u8]) -> Result<Vec<ShareInfo>> 
 fn parse_net_share_enum_all_stub(stub: &[u8]) -> Result<Vec<ShareInfo>> {
     let mut r = ReadCursor::new(stub);
 
-    // Level (u32) — should be 1
+    // Level (u32) -- should be 1
     let level = r.read_u32_le()?;
     if level != 1 {
         return Err(Error::invalid_data(format!(
@@ -118,7 +118,7 @@ fn parse_net_share_enum_all_stub(stub: &[u8]) -> Result<Vec<ShareInfo>> {
         )));
     }
 
-    // Union discriminant (u32) — should be 1
+    // Union discriminant (u32) -- should be 1
     let discriminant = r.read_u32_le()?;
     if discriminant != 1 {
         return Err(Error::invalid_data(format!(

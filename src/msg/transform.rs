@@ -2,7 +2,7 @@
 //! (MS-SMB2 sections 2.2.41, 2.2.42).
 //!
 //! These headers wrap (encrypted or compressed) SMB2 messages. They are NOT
-//! SMB2 messages themselves — they precede the actual message data.
+//! SMB2 messages themselves -- they precede the actual message data.
 
 use crate::error::Result;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
@@ -59,7 +59,7 @@ pub const SMB2_COMPRESSION_FLAG_CHAINED: u16 = 0x0001;
 /// The total header is 52 bytes:
 /// - ProtocolId (4 bytes, must be 0xFD 'S' 'M' 'B')
 /// - Signature (16 bytes)
-/// - Nonce (16 bytes — first 11 bytes used for AES-CCM, first 12 for AES-GCM)
+/// - Nonce (16 bytes -- first 11 bytes used for AES-CCM, first 12 for AES-GCM)
 /// - OriginalMessageSize (4 bytes)
 /// - Reserved (2 bytes)
 /// - Flags (2 bytes)
@@ -160,7 +160,7 @@ impl Unpack for TransformHeader {
 /// - OriginalCompressedSegmentSize (4 bytes)
 /// - CompressionAlgorithm (2 bytes)
 /// - Flags (2 bytes)
-/// - Offset (4 bytes) — offset from the end of this header to the
+/// - Offset (4 bytes) -- offset from the end of this header to the
 ///   start of compressed data
 ///
 /// Note: The chained variant (Flags = SMB2_COMPRESSION_FLAG_CHAINED)

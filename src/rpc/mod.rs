@@ -90,7 +90,7 @@ const RPC_HEADER_SIZE: usize = 16;
 pub fn build_srvsvc_bind(call_id: u32) -> Vec<u8> {
     let mut w = WriteCursor::with_capacity(72);
 
-    // Common header (16 bytes) — FragLength will be backpatched
+    // Common header (16 bytes) -- FragLength will be backpatched
     w.write_u8(RPC_VERSION_MAJOR);
     w.write_u8(RPC_VERSION_MINOR);
     w.write_u8(PDU_TYPE_BIND);
@@ -455,7 +455,7 @@ mod tests {
         w.write_u16_le(MAX_RECV_FRAG);
         w.write_u32_le(0x12345); // AssocGroup
 
-        // Secondary address: "\pipe\srvsvc\0" (empty for simplicity — use length 0)
+        // Secondary address: "\pipe\srvsvc\0" (empty for simplicity -- use length 0)
         w.write_u16_le(0); // SecAddrLen = 0
         w.write_bytes(&[0, 0]); // Padding to 4-byte alignment
 

@@ -104,10 +104,10 @@ impl Pack for QueryDirectoryRequest {
         // FileId (16 bytes)
         cursor.write_u64_le(self.file_id.persistent);
         cursor.write_u64_le(self.file_id.volatile);
-        // FileNameOffset (2 bytes) — placeholder
+        // FileNameOffset (2 bytes) -- placeholder
         let name_offset_pos = cursor.position();
         cursor.write_u16_le(0);
-        // FileNameLength (2 bytes) — placeholder
+        // FileNameLength (2 bytes) -- placeholder
         let name_length_pos = cursor.position();
         cursor.write_u16_le(0);
         // OutputBufferLength (4 bytes)
@@ -214,7 +214,7 @@ impl Pack for QueryDirectoryResponse {
 
         // StructureSize (2 bytes)
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // OutputBufferOffset (2 bytes) — placeholder
+        // OutputBufferOffset (2 bytes) -- placeholder
         let offset_pos = cursor.position();
         cursor.write_u16_le(0);
         // OutputBufferLength (4 bytes)

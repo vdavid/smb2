@@ -115,7 +115,7 @@ impl Session {
             ));
         }
 
-        // The server assigned a session ID — use it for subsequent requests.
+        // The server assigned a session ID -- use it for subsequent requests.
         debug!(
             "session: round 1 complete, status={:?}, session_id={}",
             resp1_header.status, resp1_header.session_id
@@ -152,7 +152,7 @@ impl Session {
 
         let (resp2_header, resp2_body, _resp2_raw) = conn.receive_response().await?;
 
-        // Do NOT hash the success response — the preauth hash used for
+        // Do NOT hash the success response -- the preauth hash used for
         // key derivation contains only messages up to (and including)
         // the final authenticate request, not the success response.
 

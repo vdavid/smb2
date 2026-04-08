@@ -21,7 +21,6 @@ use crate::Error;
 /// - FileId (16 bytes): persistent (8 bytes) + volatile (8 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushRequest {
-    /// The identifier of the open to flush.
     pub file_id: FileId,
 }
 
@@ -74,43 +73,12 @@ impl Unpack for FlushRequest {
     }
 }
 
-/// SMB2 FLUSH response (spec section 2.2.18).
-///
-/// Sent by the server to confirm that a FLUSH request was processed.
-/// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlushResponse;
-
-impl FlushResponse {
-    pub const STRUCTURE_SIZE: u16 = 4;
-}
-
-impl Pack for FlushResponse {
-    fn pack(&self, cursor: &mut WriteCursor) {
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // Reserved (2 bytes)
-        cursor.write_u16_le(0);
-    }
-}
-
-impl Unpack for FlushResponse {
-    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
-        // StructureSize (2 bytes)
-        let structure_size = cursor.read_u16_le()?;
-        if structure_size != Self::STRUCTURE_SIZE {
-            return Err(Error::invalid_data(format!(
-                "invalid FlushResponse structure size: expected {}, got {}",
-                Self::STRUCTURE_SIZE,
-                structure_size
-            )));
-        }
-
-        // Reserved (2 bytes)
-        let _reserved = cursor.read_u16_le()?;
-
-        Ok(FlushResponse)
-    }
+super::trivial_message! {
+    /// SMB2 FLUSH response (spec section 2.2.18).
+    ///
+    /// Sent by the server to confirm that a FLUSH request was processed.
+    /// Contains only StructureSize (2 bytes) and Reserved (2 bytes).
+    pub struct FlushResponse;
 }
 
 #[cfg(test)]
@@ -254,62 +222,11 @@ mod tests {
 
     // ── FlushResponse tests ────────────────────────────────────────
 
-    #[test]
-    fn flush_response_pack_produces_4_bytes() {
-        let resp = FlushResponse;
-        let mut cursor = WriteCursor::new();
-        resp.pack(&mut cursor);
-        let bytes = cursor.into_inner();
-        assert_eq!(bytes.len(), 4);
-    }
-
-    #[test]
-    fn flush_response_known_bytes() {
-        let resp = FlushResponse;
-        let mut cursor = WriteCursor::new();
-        resp.pack(&mut cursor);
-        let bytes = cursor.into_inner();
-
-        // StructureSize=4 (LE), Reserved=0
-        assert_eq!(bytes, [0x04, 0x00, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn flush_response_unpack_known_bytes() {
-        let bytes = [0x04, 0x00, 0x00, 0x00];
-        let mut cursor = ReadCursor::new(&bytes);
-        let resp = FlushResponse::unpack(&mut cursor).unwrap();
-        assert_eq!(resp, FlushResponse);
-        assert!(cursor.is_empty());
-    }
-
-    #[test]
-    fn flush_response_roundtrip() {
-        let original = FlushResponse;
-        let mut w = WriteCursor::new();
-        original.pack(&mut w);
-        let bytes = w.into_inner();
-
-        let mut r = ReadCursor::new(&bytes);
-        let decoded = FlushResponse::unpack(&mut r).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn flush_response_wrong_structure_size() {
-        let bytes = [0x18, 0x00, 0x00, 0x00];
-        let mut cursor = ReadCursor::new(&bytes);
-        let result = FlushResponse::unpack(&mut cursor);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("structure size"), "error was: {err}");
-    }
-
-    #[test]
-    fn flush_response_ignores_reserved_value() {
-        let bytes = [0x04, 0x00, 0xFF, 0xFF];
-        let mut cursor = ReadCursor::new(&bytes);
-        let resp = FlushResponse::unpack(&mut cursor).unwrap();
-        assert_eq!(resp, FlushResponse);
-    }
+    super::super::trivial_message_tests!(
+        FlushResponse,
+        flush_response_known_bytes,
+        flush_response_roundtrip,
+        flush_response_wrong_structure_size,
+        flush_response_too_short
+    );
 }

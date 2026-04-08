@@ -84,7 +84,7 @@ impl Pack for TreeConnectRequest {
         let path_u16: Vec<u16> = self.path.encode_utf16().collect();
         let path_byte_len = path_u16.len() * 2;
 
-        // PathOffset (2 bytes) — offset from start of SMB2 header
+        // PathOffset (2 bytes) -- offset from start of SMB2 header
         let offset = (Header::SIZE + 8) as u16; // 8 = fixed part of this struct
         cursor.write_u16_le(offset);
         // PathLength (2 bytes)
@@ -108,7 +108,7 @@ impl Unpack for TreeConnectRequest {
 
         // Flags/Reserved (2 bytes)
         let flags = TreeConnectRequestFlags(cursor.read_u16_le()?);
-        // PathOffset (2 bytes) — we ignore, read sequentially
+        // PathOffset (2 bytes) -- we ignore, read sequentially
         let _offset = cursor.read_u16_le()?;
         // PathLength (2 bytes)
         let path_length = cursor.read_u16_le()? as usize;

@@ -423,14 +423,14 @@ mod tests {
             volatile: 2,
         };
 
-        // Op 1: ReadFile — compound CREATE + READ + CLOSE
+        // Op 1: ReadFile -- compound CREATE + READ + CLOSE
         mock.queue_response(build_compound_read_response(file_id, b"hello".to_vec()));
 
-        // Op 2: Delete — CREATE (with DELETE_ON_CLOSE) + CLOSE
+        // Op 2: Delete -- CREATE (with DELETE_ON_CLOSE) + CLOSE
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_close_response());
 
-        // Op 3: ListDirectory — CREATE + QUERY_DIR + QUERY_DIR(NO_MORE) + CLOSE
+        // Op 3: ListDirectory -- CREATE + QUERY_DIR + QUERY_DIR(NO_MORE) + CLOSE
         mock.queue_response(build_create_response_directory(file_id));
         let entry = build_file_both_dir_info("test.txt", 100, false, 0);
         mock.queue_response(build_query_directory_response(NtStatus::SUCCESS, entry));
@@ -607,7 +607,7 @@ mod tests {
             volatile: 2,
         };
 
-        // Op 1: ReadFile that fails at CREATE — compound frame with cascaded errors.
+        // Op 1: ReadFile that fails at CREATE -- compound frame with cascaded errors.
         let error_body = ErrorResponse {
             error_context_count: 0,
             error_data: vec![],
@@ -635,7 +635,7 @@ mod tests {
             create_err, read_err, close_err,
         ]));
 
-        // Op 2: ReadFile that succeeds — compound frame.
+        // Op 2: ReadFile that succeeds -- compound frame.
         mock.queue_response(build_compound_read_response(file_id, b"abc".to_vec()));
 
         let mut conn = setup_connection(&mock);

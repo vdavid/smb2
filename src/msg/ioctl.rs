@@ -103,9 +103,9 @@ impl Pack for IoctlRequest {
         cursor.write_u32_le(input_count);
         // MaxInputResponse (4 bytes)
         cursor.write_u32_le(self.max_input_response);
-        // OutputOffset (4 bytes) — no output data in the request
+        // OutputOffset (4 bytes) -- no output data in the request
         cursor.write_u32_le(0);
-        // OutputCount (4 bytes) — no output data in the request
+        // OutputCount (4 bytes) -- no output data in the request
         cursor.write_u32_le(0);
         // MaxOutputResponse (4 bytes)
         cursor.write_u32_le(self.max_output_response);
@@ -179,7 +179,7 @@ impl Unpack for IoctlRequest {
 /// - OutputCount (4 bytes)
 /// - Flags (4 bytes)
 /// - Reserved2 (4 bytes)
-/// - Buffer (variable — may contain both input and output data)
+/// - Buffer (variable -- may contain both input and output data)
 #[derive(Debug, Clone)]
 pub struct IoctlResponse {
     /// The control code echoed from the request.
@@ -220,7 +220,7 @@ impl Pack for IoctlResponse {
             0
         };
 
-        // InputOffset (4 bytes) — no input data in the response
+        // InputOffset (4 bytes) -- no input data in the response
         cursor.write_u32_le(0);
         // InputCount (4 bytes)
         cursor.write_u32_le(0);

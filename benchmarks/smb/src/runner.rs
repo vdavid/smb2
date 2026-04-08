@@ -103,7 +103,7 @@ pub async fn run_all(
             println!(
                 "\n========================================\n\
                  Target: {} ({})\n\
-                 Suite: {} — {} x {} KB\n\
+                 Suite: {} -- {} x {} KB\n\
                  ========================================",
                 target.name,
                 target.host,
@@ -187,7 +187,7 @@ async fn run_suite(
     let (mut smb2_client, smb2_tree) = smb2_runner::connect(target).await?;
     println!("done");
 
-    // Warmup run (not counted) — primes NAS caches
+    // Warmup run (not counted) -- primes NAS caches
     println!(
         "  {} {}/{}: warmup run...",
         elapsed_tag(bench_start),

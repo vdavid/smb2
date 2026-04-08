@@ -164,13 +164,13 @@ impl Pack for CreateRequest {
 
         // StructureSize (2 bytes)
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // SecurityFlags (1 byte) — must be 0
+        // SecurityFlags (1 byte) -- must be 0
         cursor.write_u8(0);
         // RequestedOplockLevel (1 byte)
         cursor.write_u8(self.requested_oplock_level as u8);
         // ImpersonationLevel (4 bytes)
         cursor.write_u32_le(self.impersonation_level as u32);
-        // SmbCreateFlags (8 bytes) — must be 0
+        // SmbCreateFlags (8 bytes) -- must be 0
         cursor.write_u64_le(0);
         // Reserved (8 bytes)
         cursor.write_u64_le(0);
@@ -185,16 +185,16 @@ impl Pack for CreateRequest {
         // CreateOptions (4 bytes)
         cursor.write_u32_le(self.create_options);
 
-        // NameOffset (2 bytes) — placeholder, backpatch later
+        // NameOffset (2 bytes) -- placeholder, backpatch later
         let name_offset_pos = cursor.position();
         cursor.write_u16_le(0);
-        // NameLength (2 bytes) — placeholder, backpatch later
+        // NameLength (2 bytes) -- placeholder, backpatch later
         let name_length_pos = cursor.position();
         cursor.write_u16_le(0);
-        // CreateContextsOffset (4 bytes) — placeholder
+        // CreateContextsOffset (4 bytes) -- placeholder
         let ctx_offset_pos = cursor.position();
         cursor.write_u32_le(0);
-        // CreateContextsLength (4 bytes) — placeholder
+        // CreateContextsLength (4 bytes) -- placeholder
         let ctx_length_pos = cursor.position();
         cursor.write_u32_le(0);
 
@@ -383,10 +383,10 @@ impl Pack for CreateResponse {
         // FileId (16 bytes = persistent u64 + volatile u64)
         cursor.write_u64_le(self.file_id.persistent);
         cursor.write_u64_le(self.file_id.volatile);
-        // CreateContextsOffset (4 bytes) — placeholder
+        // CreateContextsOffset (4 bytes) -- placeholder
         let ctx_offset_pos = cursor.position();
         cursor.write_u32_le(0);
-        // CreateContextsLength (4 bytes) — placeholder
+        // CreateContextsLength (4 bytes) -- placeholder
         let ctx_length_pos = cursor.position();
         cursor.write_u32_le(0);
 

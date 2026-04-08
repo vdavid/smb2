@@ -1,4 +1,4 @@
-//! SMB2 operations — uses our `smb2` crate to talk SMB2/3 directly.
+//! SMB2 operations -- uses our `smb2` crate to talk SMB2/3 directly.
 
 use crate::config::Target;
 use smb2::{ClientConfig, SmbClient, Tree};

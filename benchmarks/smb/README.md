@@ -2,9 +2,9 @@
 
 Three-way comparison of SMB file operations:
 
-1. **Native** — OS-mounted SMB via `std::fs`
-2. **smb** — `smb` crate (third-party Rust SMB client)
-3. **smb2** — our `smb2` crate (pure-Rust pipelined SMB2/3 client)
+1. **Native**: OS-mounted SMB via `std::fs`
+2. **smb**: `smb` crate (third-party Rust SMB client)
+3. **smb2**: our `smb2` crate (pure-Rust pipelined SMB2/3 client)
 
 Measures upload, list, download, and delete across configurable file sizes, counts, and NAS targets.
 
@@ -33,8 +33,8 @@ Release mode matters: without it, local file I/O and data generation are noticea
 
 The benchmark prints a table with median times per operation and two ratio columns:
 
-- **smb2/nat** — smb2 time / native time. Values < 1.0 mean smb2 is faster than native.
-- **smb2/smb** — smb2 time / smb crate time. Values < 1.0 mean smb2 is faster than the smb crate.
+- **smb2/nat**: smb2 time / native time. Values < 1.0 mean smb2 is faster than native.
+- **smb2/smb**: smb2 time / smb crate time. Values < 1.0 mean smb2 is faster than the smb crate.
 
 Each suite runs multiple iterations (after a warmup run). The order of all three methods is randomized per iteration to
 reduce cache bias. Each iteration uses a unique directory name to avoid stale SMB cache reads.

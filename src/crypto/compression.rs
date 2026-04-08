@@ -12,15 +12,6 @@
 /// Maximum decompressed size we allow (16 MB). Prevents decompression bombs.
 const MAX_DECOMPRESSED_SIZE: u32 = 16 * 1024 * 1024;
 
-/// Supported compression algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionAlgorithm {
-    /// No compression.
-    None,
-    /// LZ4 block compression.
-    Lz4,
-}
-
 /// The result of compressing an SMB2 message (unchained mode).
 #[derive(Debug, Clone)]
 pub struct CompressedMessage {
@@ -193,7 +184,7 @@ mod tests {
 
     #[test]
     fn large_message_compresses_well() {
-        // 1 MB of repeated pattern — should compress very well.
+        // 1 MB of repeated pattern -- should compress very well.
         let message: Vec<u8> = b"SMB2 compression test data! "
             .iter()
             .copied()
@@ -226,7 +217,7 @@ mod tests {
         let message: Vec<u8> = vec![0xAA; 1024];
         let compressed = compress_message(&message, 0).expect("should compress");
 
-        // Use a wrong (smaller) original_size — decompression should fail
+        // Use a wrong (smaller) original_size -- decompression should fail
         // because LZ4 validates the output size.
         let result = decompress_message(&[], &compressed.compressed_data, 512);
         assert!(result.is_err(), "wrong original_size should cause an error");

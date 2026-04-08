@@ -337,7 +337,7 @@ impl NtlmAuthenticator {
 
     /// Get the random session key (random 16 bytes, or test override).
     ///
-    /// This MUST be cryptographically secure — the ExportedSessionKey
+    /// This MUST be cryptographically secure -- the ExportedSessionKey
     /// is used for all subsequent signing and encryption. A predictable
     /// key would let an attacker forge messages and decrypt traffic.
     fn get_random_session_key(&self) -> [u8; 16] {
@@ -576,7 +576,7 @@ fn build_temp(timestamp: u64, client_challenge: &[u8; 8], target_info: &[u8]) ->
     temp
 }
 
-/// RC4 encryption (symmetric — encrypt and decrypt are the same operation).
+/// RC4 encryption (symmetric -- encrypt and decrypt are the same operation).
 fn rc4_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut s: Vec<u8> = (0..=255).collect();
     let mut j: u8 = 0;

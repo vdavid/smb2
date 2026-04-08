@@ -394,7 +394,7 @@ impl<'a> FileUpload<'a> {
 
         let offset = self.bytes_written as usize;
         if offset >= self.data.len() {
-            // All data written — flush and close.
+            // All data written -- flush and close.
             self.flush_and_close().await?;
             return Ok(false);
         }

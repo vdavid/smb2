@@ -73,8 +73,8 @@ Integration tests need a Samba server running in Docker. See the test file for s
 
 We follow standard Rust conventions with a few specific choices:
 
-- `#![forbid(unsafe_code)]` — no unsafe code, ever
-- `#![warn(missing_docs)]` — doc comments for all public APIs
+- `#![forbid(unsafe_code)]`: no unsafe code, ever
+- `#![warn(missing_docs)]`: doc comments for all public APIs
 - Hand-rolled binary serialization (no proc macros for wire format)
 - Newtypes for protocol IDs (`SessionId`, `TreeId`, `FileId`, etc.)
 - `thiserror` for error types

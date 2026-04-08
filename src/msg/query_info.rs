@@ -1,7 +1,7 @@
 //! SMB2 QUERY_INFO request and response (spec sections 2.2.37, 2.2.38).
 //!
 //! Used to query file, filesystem, security, or quota information.
-//! The response buffer is stored as raw bytes — parsing into specific
+//! The response buffer is stored as raw bytes -- parsing into specific
 //! information classes is deferred.
 
 use crate::error::Result;
@@ -83,7 +83,7 @@ impl Pack for QueryInfoRequest {
         cursor.write_u8(self.file_info_class);
         // OutputBufferLength (4 bytes)
         cursor.write_u32_le(self.output_buffer_length);
-        // InputBufferOffset (2 bytes) — placeholder
+        // InputBufferOffset (2 bytes) -- placeholder
         let input_offset_pos = cursor.position();
         cursor.write_u16_le(0);
         // Reserved (2 bytes)
@@ -194,7 +194,7 @@ impl Pack for QueryInfoResponse {
 
         // StructureSize (2 bytes)
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // OutputBufferOffset (2 bytes) — placeholder
+        // OutputBufferOffset (2 bytes) -- placeholder
         let offset_pos = cursor.position();
         cursor.write_u16_le(0);
         // OutputBufferLength (4 bytes)

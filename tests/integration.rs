@@ -1091,7 +1091,7 @@ async fn compound_read_and_write_on_raspberry_pi() {
     assert_eq!(read_back, test_data, "data mismatch on Pi");
     println!("Pi compound read/write verified!");
 
-    // Cleanup (best-effort — Pi sometimes drops connection after compound)
+    // Cleanup (best-effort -- Pi sometimes drops connection after compound)
     let _ = tree.delete_file(&mut conn, "smb2_pi_compound.tmp").await;
     let _ = tree.disconnect(&mut conn).await;
 }
@@ -1284,7 +1284,7 @@ async fn streaming_upload_and_download_on_pi() {
     // Release the borrow.
     drop(upload);
 
-    // Download via read_file (compound) — simpler and more robust for
+    // Download via read_file (compound) -- simpler and more robust for
     // small files on Pi which sometimes resets streaming connections.
     let received = client
         .read_file(&tree, test_path)

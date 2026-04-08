@@ -100,7 +100,7 @@ impl Pack for SessionSetupRequest {
         // Channel (4 bytes)
         cursor.write_u32_le(self.channel);
 
-        // SecurityBufferOffset (2 bytes) — offset from start of SMB2 header
+        // SecurityBufferOffset (2 bytes) -- offset from start of SMB2 header
         let offset = (Header::SIZE + 24) as u16; // 24 = bytes before the buffer in this struct
         cursor.write_u16_le(offset);
         // SecurityBufferLength (2 bytes)
@@ -132,7 +132,7 @@ impl Unpack for SessionSetupRequest {
         let capabilities = Capabilities::new(cursor.read_u32_le()?);
         // Channel (4 bytes)
         let channel = cursor.read_u32_le()?;
-        // SecurityBufferOffset (2 bytes) — we ignore, read sequentially
+        // SecurityBufferOffset (2 bytes) -- we ignore, read sequentially
         let _offset = cursor.read_u16_le()?;
         // SecurityBufferLength (2 bytes)
         let buffer_length = cursor.read_u16_le()? as usize;
@@ -180,7 +180,7 @@ impl Pack for SessionSetupResponse {
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
         // SessionFlags (2 bytes)
         cursor.write_u16_le(self.session_flags.0);
-        // SecurityBufferOffset (2 bytes) — offset from start of SMB2 header
+        // SecurityBufferOffset (2 bytes) -- offset from start of SMB2 header
         let offset = (Header::SIZE + 8) as u16; // 8 = fixed part of response struct
         cursor.write_u16_le(offset);
         // SecurityBufferLength (2 bytes)

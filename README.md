@@ -6,10 +6,12 @@
 [![License](https://img.shields.io/crates/l/smb2)](LICENSE-MIT)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
-A pure-Rust SMB2/3 client library with pipelined I/O.
-No C dependencies, no FFI. Faster than native macOS SMB across all operations — 1.3-5x faster on uploads, downloads, listings, and deletes.
+A pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. Faster than native macOS SMB in all
+operations: 1.3-5x faster on uploads, downloads, listings, and deletes.
 
-I built this because I needed fast SMB access for [Cmdr](https://github.com/vdavid/cmdr) (my file manager), and the existing Rust SMB options weren't cutting it. The `smb` crate works fine for listing files but downloads are painfully slow because it sends one read at a time. Native OS SMB clients pipeline their reads, and so does this library.
+I built this because I needed fast SMB access for [Cmdr](https://github.com/vdavid/cmdr) (my file manager), and the
+existing Rust SMB options weren't cutting it. The `smb` crate works fine for listing files but downloads are painfully
+slow because it sends one read at a time. Native OS SMB clients pipeline their reads, and so does this library.
 
 **Why this matters:**
 
@@ -32,11 +34,13 @@ I built this because I needed fast SMB access for [Cmdr](https://github.com/vdav
 
 If you need any of these, check the [`smb`](https://crates.io/crates/smb) crate which supports them:
 
-- **Kerberos authentication** -- NTLM only for now. Kerberos is needed for Active Directory environments that disable NTLM. Most home NAS setups (Synology, QNAP, Pi) use NTLM.
-- **DFS path resolution** -- returns `Error::DfsReferralRequired` with the path so you can handle it yourself. Full automatic DFS follow-through is planned for post-1.0.
-- **Multi-channel** -- multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
-- **QUIC transport** -- SMB over QUIC for Azure Files and Windows Server 2022+ over the internet
-- **RDMA transport** -- datacenter-only, ultra-low-latency storage
+- **Kerberos authentication**: NTLM only for now. Kerberos is needed for Active Directory environments that disable
+  NTLM. Most home NAS setups (Synology, QNAP, Pi) use NTLM.
+- **DFS path resolution**: returns `Error::DfsReferralRequired` with the path so you can handle it yourself. Full
+  automatic DFS follow-through is planned for post-1.0.
+- **Multi-channel**: multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
+- **QUIC transport**: SMB over QUIC for Azure Files and Windows Server 2022+ over the internet
+- **RDMA transport**: datacenter-only, ultra-low-latency storage
 
 These aren't planned:
 
@@ -90,42 +94,45 @@ The pipeline is the core feature. It lets you batch multiple operations and exec
 use smb2::{Pipeline, Op, OpResult};
 
 # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
-let mut pipeline = Pipeline::new(client.connection_mut(), &share);
+    let mut pipeline = Pipeline::new(client.connection_mut(), &share);
 
-let results = pipeline.execute(vec![
-    Op::ReadFile("a.txt".into()),
-    Op::ReadFile("b.txt".into()),
-    Op::ListDirectory("docs/".into()),
-    Op::Delete("temp.txt".into()),
-]).await;
+    let results = pipeline.execute(vec![
+        Op::ReadFile("a.txt".into()),
+        Op::ReadFile("b.txt".into()),
+        Op::ListDirectory("docs/".into()),
+        Op::Delete("temp.txt".into()),
+    ]).await;
 
-for result in results {
-    match result {
-        OpResult::FileData { path, data } => println!("{}: {} bytes", path, data.len()),
-        OpResult::DirEntries { path, entries } => println!("{}: {} entries", path, entries.len()),
-        OpResult::Deleted { path } => println!("deleted {}", path),
-        OpResult::Error { path, error } => eprintln!("{}: {}", path, error),
-        other => println!("{:?}", other),
+    for result in results {
+        match result {
+            OpResult::FileData { path, data } => println!("{}: {} bytes", path, data.len()),
+            OpResult::DirEntries { path, entries } => println!("{}: {} entries", path, entries.len()),
+            OpResult::Deleted { path } => println!("deleted {}", path),
+            OpResult::Error { path, error } => eprintln!("{}: {}", path, error),
+            other => println!("{:?}", other),
+        }
     }
+    # Ok(())
+    #
 }
-# Ok(())
-# }
 ```
 
 For large file I/O, use the pipelined variants which fill the credit window:
 
 ```rust
 # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
-// Pipelined I/O with sliding window for large files
-let data = client.read_file_pipelined(&share, "big_file.iso").await?;
-client.write_file_pipelined(&share, "copy.iso", &data).await?;
-# Ok(())
-# }
+    // Pipelined I/O with sliding window for large files
+    let data = client.read_file_pipelined(&share, "big_file.iso").await?;
+    client.write_file_pipelined(&share, "copy.iso", &data).await?;
+    # Ok(())
+    #
+}
 ```
 
 ## Streaming I/O
 
-For large files that don't fit in memory, use the streaming API. It downloads one chunk at a time and supports progress reporting and cancellation.
+For large files that don't fit in memory, use the streaming API. It downloads one chunk at a time and supports progress
+reporting and cancellation.
 
 ### Streaming download
 
@@ -133,17 +140,18 @@ For large files that don't fit in memory, use the streaming API. It downloads on
 use tokio::io::AsyncWriteExt;
 
 # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
-let mut download = client.download(&share, "big_video.mp4").await?;
-println!("Downloading {} bytes...", download.size());
+    let mut download = client.download(&share, "big_video.mp4").await?;
+    println!("Downloading {} bytes...", download.size());
 
-let mut file = tokio::fs::File::create("big_video.mp4").await?;
-while let Some(chunk) = download.next_chunk().await {
-    let bytes = chunk?;
-    file.write_all(&bytes).await?;
-    println!("{:.1}%", download.progress().percent());
+    let mut file = tokio::fs::File::create("big_video.mp4").await?;
+    while let Some(chunk) = download.next_chunk().await {
+        let bytes = chunk?;
+        file.write_all(&bytes).await?;
+        println!("{:.1}%", download.progress().percent());
+    }
+    # Ok(())
+    #
 }
-# Ok(())
-# }
 ```
 
 ### Write with progress and cancellation
@@ -152,16 +160,18 @@ while let Some(chunk) = download.next_chunk().await {
 use std::ops::ControlFlow;
 
 # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
-let data = std::fs::read("big_file.bin")?;
-client.write_file_with_progress(&share, "remote.bin", &data, |progress| {
-    println!("{:.1}%", progress.percent());
-    ControlFlow::Continue(()) // return ControlFlow::Break(()) to cancel
-}).await?;
-# Ok(())
-# }
+    let data = std::fs::read("big_file.bin")?;
+    client.write_file_with_progress(&share, "remote.bin", &data, |progress| {
+        println!("{:.1}%", progress.percent());
+        ControlFlow::Continue(()) // return ControlFlow::Break(()) to cancel
+    }).await?;
+    # Ok(())
+    #
+}
 ```
 
-All write methods (`write_file`, `write_file_pipelined`, `write_file_with_progress`) flush data to persistent storage before closing the file handle.
+All write methods (`write_file`, `write_file_pipelined`, `write_file_with_progress`) flush data to persistent storage
+before closing the file handle.
 
 ## Installation
 
@@ -172,7 +182,8 @@ Add to your `Cargo.toml`:
 smb2 = "0.1"
 ```
 
-You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is the most common choice:
+You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is
+the most common choice:
 
 ```toml
 [dependencies]
@@ -220,77 +231,89 @@ For advanced use cases, the underlying types are available:
 
 ## Performance
 
-Benchmarked against native macOS SMB (with F_NOCACHE to disable kernel page cache) and the `smb` crate on a QNAP NAS over Gigabit LAN, SMB 3.1.1:
+Benchmarked against native macOS SMB (with F_NOCACHE to disable kernel page cache) and the `smb` crate on a QNAP NAS
+over Gigabit LAN, SMB 3.1.1:
 
 ### Small files (100 × 100 KB)
 
-| Operation | native | smb2 | Speedup |
-|---|---|---|---|
-| Upload | 3.69s | 1.91s | **1.9x faster** |
-| List | 47ms | 21ms | **2.2x faster** |
-| Download | 3.10s | 617ms | **5.0x faster** |
-| Delete | 3.08s | 1.03s | **3.0x faster** |
+| Operation | native | smb2  | Speedup         |
+|-----------|--------|-------|-----------------|
+| Upload    | 3.69s  | 1.91s | **1.9x faster** |
+| List      | 47ms   | 21ms  | **2.2x faster** |
+| Download  | 3.10s  | 617ms | **5.0x faster** |
+| Delete    | 3.08s  | 1.03s | **3.0x faster** |
 
 ### Medium files (10 × 10 MB)
 
-| Operation | native | smb2 | Speedup |
-|---|---|---|---|
-| Upload | 1.66s | 1.23s | **1.3x faster** |
-| List | 27ms | 19ms | **1.4x faster** |
-| Download | 4.00s | 2.93s | **1.4x faster** |
-| Delete | 301ms | 128ms | **2.4x faster** |
+| Operation | native | smb2  | Speedup         |
+|-----------|--------|-------|-----------------|
+| Upload    | 1.66s  | 1.23s | **1.3x faster** |
+| List      | 27ms   | 19ms  | **1.4x faster** |
+| Download  | 4.00s  | 2.93s | **1.4x faster** |
+| Delete    | 301ms  | 128ms | **2.4x faster** |
 
 ### Large files (3 × 50 MB)
 
-| Operation | native | smb2 | Speedup |
-|---|---|---|---|
-| Upload | 1.69s | 1.56s | ~parity |
-| List | 27ms | 18ms | **1.5x faster** |
-| Download | 5.62s | 1.11s | **5.1x faster** |
-| Delete | 117ms | 54ms | **2.1x faster** |
+| Operation | native | smb2  | Speedup         |
+|-----------|--------|-------|-----------------|
+| Upload    | 1.69s  | 1.56s | ~parity         |
+| List      | 27ms   | 18ms  | **1.5x faster** |
+| Download  | 5.62s  | 1.11s | **5.1x faster** |
+| Delete    | 117ms  | 54ms  | **2.1x faster** |
 
-Key optimizations: compound requests (CREATE+READ+CLOSE in 1 round-trip), pipelined I/O with sliding window and adaptive chunk sizing, and 256-credit request for wide pipeline windows.
+Key optimizations: compound requests (CREATE+READ+CLOSE in 1 round-trip), pipelined I/O with sliding window and adaptive
+chunk sizing, and 256-credit request for wide pipeline windows.
 
-**Note:** Native macOS download benchmarks use F_NOCACHE to bypass the kernel page cache. Without this, cached native reads appear ~20x faster because they skip the network entirely. F_NOCACHE gives a fair comparison of actual network I/O performance.
+**Note:** Native macOS download benchmarks use F_NOCACHE to bypass the kernel page cache. Without this, cached native
+reads appear ~20x faster because they skip the network entirely. F_NOCACHE gives a fair comparison of actual network I/O
+performance.
 
 The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-benchmark --release`.
 
 ## Known limitations
 
-| Limitation | Details |
-|---|---|
-| NTLM only | No Kerberos yet (works against Samba and most Windows servers) |
+| Limitation            | Details                                                           |
+|-----------------------|-------------------------------------------------------------------|
+| NTLM only             | No Kerberos yet (works against Samba and most Windows servers)    |
 | No DFS follow-through | Returns `Error::DfsReferralRequired` with the path, you handle it |
-| No multi-channel | Single TCP connection per client |
-| No QUIC/RDMA | TCP only (covers ~99% of use cases) |
-| SMB1 not supported | SMB2/3 only (SMB1 is deprecated and insecure) |
-| LZ4 only | No LZNT1 compression (LZ4 is the modern choice, LZNT1 is legacy) |
+| No multi-channel      | Single TCP connection per client                                  |
+| No QUIC/RDMA          | TCP only (covers ~99% of use cases)                               |
+| SMB1 not supported    | SMB2/3 only (SMB1 is deprecated and insecure)                     |
+| LZ4 only              | No LZNT1 compression (LZ4 is the modern choice, LZNT1 is legacy)  |
 
 ## Comparison with existing libraries
 
 ### vs `smb` crate
 
-The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 option right now. It covers more features than `smb2` (Kerberos, DFS, multi-channel, QUIC, RDMA). If you need those, use it.
+The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 option right now. It covers more features
+than `smb2` (Kerberos, DFS, multi-channel, QUIC, RDMA). If you need those, use it.
 
 But for the common case (connect to a NAS, move files around), `smb2` is a better fit:
 
-- **Compound + pipelined I/O** -- `smb` sends one request at a time; smb2 uses compound requests and pipelined reads with sliding window
-- **Auto-reconnect with durable handles** -- survives Wi-Fi drops without restarting transfers
-- **Comprehensive test suite** -- `smb` has almost no tests
-- **MIT OR Apache-2.0** -- `smb` is MIT-only
+- **Compound + pipelined I/O**: `smb` sends one request at a time; smb2 uses compound requests and pipelined reads with
+  sliding window
+- **Auto-reconnect with durable handles**: survives Wi-Fi drops without restarting transfers
+- **Comprehensive test suite**: `smb` has almost no tests
+- **MIT OR Apache-2.0**: `smb` is MIT-only
 
-I initially considered forking `smb`, but the architecture didn't support pipelining well, and adding it would have been a near-complete rewrite anyway.
+I initially considered forking `smb`, but the architecture didn't support pipelining well, and adding it would have been
+a near-complete rewrite anyway.
 
 ### vs `pavao`
 
-[`pavao`](https://crates.io/crates/pavao) wraps `libsmbclient` via FFI. It works, but you need `libsmbclient` installed, which means system package management, cross-compilation headaches, and all the fun that comes with C dependencies.
+[`pavao`](https://crates.io/crates/pavao) wraps `libsmbclient` via FFI. It works, but you need `libsmbclient` installed,
+which means system package management, cross-compilation headaches, and all the fun that comes with C dependencies.
 
 `smb2` is pure Rust. `cargo build` and done.
 
 ## Implementation notes
 
-- I used Claude extensively for this implementation. The code has a comprehensive test suite (unit tests with mock transport, property tests with proptest, integration tests against Docker Samba), and it works for my use case in Cmdr. If you distrust AI-generated code, that's fair, but please check the tests and decide for yourself.
-- The protocol implementation is based on Microsoft's [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/). I converted the relevant sections to Markdown so AI agents could work from them effectively. The spec files live in `docs/specs/`.
+- I used Claude extensively for this implementation. The code has a comprehensive test suite (unit tests with mock
+  transport, property tests with proptest, integration tests against Docker Samba), and it works for my use case in
+  Cmdr. If you distrust AI-generated code, that's fair, but please check the tests and decide for yourself.
+- The protocol implementation is based on
+  Microsoft's [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/). I converted the
+  relevant sections to Markdown so AI agents could work from them effectively. The spec files live in `docs/specs/`.
 
 ## Contributing
 

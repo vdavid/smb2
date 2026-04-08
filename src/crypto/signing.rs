@@ -573,7 +573,7 @@ mod tests {
         // For a self-roundtrip test, we need to test sign+verify on the
         // same role. Use the internal compute_signature directly, or
         // just verify that a real server flow works (sign as client,
-        // verify as server would compute — but that's an integration test).
+        // verify as server would compute -- but that's an integration test).
         //
         // For this unit test, verify that sign→verify works when the
         // message has the SERVER_TO_REDIR flag set (simulating a
@@ -594,7 +594,7 @@ mod tests {
         // Test: sign as client (role=0), verify we can detect tampering
         sign_message(&mut msg, &key, SigningAlgorithm::AesGmac, 100, false).unwrap();
         // verify_signature uses role=1 (server), so it WON'T match client-signed.
-        // This is correct behavior — client and server signatures differ.
+        // This is correct behavior -- client and server signatures differ.
         // Instead, test that the signature is non-zero and stable.
         let sig1: [u8; 16] = msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN]
             .try_into()
@@ -608,7 +608,7 @@ mod tests {
         let key = [0xDD; 16];
         sign_message(&mut msg, &key, SigningAlgorithm::AesGmac, 5, false).unwrap();
 
-        // Tamper the message — even though verify uses server role,
+        // Tamper the message -- even though verify uses server role,
         // the auth tag won't match ANY valid signature.
         let last = msg.len() - 1;
         msg[last] ^= 0xFF;
@@ -773,7 +773,7 @@ mod tests {
         let key = [0xDD; 16];
         sign_message(&mut msg, &key, SigningAlgorithm::AesGmac, 10, false).unwrap();
 
-        // verify uses server role bit, and wrong message_id — both wrong
+        // verify uses server role bit, and wrong message_id -- both wrong
         let result = verify_signature(&msg, &key, SigningAlgorithm::AesGmac, 11, false);
         assert!(result.is_err());
     }

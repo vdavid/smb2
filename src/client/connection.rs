@@ -335,65 +335,15 @@ impl Connection {
     /// Send a request and return the raw bytes that were sent (for preauth hash).
     ///
     /// Packs the header + body, optionally signs, sends, and returns the bytes.
+    /// Equivalent to `send_request_with_credits(command, body, tree_id, 1)`.
     pub async fn send_request(
         &mut self,
         command: Command,
         body: &dyn Pack,
         tree_id: Option<TreeId>,
     ) -> Result<(MessageId, Vec<u8>)> {
-        let mut header = Header::new_request(command);
-        header.message_id = MessageId(self.next_message_id);
-        header.credits = 256; // Request more credits.
-        header.credit_charge = CreditCharge(1);
-        header.session_id = self.session_id;
-        if let Some(tid) = tree_id {
-            header.tree_id = Some(tid);
-        }
-
-        // Sign if signing is active.
-        if self.should_sign {
-            header.flags.set_signed();
-        }
-
-        let mut msg_bytes = pack_message(&header, body);
-        let msg_id = MessageId(self.next_message_id);
-        self.next_message_id += 1;
-
-        // Sign the message if needed.
-        if self.should_sign {
-            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
-                signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)?;
-            }
-        }
-
-        // Try to compress after signing (per spec: sign then compress).
-        if self.compression_enabled && msg_bytes.len() > Header::SIZE {
-            if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
-                let framed = build_compressed_frame(&compressed);
-                self.sender.send(&framed).await?;
-                debug!(
-                    "send: cmd={:?}, msg_id={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
-                    command,
-                    msg_id.0,
-                    tree_id,
-                    self.should_sign,
-                    msg_bytes.len(),
-                    framed.len()
-                );
-                return Ok((msg_id, msg_bytes));
-            }
-        }
-
-        self.sender.send(&msg_bytes).await?;
-        debug!(
-            "send: cmd={:?}, msg_id={}, tree_id={:?}, signed={}, len={}",
-            command,
-            msg_id.0,
-            tree_id,
-            self.should_sign,
-            msg_bytes.len()
-        );
-        Ok((msg_id, msg_bytes))
+        self.send_request_with_credits(command, body, tree_id, 1)
+            .await
     }
 
     /// Send a request with a custom CreditCharge (for multi-credit operations).
@@ -528,7 +478,7 @@ impl Connection {
             header.credits
         );
         if self.credits == 0 {
-            warn!("recv: zero credits remaining — credit starvation");
+            warn!("recv: zero credits remaining -- credit starvation");
         }
 
         // Return the body bytes (everything after the header).
@@ -737,7 +687,7 @@ impl Connection {
             // All responses except the first must start at 8-byte aligned offsets.
             if !results.is_empty() && offset % 8 != 0 {
                 return Err(Error::invalid_data(format!(
-                    "compound response at offset {} is not 8-byte aligned — must disconnect",
+                    "compound response at offset {} is not 8-byte aligned -- must disconnect",
                     offset,
                 )));
             }
@@ -770,15 +720,10 @@ impl Connection {
             if self.should_sign {
                 let sub_slice = &resp_bytes[sub_start..sub_end];
                 if sub_slice.len() >= 20 {
-                    let flags =
-                        u32::from_le_bytes(sub_slice[16..20].try_into().map_err(|_| {
-                            Error::invalid_data("sub-response too short for flags")
-                        })?);
+                    // Length already checked (>= 20), so these slices are always 4 bytes.
+                    let flags = u32::from_le_bytes(sub_slice[16..20].try_into().unwrap());
                     let is_signed = (flags & HeaderFlags::SIGNED) != 0;
-                    let status =
-                        u32::from_le_bytes(sub_slice[8..12].try_into().map_err(|_| {
-                            Error::invalid_data("sub-response too short for status")
-                        })?);
+                    let status = u32::from_le_bytes(sub_slice[8..12].try_into().unwrap());
                     let is_pending = status == NtStatus::PENDING.0;
 
                     if is_signed && !is_pending {
@@ -826,7 +771,7 @@ impl Connection {
         }
 
         if self.credits == 0 {
-            warn!("recv_compound: zero credits remaining — credit starvation");
+            warn!("recv_compound: zero credits remaining -- credit starvation");
         }
 
         Ok(results)

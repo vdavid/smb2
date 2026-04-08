@@ -287,7 +287,7 @@ impl Tree {
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
-            // CREATE failed — all three fail (cascaded). No handle to clean up.
+            // CREATE failed -- all three fail (cascaded). No handle to clean up.
             return Err(Error::Protocol {
                 status: create_header.status,
                 command: Command::Create,
@@ -341,7 +341,7 @@ impl Tree {
     ///
     /// Sends CREATE+READ+CLOSE as a single compound message. For files
     /// that fit in MaxReadSize (typically 8 MB), this is the fastest
-    /// path — 1 round-trip instead of 3+.
+    /// path -- 1 round-trip instead of 3+.
     ///
     /// For files larger than MaxReadSize, the compound returns only the
     /// first chunk. In that case, use [`read_file_pipelined`](Self::read_file_pipelined)
@@ -807,7 +807,7 @@ impl Tree {
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
-            // CREATE failed — all four fail (cascaded). No handle to clean up.
+            // CREATE failed -- all four fail (cascaded). No handle to clean up.
             return Err(Error::Protocol {
                 status: create_header.status,
                 command: Command::Create,
@@ -911,12 +911,12 @@ impl Tree {
         // per-chunk overhead (headers, signing).
         //
         // For files that fit in one read: use file size (no chunking).
-        // For larger files: use 512 KB — gives ~20 chunks per 10 MB
+        // For larger files: use 512 KB -- gives ~20 chunks per 10 MB
         // (enough for pipelining) with 8 credits per chunk (manageable).
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         let pipeline_chunk = 512 * 1024_u32; // 512 KB
         let chunk_size = if file_size <= max_read as u64 {
-            // File fits in one read — no pipelining needed.
+            // File fits in one read -- no pipelining needed.
             (file_size as u32).min(max_read)
         } else {
             // Use pipeline chunk size, capped to MaxReadSize.

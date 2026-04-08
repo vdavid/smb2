@@ -70,7 +70,7 @@ src/
 
   rpc/                    # Named pipe RPC (MS-RPCE / NDR)
     mod.rs                # RPC PDU types, NDR encoding/decoding
-    srvsvc.rs             # NetShareEnumAll — list shares on a server
+    srvsvc.rs             # NetShareEnumAll (list shares on a server)
 
   client/                 # High-level client API
     mod.rs                # SmbClient (entry point)
@@ -174,17 +174,17 @@ These are the top issues that WILL cause bugs if not handled correctly. Read the
 
 ## Testing approach
 
-- **Unit tests:** `cargo test` — uses mock transport, no server needed
+- **Unit tests:** `cargo test` uses mock transport, no server needed
 - **Property tests:** `cargo test` includes proptest for pack/unpack roundtrips
-- **Integration tests:** `cargo test --test integration -- --ignored` — requires Docker Samba
+- **Integration tests:** `cargo test --test integration -- --ignored` requires Docker Samba
 - **Wire format tests:** Known byte sequences from spec and Wireshark captures
 
 ## Code style
 
 Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `cargo doc --no-deps`.
 
-- `#![forbid(unsafe_code)]` — no unsafe
-- `#![warn(missing_docs)]` — doc comments for public APIs
+- `#![forbid(unsafe_code)]`: no unsafe
+- `#![warn(missing_docs)]`: doc comments for public APIs
 - Hand-rolled pack/unpack, no proc macros for wire format
 - Newtypes for all protocol IDs
 - `thiserror` for error types
@@ -228,6 +228,6 @@ Agents MUST read the actual spec files, not work from memory. Protocol specs are
 
 ## References
 
-- [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/) — primary reference
-- [mtp-rs](https://github.com/vdavid/mtp-rs) — architecture template
-- [smb-rs](https://github.com/oll3/smb-rs) — reference implementation (sanity check only)
+- [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/): primary reference
+- [mtp-rs](https://github.com/vdavid/mtp-rs): architecture template
+- [smb-rs](https://github.com/oll3/smb-rs): reference implementation, sanity check only

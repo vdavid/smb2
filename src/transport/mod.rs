@@ -37,7 +37,7 @@ pub trait TransportReceive: Send + Sync {
     /// contains the SMB2 message(s) without the framing header.
     ///
     /// The buffer may contain multiple compounded responses linked
-    /// by NextCommand in the SMB2 headers — the caller must split them.
+    /// by NextCommand in the SMB2 headers -- the caller must split them.
     async fn receive(&self) -> Result<Vec<u8>>;
 }
 
