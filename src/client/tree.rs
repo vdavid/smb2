@@ -56,6 +56,9 @@ const FILE_STANDARD_INFORMATION: u8 = 5;
 /// FileRenameInformation class for SET_INFO (MS-FSCC 2.4.34.2).
 const FILE_RENAME_INFORMATION: u8 = 10;
 
+/// FileFsFullSizeInformation class for QUERY_INFO (MS-FSCC 2.5.4).
+const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
+
 /// A directory entry returned by [`Tree::list_directory`].
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
@@ -84,6 +87,22 @@ pub struct FileInfo {
     pub modified: FileTime,
     /// The last access time.
     pub accessed: FileTime,
+}
+
+/// File system space information for a share.
+#[derive(Debug, Clone)]
+pub struct FsInfo {
+    /// Total capacity in bytes.
+    pub total_bytes: u64,
+    /// Free space available to the caller in bytes.
+    pub free_bytes: u64,
+    /// Total free space on the volume in bytes (may differ from
+    /// `free_bytes` if quotas are in effect).
+    pub total_free_bytes: u64,
+    /// Bytes per sector.
+    pub bytes_per_sector: u32,
+    /// Sectors per allocation unit (cluster).
+    pub sectors_per_unit: u32,
 }
 
 /// A connection to a specific share (tree connect).
@@ -472,6 +491,146 @@ impl Tree {
         close_result?;
         debug!("tree: stat done, size={}, is_dir={}", info.size, info.is_directory);
         Ok(info)
+    }
+
+    /// Query file system space information for this share.
+    ///
+    /// Returns total capacity, free space, and allocation unit sizes.
+    /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
+    pub async fn fs_info(&self, conn: &mut Connection) -> Result<FsInfo> {
+        debug!("tree: fs_info on share={}", self.share_name);
+
+        // Build CREATE request to open the root directory of the share.
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_DIRECTORY_FILE,
+            name: String::new(), // root of share
+            create_contexts: vec![],
+        };
+
+        // Build QUERY_INFO request for FileFsFullSizeInformation.
+        // Use sentinel FileId; the compound will fill it in.
+        let query_req = QueryInfoRequest {
+            info_type: InfoType::Filesystem,
+            file_info_class: FILE_FS_FULL_SIZE_INFORMATION,
+            output_buffer_length: 32, // 3 x i64 + 2 x u32
+            additional_information: 0,
+            flags: 0,
+            file_id: FileId::SENTINEL,
+            input_buffer: vec![],
+        };
+
+        // Build CLOSE request with sentinel FileId.
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        // Send as compound.
+        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::QueryInfo, &query_req, CreditCharge(1)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+
+        // Receive compound response.
+        let responses = conn.receive_compound().await?;
+
+        if responses.len() != 3 {
+            return Err(Error::invalid_data(format!(
+                "expected 3 compound responses, got {}",
+                responses.len()
+            )));
+        }
+
+        let (create_header, _create_body) = &responses[0];
+        let (query_header, query_body) = &responses[1];
+        let (close_header, _close_body) = &responses[2];
+
+        // Check CREATE response.
+        if create_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: create_header.status,
+                command: Command::Create,
+            });
+        }
+
+        // Check QUERY_INFO response.
+        if query_header.status != NtStatus::SUCCESS {
+            // QUERY_INFO failed. Issue standalone CLOSE to clean up.
+            let mut cursor = ReadCursor::new(&responses[0].1);
+            let create_resp = CreateResponse::unpack(&mut cursor)?;
+            debug!(
+                "tree: compound QUERY_INFO failed ({:?}), issuing standalone CLOSE",
+                query_header.status
+            );
+            let _ = self.close_handle(conn, create_resp.file_id).await;
+            return Err(Error::Protocol {
+                status: query_header.status,
+                command: Command::QueryInfo,
+            });
+        }
+
+        // Parse the FileFsFullSizeInformation response.
+        let mut cursor = ReadCursor::new(query_body);
+        let query_resp = QueryInfoResponse::unpack(&mut cursor)?;
+        let buf = &query_resp.output_buffer;
+
+        if buf.len() < 32 {
+            return Err(Error::invalid_data(format!(
+                "FileFsFullSizeInformation too short: {} bytes",
+                buf.len()
+            )));
+        }
+
+        let total_allocation_units =
+            i64::from_le_bytes(buf[0..8].try_into().unwrap()) as u64;
+        let caller_available_units =
+            i64::from_le_bytes(buf[8..16].try_into().unwrap()) as u64;
+        let actual_available_units =
+            i64::from_le_bytes(buf[16..24].try_into().unwrap()) as u64;
+        let sectors_per_unit =
+            u32::from_le_bytes(buf[24..28].try_into().unwrap());
+        let bytes_per_sector =
+            u32::from_le_bytes(buf[28..32].try_into().unwrap());
+
+        let bytes_per_unit = sectors_per_unit as u64 * bytes_per_sector as u64;
+        let total_bytes = total_allocation_units * bytes_per_unit;
+        let free_bytes = caller_available_units * bytes_per_unit;
+        let total_free_bytes = actual_available_units * bytes_per_unit;
+
+        // Check CLOSE response (non-fatal if it failed).
+        if close_header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: compound CLOSE returned {:?} (non-fatal, fs_info already read)",
+                close_header.status,
+            );
+        }
+
+        debug!(
+            "tree: fs_info done, total={}, free={}, total_free={}",
+            total_bytes, free_bytes, total_free_bytes
+        );
+        Ok(FsInfo {
+            total_bytes,
+            free_bytes,
+            total_free_bytes,
+            bytes_per_sector,
+            sectors_per_unit,
+        })
     }
 
     /// Rename or move a file within the same share.

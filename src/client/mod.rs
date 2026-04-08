@@ -17,7 +17,7 @@ pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, Progress};
-pub use tree::{DirectoryEntry, FileInfo, Tree};
+pub use tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
 
 // Re-export high-level client types.
 // (SmbClient, ClientConfig, and connect are defined below in this file.)
@@ -266,6 +266,14 @@ impl SmbClient {
         data: &[u8],
     ) -> Result<u64> {
         tree.write_file_pipelined(&mut self.conn, path, data).await
+    }
+
+    /// Query file system space information for the given share.
+    ///
+    /// Returns total capacity, free space, and allocation unit sizes.
+    /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
+    pub async fn fs_info(&mut self, tree: &Tree) -> Result<tree::FsInfo> {
+        tree.fs_info(&mut self.conn).await
     }
 
     /// Delete a file on the given share.

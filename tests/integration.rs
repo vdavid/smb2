@@ -1191,3 +1191,69 @@ async fn streaming_upload_and_download_on_pi() {
     let _ = client.delete_file(&tree, test_path).await;
     let _ = client.disconnect_share(&tree).await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn fs_info_on_nas() {
+    let _ = env_logger::try_init();
+
+    let mut client = connect_client_to_nas().await;
+    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+
+    let info = client.fs_info(&tree).await.expect("fs_info failed");
+
+    assert!(info.total_bytes > 0, "total_bytes should be positive");
+    assert!(info.free_bytes > 0, "free_bytes should be positive");
+    assert!(info.free_bytes <= info.total_bytes, "free_bytes should not exceed total_bytes");
+    assert!(info.total_free_bytes > 0, "total_free_bytes should be positive");
+    assert!(info.bytes_per_sector > 0, "bytes_per_sector should be positive");
+    assert!(info.sectors_per_unit > 0, "sectors_per_unit should be positive");
+
+    let total_gb = info.total_bytes as f64 / 1_000_000_000.0;
+    let free_gb = info.free_bytes as f64 / 1_000_000_000.0;
+    println!(
+        "QNAP: {:.1} GB total, {:.1} GB free ({:.1}% used)",
+        total_gb,
+        free_gb,
+        (1.0 - free_gb / total_gb) * 100.0
+    );
+    println!(
+        "  bytes_per_sector={}, sectors_per_unit={}",
+        info.bytes_per_sector, info.sectors_per_unit
+    );
+
+    let _ = client.disconnect_share(&tree).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn fs_info_on_pi() {
+    let _ = env_logger::try_init();
+
+    let mut client = connect_client_to_pi().await;
+    let tree = client.connect_share("PiHDD").await.expect("connect_share failed");
+
+    let info = client.fs_info(&tree).await.expect("fs_info failed");
+
+    assert!(info.total_bytes > 0, "total_bytes should be positive");
+    assert!(info.free_bytes > 0, "free_bytes should be positive");
+    assert!(info.free_bytes <= info.total_bytes, "free_bytes should not exceed total_bytes");
+    assert!(info.total_free_bytes > 0, "total_free_bytes should be positive");
+    assert!(info.bytes_per_sector > 0, "bytes_per_sector should be positive");
+    assert!(info.sectors_per_unit > 0, "sectors_per_unit should be positive");
+
+    let total_gb = info.total_bytes as f64 / 1_000_000_000.0;
+    let free_gb = info.free_bytes as f64 / 1_000_000_000.0;
+    println!(
+        "Pi: {:.1} GB total, {:.1} GB free ({:.1}% used)",
+        total_gb,
+        free_gb,
+        (1.0 - free_gb / total_gb) * 100.0
+    );
+    println!(
+        "  bytes_per_sector={}, sectors_per_unit={}",
+        info.bytes_per_sector, info.sectors_per_unit
+    );
+
+    let _ = client.disconnect_share(&tree).await;
+}

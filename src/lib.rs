@@ -67,7 +67,7 @@ pub use client::{connect, ClientConfig, SmbClient};
 pub use client::stream::{FileDownload, FileUpload, Progress};
 
 // Tree and file types
-pub use client::tree::{DirectoryEntry, FileInfo, Tree};
+pub use client::tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
 
 // Pipeline
 pub use client::pipeline::{Op, OpResult, Pipeline};
