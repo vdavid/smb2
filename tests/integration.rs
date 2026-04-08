@@ -189,6 +189,65 @@ async fn write_and_read_file_on_nas() {
 
 #[tokio::test]
 #[ignore]
+async fn read_file_compound_on_nas() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+
+    // Write a small test file.
+    let test_path = "smb2_test_compound.tmp";
+    let test_data = b"compound read test data 1234567890";
+    tree.write_file(&mut conn, test_path, test_data)
+        .await
+        .expect("write_file failed");
+
+    // Read via compound (1 round-trip).
+    let start = std::time::Instant::now();
+    let compound_data = tree
+        .read_file_compound(&mut conn, test_path)
+        .await
+        .expect("read_file_compound failed");
+    let compound_elapsed = start.elapsed();
+
+    assert_eq!(compound_data, test_data);
+    println!(
+        "Compound read: {} bytes in {:?}",
+        compound_data.len(),
+        compound_elapsed
+    );
+
+    // Read via sequential (3 round-trips) for comparison.
+    let start = std::time::Instant::now();
+    let sequential_data = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect("read_file (sequential) failed");
+    let sequential_elapsed = start.elapsed();
+
+    assert_eq!(sequential_data, test_data);
+    println!(
+        "Sequential read: {} bytes in {:?}",
+        sequential_data.len(),
+        sequential_elapsed
+    );
+
+    if compound_elapsed < sequential_elapsed {
+        println!(
+            "Compound was {:.1}x faster",
+            sequential_elapsed.as_secs_f64() / compound_elapsed.as_secs_f64()
+        );
+    }
+
+    // Clean up.
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn stat_file_on_nas() {
     let _ = env_logger::try_init();
 

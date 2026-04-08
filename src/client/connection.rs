@@ -521,6 +521,218 @@ impl Connection {
     }
 
     /// Set negotiated params directly (for testing).
+    /// Send a related compound request (multiple operations chained).
+    ///
+    /// Related compounds share SessionId and TreeId. The first operation
+    /// provides the real FileId; subsequent operations use the sentinel
+    /// FileId `{0xFFFF..., 0xFFFF...}` meaning "use the FileId from the
+    /// previous response."
+    ///
+    /// Each sub-request is packed with its own header. The `NextCommand`
+    /// field links them. All sub-requests except the last are padded
+    /// to 8-byte alignment. The `SMB2_FLAGS_RELATED_OPERATIONS` flag is
+    /// set on all sub-requests except the first.
+    ///
+    /// Returns the MessageIds assigned to each sub-request.
+    pub async fn send_compound(
+        &mut self,
+        tree_id: TreeId,
+        operations: &[(Command, &dyn Pack, CreditCharge)],
+    ) -> Result<Vec<MessageId>> {
+        if operations.is_empty() {
+            return Err(Error::invalid_data("compound request must have at least one operation"));
+        }
+
+        let mut message_ids = Vec::with_capacity(operations.len());
+        let mut sub_requests: Vec<Vec<u8>> = Vec::with_capacity(operations.len());
+
+        // Step 1: Pack each sub-request with its header.
+        for (i, (command, body, credit_charge)) in operations.iter().enumerate() {
+            let mut header = Header::new_request(*command);
+            header.message_id = MessageId(self.next_message_id);
+            header.credits = 256; // Request more credits.
+            header.credit_charge = *credit_charge;
+            header.session_id = self.session_id;
+            header.tree_id = Some(tree_id);
+
+            // Set RELATED_OPERATIONS on all except the first.
+            if i > 0 {
+                header.flags.set_related();
+            }
+
+            // Sign flag (actual signing happens after padding).
+            if self.should_sign {
+                header.flags.set_signed();
+            }
+
+            let msg_id = MessageId(self.next_message_id);
+            message_ids.push(msg_id);
+            self.next_message_id += credit_charge.0 as u64;
+
+            let msg_bytes = pack_message(&header, *body);
+            sub_requests.push(msg_bytes);
+        }
+
+        // Step 2: Pad all sub-requests except the last to 8-byte alignment.
+        let last_idx = sub_requests.len() - 1;
+        for sub_req in sub_requests.iter_mut().take(last_idx) {
+            let current_len = sub_req.len();
+            let remainder = current_len % 8;
+            if remainder != 0 {
+                let pad = 8 - remainder;
+                sub_req.resize(current_len + pad, 0);
+            }
+        }
+
+        // Step 3: Set NextCommand offsets by backpatching each header.
+        // NextCommand is at header bytes 20..24.
+        for sub_req in sub_requests.iter_mut().take(last_idx) {
+            let next_cmd = sub_req.len() as u32;
+            sub_req[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+        }
+        // Last sub-request: NextCommand = 0 (already the default).
+
+        // Step 4: Sign each sub-request individually (including padding).
+        if self.should_sign {
+            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+                for (i, sub_req) in sub_requests.iter_mut().enumerate() {
+                    signing::sign_message(sub_req, key, *algo, message_ids[i].0, false)?;
+                }
+            }
+        }
+
+        // Step 5: Concatenate all sub-requests into one buffer and send.
+        let total_len: usize = sub_requests.iter().map(|r| r.len()).sum();
+        let mut compound_buf = Vec::with_capacity(total_len);
+        for sub_req in &sub_requests {
+            compound_buf.extend_from_slice(sub_req);
+        }
+
+        self.sender.send(&compound_buf).await?;
+
+        debug!(
+            "send_compound: {} operations, total_len={}, msg_ids={:?}, tree_id={}, signed={}",
+            operations.len(),
+            compound_buf.len(),
+            message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
+            tree_id,
+            self.should_sign,
+        );
+
+        Ok(message_ids)
+    }
+
+    /// Receive a compound response (multiple responses in one frame).
+    ///
+    /// Splits the response by `NextCommand` offsets and returns each
+    /// sub-response as `(Header, body_bytes)`.
+    pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>> {
+        let resp_bytes = self.receiver.receive().await?;
+        trace!("recv_compound: raw response {} bytes", resp_bytes.len());
+
+        let mut results = Vec::new();
+        let mut offset = 0usize;
+
+        loop {
+            if offset + Header::SIZE > resp_bytes.len() {
+                return Err(Error::invalid_data(format!(
+                    "compound response truncated at offset {}: need {} bytes for header, but only {} remain",
+                    offset,
+                    Header::SIZE,
+                    resp_bytes.len() - offset,
+                )));
+            }
+
+            // All responses except the first must start at 8-byte aligned offsets.
+            if !results.is_empty() && offset % 8 != 0 {
+                return Err(Error::invalid_data(format!(
+                    "compound response at offset {} is not 8-byte aligned — must disconnect",
+                    offset,
+                )));
+            }
+
+            // Verify signature on this sub-response if signing is active.
+            let sub_start = offset;
+
+            // Parse the header to get NextCommand.
+            let mut cursor = ReadCursor::new(&resp_bytes[offset..]);
+            let header = Header::unpack(&mut cursor)?;
+            let next_command = header.next_command;
+
+            // Determine the end of this sub-response.
+            let sub_end = if next_command > 0 {
+                offset + next_command as usize
+            } else {
+                resp_bytes.len()
+            };
+
+            if sub_end > resp_bytes.len() {
+                return Err(Error::invalid_data(format!(
+                    "compound NextCommand offset {} at position {} exceeds response length {}",
+                    next_command, offset, resp_bytes.len(),
+                )));
+            }
+
+            // Verify signature on the sub-response slice if needed.
+            if self.should_sign {
+                let sub_slice = &resp_bytes[sub_start..sub_end];
+                if sub_slice.len() >= 20 {
+                    let flags = u32::from_le_bytes(
+                        sub_slice[16..20]
+                            .try_into()
+                            .map_err(|_| Error::invalid_data("sub-response too short for flags"))?,
+                    );
+                    let is_signed = (flags & HeaderFlags::SIGNED) != 0;
+                    let status = u32::from_le_bytes(
+                        sub_slice[8..12]
+                            .try_into()
+                            .map_err(|_| Error::invalid_data("sub-response too short for status"))?,
+                    );
+                    let is_pending = status == NtStatus::PENDING.0;
+
+                    if is_signed && !is_pending {
+                        if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+                            signing::verify_signature(sub_slice, key, *algo, header.message_id.0, false)?;
+                        }
+                    }
+                }
+            }
+
+            // Update credits from this sub-response.
+            if header.credits > 0 {
+                self.credits = self.credits.saturating_add(header.credits);
+            }
+            // Consume credits for the request that generated this response.
+            self.credits = self.credits.saturating_sub(header.credit_charge.0);
+
+            debug!(
+                "recv_compound: cmd={:?}, status={:?}, msg_id={}, credits={}",
+                header.command, header.status, header.message_id.0, self.credits,
+            );
+
+            // Extract the body bytes (everything after the header in this sub-response).
+            let body_start = offset + Header::SIZE;
+            let body_bytes = if body_start < sub_end {
+                resp_bytes[body_start..sub_end].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            results.push((header, body_bytes));
+
+            if next_command == 0 {
+                break;
+            }
+            offset += next_command as usize;
+        }
+
+        if self.credits == 0 {
+            warn!("recv_compound: zero credits remaining — credit starvation");
+        }
+
+        Ok(results)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_params(&mut self, params: NegotiatedParams) {
         self.params = Some(params);
@@ -804,5 +1016,377 @@ mod tests {
         assert!(req.dialects.contains(&Dialect::Smb3_0));
         assert!(req.dialects.contains(&Dialect::Smb3_0_2));
         assert!(req.dialects.contains(&Dialect::Smb3_1_1));
+    }
+
+    // ── Compound tests ──────────────────────────────────────────────
+
+    use crate::msg::close::CloseRequest;
+    use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
+    use crate::msg::create::{
+        CreateAction, CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel,
+        ShareAccess,
+    };
+    use crate::msg::close::CloseResponse;
+    use crate::pack::FileTime;
+    use crate::types::{CreditCharge, FileId, OplockLevel, TreeId};
+    use crate::types::flags::FileAccessMask;
+
+    /// Build a compound response frame with proper NextCommand offsets.
+    fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
+        let mut padded: Vec<Vec<u8>> = Vec::new();
+        for (i, resp) in responses.iter().enumerate() {
+            let mut r = resp.clone();
+            let is_last = i == responses.len() - 1;
+            if !is_last {
+                // Pad to 8-byte alignment.
+                let remainder = r.len() % 8;
+                if remainder != 0 {
+                    r.resize(r.len() + (8 - remainder), 0);
+                }
+                // Set NextCommand to the padded size.
+                let next_cmd = r.len() as u32;
+                r[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+            }
+            // Last: NextCommand stays 0 (already default from pack_message).
+            padded.push(r);
+        }
+        let mut frame = Vec::new();
+        for r in &padded {
+            frame.extend_from_slice(r);
+        }
+        frame
+    }
+
+    fn build_test_create_response(file_id: FileId, end_of_file: u64) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Create);
+        h.flags.set_response();
+        h.credits = 10;
+        h.message_id = MessageId(0);
+
+        let body = CreateResponse {
+            oplock_level: OplockLevel::None,
+            flags: 0,
+            create_action: CreateAction::FileOpened,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: FileTime::ZERO,
+            change_time: FileTime::ZERO,
+            allocation_size: 0,
+            end_of_file,
+            file_attributes: 0,
+            file_id,
+            create_contexts: vec![],
+        };
+
+        pack_message(&h, &body)
+    }
+
+    fn build_test_read_response(data: Vec<u8>) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Read);
+        h.flags.set_response();
+        h.credits = 10;
+        h.message_id = MessageId(1);
+
+        let body = ReadResponse {
+            data_offset: 0x50,
+            data_remaining: 0,
+            flags: 0,
+            data,
+        };
+
+        pack_message(&h, &body)
+    }
+
+    fn build_test_close_response() -> Vec<u8> {
+        let mut h = Header::new_request(Command::Close);
+        h.flags.set_response();
+        h.credits = 10;
+        h.message_id = MessageId(2);
+
+        let body = CloseResponse {
+            flags: 0,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: FileTime::ZERO,
+            change_time: FileTime::ZERO,
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: 0,
+        };
+
+        pack_message(&h, &body)
+    }
+
+    #[tokio::test]
+    async fn send_compound_packs_three_operations_into_one_frame() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(FileAccessMask::FILE_READ_DATA),
+            file_attributes: 0,
+            share_access: ShareAccess(ShareAccess::FILE_SHARE_READ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: "test.txt".to_string(),
+            create_contexts: vec![],
+        };
+        let read_req = ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length: 65536,
+            offset: 0,
+            file_id: FileId::SENTINEL,
+            minimum_count: 0,
+            channel: SMB2_CHANNEL_NONE,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        let operations: Vec<(Command, &dyn Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::Read, &read_req, CreditCharge(1)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        let msg_ids = conn
+            .send_compound(TreeId(42), &operations)
+            .await
+            .unwrap();
+
+        // Should get 3 consecutive message IDs.
+        assert_eq!(msg_ids.len(), 3);
+        assert_eq!(msg_ids[0], MessageId(0));
+        assert_eq!(msg_ids[1], MessageId(1));
+        assert_eq!(msg_ids[2], MessageId(2));
+
+        // Should have sent exactly one frame.
+        assert_eq!(mock.sent_count(), 1);
+
+        let sent = mock.sent_message(0).unwrap();
+
+        // Parse the first header: no RELATED_OPERATIONS.
+        let mut cursor = ReadCursor::new(&sent);
+        let h1 = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(h1.command, Command::Create);
+        assert!(!h1.flags.is_related());
+        assert!(h1.next_command > 0, "first NextCommand should be non-zero");
+        assert_eq!(h1.tree_id, Some(TreeId(42)));
+        assert_eq!(h1.next_command % 8, 0, "NextCommand must be 8-byte aligned");
+
+        // Jump to second header.
+        let offset2 = h1.next_command as usize;
+        let mut cursor2 = ReadCursor::new(&sent[offset2..]);
+        let h2 = Header::unpack(&mut cursor2).unwrap();
+        assert_eq!(h2.command, Command::Read);
+        assert!(h2.flags.is_related(), "second request must have RELATED_OPERATIONS");
+        assert!(h2.next_command > 0, "second NextCommand should be non-zero");
+        assert_eq!(h2.next_command % 8, 0, "NextCommand must be 8-byte aligned");
+
+        // Jump to third header.
+        let offset3 = offset2 + h2.next_command as usize;
+        let mut cursor3 = ReadCursor::new(&sent[offset3..]);
+        let h3 = Header::unpack(&mut cursor3).unwrap();
+        assert_eq!(h3.command, Command::Close);
+        assert!(h3.flags.is_related(), "third request must have RELATED_OPERATIONS");
+        assert_eq!(h3.next_command, 0, "last NextCommand must be 0");
+    }
+
+    #[tokio::test]
+    async fn send_compound_uses_sentinel_file_id_in_subsequent_requests() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(FileAccessMask::FILE_READ_DATA),
+            file_attributes: 0,
+            share_access: ShareAccess(ShareAccess::FILE_SHARE_READ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: "x.txt".to_string(),
+            create_contexts: vec![],
+        };
+        let read_req = ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length: 65536,
+            offset: 0,
+            file_id: FileId::SENTINEL,
+            minimum_count: 0,
+            channel: SMB2_CHANNEL_NONE,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        let operations: Vec<(Command, &dyn Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::Read, &read_req, CreditCharge(1)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        conn.send_compound(TreeId(1), &operations).await.unwrap();
+        let sent = mock.sent_message(0).unwrap();
+
+        // Parse first header to get offset to second.
+        let mut c = ReadCursor::new(&sent);
+        let h1 = Header::unpack(&mut c).unwrap();
+        let off2 = h1.next_command as usize;
+
+        // Parse second sub-request body (ReadRequest) to verify sentinel FileId.
+        let mut c2 = ReadCursor::new(&sent[off2..]);
+        let _h2 = Header::unpack(&mut c2).unwrap();
+        let read_parsed = ReadRequest::unpack(&mut c2).unwrap();
+        assert_eq!(read_parsed.file_id, FileId::SENTINEL);
+
+        // Parse third sub-request offset.
+        let mut c2b = ReadCursor::new(&sent[off2..]);
+        let h2b = Header::unpack(&mut c2b).unwrap();
+        let off3 = off2 + h2b.next_command as usize;
+
+        // Parse third sub-request body (CloseRequest) to verify sentinel FileId.
+        let mut c3 = ReadCursor::new(&sent[off3..]);
+        let _h3 = Header::unpack(&mut c3).unwrap();
+        let close_parsed = CloseRequest::unpack(&mut c3).unwrap();
+        assert_eq!(close_parsed.file_id, FileId::SENTINEL);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_splits_three_responses() {
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId { persistent: 0x11, volatile: 0x22 };
+        let file_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+
+        let create_resp = build_test_create_response(file_id, file_data.len() as u64);
+        let read_resp = build_test_read_response(file_data.clone());
+        let close_resp = build_test_close_response();
+
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let responses = conn.receive_compound().await.unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].0.command, Command::Create);
+        assert_eq!(responses[1].0.command, Command::Read);
+        assert_eq!(responses[2].0.command, Command::Close);
+
+        // Verify the READ body contains our data.
+        let mut cursor = ReadCursor::new(&responses[1].1);
+        let read_body = ReadResponse::unpack(&mut cursor).unwrap();
+        assert_eq!(read_body.data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[tokio::test]
+    async fn send_compound_increments_message_ids_by_credit_charge() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(FileAccessMask::FILE_READ_DATA),
+            file_attributes: 0,
+            share_access: ShareAccess(ShareAccess::FILE_SHARE_READ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: "t.txt".to_string(),
+            create_contexts: vec![],
+        };
+        let read_req = ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length: 65536 * 4, // 256 KB -> CreditCharge = 4
+            offset: 0,
+            file_id: FileId::SENTINEL,
+            minimum_count: 0,
+            channel: SMB2_CHANNEL_NONE,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        let operations: Vec<(Command, &dyn Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::Read, &read_req, CreditCharge(4)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        let msg_ids = conn.send_compound(TreeId(1), &operations).await.unwrap();
+
+        // CREATE: msg_id=0, charge=1 -> next = 1
+        // READ:   msg_id=1, charge=4 -> next = 5
+        // CLOSE:  msg_id=5, charge=1 -> next = 6
+        assert_eq!(msg_ids[0], MessageId(0));
+        assert_eq!(msg_ids[1], MessageId(1));
+        assert_eq!(msg_ids[2], MessageId(5));
+        assert_eq!(conn.next_message_id(), 6);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_updates_credits() {
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId { persistent: 1, volatile: 2 };
+        let create_resp = build_test_create_response(file_id, 0);
+        let read_resp = build_test_read_response(vec![]);
+        let close_resp = build_test_close_response();
+
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 3;
+
+        let _responses = conn.receive_compound().await.unwrap();
+
+        // Each response grants 10 credits, consumes 1 (CreditCharge=1 default from new_request).
+        // Initial: 3
+        // After resp1: 3 + 10 - 0 (credit_charge 0 from new_request default) = 13
+        // After resp2: 13 + 10 - 0 = 23
+        // After resp3: 23 + 10 - 0 = 33
+        // (new_request sets credit_charge to CreditCharge(0))
+        assert!(conn.credits() > 3);
     }
 }

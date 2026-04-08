@@ -25,7 +25,7 @@ use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{FileTime, ReadCursor, Unpack};
 use crate::types::flags::FileAccessMask;
 use crate::types::status::NtStatus;
-use crate::types::{Command, FileId, MessageId, OplockLevel, TreeId};
+use crate::types::{Command, CreditCharge, FileId, MessageId, OplockLevel, TreeId};
 use crate::Error;
 
 /// Maximum number of requests to keep in flight during pipelining.
@@ -182,6 +182,141 @@ impl Tree {
         close_result?;
         debug!("tree: list_directory done, entries={}", entries.len());
         Ok(entries)
+    }
+
+    /// Read a small file using a compound CREATE+READ+CLOSE request.
+    ///
+    /// Sends all three operations in a single transport frame, reducing
+    /// round-trips from 3 to 1. Best for files that fit in a single
+    /// READ (up to MaxReadSize).
+    ///
+    /// For files larger than MaxReadSize, use `read_file_pipelined` instead.
+    pub async fn read_file_compound(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        let normalized = normalize_path(path);
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        debug!("tree: read_file_compound path={}, max_read={}", normalized, max_read);
+
+        // Build CREATE request (same params as open_file).
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_DATA
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+
+        // Build READ request with sentinel FileId.
+        // CreditCharge for READ = ceil(max_read / 65536).
+        let read_credit_charge = (max_read as u64).div_ceil(65536) as u16;
+        let read_req = ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length: max_read,
+            offset: 0,
+            file_id: FileId::SENTINEL,
+            minimum_count: 0,
+            channel: SMB2_CHANNEL_NONE,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
+
+        // Build CLOSE request with sentinel FileId.
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        // Send as compound.
+        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::Read, &read_req, CreditCharge(read_credit_charge)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+
+        // Receive compound response.
+        let responses = conn.receive_compound().await?;
+
+        if responses.len() != 3 {
+            return Err(Error::invalid_data(format!(
+                "expected 3 compound responses, got {}",
+                responses.len()
+            )));
+        }
+
+        let (create_header, create_body) = &responses[0];
+        let (read_header, read_body) = &responses[1];
+        let (close_header, _close_body) = &responses[2];
+
+        // Check CREATE response.
+        if create_header.status != NtStatus::SUCCESS {
+            // CREATE failed — all three fail (cascaded). No handle to clean up.
+            return Err(Error::Protocol {
+                status: create_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(create_body);
+        let create_resp = CreateResponse::unpack(&mut cursor)?;
+        let file_id = create_resp.file_id;
+
+        // Check READ response.
+        if read_header.status != NtStatus::SUCCESS
+            && read_header.status != NtStatus::END_OF_FILE
+        {
+            // READ failed. CLOSE also failed in the compound (cascaded).
+            // Issue a standalone CLOSE to clean up the handle.
+            debug!(
+                "tree: compound READ failed ({:?}), issuing standalone CLOSE",
+                read_header.status
+            );
+            let _ = self.close_handle(conn, file_id).await;
+            return Err(Error::Protocol {
+                status: read_header.status,
+                command: Command::Read,
+            });
+        }
+
+        // Parse READ data.
+        let data = if read_header.status == NtStatus::END_OF_FILE {
+            // Empty file.
+            Vec::new()
+        } else {
+            let mut cursor = ReadCursor::new(read_body);
+            let read_resp = ReadResponse::unpack(&mut cursor)?;
+            read_resp.data
+        };
+
+        // Check CLOSE response. If it failed but CREATE and READ succeeded,
+        // the handle might still be open, but there's nothing we can do
+        // since we already have the data.
+        if close_header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: compound CLOSE returned {:?} (non-fatal, data already read)",
+                close_header.status,
+            );
+        }
+
+        debug!("tree: read_file_compound done, read {} bytes", data.len());
+        Ok(data)
     }
 
     /// Read a file's contents.
@@ -2743,5 +2878,246 @@ mod tests {
 
         assert_eq!(written, 65536 + 36 * 1024);
         assert_eq!(mock.sent_count(), 5); // CREATE + 2 WRITEs + FLUSH + CLOSE
+    }
+
+    // ── Compound request tests ──────────────────────────────────────
+
+    /// Build a compound response frame with proper NextCommand offsets and padding.
+    fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {
+        let mut padded: Vec<Vec<u8>> = Vec::new();
+        for (i, resp) in responses.iter().enumerate() {
+            let mut r = resp.clone();
+            let is_last = i == responses.len() - 1;
+            if !is_last {
+                // Pad to 8-byte alignment.
+                let remainder = r.len() % 8;
+                if remainder != 0 {
+                    r.resize(r.len() + (8 - remainder), 0);
+                }
+                // Set NextCommand.
+                let next_cmd = r.len() as u32;
+                r[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+            }
+            padded.push(r);
+        }
+        let mut frame = Vec::new();
+        for r in &padded {
+            frame.extend_from_slice(r);
+        }
+        frame
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_returns_file_data() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        // Set up tree.
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        // Build compound response frame: CREATE + READ + CLOSE.
+        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+        let file_data = b"Hello, compound!".to_vec();
+
+        let create_resp = build_create_response(file_id, file_data.len() as u64);
+        let read_resp = build_read_response(NtStatus::SUCCESS, file_data.clone());
+        let close_resp = build_close_response();
+
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let data = tree.read_file_compound(&mut conn, "test.txt").await.unwrap();
+
+        assert_eq!(data, b"Hello, compound!");
+        // Should have sent one compound frame (plus the tree connect).
+        assert_eq!(mock.sent_count(), 2); // TreeConnect + compound
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_handles_empty_file() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId { persistent: 1, volatile: 2 };
+
+        // Build compound response: CREATE ok, READ returns END_OF_FILE, CLOSE ok.
+        let create_resp = build_create_response(file_id, 0);
+
+        // For END_OF_FILE, we need an error response body.
+        let read_resp = build_read_response(NtStatus::END_OF_FILE, vec![]);
+        let close_resp = build_close_response();
+
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let data = tree.read_file_compound(&mut conn, "empty.txt").await.unwrap();
+
+        assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_create_failure_returns_error() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        // Build compound response where CREATE fails with OBJECT_NAME_NOT_FOUND.
+        // When CREATE fails, server cascades error to READ and CLOSE.
+        let mut create_resp_header = Header::new_request(Command::Create);
+        create_resp_header.flags.set_response();
+        create_resp_header.credits = 32;
+        create_resp_header.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_resp = pack_message(
+            &create_resp_header,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut read_resp_header = Header::new_request(Command::Read);
+        read_resp_header.flags.set_response();
+        read_resp_header.credits = 32;
+        read_resp_header.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let read_resp = pack_message(
+            &read_resp_header,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut close_resp_header = Header::new_request(Command::Close);
+        close_resp_header.flags.set_response();
+        close_resp_header.credits = 32;
+        close_resp_header.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_resp = pack_message(
+            &close_resp_header,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let result = tree.read_file_compound(&mut conn, "nonexistent.txt").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), Some(NtStatus::OBJECT_NAME_NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_read_failure_issues_standalone_close() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+
+        // CREATE succeeds.
+        let create_resp = build_create_response(file_id, 1024);
+
+        // READ fails with INSUFFICIENT_RESOURCES.
+        let mut read_resp_header = Header::new_request(Command::Read);
+        read_resp_header.flags.set_response();
+        read_resp_header.credits = 32;
+        read_resp_header.status = NtStatus::INSUFFICIENT_RESOURCES;
+        let read_resp = pack_message(
+            &read_resp_header,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        // CLOSE also fails (cascaded).
+        let mut close_resp_header = Header::new_request(Command::Close);
+        close_resp_header.flags.set_response();
+        close_resp_header.credits = 32;
+        close_resp_header.status = NtStatus::INSUFFICIENT_RESOURCES;
+        let close_resp = pack_message(
+            &close_resp_header,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        // Queue a standalone CLOSE response for the cleanup.
+        mock.queue_response(build_close_response());
+
+        let result = tree.read_file_compound(&mut conn, "problem.txt").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), Some(NtStatus::INSUFFICIENT_RESOURCES));
+
+        // Should have sent: TreeConnect + compound + standalone CLOSE = 3.
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_sends_correct_request_structure() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId { persistent: 1, volatile: 2 };
+        let create_resp = build_create_response(file_id, 5);
+        let read_resp = build_read_response(NtStatus::SUCCESS, vec![1, 2, 3, 4, 5]);
+        let close_resp = build_close_response();
+        let frame = build_compound_response_frame(&[create_resp, read_resp, close_resp]);
+        mock.queue_response(frame);
+
+        tree.read_file_compound(&mut conn, "verify.txt").await.unwrap();
+
+        // The second sent message is the compound request.
+        let compound = mock.sent_message(1).unwrap();
+
+        // Verify it contains 3 headers linked by NextCommand.
+        let mut cursor = ReadCursor::new(&compound);
+        let h1 = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(h1.command, Command::Create);
+        assert!(!h1.flags.is_related());
+        assert!(h1.next_command > 0);
+        assert_eq!(h1.tree_id, Some(TreeId(7)));
+
+        let off2 = h1.next_command as usize;
+        let mut cursor2 = ReadCursor::new(&compound[off2..]);
+        let h2 = Header::unpack(&mut cursor2).unwrap();
+        assert_eq!(h2.command, Command::Read);
+        assert!(h2.flags.is_related());
+        assert!(h2.next_command > 0);
+
+        // Verify READ uses sentinel FileId.
+        let read_parsed = ReadRequest::unpack(&mut cursor2).unwrap();
+        assert_eq!(read_parsed.file_id, FileId::SENTINEL);
+
+        let off3 = off2 + h2.next_command as usize;
+        let mut cursor3 = ReadCursor::new(&compound[off3..]);
+        let h3 = Header::unpack(&mut cursor3).unwrap();
+        assert_eq!(h3.command, Command::Close);
+        assert!(h3.flags.is_related());
+        assert_eq!(h3.next_command, 0);
+
+        // Verify CLOSE uses sentinel FileId.
+        let close_parsed = CloseRequest::unpack(&mut cursor3).unwrap();
+        assert_eq!(close_parsed.file_id, FileId::SENTINEL);
     }
 }

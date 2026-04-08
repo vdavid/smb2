@@ -219,6 +219,15 @@ impl SmbClient {
         tree.read_file(&mut self.conn, path).await
     }
 
+    /// Read a small file using a compound CREATE+READ+CLOSE request.
+    ///
+    /// Sends all three operations in a single transport frame, reducing
+    /// round-trips from 3 to 1. Best for files that fit in a single
+    /// READ (up to MaxReadSize, typically 8 MB).
+    pub async fn read_file_compound(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
+        tree.read_file_compound(&mut self.conn, path).await
+    }
+
     /// Read a file using pipelined I/O (faster for large files).
     pub async fn read_file_pipelined(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
         tree.read_file_pipelined(&mut self.conn, path).await
