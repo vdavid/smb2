@@ -179,6 +179,21 @@ These are the top issues that WILL cause bugs if not handled correctly. Read the
 - **Integration tests:** `cargo test --test integration -- --ignored` requires Docker Samba
 - **Wire format tests:** Known byte sequences from spec and Wireshark captures
 
+## Module docs (CLAUDE.md files)
+
+Each module has a colocated `CLAUDE.md` with architecture, decisions, and gotchas. These are auto-discovered by Claude Code. Read the relevant CLAUDE.md before modifying a module.
+
+```
+src/client/CLAUDE.md    # SmbClient, Connection, compound, pipelining
+src/crypto/CLAUDE.md    # Signing, encryption, KDF, preauth hash
+src/msg/CLAUDE.md       # Wire format, Pack/Unpack, offsets, compounds
+src/transport/CLAUDE.md # Split send/receive, TCP framing, MockTransport
+src/auth/CLAUDE.md      # NTLM, MIC, session key derivation
+src/rpc/CLAUDE.md       # RPC-over-pipes, NDR, share enumeration
+src/pack/CLAUDE.md      # Cursors, GUID, FileTime, MAX_UNPACK_BUFFER
+src/types/CLAUDE.md     # Newtypes, enums, bitflags, NtStatus
+```
+
 ## Code style
 
 Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `cargo doc --no-deps`.
