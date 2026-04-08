@@ -64,7 +64,7 @@ pub use error::{Error, Result};
 pub use client::{connect, ClientConfig, SmbClient};
 
 // Streaming I/O
-pub use client::stream::{FileDownload, Progress};
+pub use client::stream::{FileDownload, FileUpload, Progress};
 
 // Tree and file types
 pub use client::tree::{DirectoryEntry, FileInfo, Tree};

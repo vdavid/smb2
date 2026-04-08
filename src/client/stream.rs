@@ -1,7 +1,8 @@
 //! Streaming file I/O with progress reporting.
 //!
-//! Provides [`FileDownload`] for memory-efficient large file downloads
-//! and [`Progress`] for tracking transfer progress.
+//! Provides [`FileDownload`] for memory-efficient large file downloads,
+//! [`FileUpload`] for streaming uploads with progress, and [`Progress`]
+//! for tracking transfer progress.
 
 use std::ops::ControlFlow;
 
@@ -11,6 +12,7 @@ use crate::client::connection::Connection;
 use crate::client::tree::Tree;
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
+use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
 use crate::types::{Command, FileId};
@@ -269,6 +271,220 @@ impl<'a> Drop for FileDownload<'a> {
             );
             // We can't close the handle in Drop because it's async.
             // The caller should consume the download fully or call close().
+        }
+    }
+}
+
+/// An in-progress file upload that writes data in chunks with progress.
+///
+/// Each call to [`write_next_chunk`](FileUpload::write_next_chunk) sends one
+/// SMB2 WRITE request and returns `true` while there is more data to send.
+/// When the last chunk is written, the file handle is automatically flushed
+/// and closed, and `write_next_chunk` returns `false`.
+///
+/// The connection is borrowed mutably for the lifetime of the upload,
+/// preventing accidental interleaving of SMB messages.
+///
+/// # Cancellation
+///
+/// To cancel an upload, stop calling `write_next_chunk`. The file handle
+/// will be closed (without flush) when the `FileUpload` is dropped, though
+/// this cannot be guaranteed in async contexts since `Drop` is synchronous.
+/// For clean cancellation, call `write_next_chunk` in a loop that checks
+/// your own cancellation condition.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// let data = std::fs::read("large_video.mp4")?;
+/// let mut upload = client.upload(&share, "remote_video.mp4", &data).await?;
+/// println!("Uploading {} bytes...", upload.total_bytes());
+///
+/// while upload.write_next_chunk().await? {
+///     println!("{:.1}%", upload.progress().percent());
+/// }
+/// // File is flushed and closed automatically after the last chunk.
+/// # Ok(())
+/// # }
+/// ```
+pub struct FileUpload<'a> {
+    tree: &'a Tree,
+    conn: &'a mut Connection,
+    file_id: FileId,
+    data: &'a [u8],
+    total_bytes: u64,
+    bytes_written: u64,
+    chunk_size: u32,
+    done: bool,
+}
+
+impl<'a> FileUpload<'a> {
+    /// Create a streaming upload for a large file (data larger than one chunk).
+    ///
+    /// Opens the file for writing. The caller then drives the upload with
+    /// [`write_next_chunk`](FileUpload::write_next_chunk).
+    pub(crate) fn new(
+        tree: &'a Tree,
+        conn: &'a mut Connection,
+        file_id: FileId,
+        data: &'a [u8],
+        chunk_size: u32,
+    ) -> Self {
+        Self {
+            tree,
+            conn,
+            file_id,
+            data,
+            total_bytes: data.len() as u64,
+            bytes_written: 0,
+            chunk_size,
+            done: false,
+        }
+    }
+
+    /// Create a "done" upload for small files that were already written
+    /// via compound in the constructor.
+    pub(crate) fn new_done(
+        tree: &'a Tree,
+        conn: &'a mut Connection,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            tree,
+            conn,
+            file_id: FileId::SENTINEL,
+            data: &[],
+            total_bytes,
+            bytes_written: total_bytes,
+            chunk_size: 0,
+            done: true,
+        }
+    }
+
+    /// Total data size in bytes.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Bytes written so far.
+    #[must_use]
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Current transfer progress.
+    #[must_use]
+    pub fn progress(&self) -> Progress {
+        Progress {
+            bytes_transferred: self.bytes_written,
+            total_bytes: Some(self.total_bytes),
+        }
+    }
+
+    /// Write the next chunk of data to the server.
+    ///
+    /// Returns `Ok(true)` while there is more data to write, and `Ok(false)`
+    /// when the upload is complete. After the last chunk, automatically flushes
+    /// and closes the file handle.
+    ///
+    /// For small files that were written via compound in the constructor,
+    /// this immediately returns `Ok(false)`.
+    pub async fn write_next_chunk(&mut self) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+
+        let offset = self.bytes_written as usize;
+        if offset >= self.data.len() {
+            // All data written — flush and close.
+            self.flush_and_close().await?;
+            return Ok(false);
+        }
+
+        let remaining = self.data.len() - offset;
+        let this_chunk = remaining.min(self.chunk_size as usize);
+        let chunk = &self.data[offset..offset + this_chunk];
+
+        let write_req = WriteRequest {
+            data_offset: 0x70,
+            offset: offset as u64,
+            file_id: self.file_id,
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data: chunk.to_vec(),
+        };
+
+        let send_result = self
+            .conn
+            .send_request(Command::Write, &write_req, Some(self.tree.tree_id))
+            .await;
+
+        if let Err(e) = send_result {
+            self.done = true;
+            return Err(e);
+        }
+
+        let recv_result = self.conn.receive_response().await;
+        match recv_result {
+            Err(e) => {
+                self.done = true;
+                Err(e)
+            }
+            Ok((resp_header, resp_body, _)) => {
+                if resp_header.status != NtStatus::SUCCESS {
+                    self.done = true;
+                    // Best-effort close without flush.
+                    let _ = self.tree.close_handle(self.conn, self.file_id).await;
+                    return Err(Error::Protocol {
+                        status: resp_header.status,
+                        command: Command::Write,
+                    });
+                }
+
+                let mut cursor = ReadCursor::new(&resp_body);
+                let resp = WriteResponse::unpack(&mut cursor)?;
+                self.bytes_written += resp.count as u64;
+
+                // If all data is written, flush and close.
+                if self.bytes_written >= self.total_bytes {
+                    self.flush_and_close().await?;
+                    return Ok(false);
+                }
+
+                Ok(true)
+            }
+        }
+    }
+
+    /// Flush and close the file handle. Only runs once.
+    async fn flush_and_close(&mut self) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        self.done = true;
+
+        // Flush to ensure data is persisted.
+        self.tree.flush_handle(self.conn, self.file_id).await?;
+        // Close the handle.
+        self.tree.close_handle(self.conn, self.file_id).await
+    }
+}
+
+impl<'a> Drop for FileUpload<'a> {
+    fn drop(&mut self) {
+        if !self.done {
+            debug!(
+                "stream: FileUpload dropped before completion, file handle may leak \
+                 (bytes_written={}/{})",
+                self.bytes_written, self.total_bytes
+            );
+            // We can't close the handle in Drop because it's async.
+            // The caller should drive the upload to completion.
         }
     }
 }

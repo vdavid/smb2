@@ -1079,6 +1079,49 @@ impl Tree {
         Ok((resp.file_id, resp.end_of_file))
     }
 
+    /// Open (or create) a file for writing, returning the file handle.
+    ///
+    /// Uses `FileOverwriteIf` disposition (create if absent, overwrite if present)
+    /// and requests write access. Used by [`FileUpload`](crate::client::stream::FileUpload).
+    pub(crate) async fn open_file_for_write(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<FileId> {
+        let req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_WRITE_DATA
+                    | FileAccessMask::FILE_WRITE_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            share_access: ShareAccess(0),
+            create_disposition: CreateDisposition::FileOverwriteIf,
+            create_options: FILE_NON_DIRECTORY_FILE,
+            name: path.to_string(),
+            create_contexts: vec![],
+        };
+
+        let (_, _) = conn
+            .send_request(Command::Create, &req, Some(self.tree_id))
+            .await?;
+
+        let (resp_header, resp_body, _) = conn.receive_response().await?;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Create,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let resp = CreateResponse::unpack(&mut cursor)?;
+        Ok(resp.file_id)
+    }
+
     /// Loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES.
     async fn query_directory_loop(
         &self,

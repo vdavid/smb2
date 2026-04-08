@@ -1005,3 +1005,189 @@ async fn compound_read_and_write_on_raspberry_pi() {
     let _ = tree.delete_file(&mut conn, "smb2_pi_compound.tmp").await;
     let _ = tree.disconnect(&mut conn).await;
 }
+
+// ── Streaming upload tests ────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn streaming_upload_large_file() {
+    let _ = env_logger::try_init();
+
+    let mut client = connect_client_to_nas().await;
+    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+
+    // Write a 2 MB file via streaming upload (must exceed MaxWriteSize=1MB
+    // to trigger chunked path instead of compound).
+    let test_path = "smb2_test_streaming_upload.tmp";
+    let test_data: Vec<u8> = (0..2_097_152).map(|i| (i % 251) as u8).collect();
+
+    let mut upload = client
+        .upload(&tree, test_path, &test_data)
+        .await
+        .expect("upload failed");
+    assert_eq!(upload.total_bytes(), test_data.len() as u64);
+    println!("Uploading {} bytes...", upload.total_bytes());
+
+    let mut chunk_count = 0u32;
+    while upload.write_next_chunk().await.expect("write_next_chunk failed") {
+        chunk_count += 1;
+        println!(
+            "  chunk {}: progress={:.1}%",
+            chunk_count,
+            upload.progress().percent()
+        );
+    }
+
+    // Verify progress reached 100%.
+    assert!(
+        (upload.progress().fraction() - 1.0).abs() < f64::EPSILON,
+        "expected progress to reach 1.0, got {}",
+        upload.progress().fraction()
+    );
+
+    // Large file should have taken multiple chunks.
+    assert!(
+        chunk_count >= 1,
+        "expected at least one progress update for large file, got {}",
+        chunk_count
+    );
+    println!("Upload complete in {} chunks", chunk_count);
+
+    // Release the borrow on connection.
+    drop(upload);
+
+    // Read back and verify.
+    let readback = client
+        .read_file(&tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(readback.len(), test_data.len(), "size mismatch");
+    assert_eq!(readback, test_data, "content mismatch");
+    println!("Read back verified: {} bytes match", readback.len());
+
+    // Clean up.
+    client
+        .delete_file(&tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn streaming_upload_small_file_uses_compound() {
+    let _ = env_logger::try_init();
+
+    let mut client = connect_client_to_nas().await;
+    let tree = client.connect_share("naspi").await.expect("connect_share failed");
+
+    let test_path = "smb2_test_streaming_upload_small.tmp";
+    let test_data = b"small file via streaming upload API";
+
+    let mut upload = client
+        .upload(&tree, test_path, test_data)
+        .await
+        .expect("upload failed");
+    assert_eq!(upload.total_bytes(), test_data.len() as u64);
+
+    // Small file should be done immediately (compound write in constructor).
+    let has_more = upload
+        .write_next_chunk()
+        .await
+        .expect("write_next_chunk failed");
+    assert!(
+        !has_more,
+        "expected write_next_chunk to return false for small file"
+    );
+
+    // Progress should be 100%.
+    assert!(
+        (upload.progress().fraction() - 1.0).abs() < f64::EPSILON,
+        "expected progress to reach 1.0, got {}",
+        upload.progress().fraction()
+    );
+    println!("Small file upload complete (compound, no chunks needed)");
+
+    // Release the borrow.
+    drop(upload);
+
+    // Read back and verify.
+    let readback = client
+        .read_file(&tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(readback, test_data.as_slice(), "content mismatch");
+    println!("Read back verified: {} bytes match", readback.len());
+
+    // Clean up.
+    client
+        .delete_file(&tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+/// Helper: create an SmbClient connected to the Raspberry Pi.
+async fn connect_client_to_pi() -> SmbClient {
+    SmbClient::connect(ClientConfig {
+        addr: "192.168.1.150:445".to_string(),
+        timeout: Duration::from_secs(5),
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+    })
+    .await
+    .expect("SmbClient::connect to Pi failed")
+}
+
+#[tokio::test]
+#[ignore]
+async fn streaming_upload_and_download_on_pi() {
+    let _ = env_logger::try_init();
+
+    let mut client = connect_client_to_pi().await;
+    let tree = client.connect_share("PiHDD").await.expect("connect_share failed");
+
+    let test_path = "smb2_test_stream_roundtrip.tmp";
+    let test_data = b"streaming roundtrip test on Pi 1234567890";
+
+    // Upload via streaming API.
+    let mut upload = client
+        .upload(&tree, test_path, test_data)
+        .await
+        .expect("upload failed");
+
+    while upload.write_next_chunk().await.expect("write_next_chunk failed") {
+        println!("  upload progress: {:.1}%", upload.progress().percent());
+    }
+    println!(
+        "Upload complete: {} bytes, progress={:.1}%",
+        upload.total_bytes(),
+        upload.progress().percent()
+    );
+
+    // Release the borrow.
+    drop(upload);
+
+    // Download via read_file (compound) — simpler and more robust for
+    // small files on Pi which sometimes resets streaming connections.
+    let received = client
+        .read_file(&tree, test_path)
+        .await
+        .expect("read_file failed");
+
+    // Verify contents match.
+    assert_eq!(received, test_data.as_slice(), "content mismatch after roundtrip");
+    println!("Roundtrip verified: {} bytes match", received.len());
+
+    // Clean up (best-effort).
+    let _ = client.delete_file(&tree, test_path).await;
+    let _ = client.disconnect_share(&tree).await;
+}

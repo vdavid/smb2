@@ -16,7 +16,7 @@ pub use connection::{Cipher, Connection, NegotiatedParams};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
-pub use stream::{FileDownload, Progress};
+pub use stream::{FileDownload, FileUpload, Progress};
 pub use tree::{DirectoryEntry, FileInfo, Tree};
 
 // Re-export high-level client types.
@@ -339,6 +339,77 @@ impl SmbClient {
             file_size,
             chunk_size,
         ))
+    }
+
+    /// Start a streaming file upload with progress tracking.
+    ///
+    /// Returns a [`FileUpload`] that writes data in chunks. Each call to
+    /// [`write_next_chunk`](FileUpload::write_next_chunk) sends one WRITE
+    /// request and reports progress.
+    ///
+    /// For small files (data fits in one MaxWriteSize), the data is written
+    /// immediately via a compound CREATE+WRITE+FLUSH+CLOSE request in the
+    /// constructor. The returned `FileUpload` is already complete, and
+    /// `write_next_chunk` returns `false` immediately. This gives the caller
+    /// a uniform API regardless of file size.
+    ///
+    /// The connection is borrowed mutably for the lifetime of the upload,
+    /// so no other operations can run concurrently. This prevents accidental
+    /// interleaving of SMB messages.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// let data = std::fs::read("large_video.mp4")?;
+    /// let mut upload = client.upload(&share, "remote_video.mp4", &data).await?;
+    /// println!("Uploading {} bytes...", upload.total_bytes());
+    ///
+    /// while upload.write_next_chunk().await? {
+    ///     println!("{:.1}%", upload.progress().percent());
+    /// }
+    /// // File is flushed and closed automatically after the last chunk.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn upload<'a>(
+        &'a mut self,
+        tree: &'a Tree,
+        path: &str,
+        data: &'a [u8],
+    ) -> Result<stream::FileUpload<'a>> {
+        let normalized = path.replace('/', "\\");
+        let normalized = normalized.trim_start_matches('\\');
+
+        let max_write = self
+            .conn
+            .params()
+            .map(|p| p.max_write_size as usize)
+            .unwrap_or(65536);
+
+        if data.len() <= max_write {
+            // Small file: write everything via compound in one round-trip.
+            tree.write_file_compound(&mut self.conn, normalized, data)
+                .await?;
+            Ok(stream::FileUpload::new_done(
+                tree,
+                &mut self.conn,
+                data.len() as u64,
+            ))
+        } else {
+            // Large file: open the file, let the caller drive chunks.
+            let file_id = tree
+                .open_file_for_write(&mut self.conn, normalized)
+                .await?;
+            let chunk_size = max_write as u32;
+            Ok(stream::FileUpload::new(
+                tree,
+                &mut self.conn,
+                file_id,
+                data,
+                chunk_size,
+            ))
+        }
     }
 
     /// Write a file with progress reporting and cancellation.
