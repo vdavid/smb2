@@ -8,6 +8,14 @@ use std::time::Duration;
 
 use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tree};
 
+/// Get the NAS password from the SMB2_TEST_NAS_PASSWORD env var.
+/// Set it before running integration tests:
+///   export SMB2_TEST_NAS_PASSWORD="your_password"
+fn nas_password() -> String {
+    std::env::var("SMB2_TEST_NAS_PASSWORD")
+        .expect("SMB2_TEST_NAS_PASSWORD env var required for integration tests")
+}
+
 #[tokio::test]
 #[ignore]
 async fn connect_and_list_directory_on_real_nas() {
@@ -32,7 +40,7 @@ async fn connect_and_list_directory_on_real_nas() {
     let session = Session::setup(
         &mut conn,
         "david",
-        "cVYiKPJK*fRbQN5!%b&cBb63",
+        &nas_password(),
         "",
     )
     .await
@@ -141,7 +149,7 @@ async fn connect_to_nas() -> (Connection, Tree) {
 
     conn.negotiate().await.expect("negotiate failed");
 
-    let _session = Session::setup(&mut conn, "david", "cVYiKPJK*fRbQN5!%b&cBb63", "")
+    let _session = Session::setup(&mut conn, "david", &nas_password(), "")
         .await
         .expect("session setup failed");
 
@@ -319,7 +327,7 @@ async fn list_shares_on_nas() {
 
     conn.negotiate().await.expect("negotiate failed");
 
-    let _session = Session::setup(&mut conn, "david", "cVYiKPJK*fRbQN5!%b&cBb63", "")
+    let _session = Session::setup(&mut conn, "david", &nas_password(), "")
         .await
         .expect("session setup failed");
 
@@ -371,7 +379,7 @@ async fn connect_client_to_nas() -> SmbClient {
         addr: "192.168.1.111:445".to_string(),
         timeout: Duration::from_secs(5),
         username: "david".to_string(),
-        password: "cVYiKPJK*fRbQN5!%b&cBb63".to_string(),
+        password: nas_password(),
         domain: String::new(),
         auto_reconnect: false,
     })
@@ -779,7 +787,7 @@ async fn debug_rapid_pipelined_writes() {
         addr: "192.168.1.111:445".into(),
         timeout: Duration::from_secs(5),
         username: "david".into(),
-        password: "cVYiKPJK*fRbQN5!%b&cBb63".into(),
+        password: nas_password(),
         domain: String::new(),
         auto_reconnect: false,
     };
@@ -835,7 +843,7 @@ async fn micro_benchmark_smb2_vs_native() {
         addr: "192.168.1.111:445".into(),
         timeout: Duration::from_secs(5),
         username: "david".into(),
-        password: "cVYiKPJK*fRbQN5!%b&cBb63".into(),
+        password: nas_password(),
         domain: String::new(),
         auto_reconnect: false,
     };
@@ -1256,4 +1264,99 @@ async fn fs_info_on_pi() {
     );
 
     let _ = client.disconnect_share(&tree).await;
+}
+
+// ── File watching (CHANGE_NOTIFY) tests ──────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn watch_directory_on_nas() {
+    use smb2::FileNotifyAction;
+
+    let _ = env_logger::try_init();
+
+    // We need two connections: one for watching, one for making changes.
+    // SmbClient is !Send (due to dyn Pack), so we use tokio::task::spawn_local
+    // with a LocalSet to run both tasks on the same thread.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut watcher_client = connect_client_to_nas().await;
+            let watcher_share = watcher_client
+                .connect_share("naspi")
+                .await
+                .expect("tree connect failed (watcher)");
+
+            // Make sure the test directory exists.
+            let _ = watcher_client
+                .create_directory(&watcher_share, "_test")
+                .await;
+
+            // Start watching the _test/ directory (non-recursive).
+            let mut watcher = watcher_client
+                .watch(&watcher_share, "_test/", false)
+                .await
+                .expect("watch failed");
+
+            // Spawn a local task to create a file after a short delay.
+            let test_file_path = "_test/smb2_watch_test.tmp";
+            let writer_task = tokio::task::spawn_local(async move {
+                let mut writer_client = connect_client_to_nas().await;
+                let writer_share = writer_client
+                    .connect_share("naspi")
+                    .await
+                    .expect("tree connect failed (writer)");
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                writer_client
+                    .write_file(&writer_share, test_file_path, b"watch test")
+                    .await
+                    .expect("write_file failed");
+
+                println!("Writer: created {}", test_file_path);
+                (writer_client, writer_share)
+            });
+
+            // Wait for the notification (with a timeout so we don't hang).
+            let events =
+                tokio::time::timeout(Duration::from_secs(10), watcher.next_events())
+                    .await
+                    .expect("timed out waiting for change notification")
+                    .expect("next_events failed");
+
+            println!("Received {} event(s):", events.len());
+            for event in &events {
+                println!("  {} {}", event.action, event.filename);
+            }
+
+            assert!(!events.is_empty(), "expected at least one event");
+
+            // We should see an Added event for our test file.
+            let added = events
+                .iter()
+                .find(|e| e.action == FileNotifyAction::Added);
+            assert!(
+                added.is_some(),
+                "expected an Added event, got: {:?}",
+                events
+                    .iter()
+                    .map(|e| format!("{}: {}", e.action, e.filename))
+                    .collect::<Vec<_>>()
+            );
+
+            // Close the watcher.
+            watcher.close().await.expect("watcher close failed");
+
+            // Wait for the writer task and clean up.
+            let (mut writer_client, writer_share) = writer_task.await.unwrap();
+            writer_client
+                .delete_file(&writer_share, test_file_path)
+                .await
+                .expect("delete_file failed");
+            println!("Cleaned up {}", test_file_path);
+
+            let _ = writer_client.disconnect_share(&writer_share).await;
+        })
+        .await;
 }
