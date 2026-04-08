@@ -715,6 +715,63 @@ async fn write_with_progress_and_cancel() {
 
 #[tokio::test]
 #[ignore]
+async fn write_file_compound_on_nas() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+
+    let test_path = "smb2_test_compound_write.tmp";
+    let test_data = b"compound write test data 1234567890";
+
+    // Write via compound (1 round-trip).
+    let start = std::time::Instant::now();
+    let written = tree
+        .write_file_compound(&mut conn, test_path, test_data)
+        .await
+        .expect("write_file_compound failed");
+    let compound_elapsed = start.elapsed();
+
+    assert_eq!(written, test_data.len() as u64);
+    println!(
+        "Compound write: {} bytes in {:?}",
+        written, compound_elapsed
+    );
+
+    // Read it back to verify data integrity.
+    let data = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(data, test_data);
+    println!("Read back verified: {} bytes match", data.len());
+
+    // Also test empty file via compound.
+    let empty_path = "smb2_test_compound_write_empty.tmp";
+    let empty_written = tree
+        .write_file_compound(&mut conn, empty_path, b"")
+        .await
+        .expect("write_file_compound (empty) failed");
+    assert_eq!(empty_written, 0);
+
+    let empty_data = tree
+        .read_file(&mut conn, empty_path)
+        .await
+        .expect("read empty file failed");
+    assert!(empty_data.is_empty());
+
+    // Clean up.
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.delete_file(&mut conn, empty_path)
+        .await
+        .expect("delete empty file failed");
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn debug_rapid_pipelined_writes() {
     let _ = env_logger::try_init();
 

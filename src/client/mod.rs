@@ -243,6 +243,21 @@ impl SmbClient {
         tree.write_file(&mut self.conn, path, data).await
     }
 
+    /// Write a small file using a compound CREATE+WRITE+FLUSH+CLOSE request.
+    ///
+    /// Sends all four operations in a single transport frame, reducing
+    /// round-trips from 4 to 1. Best for files that fit in MaxWriteSize
+    /// (typically 64 KB to 8 MB). For larger files, use
+    /// [`write_file_pipelined`](Self::write_file_pipelined).
+    pub async fn write_file_compound(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        data: &[u8],
+    ) -> Result<u64> {
+        tree.write_file_compound(&mut self.conn, path, data).await
+    }
+
     /// Write data to a file using pipelined I/O (faster for large files).
     pub async fn write_file_pipelined(
         &mut self,

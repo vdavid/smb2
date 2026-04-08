@@ -538,23 +538,26 @@ impl Tree {
         Ok(())
     }
 
-    /// Write data to a file (create or overwrite).
+    /// Write a file using a compound CREATE+WRITE+FLUSH+CLOSE request.
     ///
-    /// Opens the file with `FileOverwriteIf` (creates if it does not exist,
-    /// overwrites if it does), writes the data in chunks, flushes to ensure
-    /// data is persisted on the server, then closes the handle.
-    /// Returns the total number of bytes written.
-    pub async fn write_file(
+    /// Sends all four operations in a single transport frame (1 round-trip).
+    /// Best for files that fit in MaxWriteSize. For larger files, use
+    /// [`write_file_pipelined`](Self::write_file_pipelined).
+    pub async fn write_file_compound(
         &self,
         conn: &mut Connection,
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
         let normalized = normalize_path(path);
-        debug!("tree: write_file path={}, len={}", normalized, data.len());
+        debug!(
+            "tree: write_file_compound path={}, len={}",
+            normalized,
+            data.len()
+        );
 
-        // Open (or create) the file for writing.
-        let req = CreateRequest {
+        // Build CREATE request (write access, overwrite-if disposition).
+        let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
             desired_access: FileAccessMask::new(
@@ -570,38 +573,141 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
-            .await?;
+        // Build WRITE request with sentinel FileId.
+        // DataOffset = Header::SIZE (64) + WriteRequest fixed body (48) = 0x70.
+        let write_credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
+        let write_req = WriteRequest {
+            data_offset: 0x70,
+            offset: 0,
+            file_id: FileId::SENTINEL,
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data: data.to_vec(),
+        };
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
+        // Build FLUSH request with sentinel FileId.
+        let flush_req = FlushRequest {
+            file_id: FileId::SENTINEL,
+        };
 
-        if resp_header.status != NtStatus::SUCCESS {
+        // Build CLOSE request with sentinel FileId.
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        // Send as 4-way compound.
+        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (
+                Command::Write,
+                &write_req,
+                CreditCharge(write_credit_charge),
+            ),
+            (Command::Flush, &flush_req, CreditCharge(1)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+
+        // Receive compound response.
+        let responses = conn.receive_compound().await?;
+
+        if responses.len() != 4 {
+            return Err(Error::invalid_data(format!(
+                "expected 4 compound responses, got {}",
+                responses.len()
+            )));
+        }
+
+        let (create_header, create_body) = &responses[0];
+        let (write_header, write_body) = &responses[1];
+        let (flush_header, _flush_body) = &responses[2];
+        let (close_header, _close_body) = &responses[3];
+
+        // Check CREATE response.
+        if create_header.status != NtStatus::SUCCESS {
+            // CREATE failed — all four fail (cascaded). No handle to clean up.
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: create_header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(create_body);
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
-        // Write the data in chunks.
-        let result = self.write_loop(conn, file_id, data).await;
-
-        // Flush to ensure data is persisted on the server.
-        if result.is_ok() {
-            self.flush_handle(conn, file_id).await?;
+        // Check WRITE response.
+        if write_header.status != NtStatus::SUCCESS {
+            // WRITE failed. FLUSH and CLOSE also failed in the compound (cascaded).
+            // Issue a standalone CLOSE to clean up the handle.
+            debug!(
+                "tree: compound WRITE failed ({:?}), issuing standalone CLOSE",
+                write_header.status
+            );
+            let _ = self.close_handle(conn, file_id).await;
+            return Err(Error::Protocol {
+                status: write_header.status,
+                command: Command::Write,
+            });
         }
 
-        // Close the handle.
-        let close_result = self.close_handle(conn, file_id).await;
+        let mut cursor = ReadCursor::new(write_body);
+        let write_resp = WriteResponse::unpack(&mut cursor)?;
+        let bytes_written = write_resp.count as u64;
 
-        let bytes_written = result?;
-        close_result?;
-        debug!("tree: write_file done, wrote {} bytes", bytes_written);
+        // Check FLUSH response. If it failed but WRITE succeeded,
+        // the data might not be persisted yet but the write did happen.
+        if flush_header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: compound FLUSH returned {:?} (data written but may not be persisted)",
+                flush_header.status,
+            );
+        }
+
+        // Check CLOSE response. If it failed but CREATE and WRITE succeeded,
+        // the handle might still be open, but there's nothing we can do
+        // since we already have the data written.
+        if close_header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: compound CLOSE returned {:?} (non-fatal, data already written)",
+                close_header.status,
+            );
+        }
+
+        debug!(
+            "tree: write_file_compound done, wrote {} bytes",
+            bytes_written
+        );
         Ok(bytes_written)
+    }
+
+    /// Write data to a file (create or overwrite).
+    ///
+    /// For data that fits in MaxWriteSize (typically 64 KB to 8 MB), uses a
+    /// compound CREATE+WRITE+FLUSH+CLOSE in a single round-trip. For larger
+    /// data, falls back to the pipelined write path.
+    ///
+    /// Returns the total number of bytes written.
+    pub async fn write_file(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        data: &[u8],
+    ) -> Result<u64> {
+        let max_write = conn
+            .params()
+            .map(|p| p.max_write_size as usize)
+            .unwrap_or(65536);
+        if data.len() <= max_write {
+            self.write_file_compound(conn, path, data).await
+        } else {
+            self.write_file_pipelined(conn, path, data).await
+        }
     }
 
     /// Read a file using pipelined I/O with a sliding window.
@@ -699,7 +805,7 @@ impl Tree {
         if data.is_empty() {
             debug!("tree: write_file_pipelined path={}, len=0 (empty write)", normalized);
             // Still create the file (to match write_file behavior).
-            return self.write_file(conn, path, data).await;
+            return self.write_file_compound(conn, path, data).await;
         }
 
         // Open (or create) the file for writing.
@@ -1576,6 +1682,10 @@ impl Tree {
     }
 
     /// Write data to a file in chunks.
+    ///
+    /// Kept for potential future use by callers that need per-chunk control
+    /// without pipelining or compounding.
+    #[allow(dead_code)]
     async fn write_loop(
         &self,
         conn: &mut Connection,
@@ -2177,11 +2287,15 @@ mod tests {
             volatile: 0xDD,
         };
 
-        // WRITE = CREATE + WRITE + FLUSH + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
-        mock.queue_response(build_write_response(5));
-        mock.queue_response(build_flush_response());
-        mock.queue_response(build_close_response());
+        // write_file for small data now uses compound: CREATE+WRITE+FLUSH+CLOSE in one frame.
+        let create_resp = build_create_response(file_id, 0);
+        let write_resp = build_write_response(5);
+        let flush_resp = build_flush_response();
+        let close_resp = build_close_response();
+
+        let frame =
+            build_compound_response_frame(&[create_resp, write_resp, flush_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -2193,7 +2307,8 @@ mod tests {
 
         let written = tree.write_file(&mut conn, "out.txt", b"hello").await.unwrap();
         assert_eq!(written, 5);
-        assert_eq!(mock.sent_count(), 4);
+        // One compound frame sent.
+        assert_eq!(mock.sent_count(), 1);
     }
 
     // ── Stat tests ───────────────────────────────────────────────────
@@ -3106,6 +3221,274 @@ mod tests {
 
         // Verify CLOSE uses sentinel FileId.
         let close_parsed = CloseRequest::unpack(&mut cursor3).unwrap();
+        assert_eq!(close_parsed.file_id, FileId::SENTINEL);
+    }
+
+    // ── Compound write tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_file_compound_returns_bytes_written() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+        let file_data = b"Hello, compound write!";
+
+        let create_resp = build_create_response(file_id, 0);
+        let write_resp = build_write_response(file_data.len() as u32);
+        let flush_resp = build_flush_response();
+        let close_resp = build_close_response();
+
+        let frame =
+            build_compound_response_frame(&[create_resp, write_resp, flush_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let written = tree
+            .write_file_compound(&mut conn, "test.txt", file_data)
+            .await
+            .unwrap();
+
+        assert_eq!(written, file_data.len() as u64);
+        // Should have sent one compound frame (plus the tree connect).
+        assert_eq!(mock.sent_count(), 2); // TreeConnect + compound
+    }
+
+    #[tokio::test]
+    async fn write_file_compound_empty_file() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId { persistent: 1, volatile: 2 };
+
+        let create_resp = build_create_response(file_id, 0);
+        let write_resp = build_write_response(0);
+        let flush_resp = build_flush_response();
+        let close_resp = build_close_response();
+
+        let frame =
+            build_compound_response_frame(&[create_resp, write_resp, flush_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let written = tree
+            .write_file_compound(&mut conn, "empty.txt", b"")
+            .await
+            .unwrap();
+
+        assert_eq!(written, 0);
+    }
+
+    #[tokio::test]
+    async fn write_file_compound_create_failure_returns_error() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        // Build compound response where CREATE fails.
+        // When CREATE fails, server cascades error to WRITE, FLUSH, and CLOSE.
+        let mut create_h = Header::new_request(Command::Create);
+        create_h.flags.set_response();
+        create_h.credits = 32;
+        create_h.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_resp = pack_message(
+            &create_h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut write_h = Header::new_request(Command::Write);
+        write_h.flags.set_response();
+        write_h.credits = 32;
+        write_h.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let write_resp = pack_message(
+            &write_h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut flush_h = Header::new_request(Command::Flush);
+        flush_h.flags.set_response();
+        flush_h.credits = 32;
+        flush_h.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let flush_resp = pack_message(
+            &flush_h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut close_h = Header::new_request(Command::Close);
+        close_h.flags.set_response();
+        close_h.credits = 32;
+        close_h.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_resp = pack_message(
+            &close_h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame =
+            build_compound_response_frame(&[create_resp, write_resp, flush_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let result = tree
+            .write_file_compound(&mut conn, "bad/path.txt", b"data")
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), Some(NtStatus::OBJECT_NAME_NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn write_file_compound_write_failure_issues_standalone_close() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId { persistent: 0x42, volatile: 0x99 };
+
+        // CREATE succeeds.
+        let create_resp = build_create_response(file_id, 0);
+
+        // WRITE fails with INSUFFICIENT_RESOURCES.
+        let mut write_h = Header::new_request(Command::Write);
+        write_h.flags.set_response();
+        write_h.credits = 32;
+        write_h.status = NtStatus::INSUFFICIENT_RESOURCES;
+        let write_resp = pack_message(
+            &write_h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        // FLUSH also fails (cascaded).
+        let mut flush_h = Header::new_request(Command::Flush);
+        flush_h.flags.set_response();
+        flush_h.credits = 32;
+        flush_h.status = NtStatus::INSUFFICIENT_RESOURCES;
+        let flush_resp = pack_message(
+            &flush_h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        // CLOSE also fails (cascaded).
+        let mut close_h = Header::new_request(Command::Close);
+        close_h.flags.set_response();
+        close_h.credits = 32;
+        close_h.status = NtStatus::INSUFFICIENT_RESOURCES;
+        let close_resp = pack_message(
+            &close_h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame =
+            build_compound_response_frame(&[create_resp, write_resp, flush_resp, close_resp]);
+        mock.queue_response(frame);
+
+        // Queue a standalone CLOSE response for the cleanup.
+        mock.queue_response(build_close_response());
+
+        let result = tree
+            .write_file_compound(&mut conn, "problem.txt", b"data")
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), Some(NtStatus::INSUFFICIENT_RESOURCES));
+
+        // Should have sent: TreeConnect + compound + standalone CLOSE = 3.
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn write_file_compound_sends_correct_request_structure() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7)));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId { persistent: 1, volatile: 2 };
+        let create_resp = build_create_response(file_id, 0);
+        let write_resp = build_write_response(5);
+        let flush_resp = build_flush_response();
+        let close_resp = build_close_response();
+        let frame =
+            build_compound_response_frame(&[create_resp, write_resp, flush_resp, close_resp]);
+        mock.queue_response(frame);
+
+        tree.write_file_compound(&mut conn, "verify.txt", &[1, 2, 3, 4, 5])
+            .await
+            .unwrap();
+
+        // The second sent message is the compound request.
+        let compound = mock.sent_message(1).unwrap();
+
+        // Verify it contains 4 headers linked by NextCommand.
+        let mut cursor = ReadCursor::new(&compound);
+        let h1 = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(h1.command, Command::Create);
+        assert!(!h1.flags.is_related());
+        assert!(h1.next_command > 0);
+        assert_eq!(h1.tree_id, Some(TreeId(7)));
+
+        let off2 = h1.next_command as usize;
+        let mut cursor2 = ReadCursor::new(&compound[off2..]);
+        let h2 = Header::unpack(&mut cursor2).unwrap();
+        assert_eq!(h2.command, Command::Write);
+        assert!(h2.flags.is_related());
+        assert!(h2.next_command > 0);
+
+        // Verify WRITE uses sentinel FileId.
+        let write_parsed = WriteRequest::unpack(&mut cursor2).unwrap();
+        assert_eq!(write_parsed.file_id, FileId::SENTINEL);
+        assert_eq!(write_parsed.data, vec![1, 2, 3, 4, 5]);
+
+        let off3 = off2 + h2.next_command as usize;
+        let mut cursor3 = ReadCursor::new(&compound[off3..]);
+        let h3 = Header::unpack(&mut cursor3).unwrap();
+        assert_eq!(h3.command, Command::Flush);
+        assert!(h3.flags.is_related());
+        assert!(h3.next_command > 0);
+
+        // Verify FLUSH uses sentinel FileId.
+        let flush_parsed = FlushRequest::unpack(&mut cursor3).unwrap();
+        assert_eq!(flush_parsed.file_id, FileId::SENTINEL);
+
+        let off4 = off3 + h3.next_command as usize;
+        let mut cursor4 = ReadCursor::new(&compound[off4..]);
+        let h4 = Header::unpack(&mut cursor4).unwrap();
+        assert_eq!(h4.command, Command::Close);
+        assert!(h4.flags.is_related());
+        assert_eq!(h4.next_command, 0);
+
+        // Verify CLOSE uses sentinel FileId.
+        let close_parsed = CloseRequest::unpack(&mut cursor4).unwrap();
         assert_eq!(close_parsed.file_id, FileId::SENTINEL);
     }
 }
