@@ -99,9 +99,9 @@ examples/
 
 ## Kerberos status
 
-Implementation complete. KDC exchanges verified against real MIT Kerberos. AP-REQ NOT yet validated against any SMB
-server — Docker Samba AD DC doesn't work on macOS, so we need AWS Windows Server for end-to-end testing. See
-`tests/CLAUDE.md` for AWS access details.
+Tested end-to-end against Windows Server 2022 with AD DS (2026-04-09). Full flow works: AS exchange, TGS exchange,
+AP-REQ in SPNEGO, SMB SESSION_SETUP, file read/write. See `tests/CLAUDE.md` for AWS access details and
+`src/auth/CLAUDE.md` for design decisions discovered during testing.
 
 ## Quality bar
 
