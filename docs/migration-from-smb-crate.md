@@ -33,7 +33,7 @@ use smb2;
 let mut client = smb2::connect("192.168.1.111:445", "user", "pass").await?;
 
 // Then connect to a share (share name only, no UNC path)
-let tree = client.connect_share("ShareName").await?;
+let mut tree = client.connect_share("ShareName").await?;
 ```
 
 Or with full config:
@@ -47,6 +47,7 @@ let mut client = smb2::SmbClient::connect(smb2::ClientConfig {
     domain: String::new(),
     auto_reconnect: false,
     compression: true,
+    dfs_enabled: true,
 }).await?;
 ```
 
@@ -112,13 +113,13 @@ smb2 crate:
 
 ```rust
 // Simple (loads entire file into memory)
-let data = client.read_file(&tree, "path/to/file").await?;
+let data = client.read_file(&mut tree, "path/to/file").await?;
 
 // Compound (single round-trip, best for small files)
-let data = client.read_file_compound(&tree, "path/to/file").await?;
+let data = client.read_file_compound(&mut tree, "path/to/file").await?;
 
 // Pipelined (best for large files)
-let data = client.read_file_pipelined(&tree, "path/to/file").await?;
+let data = client.read_file_pipelined(&mut tree, "path/to/file").await?;
 
 // Streaming with progress (memory-efficient for large files)
 let mut download = client.download(&tree, "path/to/file").await?;
@@ -152,13 +153,13 @@ smb2 crate:
 
 ```rust
 // Simple (auto-flushes before close)
-client.write_file(&tree, "path/to/file", &data).await?;
+client.write_file(&mut tree, "path/to/file", &data).await?;
 
 // Compound (single round-trip for small files, auto-flushes)
-client.write_file_compound(&tree, "path/to/file", &data).await?;
+client.write_file_compound(&mut tree, "path/to/file", &data).await?;
 
 // Pipelined (best for large files, auto-flushes)
-client.write_file_pipelined(&tree, "path/to/file", &data).await?;
+client.write_file_pipelined(&mut tree, "path/to/file", &data).await?;
 
 // Streaming with progress
 let mut upload = client.upload(&tree, "path/to/file", &data).await?;
@@ -183,7 +184,7 @@ let entries: Vec<_> = stream.collect().await;
 smb2 crate:
 
 ```rust
-let entries = client.list_directory(&tree, "path/to/dir").await?;
+let entries = client.list_directory(&mut tree, "path/to/dir").await?;
 // Each entry has: name, size, created, modified, is_directory
 ```
 
@@ -206,7 +207,7 @@ drop(resource);
 smb2 crate:
 
 ```rust
-client.delete_file(&tree, "path/to/file").await?;
+client.delete_file(&mut tree, "path/to/file").await?;
 ```
 
 ### Create a directory
@@ -223,16 +224,16 @@ tree.create_directory(path, CreateDisposition::OpenIf, access).await?;
 smb2 crate:
 
 ```rust
-client.create_directory(&tree, "path/to/dir").await?;
+client.create_directory(&mut tree, "path/to/dir").await?;
 ```
 
 ### Other operations in smb2 (no smb crate equivalent used in Cmdr)
 
 ```rust
-client.delete_directory(&tree, "path").await?;
-client.rename(&tree, "old", "new").await?;
-client.stat(&tree, "path").await?;         // -> FileInfo
-client.fs_info(&tree).await?;              // -> FsInfo (disk space)
+client.delete_directory(&mut tree, "path").await?;
+client.rename(&mut tree, "old", "new").await?;
+client.stat(&mut tree, "path").await?;         // -> FileInfo
+client.fs_info(&mut tree).await?;              // -> FsInfo (disk space)
 client.watch(&tree, "path", true).await?;  // -> Watcher (change notifications)
 client.reconnect().await?;                 // re-establish after connection loss
 client.disconnect_share(&tree).await?;

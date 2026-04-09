@@ -32,11 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Read {} bytes from {}", data.len(), local_path);
 
     let mut client = smb2::connect(&addr, &user, &pass).await?;
-    let share = client.connect_share(&share_name).await?;
+    let mut share = client.connect_share(&share_name).await?;
 
     let start = Instant::now();
     let written = client
-        .write_file_pipelined(&share, remote_path, &data)
+        .write_file_pipelined(&mut share, remote_path, &data)
         .await?;
     let elapsed = start.elapsed();
 

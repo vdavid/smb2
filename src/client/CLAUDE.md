@@ -14,6 +14,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `watcher.rs` | `Watcher` -- directory change notifications via CHANGE_NOTIFY long-poll |
 | `pipeline.rs` | `Pipeline` / `Op` / `OpResult` -- batched concurrent operations (the core feature) |
 | `shares.rs` | Share enumeration via IPC$ + srvsvc RPC |
+| `dfs.rs` | DFS referral IOCTL helper, `DfsResolver` with TTL-based referral cache |
 
 ## Layering
 
@@ -57,6 +58,25 @@ All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenienc
 Partial failures are independent -- if 3 of 50 files fail, the other 47 still succeed. Each method returns `Vec<Result<T>>` in the same order as the input.
 
 No credit windowing yet -- the server's initial 256-credit grant supports ~128 deletes, ~85 renames, or ~64 stats in a single batch. Enough for typical file manager use.
+
+## DFS (Distributed File System) resolution
+
+Reactive DFS resolution with multi-target failover. When a convenience method gets `STATUS_PATH_NOT_COVERED` (mapped to `ErrorKind::DfsReferral`), it:
+
+1. Calls `handle_dfs_redirect()` which resolves the referral via `DfsResolver` (cache or IOCTL)
+2. Tries each target in the referral response (multi-target failover)
+3. Creates a new connection + session for cross-server targets via `ensure_connection()`
+4. Tree-connects to the target share via `ensure_tree()`
+5. Updates the caller's `&mut Tree` in-place to point to the new server/share
+6. Retries the operation with the resolved remaining path
+
+**Key design decisions:**
+- Convenience methods take `&mut Tree` (not `&Tree`) so DFS can update the tree in-place
+- `disconnect_share` stays as `&Tree` (no redirect on teardown)
+- Streaming methods (`download`, `upload`, `watch`) keep `&Tree` because they return handles that borrow the tree for their lifetime
+- Batch methods (`delete_files`, `rename_files`, `stat_files`) don't retry per-file; the caller should trigger one single-file operation first to resolve the redirect
+- `dfs_enabled` flag on `ClientConfig` (default `true`) gates all DFS resolution
+- Borrow checker requires inlining the connection lookup in `handle_dfs_redirect` to avoid double `&mut self` borrows
 
 ## Pipelined I/O
 

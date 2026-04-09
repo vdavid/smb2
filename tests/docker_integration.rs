@@ -52,6 +52,7 @@ async fn guest_client() -> SmbClient {
         domain: String::new(),
         auto_reconnect: false,
         compression: false,
+        dfs_enabled: true,
     })
     .await
     .expect("SmbClient::connect to smb-guest failed")
@@ -67,6 +68,7 @@ async fn auth_client() -> SmbClient {
         domain: String::new(),
         auto_reconnect: false,
         compression: false,
+        dfs_enabled: true,
     })
     .await
     .expect("SmbClient::connect to smb-auth failed")
@@ -407,7 +409,7 @@ async fn auth_connect_and_operate() {
     let _ = env_logger::try_init();
 
     let mut client = auth_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("private")
         .await
         .expect("connect_share failed");
@@ -417,18 +419,18 @@ async fn auth_connect_and_operate() {
     let test_data = b"authenticated write test";
 
     client
-        .write_file(&tree, test_path, test_data)
+        .write_file(&mut tree, test_path, test_data)
         .await
         .expect("write_file failed");
 
     let data = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed");
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
 
@@ -451,6 +453,7 @@ async fn auth_wrong_password_fails_cleanly() {
         domain: String::new(),
         auto_reconnect: false,
         compression: false,
+        dfs_enabled: true,
     })
     .await;
 
@@ -465,7 +468,7 @@ async fn guest_streaming_download() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -474,7 +477,7 @@ async fn guest_streaming_download() {
     let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
 
     client
-        .write_file(&tree, test_path, &test_data)
+        .write_file(&mut tree, test_path, &test_data)
         .await
         .expect("write_file failed");
 
@@ -501,7 +504,7 @@ async fn guest_streaming_download() {
     drop(download);
 
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -516,7 +519,7 @@ async fn guest_streaming_upload() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -546,13 +549,13 @@ async fn guest_streaming_upload() {
     drop(upload);
 
     let readback = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed");
     assert_eq!(readback, test_data);
 
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -569,7 +572,7 @@ async fn guest_write_with_progress() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -579,7 +582,7 @@ async fn guest_write_with_progress() {
 
     let mut progress_updates = Vec::new();
     let written = client
-        .write_file_with_progress(&tree, test_path, &test_data, |progress| {
+        .write_file_with_progress(&mut tree, test_path, &test_data, |progress| {
             progress_updates.push(progress.bytes_transferred);
             ControlFlow::Continue(())
         })
@@ -590,13 +593,13 @@ async fn guest_write_with_progress() {
     assert!(!progress_updates.is_empty());
 
     let readback = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed");
     assert_eq!(readback, test_data);
 
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -611,7 +614,7 @@ async fn guest_write_cancel_midway() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -621,7 +624,7 @@ async fn guest_write_cancel_midway() {
     let half = test_data.len() as u64 / 2;
 
     let result = client
-        .write_file_with_progress(&tree, cancel_path, &test_data, |progress| {
+        .write_file_with_progress(&mut tree, cancel_path, &test_data, |progress| {
             if progress.bytes_transferred >= half {
                 ControlFlow::Break(())
             } else {
@@ -636,7 +639,7 @@ async fn guest_write_cancel_midway() {
     }
 
     // Best-effort cleanup.
-    let _ = client.delete_file(&tree, cancel_path).await;
+    let _ = client.delete_file(&mut tree, cancel_path).await;
     client
         .disconnect_share(&tree)
         .await
@@ -651,12 +654,12 @@ async fn guest_fs_info() {
     let _ = env_logger::try_init();
 
     let mut client = guest_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
 
-    let info = client.fs_info(&tree).await.expect("fs_info failed");
+    let info = client.fs_info(&mut tree).await.expect("fs_info failed");
 
     assert!(info.total_bytes > 0);
     assert!(info.free_bytes <= info.total_bytes);
@@ -722,14 +725,14 @@ async fn guest_watch_directory() {
     local
         .run_until(async {
             let mut watcher_client = guest_client().await;
-            let watcher_share = watcher_client
+            let mut watcher_share = watcher_client
                 .connect_share("public")
                 .await
                 .expect("tree connect failed (watcher)");
 
             // Ensure a subdirectory to watch exists.
             let _ = watcher_client
-                .create_directory(&watcher_share, "_test_watch")
+                .create_directory(&mut watcher_share, "_test_watch")
                 .await;
 
             let mut watcher = watcher_client
@@ -741,7 +744,7 @@ async fn guest_watch_directory() {
             let test_file_path = "_test_watch/docker_watch_test.tmp";
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = guest_client().await;
-                let writer_share = writer_client
+                let mut writer_share = writer_client
                     .connect_share("public")
                     .await
                     .expect("tree connect failed (writer)");
@@ -749,7 +752,7 @@ async fn guest_watch_directory() {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
                 writer_client
-                    .write_file(&writer_share, test_file_path, b"watch test")
+                    .write_file(&mut writer_share, test_file_path, b"watch test")
                     .await
                     .expect("write_file failed");
 
@@ -768,15 +771,15 @@ async fn guest_watch_directory() {
             watcher.close().await.expect("watcher close failed");
 
             // Cleanup.
-            let (mut writer_client, writer_share) = writer_task.await.unwrap();
+            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
             writer_client
-                .delete_file(&writer_share, test_file_path)
+                .delete_file(&mut writer_share, test_file_path)
                 .await
                 .expect("delete_file failed");
             let _ = writer_client.disconnect_share(&writer_share).await;
 
             let _ = watcher_client
-                .delete_directory(&watcher_share, "_test_watch")
+                .delete_directory(&mut watcher_share, "_test_watch")
                 .await;
         })
         .await;
@@ -1054,6 +1057,7 @@ async fn encryption_client() -> SmbClient {
         domain: String::new(),
         auto_reconnect: false,
         compression: false,
+        dfs_enabled: true,
     })
     .await
     .expect("SmbClient::connect to smb-encryption failed")
@@ -1065,7 +1069,7 @@ async fn encryption_required_connect_and_operate() {
     let _ = env_logger::try_init();
 
     let mut client = encryption_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("private")
         .await
         .expect("connect_share failed");
@@ -1074,18 +1078,18 @@ async fn encryption_required_connect_and_operate() {
     let test_data = b"encrypted write test data 1234567890";
 
     client
-        .write_file(&tree, test_path, test_data)
+        .write_file(&mut tree, test_path, test_data)
         .await
         .expect("write_file failed (encrypted)");
 
     let data = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed (encrypted)");
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1100,7 +1104,7 @@ async fn encryption_required_pipelined_large_file() {
     let _ = env_logger::try_init();
 
     let mut client = encryption_client().await;
-    let tree = client
+    let mut tree = client
         .connect_share("private")
         .await
         .expect("connect_share failed");
@@ -1109,18 +1113,18 @@ async fn encryption_required_pipelined_large_file() {
     let test_data: Vec<u8> = (0..524_288).map(|i| (i % 199) as u8).collect();
 
     client
-        .write_file_pipelined(&tree, test_path, &test_data)
+        .write_file_pipelined(&mut tree, test_path, &test_data)
         .await
         .expect("write_file_pipelined failed (encrypted)");
 
     let data = client
-        .read_file_pipelined(&tree, test_path)
+        .read_file_pipelined(&mut tree, test_path)
         .await
         .expect("read_file_pipelined failed (encrypted)");
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1158,6 +1162,7 @@ async fn encryption_aes128_ccm_connect_and_operate() {
         domain: String::new(),
         auto_reconnect: false,
         compression: false,
+        dfs_enabled: true,
     })
     .await
     .expect("connect failed");
@@ -1169,7 +1174,7 @@ async fn encryption_aes128_ccm_connect_and_operate() {
         params.dialect
     );
 
-    let tree = client
+    let mut tree = client
         .connect_share("private")
         .await
         .expect("connect_share failed");
@@ -1178,18 +1183,18 @@ async fn encryption_aes128_ccm_connect_and_operate() {
     let test_data = b"AES-128-CCM encrypted write test";
 
     client
-        .write_file(&tree, test_path, test_data)
+        .write_file(&mut tree, test_path, test_data)
         .await
         .expect("write_file failed (AES-128-CCM)");
 
     let data = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed (AES-128-CCM)");
     assert_eq!(data, test_data);
 
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1253,6 +1258,7 @@ async fn flaky_error_is_clean_not_hang() {
             domain: String::new(),
             auto_reconnect: false,
             compression: false,
+            dfs_enabled: true,
         })
         .await
         {
@@ -1264,7 +1270,7 @@ async fn flaky_error_is_clean_not_hang() {
         }
     };
 
-    let tree = client
+    let mut tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -1274,7 +1280,7 @@ async fn flaky_error_is_clean_not_hang() {
     let mut got_error = false;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        match client.list_directory(&tree, "").await {
+        match client.list_directory(&mut tree, "").await {
             Ok(_) => continue,
             Err(smb2::Error::Io(_) | smb2::Error::Disconnected) => {
                 got_error = true;
@@ -1505,11 +1511,12 @@ async fn maxread_streaming_download() {
         domain: String::new(),
         auto_reconnect: false,
         compression: false,
+        dfs_enabled: true,
     })
     .await
     .expect("connect failed");
 
-    let tree = client
+    let mut tree = client
         .connect_share("public")
         .await
         .expect("connect_share failed");
@@ -1518,7 +1525,7 @@ async fn maxread_streaming_download() {
     let test_data: Vec<u8> = (0..262_144).map(|i| (i % 251) as u8).collect();
 
     client
-        .write_file(&tree, test_path, &test_data)
+        .write_file(&mut tree, test_path, &test_data)
         .await
         .expect("write_file failed");
 
@@ -1545,7 +1552,7 @@ async fn maxread_streaming_download() {
 
     drop(download);
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client

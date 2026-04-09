@@ -32,13 +32,14 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use log::info;
+use log::{debug, info};
 
 use crate::client::dfs::DfsResolver;
-use crate::error::Result;
+use crate::error::{ErrorKind, Result};
 use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
 use crate::types::FileId;
+use crate::Error;
 
 /// Configuration for an SMB client connection.
 #[derive(Debug, Clone)]
@@ -70,6 +71,13 @@ pub struct ClientConfig {
     /// Incompressible data (photos, videos) is sent uncompressed automatically.
     /// Default: true.
     pub compression: bool,
+    /// Enable DFS (Distributed File System) path resolution.
+    ///
+    /// When `true`, operations that receive a DFS referral response
+    /// (`STATUS_PATH_NOT_COVERED`) automatically resolve the referral,
+    /// connect to the target server, and retry the operation.
+    /// Default: true.
+    pub dfs_enabled: bool,
 }
 
 /// A connection to a specific server with its authenticated session.
@@ -101,7 +109,6 @@ pub struct SmbClient {
     /// Extra connections for DFS cross-server targets, keyed by server name.
     extra_connections: HashMap<String, ConnectionEntry>,
     /// DFS referral resolver with TTL-based cache.
-    #[allow(dead_code)]
     dfs_resolver: DfsResolver,
 }
 
@@ -286,21 +293,164 @@ impl SmbClient {
         }
     }
 
+    // ── DFS helpers ───────────────────────────────────────────────────
+
+    /// Handle a DFS redirect by resolving the referral, connecting to
+    /// the target server (creating a new connection if needed), and
+    /// updating the tree in-place.
+    ///
+    /// Returns the resolved remaining path to use for the retry.
+    async fn handle_dfs_redirect(
+        &mut self,
+        tree: &mut Tree,
+        original_path: &str,
+    ) -> Result<String> {
+        let server = tree.server.clone();
+        let share = tree.share_name.clone();
+        let unc_path = format!("\\\\{}\\{}\\{}", server, share, original_path);
+
+        debug!("dfs: resolving {}", unc_path);
+
+        // Resolve the referral (uses cache or IOCTL).
+        // We inline the connection lookup to avoid borrowing both
+        // `self.dfs_resolver` and `self` (via connection_for_tree)
+        // at the same time.
+        let conn = if tree.server == self.primary_server {
+            &mut self.conn
+        } else {
+            &mut self
+                .extra_connections
+                .get_mut(&tree.server)
+                .expect("no connection for tree server")
+                .conn
+        };
+        let resolved_list = self.dfs_resolver.resolve(conn, &unc_path).await?;
+
+        // Try each target (multi-target failover).
+        let mut last_error = None;
+        for resolved in &resolved_list {
+            let target_addr = format!("{}:{}", resolved.server, resolved.port);
+
+            // Get or create connection to target server.
+            match self.ensure_connection(&target_addr).await {
+                Ok(()) => {}
+                Err(e) => {
+                    debug!("dfs: failed to connect to {}: {}", target_addr, e);
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+
+            // Get or create tree on the target share.
+            match self.ensure_tree(&target_addr, &resolved.share).await {
+                Ok(new_tree) => {
+                    // Update the caller's tree in-place.
+                    *tree = new_tree;
+                    return Ok(resolved.remaining_path.clone());
+                }
+                Err(e) => {
+                    debug!(
+                        "dfs: failed to connect to share {} on {}: {}",
+                        resolved.share, target_addr, e
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| Error::invalid_data("DFS: no targets in referral")))
+    }
+
+    /// Ensure a connection exists in the pool for the given server address.
+    async fn ensure_connection(&mut self, target_addr: &str) -> Result<()> {
+        if target_addr == self.primary_server {
+            return Ok(()); // Already have primary connection.
+        }
+        if self.extra_connections.contains_key(target_addr) {
+            return Ok(()); // Already in pool.
+        }
+
+        // Create new connection to target.
+        let mut conn = Connection::connect(target_addr, self.config.timeout).await?;
+        conn.set_compression_requested(self.config.compression);
+        conn.negotiate().await?;
+
+        // Authenticate with same credentials.
+        let session = Session::setup(
+            &mut conn,
+            &self.config.username,
+            &self.config.password,
+            &self.config.domain,
+        )
+        .await?;
+
+        self.extra_connections
+            .insert(target_addr.to_string(), ConnectionEntry { conn, session });
+        Ok(())
+    }
+
+    /// Ensure a tree-connect exists for the given server and share.
+    async fn ensure_tree(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
+        let conn = if target_addr == self.primary_server {
+            &mut self.conn
+        } else {
+            &mut self
+                .extra_connections
+                .get_mut(target_addr)
+                .ok_or_else(|| Error::invalid_data("DFS: no connection for target"))?
+                .conn
+        };
+
+        Tree::connect(conn, share).await
+    }
+
+    /// Check whether a DFS retry should be attempted for the given error.
+    fn should_retry_dfs(&self, err: &Error) -> bool {
+        self.config.dfs_enabled && err.kind() == ErrorKind::DfsReferral
+    }
+
     // ── Convenience methods that delegate to Tree ──────────────────────
 
     /// List files in a directory on the given share.
     ///
     /// This is a convenience wrapper around [`Tree::list_directory`] that
     /// saves you from threading `connection_mut()` through every call.
-    pub async fn list_directory(&mut self, tree: &Tree, path: &str) -> Result<Vec<DirectoryEntry>> {
-        let conn = self.connection_for_tree(tree);
-        tree.list_directory(conn, path).await
+    /// If the server returns a DFS referral, the tree is updated in-place
+    /// and the operation is retried on the target server.
+    pub async fn list_directory(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.list_directory(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.list_directory(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Read a file from the given share.
-    pub async fn read_file(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
-        let conn = self.connection_for_tree(tree);
-        tree.read_file(conn, path).await
+    pub async fn read_file(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.read_file(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Read a small file using a compound CREATE+READ+CLOSE request.
@@ -308,21 +458,51 @@ impl SmbClient {
     /// Sends all three operations in a single transport frame, reducing
     /// round-trips from 3 to 1. Best for files that fit in a single
     /// READ (up to MaxReadSize, typically 8 MB).
-    pub async fn read_file_compound(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
-        let conn = self.connection_for_tree(tree);
-        tree.read_file_compound(conn, path).await
+    pub async fn read_file_compound(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.read_file_compound(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file_compound(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Read a file using pipelined I/O (faster for large files).
-    pub async fn read_file_pipelined(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
-        let conn = self.connection_for_tree(tree);
-        tree.read_file_pipelined(conn, path).await
+    pub async fn read_file_pipelined(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.read_file_pipelined(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file_pipelined(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Write data to a file on the given share (create or overwrite).
-    pub async fn write_file(&mut self, tree: &Tree, path: &str, data: &[u8]) -> Result<u64> {
-        let conn = self.connection_for_tree(tree);
-        tree.write_file(conn, path, data).await
+    pub async fn write_file(&mut self, tree: &mut Tree, path: &str, data: &[u8]) -> Result<u64> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.write_file(conn, path, data).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.write_file(conn, &new_path, data).await
+            }
+            other => other,
+        }
     }
 
     /// Write a small file using a compound CREATE+WRITE+FLUSH+CLOSE request.
@@ -333,89 +513,187 @@ impl SmbClient {
     /// [`write_file_pipelined`](Self::write_file_pipelined).
     pub async fn write_file_compound(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        let conn = self.connection_for_tree(tree);
-        tree.write_file_compound(conn, path, data).await
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.write_file_compound(conn, path, data).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.write_file_compound(conn, &new_path, data).await
+            }
+            other => other,
+        }
     }
 
     /// Write data to a file using pipelined I/O (faster for large files).
     pub async fn write_file_pipelined(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        let conn = self.connection_for_tree(tree);
-        tree.write_file_pipelined(conn, path, data).await
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.write_file_pipelined(conn, path, data).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.write_file_pipelined(conn, &new_path, data).await
+            }
+            other => other,
+        }
     }
 
     /// Query file system space information for the given share.
     ///
     /// Returns total capacity, free space, and allocation unit sizes.
     /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
-    pub async fn fs_info(&mut self, tree: &Tree) -> Result<tree::FsInfo> {
-        let conn = self.connection_for_tree(tree);
-        tree.fs_info(conn).await
+    pub async fn fs_info(&mut self, tree: &mut Tree) -> Result<tree::FsInfo> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.fs_info(conn).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                // fs_info has no path argument -- the DFS redirect uses
+                // the root of the share as the path.
+                let _new_path = self.handle_dfs_redirect(tree, "").await?;
+                let conn = self.connection_for_tree(tree);
+                tree.fs_info(conn).await
+            }
+            other => other,
+        }
     }
 
     /// Delete a file on the given share.
-    pub async fn delete_file(&mut self, tree: &Tree, path: &str) -> Result<()> {
-        let conn = self.connection_for_tree(tree);
-        tree.delete_file(conn, path).await
+    pub async fn delete_file(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.delete_file(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.delete_file(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Delete multiple files on the given share in a single batch.
     ///
     /// Sends all requests before waiting for responses, minimizing
     /// round-trips. Returns results in the same order as the input paths.
-    pub async fn delete_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<()>> {
+    ///
+    /// Note: DFS retry is not applied to batch operations. If the share
+    /// is a DFS target, perform a single-file operation first to trigger
+    /// the redirect, then use the batch method on the resolved tree.
+    pub async fn delete_files(&mut self, tree: &mut Tree, paths: &[&str]) -> Vec<Result<()>> {
         let conn = self.connection_for_tree(tree);
         tree.delete_files(conn, paths).await
     }
 
     /// Get file metadata (size, timestamps, whether it's a directory).
-    pub async fn stat(&mut self, tree: &Tree, path: &str) -> Result<FileInfo> {
-        let conn = self.connection_for_tree(tree);
-        tree.stat(conn, path).await
+    pub async fn stat(&mut self, tree: &mut Tree, path: &str) -> Result<FileInfo> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.stat(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.stat(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Stat multiple files on the given share in a single batch.
     ///
     /// Sends all requests before waiting for responses, minimizing
     /// round-trips. Returns results in the same order as the input paths.
-    pub async fn stat_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<FileInfo>> {
+    ///
+    /// Note: DFS retry is not applied to batch operations. If the share
+    /// is a DFS target, perform a single-file operation first to trigger
+    /// the redirect, then use the batch method on the resolved tree.
+    pub async fn stat_files(&mut self, tree: &mut Tree, paths: &[&str]) -> Vec<Result<FileInfo>> {
         let conn = self.connection_for_tree(tree);
         tree.stat_files(conn, paths).await
     }
 
     /// Rename a file or directory on the given share.
-    pub async fn rename(&mut self, tree: &Tree, from: &str, to: &str) -> Result<()> {
-        let conn = self.connection_for_tree(tree);
-        tree.rename(conn, from, to).await
+    pub async fn rename(&mut self, tree: &mut Tree, from: &str, to: &str) -> Result<()> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.rename(conn, from, to).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, from).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.rename(conn, &new_path, to).await
+            }
+            other => other,
+        }
     }
 
     /// Rename multiple files on the given share in a single batch.
     ///
     /// Sends all requests before waiting for responses, minimizing
     /// round-trips. Returns results in the same order as the input pairs.
-    pub async fn rename_files(&mut self, tree: &Tree, renames: &[(&str, &str)]) -> Vec<Result<()>> {
+    ///
+    /// Note: DFS retry is not applied to batch operations. If the share
+    /// is a DFS target, perform a single-file operation first to trigger
+    /// the redirect, then use the batch method on the resolved tree.
+    pub async fn rename_files(
+        &mut self,
+        tree: &mut Tree,
+        renames: &[(&str, &str)],
+    ) -> Vec<Result<()>> {
         let conn = self.connection_for_tree(tree);
         tree.rename_files(conn, renames).await
     }
 
     /// Create a directory on the given share.
-    pub async fn create_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
-        let conn = self.connection_for_tree(tree);
-        tree.create_directory(conn, path).await
+    pub async fn create_directory(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.create_directory(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.create_directory(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Delete an empty directory on the given share.
-    pub async fn delete_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
-        let conn = self.connection_for_tree(tree);
-        tree.delete_directory(conn, path).await
+    pub async fn delete_directory(&mut self, tree: &mut Tree, path: &str) -> Result<()> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.delete_directory(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.delete_directory(conn, &new_path).await
+            }
+            other => other,
+        }
     }
 
     /// Start a streaming file download (memory-efficient for large files).
@@ -541,13 +819,17 @@ impl SmbClient {
     /// chunk is received. Return `ControlFlow::Break(())` to cancel the read.
     pub async fn read_file_with_progress<F>(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         path: &str,
         on_progress: F,
     ) -> Result<Vec<u8>>
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        // DFS retry is not straightforward with progress callbacks (the
+        // callback is consumed by the first attempt). For now, attempt
+        // the operation directly. If DFS redirect is needed, the caller
+        // should resolve the tree first using a simpler method.
         let conn = self.connection_for_tree(tree);
         tree.read_file_pipelined_with_progress(conn, path, on_progress)
             .await
@@ -562,7 +844,7 @@ impl SmbClient {
     /// on the server.
     pub async fn write_file_with_progress<F>(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         path: &str,
         data: &[u8],
         mut on_progress: F,
@@ -696,7 +978,7 @@ impl SmbClient {
     /// `write_file_with_progress`) flush automatically before closing.
     /// Use this if you need to flush a handle obtained through the
     /// low-level API.
-    pub async fn flush_file(&mut self, tree: &Tree, file_id: FileId) -> Result<()> {
+    pub async fn flush_file(&mut self, tree: &mut Tree, file_id: FileId) -> Result<()> {
         let conn = self.connection_for_tree(tree);
         tree.flush_handle(conn, file_id).await
     }
@@ -740,6 +1022,7 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
         domain: String::new(),
         auto_reconnect: false,
         compression: true,
+        dfs_enabled: true,
     })
     .await
 }
@@ -891,6 +1174,7 @@ mod tests {
             domain: String::new(),
             auto_reconnect: false,
             compression: true,
+            dfs_enabled: true,
         };
 
         SmbClient::from_parts(config, conn, session)
@@ -1008,6 +1292,7 @@ mod tests {
             domain: String::new(),
             auto_reconnect: true,
             compression: true,
+            dfs_enabled: true,
         };
 
         let client = SmbClient::from_parts(config, conn, session);

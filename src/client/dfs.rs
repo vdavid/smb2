@@ -7,8 +7,7 @@
 //! paths using longest-prefix matching. All string comparisons are
 //! case-insensitive (DFS paths are case-insensitive per MS-DFSC).
 
-// Not yet called from non-test code (wired in a later step).
-#![allow(dead_code)]
+// DFS resolver is used by SmbClient for reactive DFS path resolution.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -634,6 +633,49 @@ mod tests {
         assert!(parse_unc_target(r"\\server").is_none());
         // Single backslash + server but no share
         assert!(parse_unc_target(r"\server").is_none());
+    }
+
+    #[test]
+    fn parse_unc_target_single_backslash_prefix() {
+        // Network addresses with single backslash prefix should also work.
+        let t = parse_unc_target(r"\server\share").unwrap();
+        assert_eq!(t.server, "server");
+        assert_eq!(t.share, "share");
+        assert_eq!(t.remaining_prefix, "");
+    }
+
+    #[test]
+    fn parse_unc_target_triple_backslash() {
+        // Extra leading backslashes are stripped.
+        let t = parse_unc_target(r"\\\server\share\path").unwrap();
+        assert_eq!(t.server, "server");
+        assert_eq!(t.share, "share");
+        assert_eq!(t.remaining_prefix, "path");
+    }
+
+    #[test]
+    fn parse_unc_target_ip_address() {
+        // IP addresses as server names.
+        let t = parse_unc_target(r"\\192.168.1.100\data").unwrap();
+        assert_eq!(t.server, "192.168.1.100");
+        assert_eq!(t.share, "data");
+        assert_eq!(t.remaining_prefix, "");
+    }
+
+    #[test]
+    fn parse_unc_target_deep_path() {
+        // The remaining prefix captures everything after server\share.
+        let t = parse_unc_target(r"\\server\share\a\b\c\d").unwrap();
+        assert_eq!(t.server, "server");
+        assert_eq!(t.share, "share");
+        assert_eq!(t.remaining_prefix, r"a\b\c\d");
+    }
+
+    #[test]
+    fn parse_unc_target_empty_components() {
+        // Empty server or share should return None.
+        assert!(parse_unc_target(r"\\\\share").is_none()); // empty server
+        assert!(parse_unc_target(r"\\\").is_none()); // server is empty after strip
     }
 
     // ── DfsResolver tests ────────────────────────────────────────────

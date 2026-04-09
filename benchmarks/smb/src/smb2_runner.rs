@@ -25,6 +25,7 @@ pub async fn connect(target: &Target) -> Result<(SmbClient, Tree), String> {
         domain: String::new(),
         auto_reconnect: false,
         compression: true,
+        dfs_enabled: true,
     };
 
     let mut client = SmbClient::connect(config)
@@ -48,7 +49,11 @@ pub async fn connect(target: &Target) -> Result<(SmbClient, Tree), String> {
 }
 
 /// Create the test directory on the share via smb2.
-pub async fn setup(client: &mut SmbClient, tree: &Tree, cycle_id: &str) -> Result<String, String> {
+pub async fn setup(
+    client: &mut SmbClient,
+    tree: &mut Tree,
+    cycle_id: &str,
+) -> Result<String, String> {
     let base = Target::smb2_test_base();
     let test_dir = format!(r"{base}\{cycle_id}");
 
@@ -70,7 +75,7 @@ pub async fn setup(client: &mut SmbClient, tree: &Tree, cycle_id: &str) -> Resul
 /// Upload `count` files of `size` bytes each via smb2 pipelined writes. Returns elapsed time.
 pub async fn upload(
     client: &mut SmbClient,
-    tree: &Tree,
+    tree: &mut Tree,
     test_dir: &str,
     count: usize,
     size: usize,
@@ -88,7 +93,7 @@ pub async fn upload(
 }
 
 /// List the test directory via smb2. Returns (count, elapsed).
-pub async fn list(client: &mut SmbClient, tree: &Tree, test_dir: &str) -> (usize, Duration) {
+pub async fn list(client: &mut SmbClient, tree: &mut Tree, test_dir: &str) -> (usize, Duration) {
     let start = Instant::now();
     let entries = client
         .list_directory(tree, test_dir)
@@ -104,7 +109,7 @@ pub async fn list(client: &mut SmbClient, tree: &Tree, test_dir: &str) -> (usize
 /// Download all files to a local temp dir via smb2 pipelined reads. Returns (bytes, elapsed).
 pub async fn download(
     client: &mut SmbClient,
-    tree: &Tree,
+    tree: &mut Tree,
     test_dir: &str,
     local_dest: &std::path::PathBuf,
 ) -> (u64, Duration) {
@@ -152,7 +157,7 @@ pub async fn download(
 }
 
 /// Delete all files in the test directory and then the directory itself via smb2.
-pub async fn delete(client: &mut SmbClient, tree: &Tree, test_dir: &str) -> Duration {
+pub async fn delete(client: &mut SmbClient, tree: &mut Tree, test_dir: &str) -> Duration {
     let start = Instant::now();
     delete_dir_recursive(client, tree, test_dir)
         .await
@@ -163,7 +168,7 @@ pub async fn delete(client: &mut SmbClient, tree: &Tree, test_dir: &str) -> Dura
 /// Recursively delete a directory and its contents via smb2.
 async fn delete_dir_recursive(
     client: &mut SmbClient,
-    tree: &Tree,
+    tree: &mut Tree,
     dir_name: &str,
 ) -> Result<(), String> {
     // List directory contents
@@ -201,9 +206,9 @@ async fn delete_dir_recursive(
 /// Remove test base directory if it exists (for --cleanup-only).
 pub async fn cleanup(target: &Target) {
     match connect(target).await {
-        Ok((mut client, tree)) => {
+        Ok((mut client, mut tree)) => {
             let base = Target::smb2_test_base();
-            match delete_dir_recursive(&mut client, &tree, base).await {
+            match delete_dir_recursive(&mut client, &mut tree, base).await {
                 Ok(()) => println!("  Removed {base} (smb2)"),
                 Err(e) => println!("  smb2 cleanup: {e} (may not exist)"),
             }

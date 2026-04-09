@@ -184,7 +184,7 @@ async fn run_suite(
         target.name,
         suite.name
     );
-    let (mut smb2_client, smb2_tree) = smb2_runner::connect(target).await?;
+    let (mut smb2_client, mut smb2_tree) = smb2_runner::connect(target).await?;
     println!("done");
 
     // Warmup run (not counted) -- primes NAS caches
@@ -198,7 +198,7 @@ async fn run_suite(
         target,
         smb_conn.as_ref(),
         &mut smb2_client,
-        &smb2_tree,
+        &mut smb2_tree,
         suite,
         &data,
         &tmp_base,
@@ -281,7 +281,7 @@ async fn run_suite(
                     s_result = Some(
                         run_smb2_cycle(
                             &mut smb2_client,
-                            &smb2_tree,
+                            &mut smb2_tree,
                             suite,
                             &data,
                             &tmp_base,
@@ -597,7 +597,7 @@ async fn run_smb_cycle(
 /// Each operation is wrapped in a 90-second timeout.
 async fn run_smb2_cycle(
     client: &mut SmbClient,
-    tree: &Tree,
+    tree: &mut Tree,
     suite: &Suite,
     data: &[u8],
     tmp_base: &PathBuf,
@@ -708,7 +708,7 @@ async fn run_one_cycle(
     target: &Target,
     smb_conn: Option<&(smb::Client, smb::UncPath, smb_runner::ChunkSizes)>,
     smb2_client: &mut SmbClient,
-    smb2_tree: &Tree,
+    smb2_tree: &mut Tree,
     suite: &Suite,
     data: &[u8],
     tmp_base: &PathBuf,

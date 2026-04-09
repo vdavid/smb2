@@ -107,10 +107,10 @@ impl Error {
 /// that consumers can match on without understanding SMB internals.
 ///
 /// ```no_run
-/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// # async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
 /// use smb2::ErrorKind;
 ///
-/// match client.read_file(&share, "photo.jpg").await {
+/// match client.read_file(share, "photo.jpg").await {
 ///     Ok(data) => println!("read {} bytes", data.len()),
 ///     Err(e) => match e.kind() {
 ///         ErrorKind::NotFound => println!("file doesn't exist"),
@@ -309,5 +309,34 @@ mod tests {
             command: Command::Ioctl,
         };
         assert_eq!(err.kind(), ErrorKind::Other);
+    }
+
+    #[test]
+    fn kind_maps_path_not_covered_to_dfs_referral() {
+        // STATUS_PATH_NOT_COVERED from the protocol layer should map to DfsReferral.
+        let err = Error::Protocol {
+            status: NtStatus::PATH_NOT_COVERED,
+            command: Command::Create,
+        };
+        assert_eq!(err.kind(), ErrorKind::DfsReferral);
+    }
+
+    #[test]
+    fn kind_maps_dfs_referral_required_to_dfs_referral() {
+        // The explicit DFS referral error variant should also map to DfsReferral.
+        let err = Error::DfsReferralRequired {
+            path: r"\\server\share\path".into(),
+        };
+        assert_eq!(err.kind(), ErrorKind::DfsReferral);
+    }
+
+    #[test]
+    fn dfs_referral_is_not_retryable() {
+        // DFS referrals need special handling, not generic retry.
+        let err = Error::Protocol {
+            status: NtStatus::PATH_NOT_COVERED,
+            command: Command::Create,
+        };
+        assert!(!err.is_retryable());
     }
 }

@@ -26,9 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = ""; // empty = root of the share
 
     let mut client = smb2::connect(&addr, &user, &pass).await?;
-    let share = client.connect_share(&share_name).await?;
+    let mut share = client.connect_share(&share_name).await?;
 
-    let entries = client.list_directory(&share, directory).await?;
+    let entries = client.list_directory(&mut share, directory).await?;
 
     println!(
         "{} entries in \\\\{}\\{}\\{}:",

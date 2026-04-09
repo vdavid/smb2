@@ -18,16 +18,16 @@
 //! let shares = client.list_shares().await?;
 //!
 //! // Connect to a share
-//! let share = client.connect_share("Documents").await?;
+//! let mut share = client.connect_share("Documents").await?;
 //!
 //! // List files
-//! let entries = client.list_directory(&share, "projects/").await?;
+//! let entries = client.list_directory(&mut share, "projects/").await?;
 //! for entry in &entries {
 //!     println!("{} ({} bytes)", entry.name, entry.size);
 //! }
 //!
 //! // Read a file
-//! let data = client.read_file(&share, "report.pdf").await?;
+//! let data = client.read_file(&mut share, "report.pdf").await?;
 //! # Ok(())
 //! # }
 //! ```

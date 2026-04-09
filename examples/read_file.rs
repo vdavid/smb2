@@ -29,10 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local_path = "report.pdf";
 
     let mut client = smb2::connect(&addr, &user, &pass).await?;
-    let share = client.connect_share(&share_name).await?;
+    let mut share = client.connect_share(&share_name).await?;
 
     let start = Instant::now();
-    let data = client.read_file(&share, remote_path).await?;
+    let data = client.read_file(&mut share, remote_path).await?;
     let elapsed = start.elapsed();
 
     std::fs::write(local_path, &data)?;

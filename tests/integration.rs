@@ -397,6 +397,7 @@ async fn connect_client_to_nas() -> SmbClient {
         domain: String::new(),
         auto_reconnect: false,
         compression: true,
+        dfs_enabled: true,
     })
     .await
     .expect("SmbClient::connect failed")
@@ -613,7 +614,7 @@ async fn streaming_download_large_file() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client
+    let mut tree = client
         .connect_share("naspi")
         .await
         .expect("connect_share failed");
@@ -623,7 +624,7 @@ async fn streaming_download_large_file() {
     let test_data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
 
     client
-        .write_file(&tree, test_path, &test_data)
+        .write_file(&mut tree, test_path, &test_data)
         .await
         .expect("write_file failed");
     println!("Setup: wrote {} bytes", test_data.len());
@@ -677,7 +678,7 @@ async fn streaming_download_large_file() {
 
     // Clean up.
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -692,7 +693,7 @@ async fn write_with_progress_and_cancel() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client
+    let mut tree = client
         .connect_share("naspi")
         .await
         .expect("connect_share failed");
@@ -703,7 +704,7 @@ async fn write_with_progress_and_cancel() {
 
     let mut progress_updates = Vec::new();
     let written = client
-        .write_file_with_progress(&tree, test_path, &test_data, |progress| {
+        .write_file_with_progress(&mut tree, test_path, &test_data, |progress| {
             println!(
                 "  progress: {}/{} ({:.1}%)",
                 progress.bytes_transferred,
@@ -724,7 +725,7 @@ async fn write_with_progress_and_cancel() {
 
     // Verify the data was written correctly by reading it back.
     let readback = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed");
     assert_eq!(
@@ -734,7 +735,7 @@ async fn write_with_progress_and_cancel() {
 
     // Clean up the first file.
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
 
@@ -742,7 +743,7 @@ async fn write_with_progress_and_cancel() {
     let cancel_path = "smb2_test_write_cancel.tmp";
     let half = test_data.len() as u64 / 2;
     let result = client
-        .write_file_with_progress(&tree, cancel_path, &test_data, |progress| {
+        .write_file_with_progress(&mut tree, cancel_path, &test_data, |progress| {
             if progress.bytes_transferred >= half {
                 println!("  cancelling at {:.1}%", progress.percent());
                 ControlFlow::Break(())
@@ -759,7 +760,7 @@ async fn write_with_progress_and_cancel() {
     }
 
     // The partially written file may or may not exist. Try to clean up.
-    let _ = client.delete_file(&tree, cancel_path).await;
+    let _ = client.delete_file(&mut tree, cancel_path).await;
 
     client
         .disconnect_share(&tree)
@@ -837,10 +838,11 @@ async fn debug_rapid_pipelined_writes() {
         domain: String::new(),
         auto_reconnect: false,
         compression: true,
+        dfs_enabled: true,
     };
 
     let mut client = SmbClient::connect(config).await.expect("connect failed");
-    let share = client.connect_share("naspi").await.expect("tree failed");
+    let mut share = client.connect_share("naspi").await.expect("tree failed");
 
     eprintln!("Connected. Credits: {}", client.credits());
 
@@ -852,7 +854,7 @@ async fn debug_rapid_pipelined_writes() {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            client.write_file_pipelined(&share, &path, &data),
+            client.write_file_pipelined(&mut share, &path, &data),
         )
         .await;
 
@@ -878,7 +880,7 @@ async fn debug_rapid_pipelined_writes() {
     // Cleanup
     for i in 0..20 {
         let path = format!("_test/smb2_diag_{}.tmp", i);
-        let _ = client.delete_file(&share, &path).await;
+        let _ = client.delete_file(&mut share, &path).await;
     }
     let _ = client.disconnect_share(&share).await;
 }
@@ -897,11 +899,14 @@ async fn micro_benchmark_smb2_vs_native() {
         domain: String::new(),
         auto_reconnect: false,
         compression: true,
+        dfs_enabled: true,
     };
     let mut client = SmbClient::connect(config).await.expect("connect");
-    let share = client.connect_share("naspi").await.expect("tree");
+    let mut share = client.connect_share("naspi").await.expect("tree");
 
-    let _ = client.create_directory(&share, "_test/smb2_bench").await;
+    let _ = client
+        .create_directory(&mut share, "_test/smb2_bench")
+        .await;
 
     let file_count = 50;
     let file_size = 100 * 1024; // 100 KB
@@ -912,7 +917,7 @@ async fn micro_benchmark_smb2_vs_native() {
     for i in 0..file_count {
         let path = format!("_test/smb2_bench/f_{}.bin", i);
         client
-            .write_file_pipelined(&share, &path, &data)
+            .write_file_pipelined(&mut share, &path, &data)
             .await
             .expect("write");
     }
@@ -921,7 +926,7 @@ async fn micro_benchmark_smb2_vs_native() {
     // --- LIST (smb2) ---
     let start = std::time::Instant::now();
     let entries = client
-        .list_directory(&share, "_test/smb2_bench")
+        .list_directory(&mut share, "_test/smb2_bench")
         .await
         .expect("list");
     let smb2_list = start.elapsed();
@@ -943,10 +948,10 @@ async fn micro_benchmark_smb2_vs_native() {
     for i in 0..file_count {
         let path = format!("_test/smb2_bench/f_{}.bin", i);
         let d = if file_size <= max_read {
-            client.read_file(&share, &path).await.expect("read")
+            client.read_file(&mut share, &path).await.expect("read")
         } else {
             client
-                .read_file_pipelined(&share, &path)
+                .read_file_pipelined(&mut share, &path)
                 .await
                 .expect("read")
         };
@@ -958,7 +963,7 @@ async fn micro_benchmark_smb2_vs_native() {
     let start = std::time::Instant::now();
     for i in 0..file_count {
         let path = format!("_test/smb2_bench/f_{}.bin", i);
-        client.delete_file(&share, &path).await.expect("delete");
+        client.delete_file(&mut share, &path).await.expect("delete");
     }
     let smb2_delete = start.elapsed();
 
@@ -1009,7 +1014,9 @@ async fn micro_benchmark_smb2_vs_native() {
     };
 
     // Cleanup
-    let _ = client.delete_directory(&share, "_test/smb2_bench").await;
+    let _ = client
+        .delete_directory(&mut share, "_test/smb2_bench")
+        .await;
     let _ = client.disconnect_share(&share).await;
 
     // Results
@@ -1104,7 +1111,7 @@ async fn streaming_upload_large_file() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client
+    let mut tree = client
         .connect_share("naspi")
         .await
         .expect("connect_share failed");
@@ -1155,7 +1162,7 @@ async fn streaming_upload_large_file() {
 
     // Read back and verify.
     let readback = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed");
     assert_eq!(readback.len(), test_data.len(), "size mismatch");
@@ -1164,7 +1171,7 @@ async fn streaming_upload_large_file() {
 
     // Clean up.
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1179,7 +1186,7 @@ async fn streaming_upload_small_file_uses_compound() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client
+    let mut tree = client
         .connect_share("naspi")
         .await
         .expect("connect_share failed");
@@ -1216,7 +1223,7 @@ async fn streaming_upload_small_file_uses_compound() {
 
     // Read back and verify.
     let readback = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed");
     assert_eq!(readback, test_data.as_slice(), "content mismatch");
@@ -1224,7 +1231,7 @@ async fn streaming_upload_small_file_uses_compound() {
 
     // Clean up.
     client
-        .delete_file(&tree, test_path)
+        .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file failed");
     client
@@ -1243,6 +1250,7 @@ async fn connect_client_to_pi() -> SmbClient {
         domain: String::new(),
         auto_reconnect: false,
         compression: true,
+        dfs_enabled: true,
     })
     .await
     .expect("SmbClient::connect to Pi failed")
@@ -1254,7 +1262,7 @@ async fn streaming_upload_and_download_on_pi() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_pi().await;
-    let tree = client
+    let mut tree = client
         .connect_share("PiHDD")
         .await
         .expect("connect_share failed");
@@ -1287,7 +1295,7 @@ async fn streaming_upload_and_download_on_pi() {
     // Download via read_file (compound) -- simpler and more robust for
     // small files on Pi which sometimes resets streaming connections.
     let received = client
-        .read_file(&tree, test_path)
+        .read_file(&mut tree, test_path)
         .await
         .expect("read_file failed");
 
@@ -1300,7 +1308,7 @@ async fn streaming_upload_and_download_on_pi() {
     println!("Roundtrip verified: {} bytes match", received.len());
 
     // Clean up (best-effort).
-    let _ = client.delete_file(&tree, test_path).await;
+    let _ = client.delete_file(&mut tree, test_path).await;
     let _ = client.disconnect_share(&tree).await;
 }
 
@@ -1310,12 +1318,12 @@ async fn fs_info_on_nas() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_nas().await;
-    let tree = client
+    let mut tree = client
         .connect_share("naspi")
         .await
         .expect("connect_share failed");
 
-    let info = client.fs_info(&tree).await.expect("fs_info failed");
+    let info = client.fs_info(&mut tree).await.expect("fs_info failed");
 
     assert!(info.total_bytes > 0, "total_bytes should be positive");
     assert!(info.free_bytes > 0, "free_bytes should be positive");
@@ -1358,12 +1366,12 @@ async fn fs_info_on_pi() {
     let _ = env_logger::try_init();
 
     let mut client = connect_client_to_pi().await;
-    let tree = client
+    let mut tree = client
         .connect_share("PiHDD")
         .await
         .expect("connect_share failed");
 
-    let info = client.fs_info(&tree).await.expect("fs_info failed");
+    let info = client.fs_info(&mut tree).await.expect("fs_info failed");
 
     assert!(info.total_bytes > 0, "total_bytes should be positive");
     assert!(info.free_bytes > 0, "free_bytes should be positive");
@@ -1416,14 +1424,14 @@ async fn watch_directory_on_nas() {
     local
         .run_until(async {
             let mut watcher_client = connect_client_to_nas().await;
-            let watcher_share = watcher_client
+            let mut watcher_share = watcher_client
                 .connect_share("naspi")
                 .await
                 .expect("tree connect failed (watcher)");
 
             // Make sure the test directory exists.
             let _ = watcher_client
-                .create_directory(&watcher_share, "_test")
+                .create_directory(&mut watcher_share, "_test")
                 .await;
 
             // Start watching the _test/ directory (non-recursive).
@@ -1436,7 +1444,7 @@ async fn watch_directory_on_nas() {
             let test_file_path = "_test/smb2_watch_test.tmp";
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = connect_client_to_nas().await;
-                let writer_share = writer_client
+                let mut writer_share = writer_client
                     .connect_share("naspi")
                     .await
                     .expect("tree connect failed (writer)");
@@ -1444,7 +1452,7 @@ async fn watch_directory_on_nas() {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
                 writer_client
-                    .write_file(&writer_share, test_file_path, b"watch test")
+                    .write_file(&mut writer_share, test_file_path, b"watch test")
                     .await
                     .expect("write_file failed");
 
@@ -1480,9 +1488,9 @@ async fn watch_directory_on_nas() {
             watcher.close().await.expect("watcher close failed");
 
             // Wait for the writer task and clean up.
-            let (mut writer_client, writer_share) = writer_task.await.unwrap();
+            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
             writer_client
-                .delete_file(&writer_share, test_file_path)
+                .delete_file(&mut writer_share, test_file_path)
                 .await
                 .expect("delete_file failed");
             println!("Cleaned up {}", test_file_path);

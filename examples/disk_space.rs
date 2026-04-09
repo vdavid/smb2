@@ -25,9 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let share_name = env_or("SMB2_SHARE", "Documents");
 
     let mut client = smb2::connect(&addr, &user, &pass).await?;
-    let share = client.connect_share(&share_name).await?;
+    let mut share = client.connect_share(&share_name).await?;
 
-    let info = client.fs_info(&share).await?;
+    let info = client.fs_info(&mut share).await?;
     println!("Share: {share_name}");
     println!("Total: {:.1} GB", info.total_bytes as f64 / 1e9);
     println!("Free:  {:.1} GB", info.free_bytes as f64 / 1e9);
