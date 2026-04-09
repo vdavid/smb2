@@ -1,6 +1,3 @@
-// ASN.1 context tags like [0], [1] in doc comments trigger rustdoc warnings.
-#![allow(rustdoc::broken_intra_doc_links)]
-
 //! Kerberos ASN.1/DER message encoding and decoding.
 //!
 //! Hand-rolled ASN.1/DER for the specific Kerberos message structures needed
@@ -118,7 +115,7 @@ pub struct EncryptionKey {
     pub keyvalue: Vec<u8>,
 }
 
-/// Parsed AP-REP (APPLICATION [15]).
+/// Parsed AP-REP (`APPLICATION [15]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApRep {
     /// Encrypted part (to be decrypted with the session key or subkey).
@@ -369,7 +366,7 @@ fn encode_encrypted_data(ed: &EncryptedData) -> Vec<u8> {
     }
 }
 
-/// Encode a Ticket as DER (APPLICATION [1]).
+/// Encode a Ticket as DER (`APPLICATION [1]`).
 fn encode_ticket(ticket: &Ticket) -> Vec<u8> {
     // Ticket ::= [APPLICATION 1] SEQUENCE {
     //   tkt-vno  [0] INTEGER (5),
@@ -470,7 +467,7 @@ fn parse_encrypted_data(data: &[u8]) -> Result<EncryptedData, Error> {
     })
 }
 
-/// Parse a Ticket from DER bytes (expects APPLICATION [1] wrapper).
+/// Parse a Ticket from DER bytes (expects `APPLICATION [1]` wrapper).
 ///
 /// Stores the raw DER bytes so the ticket can be passed through to the
 /// AP-REQ verbatim. Re-encoding the ticket from parsed fields can produce
@@ -549,7 +546,7 @@ fn parse_encryption_key(data: &[u8]) -> Result<EncryptionKey, Error> {
 // Public API: encoding
 // ---------------------------------------------------------------------------
 
-/// Encode a KRB_AS_REQ message (APPLICATION [10]).
+/// Encode a KRB_AS_REQ message (`APPLICATION [10]`).
 pub fn encode_as_req(
     cname: &PrincipalName,
     realm: &str,
@@ -574,7 +571,7 @@ pub fn encode_tgs_req_body(
     encode_kdc_req_body(None, realm, sname, nonce, etypes)
 }
 
-/// Encode a KRB_TGS_REQ message (APPLICATION [12]).
+/// Encode a KRB_TGS_REQ message (`APPLICATION [12]`).
 ///
 /// The `tgt_ap_req` is an AP-REQ wrapping the TGT, placed in PA-TGS-REQ (padata type 1).
 /// The `req_body` must be the same bytes returned by `encode_tgs_req_body` (used for
@@ -593,7 +590,7 @@ pub fn encode_tgs_req(
     encode_kdc_req(12, None, realm, sname, nonce, etypes, &padata)
 }
 
-/// Encode a KRB_AP_REQ message (APPLICATION [14]).
+/// Encode a KRB_AP_REQ message (`APPLICATION [14]`).
 ///
 /// When `mutual_required` is true, sets the mutual-required bit (bit 2) in
 /// AP-OPTIONS, requesting the server to prove its identity via an AP-REP.
@@ -626,9 +623,9 @@ pub fn encode_ap_req(
     der_application(14, &seq)
 }
 
-/// Encode an Authenticator (APPLICATION [2]), to be encrypted before embedding in AP-REQ.
+/// Encode an Authenticator (`APPLICATION [2]`), to be encrypted before embedding in AP-REQ.
 ///
-/// The optional `cksum` parameter adds a checksum field [3], used in TGS-REQ
+/// The optional `cksum` parameter adds a checksum field `[3]`, used in TGS-REQ
 /// to authenticate the KDC-REQ-BODY (RFC 4120 section 7.2.2).
 pub fn encode_authenticator(
     crealm: &str,
@@ -698,7 +695,7 @@ pub fn encode_pa_enc_timestamp(ctime: &str, cusec: u32) -> Vec<u8> {
 // Public API: parsing
 // ---------------------------------------------------------------------------
 
-/// Parse a KRB_AS_REP (APPLICATION [11]) or KRB_TGS_REP (APPLICATION [13]) message.
+/// Parse a KRB_AS_REP (`APPLICATION [11]`) or KRB_TGS_REP (`APPLICATION [13]`) message.
 pub fn parse_kdc_rep(data: &[u8]) -> Result<KdcRep, Error> {
     let (tag, inner, _) = parse_der_tlv(data)?;
     // APPLICATION [11] = 0x6b, APPLICATION [13] = 0x6d
@@ -761,7 +758,7 @@ pub fn parse_kdc_rep(data: &[u8]) -> Result<KdcRep, Error> {
 
 /// Parse the decrypted EncKDCRepPart.
 ///
-/// This can be wrapped in APPLICATION [25] (EncASRepPart) or APPLICATION [26] (EncTGSRepPart),
+/// This can be wrapped in `APPLICATION [25]` (EncASRepPart) or `APPLICATION [26]` (EncTGSRepPart),
 /// or may appear as a bare SEQUENCE (some implementations).
 pub fn parse_enc_kdc_rep_part(data: &[u8]) -> Result<EncKdcRepPart, Error> {
     let (tag, inner, _) = parse_der_tlv(data)?;
@@ -830,7 +827,7 @@ pub fn parse_enc_kdc_rep_part(data: &[u8]) -> Result<EncKdcRepPart, Error> {
     })
 }
 
-/// Parse a KRB-ERROR message (APPLICATION [30]).
+/// Parse a KRB-ERROR message (`APPLICATION [30]`).
 pub fn parse_krb_error(data: &[u8]) -> Result<KrbError, Error> {
     let (tag, inner, _) = parse_der_tlv(data)?;
     // APPLICATION [30] = 0x7e
@@ -886,7 +883,7 @@ pub fn parse_krb_error(data: &[u8]) -> Result<KrbError, Error> {
     })
 }
 
-/// Unwrap a GSS-API token: APPLICATION [0] { OID, inner-data }.
+/// Unwrap a GSS-API token: `APPLICATION [0] { OID, inner-data }`.
 ///
 /// Returns the inner data after the OID as a `Vec<u8>`.
 pub fn parse_gss_api_wrapper(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), Error> {
@@ -903,9 +900,9 @@ pub fn parse_gss_api_wrapper(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), E
     Ok((oid, rest, total))
 }
 
-/// Parse a KRB_AP_REP message (APPLICATION [15]).
+/// Parse a KRB_AP_REP message (`APPLICATION [15]`).
 ///
-/// Handles both bare AP-REP and GSS-API wrapped tokens (APPLICATION [0]
+/// Handles both bare AP-REP and GSS-API wrapped tokens (`APPLICATION [0]`
 /// containing an OID followed by the AP-REP).
 pub fn parse_ap_rep(data: &[u8]) -> Result<ApRep, Error> {
     let (tag, inner, _) = parse_der_tlv(data)?;
@@ -952,7 +949,7 @@ pub fn parse_ap_rep(data: &[u8]) -> Result<ApRep, Error> {
     })
 }
 
-/// Parse the decrypted EncAPRepPart (APPLICATION [27]).
+/// Parse the decrypted EncAPRepPart (`APPLICATION [27]`).
 pub fn parse_enc_ap_rep_part(data: &[u8]) -> Result<EncApRepPart, Error> {
     let (tag, inner, _) = parse_der_tlv(data)?;
     // APPLICATION [27] = 0x7b, or bare SEQUENCE
