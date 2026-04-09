@@ -127,6 +127,7 @@ pub mod cancel;
 pub mod change_notify;
 pub mod close;
 pub mod create;
+pub mod dfs;
 pub mod echo;
 pub mod flush;
 pub mod header;
