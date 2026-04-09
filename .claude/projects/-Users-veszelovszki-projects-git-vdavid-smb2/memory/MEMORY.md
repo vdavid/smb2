@@ -1,1 +1,0 @@
-- [Project status](project_status.md) — Current state, pending work, quality bar

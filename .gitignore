@@ -1,4 +1,5 @@
 .idea/
+.claude/projects/
 related-repos/
 target/
 .DS_Store
