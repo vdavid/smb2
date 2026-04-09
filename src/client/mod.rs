@@ -445,6 +445,23 @@ impl SmbClient {
         }
     }
 
+    /// Read a file with progress reporting and cancellation.
+    ///
+    /// Uses pipelined I/O for performance, calling `on_progress` after each
+    /// chunk is received. Return `ControlFlow::Break(())` to cancel the read.
+    pub async fn read_file_with_progress<F>(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        on_progress: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(Progress) -> ControlFlow<()>,
+    {
+        tree.read_file_pipelined_with_progress(&mut self.conn, path, on_progress)
+            .await
+    }
+
     /// Write a file with progress reporting and cancellation.
     ///
     /// Writes data in chunks, calling `on_progress` after each chunk.

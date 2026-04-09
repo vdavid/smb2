@@ -4,9 +4,12 @@
 //! It provides methods for directory listing, file reading/writing, deletion,
 //! renaming, stat, and directory creation.
 
+use std::ops::ControlFlow;
+
 use log::{debug, info, trace, warn};
 
 use crate::client::connection::Connection;
+use crate::client::stream::Progress;
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
 use crate::msg::create::{
@@ -1093,6 +1096,76 @@ impl Tree {
         Ok(data)
     }
 
+    /// Read a file using pipelined I/O with progress reporting and cancellation.
+    ///
+    /// Same as [`read_file_pipelined`](Self::read_file_pipelined) but calls
+    /// `on_progress` after each chunk is received. Return
+    /// `ControlFlow::Break(())` from the callback to cancel the read.
+    pub async fn read_file_pipelined_with_progress<F>(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        mut on_progress: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(Progress) -> ControlFlow<()>,
+    {
+        let normalized = normalize_path(path);
+
+        let (file_id, file_size) = self.open_file(conn, &normalized).await?;
+
+        if file_size == 0 {
+            debug!(
+                "tree: read_file_pipelined_with_progress path={}, size=0 (empty file)",
+                normalized
+            );
+            self.close_handle(conn, file_id).await?;
+            let _ = on_progress(Progress {
+                bytes_transferred: 0,
+                total_bytes: Some(0),
+            });
+            return Ok(Vec::new());
+        }
+
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        let pipeline_chunk = 512 * 1024_u32;
+        let chunk_size = if file_size <= max_read as u64 {
+            (file_size as u32).min(max_read)
+        } else {
+            pipeline_chunk.min(max_read)
+        };
+        let credit_charge = chunk_size.div_ceil(65536) as u16;
+        let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
+        debug!(
+            "tree: read_file_pipelined_with_progress path={}, size={}, chunk_size={}, total_chunks={}",
+            normalized, file_size, chunk_size, total_chunks
+        );
+
+        let result = self
+            .read_pipelined_loop_with_progress(
+                conn,
+                file_id,
+                file_size,
+                chunk_size,
+                credit_charge,
+                total_chunks,
+                &mut on_progress,
+            )
+            .await;
+
+        // Close the handle regardless of read result.
+        let close_result = self.close_handle(conn, file_id).await;
+
+        let data = result?;
+        close_result?;
+
+        debug!(
+            "tree: read_file_pipelined_with_progress done, read {} bytes",
+            data.len()
+        );
+        Ok(data)
+    }
+
     /// Write a file using pipelined I/O with a sliding window.
     ///
     /// Opens/creates the file, then uses a sliding window to keep the pipe
@@ -1705,6 +1778,156 @@ impl Tree {
             }
 
             // Immediately send the next chunk if available and credits allow.
+            if chunks_sent < total_chunks {
+                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
+                if credits_available > 0 {
+                    let offset = chunks_sent as u64 * chunk_size as u64;
+                    let this_chunk = if chunks_sent == total_chunks - 1 {
+                        (file_size - offset) as u32
+                    } else {
+                        chunk_size
+                    };
+
+                    let req = ReadRequest {
+                        padding: 0x50,
+                        flags: 0,
+                        length: this_chunk,
+                        offset,
+                        file_id,
+                        minimum_count: 0,
+                        channel: SMB2_CHANNEL_NONE,
+                        remaining_bytes: 0,
+                        read_channel_info: vec![],
+                    };
+
+                    let (msg_id, _) = conn
+                        .send_request_with_credits(
+                            Command::Read,
+                            &req,
+                            Some(self.tree_id),
+                            credit_charge,
+                        )
+                        .await?;
+
+                    in_flight.push((msg_id, chunks_sent));
+                    chunks_sent += 1;
+                }
+            }
+        }
+
+        Ok(data)
+    }
+
+    /// Pipelined read with progress callback and cancellation.
+    ///
+    /// Same sliding window as `read_pipelined_loop`, but calls `on_progress`
+    /// after each chunk. Returns `Error::Cancelled` if the callback breaks.
+    async fn read_pipelined_loop_with_progress<F>(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        file_size: u64,
+        chunk_size: u32,
+        credit_charge: u16,
+        total_chunks: usize,
+        on_progress: &mut F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(Progress) -> ControlFlow<()>,
+    {
+        let mut data = vec![0u8; file_size as usize];
+        let mut chunks_sent = 0usize;
+        let mut chunks_received = 0usize;
+        let mut bytes_received = 0u64;
+        let mut in_flight: Vec<(MessageId, usize)> = Vec::new();
+
+        let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
+        let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
+
+        if initial_window == 0 {
+            return Err(Error::invalid_data(
+                "no credits available for pipelined read",
+            ));
+        }
+
+        // Initial fill: send up to window_size reads.
+        for _ in 0..initial_window {
+            let offset = chunks_sent as u64 * chunk_size as u64;
+            let this_chunk = if chunks_sent == total_chunks - 1 {
+                (file_size - offset) as u32
+            } else {
+                chunk_size
+            };
+
+            let req = ReadRequest {
+                padding: 0x50,
+                flags: 0,
+                length: this_chunk,
+                offset,
+                file_id,
+                minimum_count: 0,
+                channel: SMB2_CHANNEL_NONE,
+                remaining_bytes: 0,
+                read_channel_info: vec![],
+            };
+
+            let (msg_id, _) = conn
+                .send_request_with_credits(Command::Read, &req, Some(self.tree_id), credit_charge)
+                .await?;
+
+            in_flight.push((msg_id, chunks_sent));
+            chunks_sent += 1;
+        }
+
+        // Sliding loop: receive one, report progress, send one.
+        while chunks_received < total_chunks {
+            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            chunks_received += 1;
+
+            if resp_header.status == NtStatus::END_OF_FILE {
+                continue;
+            }
+
+            if resp_header.status != NtStatus::SUCCESS {
+                return Err(Error::Protocol {
+                    status: resp_header.status,
+                    command: Command::Read,
+                });
+            }
+
+            let msg_id = resp_header.message_id;
+            let chunk_index = in_flight
+                .iter()
+                .find(|(mid, _)| *mid == msg_id)
+                .map(|(_, idx)| *idx)
+                .ok_or_else(|| {
+                    Error::invalid_data(format!(
+                        "received response with unexpected MessageId {}",
+                        msg_id
+                    ))
+                })?;
+
+            let mut cursor = ReadCursor::new(&resp_body);
+            let resp = ReadResponse::unpack(&mut cursor)?;
+
+            if !resp.data.is_empty() {
+                let dest_offset = chunk_index as u64 * chunk_size as u64;
+                let dest_end = (dest_offset as usize + resp.data.len()).min(data.len());
+                let src_len = dest_end - dest_offset as usize;
+                data[dest_offset as usize..dest_end].copy_from_slice(&resp.data[..src_len]);
+                bytes_received += src_len as u64;
+            }
+
+            // Report progress and check for cancellation.
+            let progress = Progress {
+                bytes_transferred: bytes_received,
+                total_bytes: Some(file_size),
+            };
+            if let ControlFlow::Break(()) = on_progress(progress) {
+                return Err(Error::Cancelled);
+            }
+
+            // Send next chunk if available.
             if chunks_sent < total_chunks {
                 let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
                 if credits_available > 0 {
@@ -2588,8 +2811,7 @@ mod tests {
         let std_resp = build_query_info_response(std_info);
         let close_resp = build_close_response();
 
-        let frame =
-            build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -3374,6 +3596,194 @@ mod tests {
         assert_eq!(mock.sent_count(), 10);
     }
 
+    // ── Pipelined read with progress tests ────────────────────────────
+
+    #[tokio::test]
+    async fn read_pipelined_with_progress_reports_progress() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xF1,
+            volatile: 0xF2,
+        };
+        // 2 chunks of 65536 bytes each.
+        let file_size = 65536u64 * 2;
+        let expected_data = vec![0xABu8; file_size as usize];
+
+        // CREATE response with file size.
+        let create_resp = {
+            let mut h = Header::new_request(Command::Create);
+            h.flags.set_response();
+            h.credits = 32;
+            let body = CreateResponse {
+                oplock_level: OplockLevel::None,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: file_size,
+                file_attributes: 0,
+                file_id,
+                create_contexts: vec![],
+            };
+            pack_message(&h, &body)
+        };
+        mock.queue_response(create_resp);
+
+        // 2 READ responses.
+        for i in 0..2u64 {
+            let offset = (i * 65536) as usize;
+            let chunk = expected_data[offset..offset + 65536].to_vec();
+            let resp = build_read_response_with_msg_id(NtStatus::SUCCESS, MessageId(i + 1), chunk);
+            mock.queue_response(resp);
+        }
+
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(20),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut progress_reports = Vec::new();
+        let data = tree
+            .read_file_pipelined_with_progress(&mut conn, "progress_test.bin", |p| {
+                progress_reports.push(p.bytes_transferred);
+                ControlFlow::Continue(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(data.len(), file_size as usize);
+        // Should have received 2 progress callbacks (one per chunk).
+        assert_eq!(progress_reports.len(), 2);
+        assert_eq!(progress_reports[0], 65536);
+        assert_eq!(progress_reports[1], file_size);
+    }
+
+    #[tokio::test]
+    async fn read_pipelined_with_progress_cancellation() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xF3,
+            volatile: 0xF4,
+        };
+        // 4 chunks of 65536 bytes.
+        let file_size = 65536u64 * 4;
+
+        let create_resp = {
+            let mut h = Header::new_request(Command::Create);
+            h.flags.set_response();
+            h.credits = 32;
+            let body = CreateResponse {
+                oplock_level: OplockLevel::None,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: file_size,
+                file_attributes: 0,
+                file_id,
+                create_contexts: vec![],
+            };
+            pack_message(&h, &body)
+        };
+        mock.queue_response(create_resp);
+
+        // Queue all 4 READ responses (some won't be consumed due to cancellation).
+        for i in 0..4u64 {
+            let chunk = vec![0x42u8; 65536];
+            let resp = build_read_response_with_msg_id(NtStatus::SUCCESS, MessageId(i + 1), chunk);
+            mock.queue_response(resp);
+        }
+
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(20),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        // Cancel after the first chunk.
+        let result = tree
+            .read_file_pipelined_with_progress(&mut conn, "cancel_test.bin", |_p| {
+                ControlFlow::Break(())
+            })
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Cancelled => {} // expected
+            other => panic!("expected Cancelled, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_pipelined_with_progress_empty_file() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xF5,
+            volatile: 0xF6,
+        };
+
+        // CREATE response with size=0.
+        let create_resp = {
+            let mut h = Header::new_request(Command::Create);
+            h.flags.set_response();
+            h.credits = 32;
+            let body = CreateResponse {
+                oplock_level: OplockLevel::None,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: 0,
+                file_attributes: 0,
+                file_id,
+                create_contexts: vec![],
+            };
+            pack_message(&h, &body)
+        };
+        mock.queue_response(create_resp);
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(20),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut progress_called = false;
+        let data = tree
+            .read_file_pipelined_with_progress(&mut conn, "empty.bin", |p| {
+                progress_called = true;
+                assert_eq!(p.bytes_transferred, 0);
+                assert_eq!(p.total_bytes, Some(0));
+                ControlFlow::Continue(())
+            })
+            .await
+            .unwrap();
+
+        assert!(data.is_empty());
+        assert!(progress_called);
+    }
+
     // ── Pipelined write tests ───────────────────────────────────────
 
     #[tokio::test]
@@ -4030,8 +4440,7 @@ mod tests {
 
         let close_resp = build_close_response();
 
-        let frame =
-            build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
