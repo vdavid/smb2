@@ -290,19 +290,52 @@ impl Session {
     ///
     /// The session key comes from the Kerberos TGS exchange, not from the
     /// SMB server response.
+    /// Perform Kerberos-based SESSION_SETUP using a credential cache.
+    ///
+    /// Reads cached tickets from the ccache. If a service ticket for
+    /// `cifs/<server_hostname>` is cached, uses it directly (no KDC needed).
+    /// If only a TGT is cached, does a TGS exchange for the service ticket.
+    pub async fn setup_kerberos_from_ccache(
+        conn: &mut Connection,
+        credentials: &crate::auth::kerberos::KerberosCredentials,
+        server_hostname: &str,
+        ccache: &crate::auth::kerberos::ccache::CCache,
+    ) -> Result<Session> {
+        let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
+        auth.authenticate_from_ccache(ccache, server_hostname)
+            .await?;
+        Self::setup_kerberos_with_auth(conn, &mut auth).await
+    }
+
+    /// Perform Kerberos-based SESSION_SETUP.
+    ///
+    /// Authenticates against the KDC first (AS + TGS), then sends the
+    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP. Handles both single-round
+    /// (STATUS_SUCCESS) and mutual-auth (STATUS_MORE_PROCESSING_REQUIRED)
+    /// flows.
+    ///
+    /// The session key comes from the Kerberos TGS exchange, not from the
+    /// SMB server response.
     pub async fn setup_kerberos(
         conn: &mut Connection,
         credentials: &crate::auth::kerberos::KerberosCredentials,
         server_hostname: &str,
     ) -> Result<Session> {
+        let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
+        auth.authenticate(server_hostname).await?;
+        Self::setup_kerberos_with_auth(conn, &mut auth).await
+    }
+
+    /// Shared Kerberos SESSION_SETUP logic used by both password-based
+    /// and ccache-based authentication paths.
+    async fn setup_kerberos_with_auth(
+        conn: &mut Connection,
+        auth: &mut crate::auth::kerberos::KerberosAuthenticator,
+    ) -> Result<Session> {
         let params = conn
             .params()
             .ok_or_else(|| Error::invalid_data("negotiate must complete before session setup"))?
             .clone();
-
-        // Step 1: Authenticate against the KDC (AS + TGS exchanges).
-        let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
-        auth.authenticate(server_hostname).await?;
 
         let token = auth
             .token()

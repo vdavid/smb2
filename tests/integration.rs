@@ -1620,3 +1620,74 @@ async fn kerberos_auth_against_aws_windows_ad() {
     let _ = tree.delete_file(&mut conn, "krb_test.txt").await;
     let _ = tree.disconnect(&mut conn).await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn kerberos_auth_from_ccache() {
+    let _ = env_logger::try_init();
+
+    load_dotenv();
+    let server_ip = std::env::var("SMB2_TEST_AWS_AD_IP").expect("SMB2_TEST_AWS_AD_IP not set");
+    let server_hostname =
+        std::env::var("SMB2_TEST_AWS_AD_HOSTNAME").expect("SMB2_TEST_AWS_AD_HOSTNAME not set");
+    let ccache_path = std::env::var("SMB2_TEST_CCACHE")
+        .expect("SMB2_TEST_CCACHE not set (path to a file-based Kerberos ccache)");
+
+    let spn_hostname = std::env::var("SMB2_TEST_AWS_AD_SPN")
+        .unwrap_or_else(|_| format!("{}.test.local", server_hostname.to_lowercase()));
+
+    println!("Loading ccache from {}...", ccache_path);
+    let ccache_data = std::fs::read(&ccache_path).expect("failed to read ccache file");
+    let ccache =
+        smb2::auth::kerberos::ccache::parse_ccache(&ccache_data).expect("failed to parse ccache");
+    println!(
+        "Ccache: principal={}@{}, {} credentials",
+        ccache.default_principal.components.join("/"),
+        ccache.default_principal.realm,
+        ccache.credentials.len()
+    );
+
+    // Connect and negotiate.
+    let mut conn = Connection::connect(&format!("{}:445", server_ip), Duration::from_secs(10))
+        .await
+        .expect("failed to connect");
+
+    conn.negotiate().await.expect("negotiate failed");
+    println!("Negotiated dialect: {}", conn.params().unwrap().dialect);
+
+    // Authenticate using the ccache (TGT only — does TGS exchange).
+    let credentials = smb2::KerberosCredentials {
+        username: ccache.default_principal.components[0].clone(),
+        password: String::new(), // not needed for ccache
+        realm: ccache.default_principal.realm.clone(),
+        kdc_address: format!("{}:88", server_ip),
+    };
+
+    let session =
+        Session::setup_kerberos_from_ccache(&mut conn, &credentials, &spn_hostname, &ccache)
+            .await
+            .expect("Kerberos session setup from ccache failed");
+
+    println!("Kerberos session from ccache: {}", session.session_id);
+
+    // Verify by writing and reading a file.
+    let tree = smb2::Tree::connect(&mut conn, "testshare")
+        .await
+        .expect("tree connect failed");
+
+    let test_data = b"Kerberos from ccache works!";
+    tree.write_file(&mut conn, "ccache_test.txt", test_data)
+        .await
+        .expect("write failed");
+
+    let read_back = tree
+        .read_file(&mut conn, "ccache_test.txt")
+        .await
+        .expect("read failed");
+
+    assert_eq!(read_back, test_data);
+    println!("Kerberos ccache auth verified: wrote and read file");
+
+    let _ = tree.delete_file(&mut conn, "ccache_test.txt").await;
+    let _ = tree.disconnect(&mut conn).await;
+}

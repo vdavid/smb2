@@ -166,6 +166,91 @@ impl KerberosAuthenticator {
         Ok(())
     }
 
+    /// Authenticate using a cached credential from a ccache file.
+    ///
+    /// If the ccache has a service ticket for `cifs/<server_hostname>`, uses it
+    /// directly (no KDC contact needed). If only a TGT is cached, performs a
+    /// TGS exchange to get the service ticket.
+    ///
+    /// After this returns `Ok(())`, call [`token()`](Self::token) and
+    /// [`session_key()`](Self::session_key) as usual.
+    pub async fn authenticate_from_ccache(
+        &mut self,
+        ccache: &crate::auth::kerberos::ccache::CCache,
+        server_hostname: &str,
+    ) -> Result<()> {
+        let realm = &self.credentials.realm;
+
+        // Try cached service ticket first (no KDC needed).
+        if let Some(svc) = ccache.find_service_ticket("cifs", server_hostname, realm) {
+            debug!(
+                "kerberos: using cached service ticket for cifs/{}",
+                server_hostname
+            );
+            self.load_service_ticket_from_ccache(svc)?;
+            self.build_ap_req()?;
+            debug!("kerberos: authentication complete (from cached service ticket)");
+            return Ok(());
+        }
+
+        // Fall back to cached TGT + TGS exchange.
+        if let Some(tgt_cred) = ccache.find_tgt(realm) {
+            debug!(
+                "kerberos: using cached TGT, doing TGS exchange for cifs/{}",
+                server_hostname
+            );
+            self.load_tgt_from_ccache(tgt_cred)?;
+
+            let kdc_config = KdcConfig {
+                address: self.credentials.kdc_address.clone(),
+                timeout: Duration::from_secs(10),
+            };
+            self.tgs_exchange(&kdc_config, server_hostname).await?;
+            self.build_ap_req()?;
+            debug!("kerberos: authentication complete (TGT from cache + TGS exchange)");
+            return Ok(());
+        }
+
+        Err(Error::Auth {
+            message: format!("ccache has no TGT or service ticket for realm {realm}"),
+        })
+    }
+
+    /// Load a service ticket from a ccache credential entry.
+    fn load_service_ticket_from_ccache(
+        &mut self,
+        cred: &crate::auth::kerberos::ccache::CcacheCredential,
+    ) -> Result<()> {
+        // Parse the ticket from the raw DER bytes.
+        let ticket = crate::auth::kerberos::messages::parse_ticket(&cred.ticket)?;
+
+        // Determine the etype from the session key.
+        let etype = etype_from_code(cred.key_etype as i32)?;
+        self.etype = etype;
+
+        self.service_ticket = Some(ticket);
+        self.tgs_session_key = Some(cred.key_data.clone());
+        self.session_key = Some(cred.key_data.clone());
+
+        Ok(())
+    }
+
+    /// Load a TGT from a ccache credential entry.
+    fn load_tgt_from_ccache(
+        &mut self,
+        cred: &crate::auth::kerberos::ccache::CcacheCredential,
+    ) -> Result<()> {
+        let ticket = crate::auth::kerberos::messages::parse_ticket(&cred.ticket)?;
+
+        let etype = etype_from_code(cred.key_etype as i32)?;
+        self.etype = etype;
+
+        self.tgt = Some(ticket);
+        self.as_session_key = Some(cred.key_data.clone());
+
+        Ok(())
+    }
+
     /// Get the SPNEGO-wrapped AP-REQ token for SESSION_SETUP.
     ///
     /// Available after [`authenticate()`](Self::authenticate) succeeds.
@@ -1090,6 +1175,18 @@ fn secs_to_datetime(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
 
     (y as u32, m as u32, d as u32, hour, minute, second)
+}
+
+/// Convert an etype integer code to an [`EncryptionType`] enum value.
+fn etype_from_code(code: i32) -> Result<EncryptionType> {
+    match code {
+        18 => Ok(EncryptionType::Aes256CtsHmacSha196),
+        17 => Ok(EncryptionType::Aes128CtsHmacSha196),
+        23 => Ok(EncryptionType::Rc4Hmac),
+        other => Err(Error::Auth {
+            message: format!("unsupported etype {other}"),
+        }),
+    }
 }
 
 /// Generate a random 32-bit nonce.

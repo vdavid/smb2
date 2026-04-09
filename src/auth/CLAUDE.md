@@ -111,6 +111,8 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **GSS-API wrapping**: The AP-REQ in SPNEGO NegTokenInit must include the GSS-API OID header (`0x60 len OID ap-req`), not just the raw AP-REQ bytes.
 - **Mutual authentication**: AP-REQ sets the mutual-required flag. The server returns an AP-REP (in SPNEGO NegTokenResp) containing a server sub-session key. The client decrypts the AP-REP (key usage 12) to extract this subkey, which becomes the SMB session key. This provides cryptographic proof that the server possesses the service key. The AP-REP may arrive in a `STATUS_SUCCESS` response (not always `STATUS_MORE_PROCESSING_REQUIRED`).
 
+- **Credential cache (ccache) support**: `kerberos/ccache.rs` parses MIT Kerberos ccache files (v3 and v4). Supports loading cached TGTs (skip AS exchange, do TGS) and cached service tickets (skip both AS and TGS). Integrates via `Session::setup_kerberos_from_ccache()` and `KerberosAuthenticator::authenticate_from_ccache()`. `load_ccache()` reads from a path or `$KRB5CCNAME`.
+
 ## Known tech debt (Kerberos)
 
 - ~~DER helpers duplicated between `spnego.rs` and `kerberos/messages.rs`~~ (resolved: shared `auth/der.rs`)
