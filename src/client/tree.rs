@@ -411,54 +411,13 @@ impl Tree {
         ))
     }
 
-    /// Delete a file.
+    /// Delete a file using a compound request (1 round-trip).
     ///
-    /// Opens the file with `DELETE_ON_CLOSE`, then closes the handle.
-    /// The server deletes the file when the last handle is closed.
+    /// Sends CREATE (with `DELETE_ON_CLOSE`) + CLOSE as a single compound
+    /// message. The server deletes the file when the CLOSE completes.
     pub async fn delete_file(&self, conn: &mut Connection, path: &str) -> Result<()> {
-        let normalized = normalize_path(path);
-        debug!("tree: delete_file path={}", normalized);
-
-        let req = CreateRequest {
-            requested_oplock_level: OplockLevel::None,
-            impersonation_level: ImpersonationLevel::Impersonation,
-            desired_access: FileAccessMask::new(
-                FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
-            ),
-            file_attributes: 0,
-            share_access: ShareAccess(
-                ShareAccess::FILE_SHARE_READ
-                    | ShareAccess::FILE_SHARE_WRITE
-                    | ShareAccess::FILE_SHARE_DELETE,
-            ),
-            create_disposition: CreateDisposition::FileOpen,
-            create_options: FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE,
-            name: normalized.clone(),
-            create_contexts: vec![],
-        };
-
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
-            .await?;
-
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
-            return Err(Error::Protocol {
-                status: resp_header.status,
-                command: Command::Create,
-            });
-        }
-
-        let mut cursor = ReadCursor::new(&resp_body);
-        let resp = CreateResponse::unpack(&mut cursor)?;
-        let file_id = resp.file_id;
-
-        // Close the handle, which triggers deletion.
-        self.close_handle(conn, file_id).await?;
-
-        info!("tree: deleted file={}", normalized);
-        Ok(())
+        self.delete_compound(conn, path, FILE_NON_DIRECTORY_FILE, "file")
+            .await
     }
 
     /// Get file metadata (size, timestamps, is_directory).
@@ -1117,15 +1076,32 @@ impl Tree {
         Ok(())
     }
 
-    /// Delete a directory.
+    /// Delete a directory using a compound request (1 round-trip).
     ///
-    /// Opens the directory with `DELETE_ON_CLOSE`, then closes the handle.
-    /// The directory must be empty.
+    /// Sends CREATE (with `DELETE_ON_CLOSE`) + CLOSE as a single compound
+    /// message. The directory must be empty.
     pub async fn delete_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
-        let normalized = normalize_path(path);
-        debug!("tree: delete_directory path={}", normalized);
+        self.delete_compound(conn, path, FILE_DIRECTORY_FILE, "directory")
+            .await
+    }
 
-        let req = CreateRequest {
+    // ── Private helpers ──────────────────────────────────────────────
+
+    /// Compound CREATE (DELETE_ON_CLOSE) + CLOSE in a single round-trip.
+    ///
+    /// `type_option` selects file vs directory (`FILE_NON_DIRECTORY_FILE`
+    /// or `FILE_DIRECTORY_FILE`). `kind` is used only for log messages.
+    async fn delete_compound(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        type_option: u32,
+        kind: &str,
+    ) -> Result<()> {
+        let normalized = normalize_path(path);
+        debug!("tree: delete_{} (compound) path={}", kind, normalized);
+
+        let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
             desired_access: FileAccessMask::new(
@@ -1138,34 +1114,61 @@ impl Tree {
                     | ShareAccess::FILE_SHARE_DELETE,
             ),
             create_disposition: CreateDisposition::FileOpen,
-            create_options: FILE_DELETE_ON_CLOSE | FILE_DIRECTORY_FILE,
+            create_options: FILE_DELETE_ON_CLOSE | type_option,
             name: normalized.clone(),
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
-            .await?;
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
+        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
 
-        if resp_header.status != NtStatus::SUCCESS {
+        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+        let responses = conn.receive_compound().await?;
+
+        if responses.len() != 2 {
+            return Err(Error::invalid_data(format!(
+                "expected 2 compound responses, got {}",
+                responses.len()
+            )));
+        }
+
+        let (create_header, create_body) = &responses[0];
+        let (close_header, _close_body) = &responses[1];
+
+        // If CREATE failed, all ops in the compound fail (cascaded). No handle to clean up.
+        if create_header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: create_header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
-        let resp = CreateResponse::unpack(&mut cursor)?;
-        let file_id = resp.file_id;
+        // CREATE succeeded. If CLOSE failed, issue a standalone CLOSE
+        // to avoid leaking the handle (and to ensure deletion happens).
+        if close_header.status != NtStatus::SUCCESS {
+            let mut cursor = ReadCursor::new(create_body);
+            let create_resp = CreateResponse::unpack(&mut cursor)?;
+            warn!(
+                "tree: compound CLOSE failed ({:?}), issuing standalone CLOSE",
+                close_header.status
+            );
+            let _ = self.close_handle(conn, create_resp.file_id).await;
+            return Err(Error::Protocol {
+                status: close_header.status,
+                command: Command::Close,
+            });
+        }
 
-        self.close_handle(conn, file_id).await?;
-        info!("tree: deleted directory={}", normalized);
+        info!("tree: deleted {}={}", kind, normalized);
         Ok(())
     }
-
-    // ── Private helpers ──────────────────────────────────────────────
 
     /// Open a directory handle.
     async fn open_directory(&self, conn: &mut Connection, path: &str) -> Result<FileId> {
@@ -2360,16 +2363,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_file_sends_create_and_close() {
+    async fn delete_file_sends_compound_create_and_close() {
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId {
             persistent: 0xAA,
             volatile: 0xBB,
         };
 
-        // DELETE = CREATE(DELETE_ON_CLOSE) + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
-        mock.queue_response(build_close_response());
+        // DELETE = compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        let create_resp = build_create_response(file_id, 0);
+        let close_resp = build_close_response();
+        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -2381,8 +2386,8 @@ mod tests {
 
         tree.delete_file(&mut conn, "remove.txt").await.unwrap();
 
-        // Should have sent CREATE and CLOSE
-        assert_eq!(mock.sent_count(), 2);
+        // One compound frame sent.
+        assert_eq!(mock.sent_count(), 1);
 
         // Verify the CREATE request has DELETE access and DELETE_ON_CLOSE
         let sent = mock.sent_message(0).unwrap();
@@ -2391,6 +2396,100 @@ mod tests {
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert!(req.desired_access.contains(FileAccessMask::DELETE));
         assert_ne!(req.create_options & FILE_DELETE_ON_CLOSE, 0);
+        assert_ne!(req.create_options & FILE_NON_DIRECTORY_FILE, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_file_create_failure_returns_error() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Build compound response where CREATE fails.
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_resp = pack_message(
+            &create_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_resp = pack_message(
+            &close_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.delete_file(&mut conn, "nonexistent.txt").await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().status(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        // Only the one compound frame, no standalone CLOSE needed.
+        assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_file_close_failure_issues_standalone_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+
+        // Compound: CREATE succeeds, CLOSE fails.
+        let create_resp = build_create_response(file_id, 0);
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::UNSUCCESSFUL;
+        let close_resp = pack_message(
+            &close_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        mock.queue_response(frame);
+
+        // Queue response for the standalone CLOSE retry.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.delete_file(&mut conn, "tricky.txt").await;
+        assert!(result.is_err());
+        // Compound frame + standalone CLOSE = 2 messages sent.
+        assert_eq!(mock.sent_count(), 2);
     }
 
     // ── Write file tests ─────────────────────────────────────────────
@@ -2544,15 +2643,18 @@ mod tests {
     // ── Delete directory tests ───────────────────────────────────────
 
     #[tokio::test]
-    async fn delete_directory_sends_create_and_close() {
+    async fn delete_directory_sends_compound_create_and_close() {
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId {
             persistent: 0x55,
             volatile: 0x66,
         };
 
-        mock.queue_response(build_create_response(file_id, 0));
-        mock.queue_response(build_close_response());
+        // DELETE = compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        let create_resp = build_create_response(file_id, 0);
+        let close_resp = build_close_response();
+        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -2563,7 +2665,9 @@ mod tests {
         };
 
         tree.delete_directory(&mut conn, "old_dir").await.unwrap();
-        assert_eq!(mock.sent_count(), 2);
+
+        // One compound frame sent.
+        assert_eq!(mock.sent_count(), 1);
 
         // Verify the CREATE has DELETE_ON_CLOSE and FILE_DIRECTORY_FILE
         let sent = mock.sent_message(0).unwrap();

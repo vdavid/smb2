@@ -426,9 +426,10 @@ mod tests {
         // Op 1: ReadFile -- compound CREATE + READ + CLOSE
         mock.queue_response(build_compound_read_response(file_id, b"hello".to_vec()));
 
-        // Op 2: Delete -- CREATE (with DELETE_ON_CLOSE) + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
-        mock.queue_response(build_close_response());
+        // Op 2: Delete -- compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        let del_create = build_create_response(file_id, 0);
+        let del_close = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[del_create, del_close]));
 
         // Op 3: ListDirectory -- CREATE + QUERY_DIR + QUERY_DIR(NO_MORE) + CLOSE
         mock.queue_response(build_create_response_directory(file_id));
@@ -481,9 +482,11 @@ mod tests {
             volatile: 2,
         };
 
-        // DELETE = CREATE(DELETE_ON_CLOSE) + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
-        mock.queue_response(build_close_response());
+        // DELETE = compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        let create_resp = build_create_response(file_id, 0);
+        let close_resp = build_close_response();
+        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = test_tree();
@@ -499,9 +502,9 @@ mod tests {
             other => panic!("expected Deleted, got {:?}", other),
         }
 
-        // Verify CREATE was sent with DELETE access
+        // One compound frame sent.
         let sent = mock.sent_messages();
-        assert_eq!(sent.len(), 2); // CREATE + CLOSE
+        assert_eq!(sent.len(), 1);
     }
 
     #[tokio::test]
