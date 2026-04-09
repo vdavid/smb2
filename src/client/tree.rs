@@ -420,16 +420,16 @@ impl Tree {
             .await
     }
 
-    /// Get file metadata (size, timestamps, is_directory).
+    /// Get file metadata (size, timestamps, is_directory) using a compound request (1 round-trip).
     ///
-    /// Opens the file, queries `FileBasicInformation` and
-    /// `FileStandardInformation`, then closes the handle.
+    /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
+    /// QUERY_INFO (FileStandardInformation) + CLOSE as a single compound message.
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
         let normalized = normalize_path(path);
-        debug!("tree: stat path={}", normalized);
+        debug!("tree: stat (compound) path={}", normalized);
 
-        // Open the file/directory for reading attributes.
-        let req = CreateRequest {
+        // BUILD CREATE request for reading attributes.
+        let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
             desired_access: FileAccessMask::new(
@@ -447,36 +447,158 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
-            .await?;
+        // QUERY_INFO for FileBasicInformation (timestamps + attributes).
+        let basic_req = QueryInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_BASIC_INFORMATION,
+            output_buffer_length: 40,
+            additional_information: 0,
+            flags: 0,
+            file_id: FileId::SENTINEL,
+            input_buffer: vec![],
+        };
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
+        // QUERY_INFO for FileStandardInformation (size + is_directory).
+        let std_req = QueryInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_STANDARD_INFORMATION,
+            output_buffer_length: 24,
+            additional_information: 0,
+            flags: 0,
+            file_id: FileId::SENTINEL,
+            input_buffer: vec![],
+        };
 
-        if resp_header.status != NtStatus::SUCCESS {
+        // CLOSE with sentinel FileId.
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+
+        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::QueryInfo, &basic_req, CreditCharge(1)),
+            (Command::QueryInfo, &std_req, CreditCharge(1)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+        let responses = conn.receive_compound().await?;
+
+        if responses.len() != 4 {
+            return Err(Error::invalid_data(format!(
+                "expected 4 compound responses, got {}",
+                responses.len()
+            )));
+        }
+
+        let (create_header, create_body) = &responses[0];
+        let (basic_header, basic_body) = &responses[1];
+        let (std_header, std_body) = &responses[2];
+        let (close_header, _close_body) = &responses[3];
+
+        // If CREATE failed, all ops cascade. No handle to clean up.
+        if create_header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: create_header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
-        let create_resp = CreateResponse::unpack(&mut cursor)?;
-        let file_id = create_resp.file_id;
+        // Check first QUERY_INFO (basic). If it failed, issue standalone CLOSE.
+        if !basic_header.status.is_success_or_partial() {
+            let mut cursor = ReadCursor::new(create_body);
+            let create_resp = CreateResponse::unpack(&mut cursor)?;
+            warn!(
+                "tree: compound QUERY_INFO (basic) failed ({:?}), issuing standalone CLOSE",
+                basic_header.status
+            );
+            let _ = self.close_handle(conn, create_resp.file_id).await;
+            return Err(Error::Protocol {
+                status: basic_header.status,
+                command: Command::QueryInfo,
+            });
+        }
+        if basic_header.status == NtStatus::BUFFER_OVERFLOW {
+            warn!("recv: STATUS_BUFFER_OVERFLOW on FileBasicInformation, response data may be truncated");
+        }
 
-        // Query FileBasicInformation (timestamps + attributes).
-        let result = self.query_file_info(conn, file_id).await;
+        // Parse FileBasicInformation.
+        let mut cursor = ReadCursor::new(basic_body);
+        let basic_resp = QueryInfoResponse::unpack(&mut cursor)?;
+        let basic_buf = &basic_resp.output_buffer;
 
-        // Close regardless of query result.
-        let close_result = self.close_handle(conn, file_id).await;
+        if basic_buf.len() < 36 {
+            return Err(Error::invalid_data(format!(
+                "FileBasicInformation too short: {} bytes",
+                basic_buf.len()
+            )));
+        }
 
-        let info = result?;
-        close_result?;
+        let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
+        let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
+        let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
+        let _change_time = u64::from_le_bytes(basic_buf[24..32].try_into().unwrap());
+        let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
+
+        // Check second QUERY_INFO (standard). If it failed, issue standalone CLOSE.
+        if !std_header.status.is_success_or_partial() {
+            let mut cursor = ReadCursor::new(create_body);
+            let create_resp = CreateResponse::unpack(&mut cursor)?;
+            warn!(
+                "tree: compound QUERY_INFO (standard) failed ({:?}), issuing standalone CLOSE",
+                std_header.status
+            );
+            let _ = self.close_handle(conn, create_resp.file_id).await;
+            return Err(Error::Protocol {
+                status: std_header.status,
+                command: Command::QueryInfo,
+            });
+        }
+        if std_header.status == NtStatus::BUFFER_OVERFLOW {
+            warn!("recv: STATUS_BUFFER_OVERFLOW on FileStandardInformation, response data may be truncated");
+        }
+
+        // Parse FileStandardInformation.
+        let mut cursor = ReadCursor::new(std_body);
+        let std_resp = QueryInfoResponse::unpack(&mut cursor)?;
+        let std_buf = &std_resp.output_buffer;
+
+        if std_buf.len() < 22 {
+            return Err(Error::invalid_data(format!(
+                "FileStandardInformation too short: {} bytes",
+                std_buf.len()
+            )));
+        }
+
+        let _allocation_size = u64::from_le_bytes(std_buf[0..8].try_into().unwrap());
+        let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
+        let _number_of_links = u32::from_le_bytes(std_buf[16..20].try_into().unwrap());
+        let _delete_pending = std_buf[20];
+        let is_directory_byte = std_buf[21];
+
+        let is_directory =
+            is_directory_byte != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+        // Check CLOSE response (non-fatal, we already have the data).
+        if close_header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: compound CLOSE returned {:?} (non-fatal, stat data already read)",
+                close_header.status,
+            );
+        }
+
         debug!(
             "tree: stat done, size={}, is_dir={}",
-            info.size, info.is_directory
+            end_of_file, is_directory
         );
-        Ok(info)
+        Ok(FileInfo {
+            size: end_of_file,
+            is_directory,
+            created,
+            modified,
+            accessed,
+        })
     }
 
     /// Query file system space information for this share.
@@ -1778,106 +1900,6 @@ impl Tree {
         Ok(())
     }
 
-    /// Query `FileBasicInformation` and `FileStandardInformation` to build `FileInfo`.
-    async fn query_file_info(&self, conn: &mut Connection, file_id: FileId) -> Result<FileInfo> {
-        // Query FileBasicInformation (timestamps + attributes).
-        let basic_req = QueryInfoRequest {
-            info_type: InfoType::File,
-            file_info_class: FILE_BASIC_INFORMATION,
-            output_buffer_length: 40,
-            additional_information: 0,
-            flags: 0,
-            file_id,
-            input_buffer: vec![],
-        };
-
-        let (_, _) = conn
-            .send_request(Command::QueryInfo, &basic_req, Some(self.tree_id))
-            .await?;
-
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-        if !resp_header.status.is_success_or_partial() {
-            return Err(Error::Protocol {
-                status: resp_header.status,
-                command: Command::QueryInfo,
-            });
-        }
-        if resp_header.status == NtStatus::BUFFER_OVERFLOW {
-            warn!("recv: STATUS_BUFFER_OVERFLOW on FileBasicInformation, response data may be truncated");
-        }
-
-        let mut cursor = ReadCursor::new(&resp_body);
-        let basic_resp = QueryInfoResponse::unpack(&mut cursor)?;
-        let basic_buf = &basic_resp.output_buffer;
-
-        if basic_buf.len() < 36 {
-            return Err(Error::invalid_data(format!(
-                "FileBasicInformation too short: {} bytes",
-                basic_buf.len()
-            )));
-        }
-
-        let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
-        let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
-        let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
-        let _change_time = u64::from_le_bytes(basic_buf[24..32].try_into().unwrap());
-        let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
-
-        // Query FileStandardInformation (size + is_directory).
-        let std_req = QueryInfoRequest {
-            info_type: InfoType::File,
-            file_info_class: FILE_STANDARD_INFORMATION,
-            output_buffer_length: 24,
-            additional_information: 0,
-            flags: 0,
-            file_id,
-            input_buffer: vec![],
-        };
-
-        let (_, _) = conn
-            .send_request(Command::QueryInfo, &std_req, Some(self.tree_id))
-            .await?;
-
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-        if !resp_header.status.is_success_or_partial() {
-            return Err(Error::Protocol {
-                status: resp_header.status,
-                command: Command::QueryInfo,
-            });
-        }
-        if resp_header.status == NtStatus::BUFFER_OVERFLOW {
-            warn!("recv: STATUS_BUFFER_OVERFLOW on FileStandardInformation, response data may be truncated");
-        }
-
-        let mut cursor = ReadCursor::new(&resp_body);
-        let std_resp = QueryInfoResponse::unpack(&mut cursor)?;
-        let std_buf = &std_resp.output_buffer;
-
-        if std_buf.len() < 22 {
-            return Err(Error::invalid_data(format!(
-                "FileStandardInformation too short: {} bytes",
-                std_buf.len()
-            )));
-        }
-
-        let _allocation_size = u64::from_le_bytes(std_buf[0..8].try_into().unwrap());
-        let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
-        let _number_of_links = u32::from_le_bytes(std_buf[16..20].try_into().unwrap());
-        let _delete_pending = std_buf[20];
-        let is_directory_byte = std_buf[21];
-
-        let is_directory =
-            is_directory_byte != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-        Ok(FileInfo {
-            size: end_of_file,
-            is_directory,
-            created,
-            modified,
-            accessed,
-        })
-    }
-
     /// Write data to a file in chunks.
     ///
     /// Kept for potential future use by callers that need per-chunk control
@@ -2545,16 +2567,15 @@ mod tests {
     // ── Stat tests ───────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn stat_returns_file_info() {
+    async fn stat_sends_compound_and_returns_file_info() {
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId {
             persistent: 0xEE,
             volatile: 0xFF,
         };
 
-        // STAT = CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
-
+        // STAT = compound CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
+        let create_resp = build_create_response(file_id, 0);
         let basic = build_file_basic_info(
             132_000_000_000_000_000,
             132_100_000_000_000_000,
@@ -2562,12 +2583,14 @@ mod tests {
             133_000_000_000_000_000,
             0x20, // ARCHIVE
         );
-        mock.queue_response(build_query_info_response(basic));
-
+        let basic_resp = build_query_info_response(basic);
         let std_info = build_file_standard_info(4096, 2048, 1, false, false);
-        mock.queue_response(build_query_info_response(std_info));
+        let std_resp = build_query_info_response(std_info);
+        let close_resp = build_close_response();
 
-        mock.queue_response(build_close_response());
+        let frame =
+            build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -2583,7 +2606,115 @@ mod tests {
         assert_eq!(info.created, FileTime(132_000_000_000_000_000));
         assert_eq!(info.modified, FileTime(133_000_000_000_000_000));
         assert_eq!(info.accessed, FileTime(132_100_000_000_000_000));
-        assert_eq!(mock.sent_count(), 4);
+        // One compound frame sent.
+        assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stat_create_failure_returns_error() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Build compound response where CREATE fails (all ops cascade).
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let err_body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+        let create_resp = pack_message(&create_hdr, &err_body);
+
+        let mut q1_hdr = Header::new_request(Command::QueryInfo);
+        q1_hdr.flags.set_response();
+        q1_hdr.credits = 32;
+        q1_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let q1_resp = pack_message(&q1_hdr, &err_body);
+
+        let mut q2_hdr = Header::new_request(Command::QueryInfo);
+        q2_hdr.flags.set_response();
+        q2_hdr.credits = 32;
+        q2_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let q2_resp = pack_message(&q2_hdr, &err_body);
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_resp = pack_message(&close_hdr, &err_body);
+
+        let frame = build_compound_response_frame(&[create_resp, q1_resp, q2_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.stat(&mut conn, "nonexistent.txt").await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().status(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stat_query_failure_issues_standalone_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xEE,
+            volatile: 0xFF,
+        };
+
+        // Compound: CREATE succeeds, first QUERY_INFO fails, rest cascade.
+        let create_resp = build_create_response(file_id, 0);
+
+        let err_body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+
+        let mut q1_hdr = Header::new_request(Command::QueryInfo);
+        q1_hdr.flags.set_response();
+        q1_hdr.credits = 32;
+        q1_hdr.status = NtStatus::UNSUCCESSFUL;
+        let q1_resp = pack_message(&q1_hdr, &err_body);
+
+        let mut q2_hdr = Header::new_request(Command::QueryInfo);
+        q2_hdr.flags.set_response();
+        q2_hdr.credits = 32;
+        q2_hdr.status = NtStatus::UNSUCCESSFUL;
+        let q2_resp = pack_message(&q2_hdr, &err_body);
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::UNSUCCESSFUL;
+        let close_resp = pack_message(&close_hdr, &err_body);
+
+        let frame = build_compound_response_frame(&[create_resp, q1_resp, q2_resp, close_resp]);
+        mock.queue_response(frame);
+
+        // Queue response for the standalone CLOSE retry.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.stat(&mut conn, "tricky.txt").await;
+        assert!(result.is_err());
+        // Compound frame + standalone CLOSE = 2 messages sent.
+        assert_eq!(mock.sent_count(), 2);
     }
 
     // ── Rename tests ─────────────────────────────────────────────────
@@ -3882,11 +4013,9 @@ mod tests {
             volatile: 0xDD,
         };
 
-        // STAT = CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
+        // STAT = compound CREATE + QUERY_INFO(basic, BUFFER_OVERFLOW) + QUERY_INFO(standard) + CLOSE
+        let create_resp = build_create_response(file_id, 0);
 
-        // Return BUFFER_OVERFLOW for the basic info query (simulating truncated data
-        // that still contains the minimum required fields).
         let basic = build_file_basic_info(
             132_000_000_000_000_000,
             132_100_000_000_000_000,
@@ -3894,16 +4023,16 @@ mod tests {
             133_000_000_000_000_000,
             0x20, // ARCHIVE
         );
-        mock.queue_response(build_query_info_response_with_status(
-            NtStatus::BUFFER_OVERFLOW,
-            basic,
-        ));
+        let basic_resp = build_query_info_response_with_status(NtStatus::BUFFER_OVERFLOW, basic);
 
-        // Standard info returns SUCCESS.
         let std_info = build_file_standard_info(4096, 1024, 1, false, false);
-        mock.queue_response(build_query_info_response(std_info));
+        let std_resp = build_query_info_response(std_info);
 
-        mock.queue_response(build_close_response());
+        let close_resp = build_close_response();
+
+        let frame =
+            build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -3918,6 +4047,7 @@ mod tests {
         assert_eq!(info.size, 1024);
         assert!(!info.is_directory);
         assert_eq!(info.created, FileTime(132_000_000_000_000_000));
-        assert_eq!(mock.sent_count(), 4);
+        // One compound frame sent.
+        assert_eq!(mock.sent_count(), 1);
     }
 }

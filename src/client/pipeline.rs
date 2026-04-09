@@ -556,10 +556,9 @@ mod tests {
             volatile: 2,
         };
 
-        // STAT = CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
+        // STAT = compound CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
+        let create_resp = build_create_response(file_id, 0);
 
-        // FileBasicInformation response
         let basic_info = build_file_basic_info(
             132_000_000_000_000_000,
             132_100_000_000_000_000,
@@ -567,9 +566,8 @@ mod tests {
             133_000_000_000_000_000,
             0x20, // ARCHIVE (not a directory)
         );
-        mock.queue_response(build_query_info_response(basic_info));
+        let basic_resp = build_query_info_response(basic_info);
 
-        // FileStandardInformation response
         let std_info = build_file_standard_info(
             4096,  // allocation_size
             2048,  // end_of_file (actual size)
@@ -577,9 +575,13 @@ mod tests {
             false, // delete_pending
             false, // directory
         );
-        mock.queue_response(build_query_info_response(std_info));
+        let std_resp = build_query_info_response(std_info);
 
-        mock.queue_response(build_close_response());
+        let close_resp = build_close_response();
+
+        let frame =
+            build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = test_tree();
