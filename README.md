@@ -22,7 +22,7 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 
 ## What it does
 
-- Connect to SMB2/3 shares using NTLM authentication
+- Connect to SMB2/3 shares using NTLM or Kerberos authentication
 - List directories, read files, write files, delete, rename, stat, create directories
 - Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds)
 - Pipelined I/O with sliding window for large file transfers
@@ -39,8 +39,6 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 
 If you need any of these, check the [`smb`](https://crates.io/crates/smb) crate which supports them:
 
-- **Kerberos authentication**: NTLM only for now. Kerberos is needed for Active Directory environments that disable
-  NTLM. Most home NAS setups (Synology, QNAP, Pi) use NTLM.
 - **DFS path resolution**: returns `Error::DfsReferralRequired` with the path so you can handle it yourself. Full
   automatic DFS follow-through is planned for post-1.0.
 - **Multi-channel**: multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
@@ -283,7 +281,7 @@ The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-
 
 | Limitation            | Details                                                           |
 |-----------------------|-------------------------------------------------------------------|
-| NTLM only             | No Kerberos yet (works against Samba and most Windows servers)    |
+| No credential cache   | Kerberos tickets are fetched fresh each connection (no ccache)    |
 | No DFS follow-through | Returns `Error::DfsReferralRequired` with the path, you handle it |
 | No multi-channel      | Single TCP connection per client                                  |
 | No QUIC/RDMA          | TCP only (covers ~99% of use cases)                               |
@@ -295,7 +293,7 @@ The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-
 ### vs `smb` crate
 
 The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 option right now. It covers more features
-than `smb2` (Kerberos, DFS, multi-channel, QUIC, RDMA). If you need those, use it.
+than `smb2` (DFS, multi-channel, QUIC, RDMA). If you need those, use it.
 
 But for the common case (connect to a NAS, move files around), `smb2` is a better fit:
 
