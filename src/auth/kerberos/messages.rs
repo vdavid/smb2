@@ -592,9 +592,24 @@ pub fn encode_as_req(
     encode_kdc_req(10, Some(cname), realm, sname, nonce, etypes, padata)
 }
 
+/// Encode the KDC-REQ-BODY for a TGS-REQ.
+///
+/// Returns the DER-encoded body, which is needed for computing the
+/// checksum in the Authenticator (per RFC 4120 section 7.2.2).
+pub fn encode_tgs_req_body(
+    realm: &str,
+    sname: &PrincipalName,
+    nonce: u32,
+    etypes: &[EncryptionType],
+) -> Vec<u8> {
+    encode_kdc_req_body(None, realm, sname, nonce, etypes)
+}
+
 /// Encode a KRB_TGS_REQ message (APPLICATION [12]).
 ///
 /// The `tgt_ap_req` is an AP-REQ wrapping the TGT, placed in PA-TGS-REQ (padata type 1).
+/// The `req_body` must be the same bytes returned by `encode_tgs_req_body` (used for
+/// the Authenticator checksum).
 pub fn encode_tgs_req(
     realm: &str,
     sname: &PrincipalName,
@@ -628,6 +643,9 @@ pub fn encode_ap_req(ticket: &Ticket, encrypted_authenticator: &EncryptedData) -
 }
 
 /// Encode an Authenticator (APPLICATION [2]), to be encrypted before embedding in AP-REQ.
+///
+/// The optional `cksum` parameter adds a checksum field [3], used in TGS-REQ
+/// to authenticate the KDC-REQ-BODY (RFC 4120 section 7.2.2).
 pub fn encode_authenticator(
     crealm: &str,
     cname: &PrincipalName,
@@ -635,11 +653,13 @@ pub fn encode_authenticator(
     cusec: u32,
     subkey: Option<(&[u8], i32)>,
     seq_number: Option<u32>,
+    cksum: Option<(&[u8], i32)>,
 ) -> Vec<u8> {
     // Authenticator ::= [APPLICATION 2] SEQUENCE {
     //   authenticator-vno [0] INTEGER (5),
     //   crealm           [1] Realm (GeneralString),
     //   cname            [2] PrincipalName,
+    //   cksum            [3] Checksum OPTIONAL,
     //   cusec            [4] Microseconds (INTEGER),
     //   ctime            [5] KerberosTime (GeneralizedTime),
     //   subkey           [6] EncryptionKey OPTIONAL,
@@ -648,10 +668,21 @@ pub fn encode_authenticator(
     let auth_vno = der_context(0, &der_integer(5));
     let crealm_enc = der_context(1, &der_general_string(crealm));
     let cname_enc = der_context(2, &encode_principal_name(cname));
+
+    let mut items: Vec<Vec<u8>> = vec![auth_vno, crealm_enc, cname_enc];
+
+    if let Some((checksum_data, checksum_type)) = cksum {
+        // Checksum ::= SEQUENCE { cksumtype [0] Int32, checksum [1] OCTET STRING }
+        let cktype = der_context(0, &der_integer(checksum_type));
+        let ckval = der_context(1, &der_octet_string(checksum_data));
+        let ck = der_sequence(&[&cktype, &ckval]);
+        items.push(der_context(3, &ck));
+    }
+
     let cusec_enc = der_context(4, &der_integer_u32(cusec));
     let ctime_enc = der_context(5, &der_generalized_time(ctime));
-
-    let mut items: Vec<Vec<u8>> = vec![auth_vno, crealm_enc, cname_enc, cusec_enc, ctime_enc];
+    items.push(cusec_enc);
+    items.push(ctime_enc);
 
     if let Some((key_value, key_type)) = subkey {
         // EncryptionKey ::= SEQUENCE { keytype [0], keyvalue [1] }
@@ -875,16 +906,14 @@ pub fn parse_krb_error(data: &[u8]) -> Result<KrbError, Error> {
 // Internal: KDC-REQ encoding (shared by AS-REQ and TGS-REQ)
 // ---------------------------------------------------------------------------
 
-fn encode_kdc_req(
-    msg_type_val: i32,
+/// Encode just the KDC-REQ-BODY portion of a KDC-REQ.
+fn encode_kdc_req_body(
     cname: Option<&PrincipalName>,
     realm: &str,
     sname: &PrincipalName,
     nonce: u32,
     etypes: &[EncryptionType],
-    padata: &[PaData],
 ) -> Vec<u8> {
-    // KDC-REQ-BODY
     let kdc_options = der_context(0, &der_bit_string(&[0x40, 0x81, 0x00, 0x10], 0));
     let mut body_items: Vec<Vec<u8>> = vec![kdc_options];
 
@@ -904,7 +933,19 @@ fn encode_kdc_req(
     body_items.push(der_context(8, &etype_seq));
 
     let body_refs: Vec<&[u8]> = body_items.iter().map(|v| v.as_slice()).collect();
-    let req_body = der_sequence(&body_refs);
+    der_sequence(&body_refs)
+}
+
+fn encode_kdc_req(
+    msg_type_val: i32,
+    cname: Option<&PrincipalName>,
+    realm: &str,
+    sname: &PrincipalName,
+    nonce: u32,
+    etypes: &[EncryptionType],
+    padata: &[PaData],
+) -> Vec<u8> {
+    let req_body = encode_kdc_req_body(cname, realm, sname, nonce, etypes);
 
     // KDC-REQ
     let pvno = der_context(1, &der_integer(5));
@@ -1221,8 +1262,15 @@ mod tests {
             name_type: 1,
             name_string: vec!["user".to_string()],
         };
-        let encoded =
-            encode_authenticator("EXAMPLE.COM", &cname, "20260408120000Z", 123456, None, None);
+        let encoded = encode_authenticator(
+            "EXAMPLE.COM",
+            &cname,
+            "20260408120000Z",
+            123456,
+            None,
+            None,
+            None,
+        );
         // APPLICATION [2] = 0x62
         assert_eq!(
             encoded[0], 0x62,
@@ -1244,6 +1292,7 @@ mod tests {
             0,
             Some((&subkey_value, 18)),
             Some(42),
+            None,
         );
         assert_eq!(encoded[0], 0x62);
         // Should contain the subkey context tag [6] = 0xa6

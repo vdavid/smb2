@@ -101,10 +101,26 @@ pub fn usage_enc(usage: u32) -> [u8; 5] {
     out
 }
 
-/// Build the 5-byte key usage constant for AES integrity (checksum) keys.
+/// Build the 5-byte key usage constant for AES integrity (Ki) keys.
 ///
-/// Format: 4-byte big-endian usage number + `0x99` (integrity).
+/// Format: 4-byte big-endian usage number + `0x55`.
+///
+/// Per RFC 3961 section 3, the integrity subkey Ki is derived with
+/// `0x55` and used for the HMAC inside `encrypt()`/`decrypt()`.
 pub fn usage_int(usage: u32) -> [u8; 5] {
+    let mut out = [0u8; 5];
+    out[0..4].copy_from_slice(&usage.to_be_bytes());
+    out[4] = 0x55;
+    out
+}
+
+/// Build the 5-byte key usage constant for AES checksum (Kc) keys.
+///
+/// Format: 4-byte big-endian usage number + `0x99`.
+///
+/// Per RFC 3961 section 5.4, the checksum subkey Kc is derived with
+/// `0x99` and used for standalone `get_mic()` / checksum operations.
+pub fn usage_chk(usage: u32) -> [u8; 5] {
     let mut out = [0u8; 5];
     out[0..4].copy_from_slice(&usage.to_be_bytes());
     out[4] = 0x99;
@@ -347,18 +363,21 @@ pub fn decrypt_rc4_hmac(key: &[u8], usage: u32, ciphertext: &[u8]) -> Result<Vec
 // Checksum computation
 // ---------------------------------------------------------------------------
 
-/// Compute a Kerberos checksum for the given data.
+/// Compute a standalone Kerberos checksum (MIC) for the given data.
+///
+/// Uses the checksum subkey Kc (derived with `0x99`) per RFC 3961 section 5.4.
+/// This is for standalone checksum operations (for example, the body checksum
+/// in the TGS-REQ Authenticator), NOT for the HMAC inside encrypt/decrypt
+/// (which uses Ki derived with `0x55`).
 ///
 /// - For AES (etypes 17, 18): HMAC-SHA1 truncated to 12 bytes (96 bits).
-///   The key should be derived with `derive_key_aes(base_key, &usage_int(usage))`.
 /// - For RC4 (etype 23): HMAC-MD5, producing 16 bytes.
-///   K1 = HMAC-MD5(key, usage_le), then checksum = HMAC-MD5(K1, data).
 pub fn compute_checksum(key: &[u8], usage: u32, data: &[u8], etype: EncryptionType) -> Vec<u8> {
     match etype {
         EncryptionType::Aes128CtsHmacSha196 | EncryptionType::Aes256CtsHmacSha196 => {
-            // Derive the integrity key for this usage.
-            let ki = derive_key_aes(key, &usage_int(usage));
-            hmac_sha1_96(&ki, data)
+            // Derive the checksum key Kc for this usage.
+            let kc = derive_key_aes(key, &usage_chk(usage));
+            hmac_sha1_96(&kc, data)
         }
         EncryptionType::Rc4Hmac => {
             use hmac::{Hmac, Mac};
@@ -1030,16 +1049,51 @@ mod tests {
     #[test]
     fn usage_int_format() {
         let u = usage_int(7);
-        assert_eq!(u, [0, 0, 0, 7, 0x99]);
+        assert_eq!(u, [0, 0, 0, 7, 0x55]);
     }
 
     // ── Helper ───────────────────────────────────────────────────────
 
-    /// Parse a hex string into bytes.
+    /// Parse a hex string into bytes (ignores spaces).
     fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
         (0..s.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn string_to_key_aes256_matches_mit_kdc_keytab() {
+        // Key from MIT KDC keytab for testuser@TEST.LOCAL with password "testpass"
+        // Salt = "TEST.LOCALtestuser"
+        let key = string_to_key_aes("testpass", "TEST.LOCALtestuser", 32);
+        let expected = hex("7964c7e6f475912def26f886f2683da03f58257a987bca47e461daddb18cb336");
+        assert_eq!(key, expected, "key must match MIT KDC keytab");
+    }
+
+    #[test]
+    fn aes_cts_known_vectors() {
+        // AES-CTS test vectors. Key: "chicken teriyaki", IV: all zeros.
+        // Plaintext: "I would like the General Gau's Chicken, please, and wonton soup."
+        let key = hex("636869636b656e207465726979616b69");
+        let iv = [0u8; 16];
+        let full_plain = b"I would like the General Gau's Chicken, please, and wonton soup.";
+
+        // 17 bytes: verified against minikerberos (Python Kerberos reference).
+        let ct_17 = encrypt_aes_cts(&key, &iv, &full_plain[..17]);
+        assert_eq!(
+            ct_17,
+            hex("c6353568f2bf8cb4d8a580362da7ff7f97"),
+            "17-byte CTS failed"
+        );
+
+        // All CTS vectors must roundtrip correctly.
+        for len in [17, 31, 32, 47, 48, 64] {
+            let ct = encrypt_aes_cts(&key, &iv, &full_plain[..len]);
+            assert_eq!(ct.len(), len, "CTS ciphertext length for {len} bytes");
+            let pt = decrypt_aes_cts(&key, &iv, &ct).unwrap();
+            assert_eq!(&pt[..], &full_plain[..len], "CTS roundtrip for {len} bytes");
+        }
     }
 }

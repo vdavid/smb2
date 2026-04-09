@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use crate::auth::kerberos::crypto::{
     compute_checksum, decrypt_aes_cts, decrypt_rc4_hmac, derive_key_aes, encrypt_aes_cts,
-    encrypt_rc4_hmac, string_to_key_aes, string_to_key_rc4, usage_enc, EncryptionType,
+    encrypt_rc4_hmac, string_to_key_aes, string_to_key_rc4, usage_enc, usage_int, EncryptionType,
 };
 use crate::auth::kerberos::kdc::{send_to_kdc, KdcConfig};
 use crate::auth::kerberos::messages::{
     encode_ap_req, encode_as_req, encode_authenticator, encode_pa_enc_timestamp, encode_tgs_req,
-    parse_enc_kdc_rep_part, parse_kdc_rep, parse_krb_error, EncryptedData, PaData, PrincipalName,
-    Ticket,
+    encode_tgs_req_body, parse_enc_kdc_rep_part, parse_kdc_rep, parse_krb_error, EncryptedData,
+    PaData, PrincipalName, Ticket,
 };
 use crate::auth::spnego::{wrap_neg_token_init, OID_KERBEROS, OID_NTLMSSP};
 use crate::error::{Error, Result};
@@ -379,8 +379,38 @@ impl KerberosAuthenticator {
             name_string: vec![username.clone()],
         };
 
+        let nonce = generate_nonce();
+        let etypes = [self.etype];
+
+        // Build the KDC-REQ-BODY first, so we can compute a checksum
+        // over it for the Authenticator (required per RFC 4120 section 7.2.2).
+        let req_body = encode_tgs_req_body(realm, &sname, nonce, &etypes);
+
+        // Compute checksum over KDC-REQ-BODY using key usage 6
+        // (PA-TGS-REQ padata AP-REQ Authenticator cksum).
+        let body_checksum = compute_checksum(&as_session_key, 6, &req_body, self.etype);
+        let checksum_type: i32 = match self.etype {
+            EncryptionType::Aes256CtsHmacSha196 => 16, // hmac-sha1-96-aes256
+            EncryptionType::Aes128CtsHmacSha196 => 15, // hmac-sha1-96-aes128
+            EncryptionType::Rc4Hmac => -138,           // HMAC_MD5 (KERB_CHECKSUM_HMAC_MD5)
+        };
+
         let (ctime, cusec) = current_kerberos_time();
-        let authenticator_plain = encode_authenticator(realm, &cname, &ctime, cusec, None, None);
+        let authenticator_plain = encode_authenticator(
+            realm,
+            &cname,
+            &ctime,
+            cusec,
+            None,
+            None,
+            Some((&body_checksum, checksum_type)),
+        );
+
+        debug!(
+            "kerberos: TGS authenticator plain ({} bytes), session key prefix={:02x?}",
+            authenticator_plain.len(),
+            &as_session_key[..as_session_key.len().min(8)]
+        );
 
         let encrypted_authenticator = kerberos_encrypt(
             &as_session_key,
@@ -396,9 +426,6 @@ impl KerberosAuthenticator {
         };
 
         let tgt_ap_req = encode_ap_req(&tgt, &authenticator_enc_data);
-
-        let nonce = generate_nonce();
-        let etypes = [self.etype];
 
         let tgs_req = encode_tgs_req(realm, &sname, nonce, &etypes, &tgt_ap_req);
         let response = send_to_kdc(kdc_config, &tgs_req).await?;
@@ -504,6 +531,7 @@ impl KerberosAuthenticator {
             cusec,
             Some((&subkey, subkey_type)),
             Some(generate_nonce()),
+            None,
         );
 
         let encrypted_authenticator = kerberos_encrypt(
@@ -580,7 +608,7 @@ impl KerberosAuthenticator {
 //
 // For AES (etypes 17, 18):
 //   1. Derive encryption key: Ke = DK(base_key, usage || 0xAA)
-//   2. Derive integrity key: Ki = DK(base_key, usage || 0x99)
+//   2. Derive integrity key: Ki = DK(base_key, usage || 0x55)
 //   3. Generate random 16-byte confounder
 //   4. Plaintext' = confounder || plaintext
 //   5. Ciphertext = AES-CTS(Ke, iv=0, plaintext')
@@ -591,6 +619,18 @@ impl KerberosAuthenticator {
 //   Uses the encrypt_rc4_hmac function directly (it handles confounder
 //   and checksum internally).
 
+/// Compute HMAC-SHA1 truncated to 12 bytes (96 bits).
+fn hmac_sha1_96(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    type HmacSha1 = Hmac<Sha1>;
+
+    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    let result = mac.finalize().into_bytes();
+    result[..12].to_vec()
+}
+
 /// Encrypt data using the Kerberos profile for the given etype and key usage.
 fn kerberos_encrypt(
     base_key: &[u8],
@@ -600,8 +640,9 @@ fn kerberos_encrypt(
 ) -> Vec<u8> {
     match etype {
         EncryptionType::Aes128CtsHmacSha196 | EncryptionType::Aes256CtsHmacSha196 => {
-            // Derive Ke (encryption key).
+            // Derive Ke (encryption key) and Ki (integrity key).
             let ke = derive_key_aes(base_key, &usage_enc(usage));
+            let ki = derive_key_aes(base_key, &usage_int(usage));
 
             // Generate 16-byte random confounder.
             let mut confounder = [0u8; 16];
@@ -612,9 +653,8 @@ fn kerberos_encrypt(
             full_plain.extend_from_slice(&confounder);
             full_plain.extend_from_slice(plaintext);
 
-            // Compute HMAC-SHA1-96 over plaintext' (Ki derivation happens
-            // inside compute_checksum).
-            let hmac = compute_checksum(base_key, usage, &full_plain, etype);
+            // Compute HMAC-SHA1-96 over plaintext' using Ki.
+            let hmac = hmac_sha1_96(&ki, &full_plain);
 
             // Encrypt plaintext' with AES-CTS using Ke and IV=0.
             let iv = [0u8; 16];
@@ -649,16 +689,16 @@ fn kerberos_decrypt(
             let enc_data = &ciphertext[..hmac_offset];
             let expected_hmac = &ciphertext[hmac_offset..];
 
-            // Derive Ke (encryption key).
+            // Derive Ke (encryption key) and Ki (integrity key).
             let ke = derive_key_aes(base_key, &usage_enc(usage));
+            let ki = derive_key_aes(base_key, &usage_int(usage));
 
             // Decrypt with AES-CTS using Ke and IV=0.
             let iv = [0u8; 16];
             let full_plain = decrypt_aes_cts(&ke, &iv, enc_data)?;
 
-            // Verify HMAC-SHA1-96 (Ki derivation happens inside
-            // compute_checksum).
-            let computed_hmac = compute_checksum(base_key, usage, &full_plain, etype);
+            // Verify HMAC-SHA1-96 using Ki.
+            let computed_hmac = hmac_sha1_96(&ki, &full_plain);
             if computed_hmac != expected_hmac {
                 return Err(Error::Auth {
                     message: "Kerberos AES HMAC verification failed".to_string(),
@@ -1272,8 +1312,15 @@ mod tests {
             name_type: 1,
             name_string: vec!["user".to_string()],
         };
-        let authenticator_plain =
-            encode_authenticator("EXAMPLE.COM", &cname, "20260408120000Z", 0, None, None);
+        let authenticator_plain = encode_authenticator(
+            "EXAMPLE.COM",
+            &cname,
+            "20260408120000Z",
+            0,
+            None,
+            None,
+            None,
+        );
 
         let encrypted = kerberos_encrypt(
             &key,
@@ -1319,8 +1366,15 @@ mod tests {
             name_string: vec!["user".to_string()],
         };
 
-        let authenticator_plain =
-            encode_authenticator("EXAMPLE.COM", &cname, "20260408120000Z", 0, None, None);
+        let authenticator_plain = encode_authenticator(
+            "EXAMPLE.COM",
+            &cname,
+            "20260408120000Z",
+            0,
+            None,
+            None,
+            None,
+        );
 
         let encrypted_auth = kerberos_encrypt(
             &session_key,

@@ -37,6 +37,7 @@ The flow differs from NTLM: Kerberos contacts the KDC directly (async, network I
 
 - 1: PA-ENC-TIMESTAMP encryption
 - 3: AS-REP EncKDCRepPart decryption
+- 6: TGS-REQ PA-TGS-REQ Authenticator cksum (body checksum)
 - 7: AP-REQ Authenticator encryption
 - 8: TGS-REP EncKDCRepPart decryption (tries 8 first, falls back to 9)
 
@@ -46,9 +47,18 @@ The flow differs from NTLM: Kerberos contacts the KDC directly (async, network I
 - AES-128-CTS-HMAC-SHA1-96 (etype 17)
 - RC4-HMAC (etype 23) -- legacy
 
+### Key derivation constants (RFC 3961)
+
+Three subkeys are derived from each base key + usage number:
+- **Ke** = DK(key, usage || 0xAA) -- encryption subkey, used for AES-CTS
+- **Ki** = DK(key, usage || 0x55) -- integrity subkey, used for HMAC inside encrypt/decrypt
+- **Kc** = DK(key, usage || 0x99) -- checksum subkey, used for standalone checksum/MIC
+
+Ki and Kc are NOT the same key. Ki is for the HMAC that's appended to ciphertext in the encrypt() function. Kc is for standalone operations like the body checksum in the TGS-REQ Authenticator.
+
 ### Kerberos wire encryption format (AES)
 
-1. Derive Ke (encryption) and Ki (integrity) keys from base key + usage
+1. Derive Ke (with 0xAA) and Ki (with 0x55) from base key + usage
 2. Generate 16-byte random confounder
 3. plaintext' = confounder || plaintext
 4. ciphertext = AES-CTS(Ke, iv=0, plaintext')
