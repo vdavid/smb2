@@ -4,6 +4,7 @@
 //! handling negotiate, credit tracking, message ID sequencing, preauth hash
 //! maintenance, and message signing.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use log::{debug, info, trace, warn};
@@ -97,6 +98,8 @@ pub struct Connection {
     nonce_gen: Option<NonceGenerator>,
     /// Whether to encrypt outgoing messages.
     should_encrypt: bool,
+    /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
+    dfs_trees: HashSet<TreeId>,
 }
 
 impl Connection {
@@ -126,6 +129,7 @@ impl Connection {
             encryption_cipher: None,
             nonce_gen: None,
             should_encrypt: false,
+            dfs_trees: HashSet::new(),
         }
     }
 
@@ -159,6 +163,7 @@ impl Connection {
             encryption_cipher: None,
             nonce_gen: None,
             should_encrypt: false,
+            dfs_trees: HashSet::new(),
         })
     }
 
@@ -391,6 +396,11 @@ impl Connection {
         // When encrypting, we zero the Signature field; AEAD provides auth.
         if self.should_sign && !self.should_encrypt {
             header.flags.set_signed();
+        }
+
+        // Auto-set DFS flag for trees with DFS capability.
+        if self.should_set_dfs_flag(tree_id) {
+            header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
         }
 
         let mut msg_bytes = pack_message(&header, body);
@@ -715,6 +725,11 @@ impl Connection {
             // Signing and encryption are mutually exclusive (pitfall #4).
             if self.should_sign && !self.should_encrypt {
                 header.flags.set_signed();
+            }
+
+            // Auto-set DFS flag for trees with DFS capability.
+            if self.should_set_dfs_flag(Some(tree_id)) {
+                header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
             }
 
             let msg_id = MessageId(self.next_message_id);
@@ -1063,6 +1078,22 @@ impl Connection {
         );
 
         Ok(plaintext)
+    }
+
+    /// Register a tree as DFS-enabled. Called by `Tree::connect` when the
+    /// share has the DFS capability flag.
+    pub fn register_dfs_tree(&mut self, tree_id: TreeId) {
+        self.dfs_trees.insert(tree_id);
+    }
+
+    /// Deregister a tree from DFS tracking. Called by `Tree::disconnect`.
+    pub fn deregister_dfs_tree(&mut self, tree_id: TreeId) {
+        self.dfs_trees.remove(&tree_id);
+    }
+
+    /// Check whether the DFS flag should be set for a given tree ID.
+    fn should_set_dfs_flag(&self, tree_id: Option<TreeId>) -> bool {
+        tree_id.is_some_and(|id| self.dfs_trees.contains(&id))
     }
 
     #[cfg(test)]
@@ -2806,5 +2837,133 @@ mod tests {
         assert_eq!(results.len(), 2, "compound must contain two responses");
         assert_eq!(results[0].0.command, Command::Echo);
         assert_eq!(results[1].0.command, Command::Echo);
+    }
+
+    // ── DFS flag tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dfs_flag_set_for_registered_tree() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+
+        let tree_id = TreeId(7);
+        conn.register_dfs_tree(tree_id);
+
+        use crate::msg::echo::EchoRequest;
+        let body = EchoRequest;
+        let (_mid, msg_bytes) = conn
+            .send_request_with_credits(Command::Echo, &body, Some(tree_id), 1)
+            .await
+            .unwrap();
+
+        // Header flags are at bytes 16..20 (little-endian u32).
+        let flags_raw = u32::from_le_bytes(msg_bytes[16..20].try_into().unwrap());
+        assert_ne!(
+            flags_raw & HeaderFlags::DFS_OPERATIONS,
+            0,
+            "DFS_OPERATIONS flag must be set for registered tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn dfs_flag_not_set_for_unregistered_tree() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+
+        use crate::msg::echo::EchoRequest;
+        let body = EchoRequest;
+        let (_mid, msg_bytes) = conn
+            .send_request_with_credits(Command::Echo, &body, Some(TreeId(7)), 1)
+            .await
+            .unwrap();
+
+        let flags_raw = u32::from_le_bytes(msg_bytes[16..20].try_into().unwrap());
+        assert_eq!(
+            flags_raw & HeaderFlags::DFS_OPERATIONS,
+            0,
+            "DFS_OPERATIONS flag must NOT be set for unregistered tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn dfs_flag_cleared_after_deregister() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+
+        let tree_id = TreeId(7);
+        conn.register_dfs_tree(tree_id);
+        conn.deregister_dfs_tree(tree_id);
+
+        use crate::msg::echo::EchoRequest;
+        let body = EchoRequest;
+        let (_mid, msg_bytes) = conn
+            .send_request_with_credits(Command::Echo, &body, Some(tree_id), 1)
+            .await
+            .unwrap();
+
+        let flags_raw = u32::from_le_bytes(msg_bytes[16..20].try_into().unwrap());
+        assert_eq!(
+            flags_raw & HeaderFlags::DFS_OPERATIONS,
+            0,
+            "DFS_OPERATIONS flag must NOT be set after deregister"
+        );
+    }
+
+    #[tokio::test]
+    async fn compound_dfs_flag_set() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 256;
+
+        let tree_id = TreeId(42);
+        conn.register_dfs_tree(tree_id);
+
+        use crate::msg::echo::EchoRequest;
+        let echo1 = EchoRequest;
+        let echo2 = EchoRequest;
+        let operations: Vec<(Command, &dyn Pack, CreditCharge)> = vec![
+            (Command::Echo, &echo1, CreditCharge(1)),
+            (Command::Echo, &echo2, CreditCharge(1)),
+        ];
+
+        let _msg_ids = conn.send_compound(tree_id, &operations).await.unwrap();
+
+        let sent = mock.sent_message(0).unwrap();
+
+        // Check first sub-request header flags at bytes 16..20.
+        let flags1 = u32::from_le_bytes(sent[16..20].try_into().unwrap());
+        assert_ne!(
+            flags1 & HeaderFlags::DFS_OPERATIONS,
+            0,
+            "first compound sub-request must have DFS_OPERATIONS"
+        );
+
+        // Jump to second sub-request using NextCommand from first header.
+        let next_cmd = u32::from_le_bytes(sent[20..24].try_into().unwrap()) as usize;
+        let flags2 = u32::from_le_bytes(sent[next_cmd + 16..next_cmd + 20].try_into().unwrap());
+        assert_ne!(
+            flags2 & HeaderFlags::DFS_OPERATIONS,
+            0,
+            "second compound sub-request must have DFS_OPERATIONS"
+        );
     }
 }

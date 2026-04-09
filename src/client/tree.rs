@@ -159,24 +159,25 @@ impl Tree {
             .tree_id
             .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
 
+        let is_dfs = resp
+            .capabilities
+            .contains(crate::types::flags::ShareCapabilities::DFS);
+        let encrypt_data = resp
+            .share_flags
+            .contains(crate::types::flags::ShareFlags::ENCRYPT_DATA);
+
         info!("tree: connected share={}, tree_id={}", share_name, tree_id);
-        debug!(
-            "tree: is_dfs={}, encrypt_data={}",
-            resp.capabilities
-                .contains(crate::types::flags::ShareCapabilities::DFS),
-            resp.share_flags
-                .contains(crate::types::flags::ShareFlags::ENCRYPT_DATA),
-        );
+        debug!("tree: is_dfs={}, encrypt_data={}", is_dfs, encrypt_data);
+
+        if is_dfs {
+            conn.register_dfs_tree(tree_id);
+        }
 
         Ok(Tree {
             tree_id,
             share_name: share_name.to_string(),
-            is_dfs: resp
-                .capabilities
-                .contains(crate::types::flags::ShareCapabilities::DFS),
-            encrypt_data: resp
-                .share_flags
-                .contains(crate::types::flags::ShareFlags::ENCRYPT_DATA),
+            is_dfs,
+            encrypt_data,
         })
     }
 
@@ -372,6 +373,8 @@ impl Tree {
                 command: Command::TreeDisconnect,
             });
         }
+
+        conn.deregister_dfs_tree(self.tree_id);
 
         info!(
             "tree: disconnected share={}, tree_id={}",
