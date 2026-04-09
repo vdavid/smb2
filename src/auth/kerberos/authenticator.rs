@@ -388,10 +388,13 @@ impl KerberosAuthenticator {
         };
 
         let nonce = generate_nonce();
-        // Request RC4-HMAC for the TGS session key. Windows KDCs assign
-        // the session key type from the TGS-REQ etypes list, and RC4 (16
-        // bytes) is what Windows SMB expects for the session key.
-        let etypes = [EncryptionType::Rc4Hmac];
+        // Request etypes in preference order. The KDC picks the session key
+        // type from this list. AES-256 preferred, with AES-128 and RC4 fallback.
+        let etypes = [
+            EncryptionType::Aes256CtsHmacSha196,
+            EncryptionType::Aes128CtsHmacSha196,
+            EncryptionType::Rc4Hmac,
+        ];
 
         // Build the KDC-REQ-BODY first, so we can compute a checksum
         // over it for the Authenticator (required per RFC 4120 section 7.2.2).
