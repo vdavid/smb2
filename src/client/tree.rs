@@ -423,6 +423,136 @@ impl Tree {
             .await
     }
 
+    /// Delete multiple files using batch compound requests.
+    ///
+    /// Sends all compound (CREATE+CLOSE) requests before waiting for any
+    /// responses, minimizing total round-trips. Returns results in the same
+    /// order as the input paths. Each file's result is independent -- one
+    /// failure does not affect the others.
+    pub async fn delete_files(&self, conn: &mut Connection, paths: &[&str]) -> Vec<Result<()>> {
+        if paths.is_empty() {
+            return vec![];
+        }
+
+        debug!("tree: delete_files batch, count={}", paths.len());
+
+        // Phase 1: Send all compound requests.
+        let mut sent_count = 0;
+        let mut send_error: Option<Error> = None;
+
+        for path in paths {
+            let normalized = normalize_path(path);
+            let create_req = CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: FileAccessMask::new(
+                    FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
+                ),
+                file_attributes: 0,
+                share_access: ShareAccess(
+                    ShareAccess::FILE_SHARE_READ
+                        | ShareAccess::FILE_SHARE_WRITE
+                        | ShareAccess::FILE_SHARE_DELETE,
+                ),
+                create_disposition: CreateDisposition::FileOpen,
+                create_options: FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE,
+                name: normalized,
+                create_contexts: vec![],
+            };
+
+            let close_req = CloseRequest {
+                flags: 0,
+                file_id: FileId::SENTINEL,
+            };
+
+            let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+                (Command::Create, &create_req, CreditCharge(1)),
+                (Command::Close, &close_req, CreditCharge(1)),
+            ];
+
+            match conn.send_compound(self.tree_id, &operations).await {
+                Ok(_) => sent_count += 1,
+                Err(e) => {
+                    send_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        // Phase 2: Receive all compound responses.
+        let mut results: Vec<Result<()>> = Vec::with_capacity(paths.len());
+        let mut cleanup_handles: Vec<FileId> = Vec::new();
+
+        for (i, path) in paths.iter().enumerate().take(sent_count) {
+            match conn.receive_compound().await {
+                Ok(responses) => {
+                    if responses.len() != 2 {
+                        results.push(Err(Error::invalid_data(format!(
+                            "expected 2 compound responses, got {}",
+                            responses.len()
+                        ))));
+                        continue;
+                    }
+
+                    let (create_header, create_body) = &responses[0];
+                    let (close_header, _) = &responses[1];
+
+                    if create_header.status != NtStatus::SUCCESS {
+                        results.push(Err(Error::Protocol {
+                            status: create_header.status,
+                            command: Command::Create,
+                        }));
+                    } else if close_header.status != NtStatus::SUCCESS {
+                        // CREATE succeeded, CLOSE failed. Need cleanup.
+                        if let Ok(create_resp) =
+                            CreateResponse::unpack(&mut ReadCursor::new(create_body))
+                        {
+                            cleanup_handles.push(create_resp.file_id);
+                        }
+                        results.push(Err(Error::Protocol {
+                            status: close_header.status,
+                            command: Command::Close,
+                        }));
+                    } else {
+                        info!("tree: batch deleted file={}", path);
+                        results.push(Ok(()));
+                    }
+                }
+                Err(e) => {
+                    results.push(Err(e));
+                    for _ in (i + 1)..sent_count {
+                        results.push(Err(Error::Disconnected));
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Fill unsent paths with the send error.
+        if let Some(err) = send_error {
+            results.push(Err(err));
+            for _ in (sent_count + 1)..paths.len() {
+                results.push(Err(Error::Disconnected));
+            }
+        }
+
+        // Phase 3: Cleanup -- issue standalone CLOSEs for leaked handles.
+        for file_id in &cleanup_handles {
+            warn!(
+                "tree: batch delete cleanup, issuing standalone CLOSE for {:?}",
+                file_id
+            );
+            let _ = self.close_handle(conn, *file_id).await;
+        }
+
+        debug!(
+            "tree: delete_files batch done, {}/{} succeeded",
+            results.iter().filter(|r| r.is_ok()).count(),
+            paths.len()
+        );
+        results
+    }
+
     /// Get file metadata (size, timestamps, is_directory) using a compound request (1 round-trip).
     ///
     /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
@@ -595,6 +725,232 @@ impl Tree {
             "tree: stat done, size={}, is_dir={}",
             end_of_file, is_directory
         );
+        Ok(FileInfo {
+            size: end_of_file,
+            is_directory,
+            created,
+            modified,
+            accessed,
+        })
+    }
+
+    /// Stat multiple files using batch compound requests.
+    ///
+    /// Sends all compound (CREATE+QUERY_INFO+QUERY_INFO+CLOSE) requests before
+    /// waiting for any responses. Returns results in the same order as the
+    /// input paths.
+    pub async fn stat_files(
+        &self,
+        conn: &mut Connection,
+        paths: &[&str],
+    ) -> Vec<Result<FileInfo>> {
+        if paths.is_empty() {
+            return vec![];
+        }
+
+        debug!("tree: stat_files batch, count={}", paths.len());
+
+        // Phase 1: Send all compound requests.
+        let mut sent_count = 0;
+        let mut send_error: Option<Error> = None;
+
+        for path in paths {
+            let normalized = normalize_path(path);
+
+            let create_req = CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: FileAccessMask::new(
+                    FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+                ),
+                file_attributes: 0,
+                share_access: ShareAccess(
+                    ShareAccess::FILE_SHARE_READ
+                        | ShareAccess::FILE_SHARE_WRITE
+                        | ShareAccess::FILE_SHARE_DELETE,
+                ),
+                create_disposition: CreateDisposition::FileOpen,
+                create_options: 0,
+                name: normalized,
+                create_contexts: vec![],
+            };
+
+            let basic_req = QueryInfoRequest {
+                info_type: InfoType::File,
+                file_info_class: FILE_BASIC_INFORMATION,
+                output_buffer_length: 40,
+                additional_information: 0,
+                flags: 0,
+                file_id: FileId::SENTINEL,
+                input_buffer: vec![],
+            };
+
+            let std_req = QueryInfoRequest {
+                info_type: InfoType::File,
+                file_info_class: FILE_STANDARD_INFORMATION,
+                output_buffer_length: 24,
+                additional_information: 0,
+                flags: 0,
+                file_id: FileId::SENTINEL,
+                input_buffer: vec![],
+            };
+
+            let close_req = CloseRequest {
+                flags: 0,
+                file_id: FileId::SENTINEL,
+            };
+
+            let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+                (Command::Create, &create_req, CreditCharge(1)),
+                (Command::QueryInfo, &basic_req, CreditCharge(1)),
+                (Command::QueryInfo, &std_req, CreditCharge(1)),
+                (Command::Close, &close_req, CreditCharge(1)),
+            ];
+
+            match conn.send_compound(self.tree_id, &operations).await {
+                Ok(_) => sent_count += 1,
+                Err(e) => {
+                    send_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        // Phase 2: Receive all compound responses.
+        let mut results: Vec<Result<FileInfo>> = Vec::with_capacity(paths.len());
+        let mut cleanup_handles: Vec<FileId> = Vec::new();
+
+        for i in 0..sent_count {
+            match conn.receive_compound().await {
+                Ok(responses) => {
+                    results.push(self.parse_stat_batch_response(&responses, &mut cleanup_handles));
+                    if results[i].is_ok() {
+                        debug!("tree: batch stat done for file={}", paths[i]);
+                    }
+                }
+                Err(e) => {
+                    results.push(Err(e));
+                    for _ in (i + 1)..sent_count {
+                        results.push(Err(Error::Disconnected));
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Fill unsent paths with the send error.
+        if let Some(err) = send_error {
+            results.push(Err(err));
+            for _ in (sent_count + 1)..paths.len() {
+                results.push(Err(Error::Disconnected));
+            }
+        }
+
+        // Phase 3: Cleanup -- standalone CLOSEs for leaked handles.
+        for file_id in &cleanup_handles {
+            warn!(
+                "tree: batch stat cleanup, issuing standalone CLOSE for {:?}",
+                file_id
+            );
+            let _ = self.close_handle(conn, *file_id).await;
+        }
+
+        debug!(
+            "tree: stat_files batch done, {}/{} succeeded",
+            results.iter().filter(|r| r.is_ok()).count(),
+            paths.len()
+        );
+        results
+    }
+
+    /// Parse a single stat compound response for the batch stat method.
+    fn parse_stat_batch_response(
+        &self,
+        responses: &[(crate::msg::header::Header, Vec<u8>)],
+        cleanup_handles: &mut Vec<FileId>,
+    ) -> Result<FileInfo> {
+        if responses.len() != 4 {
+            return Err(Error::invalid_data(format!(
+                "expected 4 compound responses, got {}",
+                responses.len()
+            )));
+        }
+
+        let (create_header, create_body) = &responses[0];
+        let (basic_header, basic_body) = &responses[1];
+        let (std_header, std_body) = &responses[2];
+
+        if create_header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: create_header.status,
+                command: Command::Create,
+            });
+        }
+
+        // CREATE succeeded -- if a later op fails, we need cleanup.
+        let file_id = CreateResponse::unpack(&mut ReadCursor::new(create_body))
+            .map(|r| r.file_id)
+            .ok();
+
+        if !basic_header.status.is_success_or_partial() {
+            if let Some(fid) = file_id {
+                cleanup_handles.push(fid);
+            }
+            return Err(Error::Protocol {
+                status: basic_header.status,
+                command: Command::QueryInfo,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(basic_body);
+        let basic_resp = QueryInfoResponse::unpack(&mut cursor)?;
+        let basic_buf = &basic_resp.output_buffer;
+
+        if basic_buf.len() < 36 {
+            if let Some(fid) = file_id {
+                cleanup_handles.push(fid);
+            }
+            return Err(Error::invalid_data(format!(
+                "FileBasicInformation too short: {} bytes",
+                basic_buf.len()
+            )));
+        }
+
+        let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
+        let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
+        let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
+        let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
+
+        if !std_header.status.is_success_or_partial() {
+            if let Some(fid) = file_id {
+                cleanup_handles.push(fid);
+            }
+            return Err(Error::Protocol {
+                status: std_header.status,
+                command: Command::QueryInfo,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(std_body);
+        let std_resp = QueryInfoResponse::unpack(&mut cursor)?;
+        let std_buf = &std_resp.output_buffer;
+
+        if std_buf.len() < 22 {
+            if let Some(fid) = file_id {
+                cleanup_handles.push(fid);
+            }
+            return Err(Error::invalid_data(format!(
+                "FileStandardInformation too short: {} bytes",
+                std_buf.len()
+            )));
+        }
+
+        let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
+        let is_directory_byte = std_buf[21];
+
+        let is_directory =
+            is_directory_byte != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
         Ok(FileInfo {
             size: end_of_file,
             is_directory,
@@ -845,6 +1201,157 @@ impl Tree {
             from_normalized, to_normalized
         );
         Ok(())
+    }
+
+    /// Rename multiple files using batch compound requests.
+    ///
+    /// Sends all compound (CREATE+SET_INFO+CLOSE) requests before waiting for
+    /// any responses. Returns results in the same order as the input pairs.
+    pub async fn rename_files(
+        &self,
+        conn: &mut Connection,
+        renames: &[(&str, &str)],
+    ) -> Vec<Result<()>> {
+        if renames.is_empty() {
+            return vec![];
+        }
+
+        debug!("tree: rename_files batch, count={}", renames.len());
+
+        // Phase 1: Send all compound requests.
+        let mut sent_count = 0;
+        let mut send_error: Option<Error> = None;
+
+        for (from, to) in renames {
+            let from_normalized = normalize_path(from);
+            let to_normalized = normalize_path(to);
+
+            let create_req = CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: FileAccessMask::new(
+                    FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
+                ),
+                file_attributes: 0,
+                share_access: ShareAccess(
+                    ShareAccess::FILE_SHARE_READ
+                        | ShareAccess::FILE_SHARE_WRITE
+                        | ShareAccess::FILE_SHARE_DELETE,
+                ),
+                create_disposition: CreateDisposition::FileOpen,
+                create_options: 0,
+                name: from_normalized,
+                create_contexts: vec![],
+            };
+
+            let setinfo_req = SetInfoRequest {
+                info_type: InfoType::File,
+                file_info_class: FILE_RENAME_INFORMATION,
+                additional_information: 0,
+                file_id: FileId::SENTINEL,
+                buffer: build_rename_info_buffer(&to_normalized),
+            };
+
+            let close_req = CloseRequest {
+                flags: 0,
+                file_id: FileId::SENTINEL,
+            };
+
+            let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+                (Command::Create, &create_req, CreditCharge(1)),
+                (Command::SetInfo, &setinfo_req, CreditCharge(1)),
+                (Command::Close, &close_req, CreditCharge(1)),
+            ];
+
+            match conn.send_compound(self.tree_id, &operations).await {
+                Ok(_) => sent_count += 1,
+                Err(e) => {
+                    send_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        // Phase 2: Receive all compound responses.
+        let mut results: Vec<Result<()>> = Vec::with_capacity(renames.len());
+        let mut cleanup_handles: Vec<FileId> = Vec::new();
+
+        for (i, (from, to)) in renames.iter().enumerate().take(sent_count) {
+            match conn.receive_compound().await {
+                Ok(responses) => {
+                    if responses.len() != 3 {
+                        results.push(Err(Error::invalid_data(format!(
+                            "expected 3 compound responses, got {}",
+                            responses.len()
+                        ))));
+                        continue;
+                    }
+
+                    let (create_header, create_body) = &responses[0];
+                    let (setinfo_header, _) = &responses[1];
+                    let (close_header, _) = &responses[2];
+
+                    if create_header.status != NtStatus::SUCCESS {
+                        results.push(Err(Error::Protocol {
+                            status: create_header.status,
+                            command: Command::Create,
+                        }));
+                    } else if setinfo_header.status != NtStatus::SUCCESS {
+                        // CREATE succeeded, SET_INFO failed. Need cleanup.
+                        if let Ok(create_resp) =
+                            CreateResponse::unpack(&mut ReadCursor::new(create_body))
+                        {
+                            cleanup_handles.push(create_resp.file_id);
+                        }
+                        results.push(Err(Error::Protocol {
+                            status: setinfo_header.status,
+                            command: Command::SetInfo,
+                        }));
+                    } else {
+                        // Check CLOSE (non-fatal if rename succeeded).
+                        if close_header.status != NtStatus::SUCCESS {
+                            debug!(
+                                "tree: batch rename CLOSE returned {:?} (non-fatal)",
+                                close_header.status,
+                            );
+                        }
+                        info!("tree: batch renamed from={} to={}", from, to);
+                        results.push(Ok(()));
+                    }
+                }
+                Err(e) => {
+                    results.push(Err(e));
+                    for _ in (i + 1)..sent_count {
+                        results.push(Err(Error::Disconnected));
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Fill unsent paths with the send error.
+        if let Some(err) = send_error {
+            results.push(Err(err));
+            for _ in (sent_count + 1)..renames.len() {
+                results.push(Err(Error::Disconnected));
+            }
+        }
+
+        // Phase 3: Cleanup -- standalone CLOSEs for leaked handles.
+        for file_id in &cleanup_handles {
+            warn!(
+                "tree: batch rename cleanup, issuing standalone CLOSE for {:?}",
+                file_id
+            );
+            let _ = self.close_handle(conn, *file_id).await;
+        }
+
+        debug!(
+            "tree: rename_files batch done, {}/{} succeeded",
+            results.iter().filter(|r| r.is_ok()).count(),
+            renames.len()
+        );
+        results
     }
 
     /// Write a file using a compound CREATE+WRITE+FLUSH+CLOSE request.
@@ -2939,6 +3446,154 @@ mod tests {
         assert_eq!(mock.sent_count(), 2);
     }
 
+    // ── Batch stat tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stat_files_batch_happy_path() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Queue 3 compound responses (CREATE+QUERY+QUERY+CLOSE each).
+        for i in 0..3u64 {
+            let file_id = FileId {
+                persistent: i + 1,
+                volatile: i + 100,
+            };
+            let create_resp = build_create_response(file_id, 0);
+            let basic = build_file_basic_info(
+                132_000_000_000_000_000 + i,
+                132_100_000_000_000_000 + i,
+                133_000_000_000_000_000 + i,
+                133_000_000_000_000_000 + i,
+                0x20,
+            );
+            let basic_resp = build_query_info_response(basic);
+            let std_info = build_file_standard_info(4096, 1024 * (i + 1), 1, false, false);
+            let std_resp = build_query_info_response(std_info);
+            let close_resp = build_close_response();
+            mock.queue_response(build_compound_response_frame(&[
+                create_resp,
+                basic_resp,
+                std_resp,
+                close_resp,
+            ]));
+        }
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree
+            .stat_files(&mut conn, &["a.txt", "b.txt", "c.txt"])
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap().size, 1024);
+        assert_eq!(results[1].as_ref().unwrap().size, 2048);
+        assert_eq!(results[2].as_ref().unwrap().size, 3072);
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn stat_files_batch_partial_failure() {
+        let mock = Arc::new(MockTransport::new());
+
+        let err_body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+
+        // File 1: success
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 100,
+        };
+        let create_resp = build_create_response(file_id, 0);
+        let basic = build_file_basic_info(
+            132_000_000_000_000_000,
+            132_100_000_000_000_000,
+            133_000_000_000_000_000,
+            133_000_000_000_000_000,
+            0x20,
+        );
+        let basic_resp = build_query_info_response(basic);
+        let std_info = build_file_standard_info(4096, 512, 1, false, false);
+        let std_resp = build_query_info_response(std_info);
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            basic_resp,
+            std_resp,
+            close_resp,
+        ]));
+
+        // File 2: CREATE fails -- cascaded failure
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_err = pack_message(&create_hdr, &err_body);
+
+        let mut q1_hdr = Header::new_request(Command::QueryInfo);
+        q1_hdr.flags.set_response();
+        q1_hdr.credits = 32;
+        q1_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let q1_err = pack_message(&q1_hdr, &err_body);
+
+        let mut q2_hdr = Header::new_request(Command::QueryInfo);
+        q2_hdr.flags.set_response();
+        q2_hdr.credits = 32;
+        q2_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let q2_err = pack_message(&q2_hdr, &err_body);
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_err = pack_message(&close_hdr, &err_body);
+        mock.queue_response(build_compound_response_frame(&[
+            create_err, q1_err, q2_err, close_err,
+        ]));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree
+            .stat_files(&mut conn, &["exists.txt", "missing.txt"])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().size, 512);
+        assert!(results[1].is_err());
+        assert_eq!(
+            results[1].as_ref().unwrap_err().status(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_files_empty_returns_empty() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results: Vec<Result<FileInfo>> = tree.stat_files(&mut conn, &[]).await;
+        assert!(results.is_empty());
+    }
+
     // ── Rename tests ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -3095,6 +3750,154 @@ mod tests {
         assert_eq!(mock.sent_count(), 2);
     }
 
+    // ── Batch rename tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rename_files_batch_happy_path() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Queue 3 compound responses (CREATE+SET_INFO+CLOSE each).
+        for i in 0..3u64 {
+            let file_id = FileId {
+                persistent: i + 1,
+                volatile: i + 100,
+            };
+            let create_resp = build_create_response(file_id, 0);
+            let setinfo_resp = build_set_info_response();
+            let close_resp = build_close_response();
+            mock.queue_response(build_compound_response_frame(&[
+                create_resp,
+                setinfo_resp,
+                close_resp,
+            ]));
+        }
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree
+            .rename_files(
+                &mut conn,
+                &[("a.txt", "a2.txt"), ("b.txt", "b2.txt"), ("c.txt", "c2.txt")],
+            )
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(results[2].is_ok());
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn rename_files_batch_partial_failure() {
+        let mock = Arc::new(MockTransport::new());
+
+        let err_body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+
+        // File 1: success
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 100,
+        };
+        let create_resp = build_create_response(file_id, 0);
+        let setinfo_resp = build_set_info_response();
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            setinfo_resp,
+            close_resp,
+        ]));
+
+        // File 2: CREATE fails (not found)
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_err = pack_message(&create_hdr, &err_body);
+
+        let mut si_hdr = Header::new_request(Command::SetInfo);
+        si_hdr.flags.set_response();
+        si_hdr.credits = 32;
+        si_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let si_err = pack_message(&si_hdr, &err_body);
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_err = pack_message(&close_hdr, &err_body);
+        mock.queue_response(build_compound_response_frame(&[
+            create_err, si_err, close_err,
+        ]));
+
+        // File 3: success
+        let file_id = FileId {
+            persistent: 3,
+            volatile: 102,
+        };
+        let create_resp = build_create_response(file_id, 0);
+        let setinfo_resp = build_set_info_response();
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            setinfo_resp,
+            close_resp,
+        ]));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree
+            .rename_files(
+                &mut conn,
+                &[
+                    ("a.txt", "a2.txt"),
+                    ("missing.txt", "m2.txt"),
+                    ("c.txt", "c2.txt"),
+                ],
+            )
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert_eq!(
+            results[1].as_ref().unwrap_err().status(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert!(results[2].is_ok());
+    }
+
+    #[tokio::test]
+    async fn rename_files_empty_returns_empty() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results: Vec<Result<()>> = tree.rename_files(&mut conn, &[]).await;
+        assert!(results.is_empty());
+        assert_eq!(mock.sent_count(), 0);
+    }
+
     // ── Create directory tests ───────────────────────────────────────
 
     #[tokio::test]
@@ -3164,6 +3967,176 @@ mod tests {
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert_ne!(req.create_options & FILE_DELETE_ON_CLOSE, 0);
         assert_ne!(req.create_options & FILE_DIRECTORY_FILE, 0);
+    }
+
+    // ── Batch delete tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_files_batch_happy_path() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Queue 3 compound responses (CREATE+CLOSE each).
+        for i in 0..3u64 {
+            let file_id = FileId {
+                persistent: i + 1,
+                volatile: i + 100,
+            };
+            let create_resp = build_create_response(file_id, 0);
+            let close_resp = build_close_response();
+            mock.queue_response(build_compound_response_frame(&[create_resp, close_resp]));
+        }
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree
+            .delete_files(&mut conn, &["a.txt", "b.txt", "c.txt"])
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(results[2].is_ok());
+        // 3 compound frames sent (one per file).
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn delete_files_batch_partial_failure() {
+        let mock = Arc::new(MockTransport::new());
+
+        let err_body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+
+        // File 1: success
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 100,
+        };
+        let create_resp = build_create_response(file_id, 0);
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[create_resp, close_resp]));
+
+        // File 2: CREATE fails (not found) -- cascaded failure
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_err = pack_message(&create_hdr, &err_body);
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_err = pack_message(&close_hdr, &err_body);
+        mock.queue_response(build_compound_response_frame(&[create_err, close_err]));
+
+        // File 3: success
+        let file_id = FileId {
+            persistent: 3,
+            volatile: 102,
+        };
+        let create_resp = build_create_response(file_id, 0);
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[create_resp, close_resp]));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree
+            .delete_files(&mut conn, &["a.txt", "missing.txt", "c.txt"])
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert_eq!(
+            results[1].as_ref().unwrap_err().status(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        assert!(results[2].is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_files_batch_close_failure_issues_cleanup() {
+        let mock = Arc::new(MockTransport::new());
+
+        let err_body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+
+        // File 1: CREATE succeeds, CLOSE fails
+        let file_id = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+        let create_resp = build_create_response(file_id, 0);
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::UNSUCCESSFUL;
+        let close_fail = pack_message(&close_hdr, &err_body);
+        mock.queue_response(build_compound_response_frame(&[create_resp, close_fail]));
+
+        // File 2: success
+        let file_id2 = FileId {
+            persistent: 0xCC,
+            volatile: 0xDD,
+        };
+        let create_resp2 = build_create_response(file_id2, 0);
+        let close_resp2 = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[create_resp2, close_resp2]));
+
+        // Queue response for the standalone CLOSE cleanup of file 1.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree
+            .delete_files(&mut conn, &["leaky.txt", "ok.txt"])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_err());
+        assert!(results[1].is_ok());
+        // 2 compound frames + 1 standalone CLOSE = 3 messages sent.
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn delete_files_empty_returns_empty() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let results = tree.delete_files(&mut conn, &[]).await;
+        assert!(results.is_empty());
+        assert_eq!(mock.sent_count(), 0);
     }
 
     // ── Pipelined read tests ────────────────────────────────────────

@@ -24,7 +24,8 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 
 - Connect to SMB2/3 shares using NTLM or Kerberos authentication
 - List directories, read files, write files, delete, rename, stat, create directories
-- Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds)
+- Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds, compound delete/rename/stat)
+- Batch operations (delete, rename, stat multiple files -- all requests sent before waiting for responses)
 - Pipelined I/O with sliding window for large file transfers
 - SMB 3.x signing (HMAC-SHA256, AES-CMAC, AES-GMAC) and encryption (AES-128/256-CCM/GCM)
 - LZ4 compression
@@ -207,8 +208,11 @@ For when you want to do one thing and get the result:
 - `client.read_file(&share, path)` -- download a file
 - `client.write_file(&share, path, data)` -- upload a file
 - `client.delete_file(&share, path)` -- delete a file
+- `client.delete_files(&share, &paths)` -- batch delete (all requests sent before waiting)
 - `client.stat(&share, path)` -- get file metadata
+- `client.stat_files(&share, &paths)` -- batch stat
 - `client.rename(&share, from, to)` -- rename a file
+- `client.rename_files(&share, &renames)` -- batch rename
 - `client.create_directory(&share, path)` -- create a directory
 - `client.delete_directory(&share, path)` -- remove a directory
 - `client.download(&share, path)` -- streaming download with progress (memory-efficient)

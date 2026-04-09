@@ -308,14 +308,42 @@ impl SmbClient {
         tree.delete_file(&mut self.conn, path).await
     }
 
+    /// Delete multiple files on the given share in a single batch.
+    ///
+    /// Sends all requests before waiting for responses, minimizing
+    /// round-trips. Returns results in the same order as the input paths.
+    pub async fn delete_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<()>> {
+        tree.delete_files(&mut self.conn, paths).await
+    }
+
     /// Get file metadata (size, timestamps, whether it's a directory).
     pub async fn stat(&mut self, tree: &Tree, path: &str) -> Result<FileInfo> {
         tree.stat(&mut self.conn, path).await
     }
 
+    /// Stat multiple files on the given share in a single batch.
+    ///
+    /// Sends all requests before waiting for responses, minimizing
+    /// round-trips. Returns results in the same order as the input paths.
+    pub async fn stat_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<FileInfo>> {
+        tree.stat_files(&mut self.conn, paths).await
+    }
+
     /// Rename a file or directory on the given share.
     pub async fn rename(&mut self, tree: &Tree, from: &str, to: &str) -> Result<()> {
         tree.rename(&mut self.conn, from, to).await
+    }
+
+    /// Rename multiple files on the given share in a single batch.
+    ///
+    /// Sends all requests before waiting for responses, minimizing
+    /// round-trips. Returns results in the same order as the input pairs.
+    pub async fn rename_files(
+        &mut self,
+        tree: &Tree,
+        renames: &[(&str, &str)],
+    ) -> Vec<Result<()>> {
+        tree.rename_files(&mut self.conn, renames).await
     }
 
     /// Create a directory on the given share.

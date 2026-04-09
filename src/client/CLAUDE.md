@@ -39,7 +39,22 @@ All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenienc
 
 - **Read compound**: CREATE + READ + CLOSE (3 ops, 1 round-trip). Default for `read_file`.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
+- **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
+- **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.
+- **Stat compound**: CREATE + QUERY_INFO (basic) + QUERY_INFO (standard) + CLOSE (4 ops, 1 round-trip). Default for `stat`.
 - If CREATE succeeds but a later op fails, the client issues a standalone CLOSE to avoid leaking the handle.
+
+## Batch operations
+
+`delete_files`, `rename_files`, and `stat_files` send all compound requests before waiting for any responses, minimizing total round-trips for multi-file operations. The pattern:
+
+1. **Send all**: build and send N independent compound chains (one per file)
+2. **Receive all**: collect N compound responses, parse each independently
+3. **Cleanup**: issue standalone CLOSEs for any compound where CREATE succeeded but a later op failed
+
+Partial failures are independent -- if 3 of 50 files fail, the other 47 still succeed. Each method returns `Vec<Result<T>>` in the same order as the input.
+
+No credit windowing yet -- the server's initial 256-credit grant supports ~128 deletes, ~85 renames, or ~64 stats in a single batch. Enough for typical file manager use.
 
 ## Pipelined I/O
 

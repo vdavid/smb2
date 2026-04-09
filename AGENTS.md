@@ -162,6 +162,7 @@ receive task that demultiplexes by `MessageId`.
 | Transport trait      | Split send/receive                         | Avoids deadlock in pipeline's `select!` loop                         |
 | Single crate         | No workspace                               | Like mtp-rs, keeps things simple                                     |
 | I/O performance      | Pipelined reads/writes as core feature     | Not an optimization, the reason the lib exists                       |
+| Batch operations     | Send-all-then-receive-all for multi-file ops | No new infra needed -- N `send_compound` + N `receive_compound`    |
 | Testing              | TDD with mock transport                    | Spec-driven tests first                                              |
 | Primary reference    | MS-SMB2 spec (~80%)                        | smb-rs as sanity check (~15%), mtp-rs as architecture template (~5%) |
 
