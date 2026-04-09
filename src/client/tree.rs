@@ -739,11 +739,7 @@ impl Tree {
     /// Sends all compound (CREATE+QUERY_INFO+QUERY_INFO+CLOSE) requests before
     /// waiting for any responses. Returns results in the same order as the
     /// input paths.
-    pub async fn stat_files(
-        &self,
-        conn: &mut Connection,
-        paths: &[&str],
-    ) -> Vec<Result<FileInfo>> {
+    pub async fn stat_files(&self, conn: &mut Connection, paths: &[&str]) -> Vec<Result<FileInfo>> {
         if paths.is_empty() {
             return vec![];
         }
@@ -3783,7 +3779,11 @@ mod tests {
         let results = tree
             .rename_files(
                 &mut conn,
-                &[("a.txt", "a2.txt"), ("b.txt", "b2.txt"), ("c.txt", "c2.txt")],
+                &[
+                    ("a.txt", "a2.txt"),
+                    ("b.txt", "b2.txt"),
+                    ("c.txt", "c2.txt"),
+                ],
             )
             .await;
 
@@ -4112,9 +4112,7 @@ mod tests {
             encrypt_data: false,
         };
 
-        let results = tree
-            .delete_files(&mut conn, &["leaky.txt", "ok.txt"])
-            .await;
+        let results = tree.delete_files(&mut conn, &["leaky.txt", "ok.txt"]).await;
 
         assert_eq!(results.len(), 2);
         assert!(results[0].is_err());

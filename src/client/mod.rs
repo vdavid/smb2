@@ -338,11 +338,7 @@ impl SmbClient {
     ///
     /// Sends all requests before waiting for responses, minimizing
     /// round-trips. Returns results in the same order as the input pairs.
-    pub async fn rename_files(
-        &mut self,
-        tree: &Tree,
-        renames: &[(&str, &str)],
-    ) -> Vec<Result<()>> {
+    pub async fn rename_files(&mut self, tree: &Tree, renames: &[(&str, &str)]) -> Vec<Result<()>> {
         tree.rename_files(&mut self.conn, renames).await
     }
 
