@@ -114,5 +114,5 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 ## Known tech debt (Kerberos)
 
 - ~~DER helpers duplicated between `spnego.rs` and `kerberos/messages.rs`~~ (resolved: shared `auth/der.rs`)
-- `kerberos/authenticator.rs` mixes crypto wrappers with protocol flow (700+ lines) — could be split
+- ~~`kerberos/authenticator.rs` mixes crypto wrappers with protocol flow~~ (resolved: `kerberos_encrypt`, `kerberos_decrypt`, `etype_from_i32`, and `generate_random_key` moved to `kerberos/crypto.rs`)
 - `#![allow(rustdoc::broken_intra_doc_links)]` hack in `kerberos/messages.rs`

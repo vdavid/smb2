@@ -14,8 +14,8 @@ use log::{debug, trace};
 use std::time::Duration;
 
 use crate::auth::kerberos::crypto::{
-    compute_checksum, decrypt_aes_cts, decrypt_rc4_hmac, derive_key_aes, encrypt_aes_cts,
-    encrypt_rc4_hmac, string_to_key_aes, string_to_key_rc4, usage_enc, usage_int, EncryptionType,
+    compute_checksum, etype_from_i32, kerberos_decrypt, kerberos_encrypt, string_to_key_aes,
+    string_to_key_rc4, EncryptionType,
 };
 use crate::auth::kerberos::kdc::{send_to_kdc, KdcConfig};
 use crate::auth::kerberos::messages::{
@@ -763,121 +763,6 @@ impl KerberosAuthenticator {
 }
 
 // =========================================================================
-// Kerberos encrypt/decrypt (RFC 3961 section 5.3)
-// =========================================================================
-//
-// For AES (etypes 17, 18):
-//   1. Derive encryption key: Ke = DK(base_key, usage || 0xAA)
-//   2. Derive integrity key: Ki = DK(base_key, usage || 0x55)
-//   3. Generate random 16-byte confounder
-//   4. Plaintext' = confounder || plaintext
-//   5. Ciphertext = AES-CTS(Ke, iv=0, plaintext')
-//   6. HMAC = HMAC-SHA1-96(Ki, plaintext')
-//   7. Output = ciphertext || HMAC (12 bytes)
-//
-// For RC4-HMAC (etype 23):
-//   Uses the encrypt_rc4_hmac function directly (it handles confounder
-//   and checksum internally).
-
-/// Compute HMAC-SHA1 truncated to 12 bytes (96 bits).
-fn hmac_sha1_96(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
-    use sha1::Sha1;
-    type HmacSha1 = Hmac<Sha1>;
-
-    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    result[..12].to_vec()
-}
-
-/// Encrypt data using the Kerberos profile for the given etype and key usage.
-fn kerberos_encrypt(
-    base_key: &[u8],
-    usage: u32,
-    plaintext: &[u8],
-    etype: EncryptionType,
-) -> Vec<u8> {
-    match etype {
-        EncryptionType::Aes128CtsHmacSha196 | EncryptionType::Aes256CtsHmacSha196 => {
-            // Derive Ke (encryption key) and Ki (integrity key).
-            let ke = derive_key_aes(base_key, &usage_enc(usage));
-            let ki = derive_key_aes(base_key, &usage_int(usage));
-
-            // Generate 16-byte random confounder.
-            let mut confounder = [0u8; 16];
-            getrandom::fill(&mut confounder).expect("CSPRNG failed");
-
-            // Build plaintext' = confounder || plaintext.
-            let mut full_plain = Vec::with_capacity(16 + plaintext.len());
-            full_plain.extend_from_slice(&confounder);
-            full_plain.extend_from_slice(plaintext);
-
-            // Compute HMAC-SHA1-96 over plaintext' using Ki.
-            let hmac = hmac_sha1_96(&ki, &full_plain);
-
-            // Encrypt plaintext' with AES-CTS using Ke and IV=0.
-            let iv = [0u8; 16];
-            let ciphertext = encrypt_aes_cts(&ke, &iv, &full_plain);
-
-            // Output = ciphertext || HMAC (12 bytes).
-            let mut output = ciphertext;
-            output.extend_from_slice(&hmac);
-            output
-        }
-        EncryptionType::Rc4Hmac => encrypt_rc4_hmac(base_key, usage, plaintext),
-    }
-}
-
-/// Decrypt data using the Kerberos profile for the given etype and key usage.
-fn kerberos_decrypt(
-    base_key: &[u8],
-    usage: u32,
-    ciphertext: &[u8],
-    etype: EncryptionType,
-) -> Result<Vec<u8>> {
-    match etype {
-        EncryptionType::Aes128CtsHmacSha196 | EncryptionType::Aes256CtsHmacSha196 => {
-            // HMAC-SHA1-96 is 12 bytes, appended to the ciphertext.
-            if ciphertext.len() < 12 + 16 {
-                return Err(Error::invalid_data(
-                    "Kerberos AES ciphertext too short (need at least confounder + HMAC)",
-                ));
-            }
-
-            let hmac_offset = ciphertext.len() - 12;
-            let enc_data = &ciphertext[..hmac_offset];
-            let expected_hmac = &ciphertext[hmac_offset..];
-
-            // Derive Ke (encryption key) and Ki (integrity key).
-            let ke = derive_key_aes(base_key, &usage_enc(usage));
-            let ki = derive_key_aes(base_key, &usage_int(usage));
-
-            // Decrypt with AES-CTS using Ke and IV=0.
-            let iv = [0u8; 16];
-            let full_plain = decrypt_aes_cts(&ke, &iv, enc_data)?;
-
-            // Verify HMAC-SHA1-96 using Ki.
-            let computed_hmac = hmac_sha1_96(&ki, &full_plain);
-            if computed_hmac != expected_hmac {
-                return Err(Error::Auth {
-                    message: "Kerberos AES HMAC verification failed".to_string(),
-                });
-            }
-
-            // Strip the 16-byte confounder.
-            if full_plain.len() < 16 {
-                return Err(Error::invalid_data(
-                    "Kerberos AES decrypted data too short for confounder",
-                ));
-            }
-            Ok(full_plain[16..].to_vec())
-        }
-        EncryptionType::Rc4Hmac => decrypt_rc4_hmac(base_key, usage, ciphertext),
-    }
-}
-
-// =========================================================================
 // DER encoding helpers for PA-DATA values
 // =========================================================================
 
@@ -1211,31 +1096,6 @@ fn generate_nonce() -> u32 {
     u32::from_ne_bytes(buf) & 0x7FFF_FFFF // Ensure positive (Kerberos nonce is UInt32 but some KDCs treat it as signed)
 }
 
-/// Generate a random key of the appropriate size for the given etype.
-#[cfg(test)]
-fn generate_random_key(etype: EncryptionType) -> Vec<u8> {
-    let key_size = match etype {
-        EncryptionType::Aes256CtsHmacSha196 => 32,
-        EncryptionType::Aes128CtsHmacSha196 => 16,
-        EncryptionType::Rc4Hmac => 16,
-    };
-    let mut key = vec![0u8; key_size];
-    getrandom::fill(&mut key).expect("CSPRNG failed");
-    key
-}
-
-/// Convert an etype integer value to our enum.
-fn etype_from_i32(val: i32) -> Result<EncryptionType> {
-    match val {
-        18 => Ok(EncryptionType::Aes256CtsHmacSha196),
-        17 => Ok(EncryptionType::Aes128CtsHmacSha196),
-        23 => Ok(EncryptionType::Rc4Hmac),
-        _ => Err(Error::Auth {
-            message: format!("unsupported Kerberos encryption type: {val}"),
-        }),
-    }
-}
-
 // =========================================================================
 // Tests
 // =========================================================================
@@ -1243,7 +1103,9 @@ fn etype_from_i32(val: i32) -> Result<EncryptionType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::kerberos::crypto::{string_to_key_aes, string_to_key_rc4};
+    use crate::auth::kerberos::crypto::{
+        generate_random_key, kerberos_decrypt, kerberos_encrypt, string_to_key_aes,
+    };
     use crate::auth::kerberos::messages::{
         encode_ap_req, encode_as_req, encode_authenticator, encode_pa_enc_timestamp, EncryptedData,
         PrincipalName, Ticket,
@@ -1312,42 +1174,6 @@ mod tests {
         }
     }
 
-    // ── Random key generation ────────────────────────────────────────
-
-    #[test]
-    fn generate_random_key_sizes() {
-        assert_eq!(
-            generate_random_key(EncryptionType::Aes256CtsHmacSha196).len(),
-            32
-        );
-        assert_eq!(
-            generate_random_key(EncryptionType::Aes128CtsHmacSha196).len(),
-            16
-        );
-        assert_eq!(generate_random_key(EncryptionType::Rc4Hmac).len(), 16);
-    }
-
-    // ── Etype conversion ─────────────────────────────────────────────
-
-    #[test]
-    fn etype_from_i32_valid() {
-        assert_eq!(
-            etype_from_i32(18).unwrap(),
-            EncryptionType::Aes256CtsHmacSha196
-        );
-        assert_eq!(
-            etype_from_i32(17).unwrap(),
-            EncryptionType::Aes128CtsHmacSha196
-        );
-        assert_eq!(etype_from_i32(23).unwrap(), EncryptionType::Rc4Hmac);
-    }
-
-    #[test]
-    fn etype_from_i32_unsupported() {
-        assert!(etype_from_i32(99).is_err());
-        assert!(etype_from_i32(0).is_err());
-    }
-
     // ── PA-PAC-REQUEST encoding ──────────────────────────────────────
 
     #[test]
@@ -1364,71 +1190,6 @@ mod tests {
         let encoded = encode_pa_pac_request(false);
         assert_eq!(encoded[0], 0x30);
         assert!(encoded.windows(3).any(|w| w == [0x01, 0x01, 0x00]));
-    }
-
-    // ── Kerberos encrypt/decrypt roundtrip ───────────────────────────
-
-    #[test]
-    fn kerberos_encrypt_decrypt_aes256() {
-        let key = string_to_key_aes("password", "EXAMPLE.COMuser", 32);
-        let plaintext = b"Hello, Kerberos!";
-
-        let ciphertext = kerberos_encrypt(&key, 7, plaintext, EncryptionType::Aes256CtsHmacSha196);
-        let decrypted =
-            kerberos_decrypt(&key, 7, &ciphertext, EncryptionType::Aes256CtsHmacSha196).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn kerberos_encrypt_decrypt_aes128() {
-        let key = string_to_key_aes("password", "EXAMPLE.COMuser", 16);
-        let plaintext = b"Hello, Kerberos AES-128!";
-
-        let ciphertext = kerberos_encrypt(&key, 3, plaintext, EncryptionType::Aes128CtsHmacSha196);
-        let decrypted =
-            kerberos_decrypt(&key, 3, &ciphertext, EncryptionType::Aes128CtsHmacSha196).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn kerberos_encrypt_decrypt_rc4() {
-        let key = string_to_key_rc4("password");
-        let plaintext = b"Hello, RC4!";
-
-        let ciphertext = kerberos_encrypt(&key, 7, plaintext, EncryptionType::Rc4Hmac);
-        let decrypted = kerberos_decrypt(&key, 7, &ciphertext, EncryptionType::Rc4Hmac).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn kerberos_decrypt_wrong_key_fails() {
-        let key = string_to_key_aes("password", "EXAMPLE.COMuser", 32);
-        let wrong_key = string_to_key_aes("wrong", "EXAMPLE.COMuser", 32);
-        let plaintext = b"secret data";
-
-        let ciphertext = kerberos_encrypt(&key, 1, plaintext, EncryptionType::Aes256CtsHmacSha196);
-        let result = kerberos_decrypt(
-            &wrong_key,
-            1,
-            &ciphertext,
-            EncryptionType::Aes256CtsHmacSha196,
-        );
-
-        assert!(result.is_err(), "decryption with wrong key should fail");
-    }
-
-    #[test]
-    fn kerberos_decrypt_wrong_usage_fails() {
-        let key = string_to_key_aes("password", "EXAMPLE.COMuser", 32);
-        let plaintext = b"secret data";
-
-        let ciphertext = kerberos_encrypt(&key, 1, plaintext, EncryptionType::Aes256CtsHmacSha196);
-        let result = kerberos_decrypt(&key, 7, &ciphertext, EncryptionType::Aes256CtsHmacSha196);
-
-        assert!(result.is_err(), "decryption with wrong usage should fail");
     }
 
     // ── PA-ENC-TIMESTAMP encrypt ─────────────────────────────────────
