@@ -7,6 +7,7 @@ NTLMv2 and Kerberos authentication for SMB2 session setup.
 | File | Purpose |
 |---|---|
 | `mod.rs` | Module exports |
+| `der.rs` | Shared ASN.1/DER primitives (TLV encode/decode) |
 | `ntlm.rs` | `NtlmAuthenticator` -- 3-message NTLM exchange |
 | `spnego.rs` | SPNEGO NegTokenInit/NegTokenResp wrapping |
 | `kerberos/mod.rs` | Kerberos module root, re-exports authenticator |
@@ -99,7 +100,7 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **Target info modification (NTLM)**: The client modifies the server's target info before including it in the client blob.
 - **TGS-REP key usage ambiguity (Kerberos)**: RFC 4120 says key usage 8 for TGS-REP encrypted with session key, but some KDCs use 9. The authenticator tries 8 first, falls back to 9.
 - **KDC_ERR_PREAUTH_REQUIRED handling (Kerberos)**: First AS-REQ without pre-auth gets error 25. The authenticator extracts supported etypes from the e-data (ETYPE-INFO2) and retries with pre-authentication.
-- **DER parsing duplicated (Kerberos)**: `authenticator.rs` has its own minimal DER helpers to avoid depending on `messages.rs` internals. Some duplication, but keeps the module self-contained.
+- **DER primitives in `auth::der`**: Core DER encoding/decoding helpers (`der_length`, `der_tlv`, `parse_der_length`, `parse_der_tlv`) live in `auth/der.rs` and are shared by `spnego.rs` and `kerberos/messages.rs`. Type-specific helpers (INTEGER, GeneralString, etc.) stay in their respective modules.
 
 ## Kerberos key design decisions (from end-to-end testing)
 
@@ -112,6 +113,6 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 
 ## Known tech debt (Kerberos)
 
-- DER helpers duplicated between `spnego.rs` and `kerberos/messages.rs`
+- ~~DER helpers duplicated between `spnego.rs` and `kerberos/messages.rs`~~ (resolved: shared `auth/der.rs`)
 - `kerberos/authenticator.rs` mixes crypto wrappers with protocol flow (700+ lines) — could be split
 - `#![allow(rustdoc::broken_intra_doc_links)]` hack in `kerberos/messages.rs`

@@ -10,6 +10,7 @@
 //! - RFC 4120: The Kerberos Network Authentication Service (V5)
 //! - MS-KILE: Kerberos Protocol Extensions
 
+use crate::auth::der::{der_tlv, parse_der_tlv};
 use crate::auth::kerberos::crypto::EncryptionType;
 use crate::Error;
 
@@ -151,28 +152,12 @@ pub struct KrbError {
     pub e_data: Option<Vec<u8>>,
 }
 
-// ---------------------------------------------------------------------------
-// DER encoding helpers
-// ---------------------------------------------------------------------------
+// Core DER encoding/decoding helpers (der_length, der_tlv, parse_der_length,
+// parse_der_tlv) are in `crate::auth::der`. Imported at the top.
 
-/// Encode a DER length field.
-fn der_length(len: usize) -> Vec<u8> {
-    if len < 128 {
-        vec![len as u8]
-    } else if len < 256 {
-        vec![0x81, len as u8]
-    } else {
-        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
-    }
-}
-
-/// Wrap data in a DER TLV (tag-length-value).
-fn der_tlv(tag: u8, data: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    out.extend_from_slice(&der_length(data.len()));
-    out.extend_from_slice(data);
-    out
-}
+// ---------------------------------------------------------------------------
+// DER encoding helpers (Kerberos-specific)
+// ---------------------------------------------------------------------------
 
 /// Encode a context-specific constructed tag: `[tag_num]`.
 fn der_context(tag_num: u8, data: &[u8]) -> Vec<u8> {
@@ -248,58 +233,8 @@ fn der_sequence(items: &[&[u8]]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// DER parsing helpers
+// DER parsing helpers (Kerberos-specific)
 // ---------------------------------------------------------------------------
-
-/// Parse a DER length field, returning `(length, bytes_consumed)`.
-fn parse_der_length(data: &[u8]) -> Result<(usize, usize), Error> {
-    if data.is_empty() {
-        return Err(Error::invalid_data("Kerberos: truncated DER length"));
-    }
-    let first = data[0];
-    if first < 128 {
-        Ok((first as usize, 1))
-    } else if first == 0x81 {
-        if data.len() < 2 {
-            return Err(Error::invalid_data("Kerberos: truncated DER length (0x81)"));
-        }
-        Ok((data[1] as usize, 2))
-    } else if first == 0x82 {
-        if data.len() < 3 {
-            return Err(Error::invalid_data("Kerberos: truncated DER length (0x82)"));
-        }
-        let len = ((data[1] as usize) << 8) | (data[2] as usize);
-        Ok((len, 3))
-    } else if first == 0x83 {
-        if data.len() < 4 {
-            return Err(Error::invalid_data("Kerberos: truncated DER length (0x83)"));
-        }
-        let len = ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
-        Ok((len, 4))
-    } else {
-        Err(Error::invalid_data(format!(
-            "Kerberos: unsupported DER length encoding: 0x{first:02x}"
-        )))
-    }
-}
-
-/// Parse a DER TLV, returning `(tag, value_slice, total_bytes_consumed)`.
-fn parse_der_tlv(data: &[u8]) -> Result<(u8, &[u8], usize), Error> {
-    if data.is_empty() {
-        return Err(Error::invalid_data("Kerberos: truncated DER TLV"));
-    }
-    let tag = data[0];
-    let (len, len_bytes) = parse_der_length(&data[1..])?;
-    let header_len = 1 + len_bytes;
-    let total = header_len + len;
-    if data.len() < total {
-        return Err(Error::invalid_data(format!(
-            "Kerberos: DER TLV truncated: need {total} bytes, have {}",
-            data.len()
-        )));
-    }
-    Ok((tag, &data[header_len..total], total))
-}
 
 /// Parse all TLV elements in a SEQUENCE body, returning `(tag, value)` pairs.
 fn parse_sequence_fields(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, Error> {
@@ -1214,26 +1149,11 @@ mod tests {
         assert_eq!(&encoded[2..], b"EXAMPLE.COM");
     }
 
-    #[test]
-    fn test_der_length_short() {
-        assert_eq!(der_length(5), vec![5]);
-        assert_eq!(der_length(127), vec![127]);
-    }
-
-    #[test]
-    fn test_der_length_medium() {
-        assert_eq!(der_length(128), vec![0x81, 128]);
-        assert_eq!(der_length(255), vec![0x81, 255]);
-    }
-
-    #[test]
-    fn test_der_length_long() {
-        assert_eq!(der_length(256), vec![0x82, 0x01, 0x00]);
-        assert_eq!(der_length(1000), vec![0x82, 0x03, 0xe8]);
-    }
+    // DER primitive tests (der_length, der_tlv, parse_der_length, parse_der_tlv)
+    // live in `auth::der::tests`.
 
     // -----------------------------------------------------------------------
-    // Parse helper tests
+    // Parse helper tests (Kerberos-specific)
     // -----------------------------------------------------------------------
 
     #[test]
