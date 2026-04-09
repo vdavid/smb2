@@ -79,6 +79,20 @@ cargo test --test docker_integration -- --ignored   # repeat (~8s)
 | `cargo test --test wire_format_captures -- --ignored` | Wire format vs real server | NAS + .env |
 | `just test-docker` | Docker integration tests | Docker |
 
+## AWS integration tests (Kerberos)
+
+For Kerberos end-to-end testing, we use AWS EC2 to spin up a Windows Server with Active Directory Domain Services. No Docker alternative exists (Samba AD DC doesn't work on macOS).
+
+**AWS access:**
+- **Profile:** `smb2-agent` (configured in `~/.aws/credentials`)
+- **Region:** `eu-north-1`
+- **IAM user:** `smb2-agent` (account 791732162721)
+- **Permissions:** EC2 lifecycle (run/terminate/describe instances, security groups, key pairs), SSM parameter reads. Scoped to eu-north-1 only.
+
+**Usage:** Always pass `AWS_PROFILE=smb2-agent` or `--profile smb2-agent` for all AWS CLI calls.
+
+**Important:** Terminate instances when testing is done. David has billing guards but don't leave things running.
+
 ## Writing new tests
 
 - **Protocol correctness** (does our Pack/Unpack match the spec?): unit test with known byte sequences

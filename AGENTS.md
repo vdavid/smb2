@@ -4,13 +4,13 @@ Pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. S
 
 ## Quick commands
 
-| Command                | Description                                          |
-|------------------------|------------------------------------------------------|
-| `just`                 | Fast checks: format, lint, test, doc (~2s)           |
-| `just check-live`      | Fast checks + integration tests on real servers (~6s)|
-| `just fix`             | Auto-fix formatting and clippy warnings              |
-| `just check-all`       | Include MSRV check, security audit, and license check|
-| `cargo test`           | Run unit tests (mock transport, no server needed)    |
+| Command           | Description                                           |
+|-------------------|-------------------------------------------------------|
+| `just`            | Fast checks: format, lint, test, doc (~2s)            |
+| `just check-live` | Fast checks + integration tests on real servers (~6s) |
+| `just fix`        | Auto-fix formatting and clippy warnings               |
+| `just check-all`  | Include MSRV check, security audit, and license check |
+| `cargo test`      | Run unit tests (mock transport, no server needed)     |
 
 ## Project structure
 
@@ -97,6 +97,17 @@ examples/
   write_file.rs           # Write a file to a share
 ```
 
+## Kerberos status
+
+Implementation complete. KDC exchanges verified against real MIT Kerberos. AP-REQ NOT yet validated against any SMB
+server — Docker Samba AD DC doesn't work on macOS, so we need AWS Windows Server for end-to-end testing. See
+`tests/CLAUDE.md` for AWS access details.
+
+## Quality bar
+
+Each change must be solid AND elegant. Safe for family photos and company docs. No races, no code smells, no missing
+docs. Agents must update CLAUDE.md files when modifying modules.
+
 ## Architecture
 
 ```
@@ -109,58 +120,77 @@ transport:: (Transport trait)
 tcp::TcpTransport  or  mock::MockTransport
 ```
 
-**Entry points:** `SmbClient::connect()` for high-level use (handles negotiate + session setup + reconnection), or `Connection::connect()` + `Session::setup()` for low-level control
+**Entry points:** `SmbClient::connect()` for high-level use (handles negotiate + session setup + reconnection), or
+`Connection::connect()` + `Session::setup()` for low-level control
 
-**Key types:** `SessionId(u64)`, `TreeId(u32)`, `FileId { persistent: u64, volatile: u64 }`, `MessageId(u64)`, `CreditCharge(u16)`
+**Key types:** `SessionId(u64)`, `TreeId(u32)`, `FileId { persistent: u64, volatile: u64 }`, `MessageId(u64)`,
+`CreditCharge(u16)`
 
 **Layers:**
+
 1. **Client API** (`client/`): High-level operations (connect, read file, list directory). Wraps the pipeline.
-2. **Protocol logic** (`client/connection.rs`, `client/pipeline.rs`): Credit management, message sequencing, response demux, compounding. The pipeline is the core feature.
+2. **Protocol logic** (`client/connection.rs`, `client/pipeline.rs`): Credit management, message sequencing, response
+   demux, compounding. The pipeline is the core feature.
 3. **Wire format** (`msg/`, `pack/`): Serialize/deserialize SMB2 messages. Hand-rolled, no proc macros.
-4. **Transport** (`transport/`): Send/receive raw bytes over TCP. Split into send/receive halves to avoid deadlocks in the pipeline's `select!` loop.
+4. **Transport** (`transport/`): Send/receive raw bytes over TCP. Split into send/receive halves to avoid deadlocks in
+   the pipeline's `select!` loop.
 
 ## Pipeline design
 
-The pipeline is the reason this library exists. Without pipelining, SMB downloads are ~10x slower than native OS implementations.
+The pipeline is the reason this library exists. Without pipelining, SMB downloads are ~10x slower than native OS
+implementations.
 
 **How it works:**
+
 - Caller pushes `Op` requests into a channel (`tx`)
 - A driver task expands ops into SMB2 messages, sends as many as credits allow
 - Responses arrive asynchronously, get matched by `MessageId`, results stream back via `rx`
 - Large files get chunked at `MaxReadSize`/`MaxWriteSize` and reassembled
 - Credits flow back from responses, sliding the window forward
 
-**Key constraint:** Only ONE task reads from the transport. Multiple pipelines on the same connection share a single receive task that demultiplexes by `MessageId`.
+**Key constraint:** Only ONE task reads from the transport. Multiple pipelines on the same connection share a single
+receive task that demultiplexes by `MessageId`.
 
 ## Key design decisions
 
-| Decision | Choice | Why |
-|----------|--------|-----|
-| Binary serialization | Hand-rolled `ReadCursor`/`WriteCursor` | Full control, debuggable, no proc-macro dep |
-| Async strategy | `dyn Transport` + `async_trait` | Simpler public API than generics |
-| ID types | Newtypes (`SessionId(u64)`, etc.) | Zero-cost compile-time safety |
-| Error handling | Rich context + `is_retryable()` + NTSTATUS | mtp-rs style |
-| Transport trait | Split send/receive | Avoids deadlock in pipeline's `select!` loop |
-| Single crate | No workspace | Like mtp-rs, keeps things simple |
-| I/O performance | Pipelined reads/writes as core feature | Not an optimization, the reason the lib exists |
-| Testing | TDD with mock transport | Spec-driven tests first |
-| Primary reference | MS-SMB2 spec (~80%) | smb-rs as sanity check (~15%), mtp-rs as architecture template (~5%) |
+| Decision             | Choice                                     | Why                                                                  |
+|----------------------|--------------------------------------------|----------------------------------------------------------------------|
+| Binary serialization | Hand-rolled `ReadCursor`/`WriteCursor`     | Full control, debuggable, no proc-macro dep                          |
+| Async strategy       | `dyn Transport` + `async_trait`            | Simpler public API than generics                                     |
+| ID types             | Newtypes (`SessionId(u64)`, etc.)          | Zero-cost compile-time safety                                        |
+| Error handling       | Rich context + `is_retryable()` + NTSTATUS | mtp-rs style                                                         |
+| Transport trait      | Split send/receive                         | Avoids deadlock in pipeline's `select!` loop                         |
+| Single crate         | No workspace                               | Like mtp-rs, keeps things simple                                     |
+| I/O performance      | Pipelined reads/writes as core feature     | Not an optimization, the reason the lib exists                       |
+| Testing              | TDD with mock transport                    | Spec-driven tests first                                              |
+| Primary reference    | MS-SMB2 spec (~80%)                        | smb-rs as sanity check (~15%), mtp-rs as architecture template (~5%) |
 
 ## Protocol pitfalls (all handled)
 
-Cross-module protocol concerns that span multiple files. Each is handled, but documented here so you understand non-obvious code patterns. Module-specific gotchas go in the relevant `CLAUDE.md`; cross-cutting ones go here. If you discover a new pitfall that involves 2+ modules, add it to this list.
+Cross-module protocol concerns that span multiple files. Each is handled, but documented here so you understand
+non-obvious code patterns. Module-specific gotchas go in the relevant `CLAUDE.md`; cross-cutting ones go here. If you
+discover a new pitfall that involves 2+ modules, add it to this list.
 
-1. **Preauth hash excludes success response** ✅ -- The final SESSION_SETUP response (STATUS_SUCCESS) is NOT included in the preauth hash. Including it produces wrong keys. See `session.rs`.
-2. **Compound partial failure** ✅ -- Standalone CLOSE issued when CREATE succeeds but a later op fails. See `tree.rs` compound methods.
-3. **Consecutive MessageIds** ✅ -- `send_request_with_credits()` advances MessageId by CreditCharge. See `connection.rs`.
-4. **Signing/encryption mutual exclusion** ✅ -- When encrypting, Signature is zeroed, AEAD provides auth. See `connection.rs` send/receive paths.
+1. **Preauth hash excludes success response** ✅ -- The final SESSION_SETUP response (STATUS_SUCCESS) is NOT included in
+   the preauth hash. Including it produces wrong keys. See `session.rs`.
+2. **Compound partial failure** ✅ -- Standalone CLOSE issued when CREATE succeeds but a later op fails. See `tree.rs`
+   compound methods.
+3. **Consecutive MessageIds** ✅ -- `send_request_with_credits()` advances MessageId by CreditCharge. See
+   `connection.rs`.
+4. **Signing/encryption mutual exclusion** ✅ -- When encrypting, Signature is zeroed, AEAD provides auth. See
+   `connection.rs` send/receive paths.
 5. **TCP framing is big-endian** ✅ -- 0x00 + 3-byte BE length. Only big-endian thing in SMB. See `transport/tcp.rs`.
-6. **STATUS_PENDING loop** ✅ -- `receive_response()` loops past interim responses, extracting credits. See `connection.rs`.
+6. **STATUS_PENDING loop** ✅ -- `receive_response()` loops past interim responses, extracting credits. See
+   `connection.rs`.
 7. **CANCEL two modes** ✅ -- `send_cancel()` handles sync (MessageId) and async (AsyncId + flag). See `connection.rs`.
-8. **Session expiry** ✅ -- `receive_response()` detects STATUS_NETWORK_SESSION_EXPIRED, returns `Error::SessionExpired`. Caller reconnects. See `connection.rs`.
-9. **Compound encryption wraps entire chain** ✅ -- One TRANSFORM_HEADER for concatenated compound. See `connection.rs` `send_compound()`.
-10. **STATUS_BUFFER_OVERFLOW** ✅ -- Accepted as partial success in QueryInfo responses via `is_success_or_partial()`. See `tree.rs`.
-11. **Oplock break notifications** ✅ -- Detected by MessageId 0xFFFF..., logged, skipped. See `connection.rs` receive loop.
+8. **Session expiry** ✅ -- `receive_response()` detects STATUS_NETWORK_SESSION_EXPIRED, returns `Error::SessionExpired`.
+   Caller reconnects. See `connection.rs`.
+9. **Compound encryption wraps entire chain** ✅ -- One TRANSFORM_HEADER for concatenated compound. See `connection.rs`
+   `send_compound()`.
+10. **STATUS_BUFFER_OVERFLOW** ✅ -- Accepted as partial success in QueryInfo responses via `is_success_or_partial()`.
+    See `tree.rs`.
+11. **Oplock break notifications** ✅ -- Detected by MessageId 0xFFFF..., logged, skipped. See `connection.rs` receive
+    loop.
 12. **NTLM MIC** ✅ -- Computed when MsvAvTimestamp present, using retained raw bytes. See `auth/ntlm.rs`.
 
 ## Testing
@@ -176,32 +206,35 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 
 12 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
-| Container | Port | What it tests |
-|-----------|------|---------------|
-| smb-guest | 10445 | Guest access, basic operations |
-| smb-auth | 10446 | NTLM authentication |
-| smb-signing | 10447 | Mandatory signing (server rejects unsigned) |
-| smb-readonly | 10448 | Write/delete return clean NTSTATUS errors |
-| smb-ancient | 10449 | SMB1 only, clean protocol rejection |
-| smb-flaky | 10450 | 5s up / 5s down, reconnect behavior |
-| smb-slow | 10451 | 200ms latency, pipelining under delay |
-| smb-encryption | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1) |
-| smb-50shares | 10453 | 50 shares, RPC enumeration at scale |
-| smb-maxreadsize | 10454 | 64 KB max read/write, chunking edge cases |
+| Container             | Port  | What it tests                                 |
+|-----------------------|-------|-----------------------------------------------|
+| smb-guest             | 10445 | Guest access, basic operations                |
+| smb-auth              | 10446 | NTLM authentication                           |
+| smb-signing           | 10447 | Mandatory signing (server rejects unsigned)   |
+| smb-readonly          | 10448 | Write/delete return clean NTSTATUS errors     |
+| smb-ancient           | 10449 | SMB1 only, clean protocol rejection           |
+| smb-flaky             | 10450 | 5s up / 5s down, reconnect behavior           |
+| smb-slow              | 10451 | 200ms latency, pipelining under delay         |
+| smb-encryption        | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1) |
+| smb-50shares          | 10453 | 50 shares, RPC enumeration at scale           |
+| smb-maxreadsize       | 10454 | 64 KB max read/write, chunking edge cases     |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
 
 ### Tested hardware
 
 Integration tests (`tests/integration.rs`) run against real hardware:
+
 - QNAP TS-464 NAS (SMB 3.1.1, NTLM auth, AES-GMAC signing)
 - Raspberry Pi 4 Model B (SMB 3.1.1, guest access)
 
 ## Module docs (CLAUDE.md files)
 
-Each module has a colocated `CLAUDE.md` with architecture, decisions, and gotchas. These are auto-discovered by Claude Code.
+Each module has a colocated `CLAUDE.md` with architecture, decisions, and gotchas. These are auto-discovered by Claude
+Code.
 
 **Before modifying a module:** Read its CLAUDE.md.
-**After modifying a module:** Update its CLAUDE.md if you changed architecture, added decisions, or discovered new gotchas. Keep them current.
+**After modifying a module:** Update its CLAUDE.md if you changed architecture, added decisions, or discovered new
+gotchas. Keep them current.
 
 ```
 src/client/CLAUDE.md    # SmbClient, Connection, compound, pipelining
@@ -212,12 +245,13 @@ src/auth/CLAUDE.md      # NTLM, MIC, session key derivation
 src/rpc/CLAUDE.md       # RPC-over-pipes, NDR, share enumeration
 src/pack/CLAUDE.md      # Cursors, GUID, FileTime, MAX_UNPACK_BUFFER
 src/types/CLAUDE.md     # Newtypes, enums, bitflags, NtStatus
-tests/CLAUDE.md         # Test categories, how to run, writing new tests
+tests/CLAUDE.md         # Test categories, how to run, writing new tests, AWS access for Kerberos testing
 ```
 
 ## Code style
 
-Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `cargo doc --no-deps`.
+Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and
+`cargo doc --no-deps`.
 
 - `#![forbid(unsafe_code)]`: no unsafe
 - `#![warn(missing_docs)]`: doc comments for public APIs
@@ -227,17 +261,18 @@ Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy
 
 ## Logging
 
-The crate uses `log` (a facade) for structured logging. The application picks the backend (for example, `env_logger`, `tracing`).
+The crate uses `log` (a facade) for structured logging. The application picks the backend (for example, `env_logger`,
+`tracing`).
 
 **Log levels:**
 
-| Level   | Use for                                                                      | Examples                                                  |
-|---------|-----------------------------------------------------------------------------|-----------------------------------------------------------|
-| `info`  | Major lifecycle events users care about                                      | Connected, negotiated dialect, session established, tree connected/disconnected |
-| `debug` | Protocol details useful for debugging                                        | Negotiate params, session setup rounds, signing activation, credit changes, each request/response |
-| `trace` | Very verbose, byte-level                                                     | Raw message sizes, signature bytes (first 4), nonce values, preauth hash updates, TCP framing, individual directory entries |
-| `warn`  | Unexpected but recoverable                                                   | Signature verification skipped, credit starvation, retryable errors |
-| `error` | Should not happen during normal operation                                    | Protocol violations, decryption/signature failures, connection drops |
+| Level   | Use for                                   | Examples                                                                                                                    |
+|---------|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| `info`  | Major lifecycle events users care about   | Connected, negotiated dialect, session established, tree connected/disconnected                                             |
+| `debug` | Protocol details useful for debugging     | Negotiate params, session setup rounds, signing activation, credit changes, each request/response                           |
+| `trace` | Very verbose, byte-level                  | Raw message sizes, signature bytes (first 4), nonce values, preauth hash updates, TCP framing, individual directory entries |
+| `warn`  | Unexpected but recoverable                | Signature verification skipped, credit starvation, retryable errors                                                         |
+| `error` | Should not happen during normal operation | Protocol violations, decryption/signature failures, connection drops                                                        |
 
 **How to enable:**
 
@@ -245,13 +280,16 @@ The crate uses `log` (a facade) for structured logging. The application picks th
 RUST_LOG=smb2=debug cargo test --test integration -- --ignored
 ```
 
-**Security rule:** Never log passwords, session keys, signing keys, or full signatures. At most log key lengths and the first four bytes of signatures for correlation.
+**Security rule:** Never log passwords, session keys, signing keys, or full signatures. At most log key lengths and the
+first four bytes of signatures for correlation.
 
-**Backend note:** `log` is a facade. This crate does NOT depend on any specific backend. Applications using smb2 pick their own (for example, `env_logger`). The `env_logger` dev-dependency is only used in integration tests.
+**Backend note:** `log` is a facade. This crate does NOT depend on any specific backend. Applications using smb2 pick
+their own (for example, `env_logger`). The `env_logger` dev-dependency is only used in integration tests.
 
 ## Spec files
 
-Agents MUST read the actual spec files, not work from memory. Protocol specs are dense and full of edge cases that are easy to get wrong.
+Agents MUST read the actual spec files, not work from memory. Protocol specs are dense and full of edge cases that are
+easy to get wrong.
 
 - Implementation plan: `docs/specs/implementation-plan.md`
 - MS-SMB2 spec: `related-repos/openspecs/skills/windows-protocols/MS-SMB2/MS-SMB2.md`
@@ -267,3 +305,4 @@ Agents MUST read the actual spec files, not work from memory. Protocol specs are
 - [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/): primary reference
 - [mtp-rs](https://github.com/vdavid/mtp-rs): architecture template
 - [smb-rs](https://github.com/oll3/smb-rs): reference implementation, sanity check only
+- [docs/releasing.md](docs/releasing.md) — how to publish a new version to crates.io

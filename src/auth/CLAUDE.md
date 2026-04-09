@@ -100,3 +100,9 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **TGS-REP key usage ambiguity (Kerberos)**: RFC 4120 says key usage 8 for TGS-REP encrypted with session key, but some KDCs use 9. The authenticator tries 8 first, falls back to 9.
 - **KDC_ERR_PREAUTH_REQUIRED handling (Kerberos)**: First AS-REQ without pre-auth gets error 25. The authenticator extracts supported etypes from the e-data (ETYPE-INFO2) and retries with pre-authentication.
 - **DER parsing duplicated (Kerberos)**: `authenticator.rs` has its own minimal DER helpers to avoid depending on `messages.rs` internals. Some duplication, but keeps the module self-contained.
+
+## Known tech debt (Kerberos)
+
+- DER helpers duplicated between `spnego.rs` and `kerberos/messages.rs`
+- `kerberos/authenticator.rs` mixes crypto wrappers with protocol flow (700+ lines) — could be split
+- `#![allow(rustdoc::broken_intra_doc_links)]` hack in `kerberos/messages.rs`
