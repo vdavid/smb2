@@ -1,3 +1,6 @@
+// ASN.1 context tags like [0], [1] in doc comments trigger rustdoc warnings.
+#![allow(rustdoc::broken_intra_doc_links)]
+
 //! Kerberos ASN.1/DER message encoding and decoding.
 //!
 //! Hand-rolled ASN.1/DER for the specific Kerberos message structures needed
