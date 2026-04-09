@@ -617,17 +617,20 @@ impl Tree {
         })
     }
 
-    /// Rename or move a file within the same share.
+    /// Rename or move a file within the same share using a compound request (1 round-trip).
     ///
-    /// Opens the source file, issues a SET_INFO with
-    /// `FileRenameInformation`, then closes the handle.
+    /// Sends CREATE + SET_INFO (FileRenameInformation) + CLOSE as a single
+    /// compound message.
     pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
         let from_normalized = normalize_path(from);
         let to_normalized = normalize_path(to);
-        debug!("tree: rename from={} to={}", from_normalized, to_normalized);
+        debug!(
+            "tree: rename (compound) from={} to={}",
+            from_normalized, to_normalized
+        );
 
-        // Open the source file with DELETE access (required for rename).
-        let req = CreateRequest {
+        // Build CREATE request with DELETE access (required for rename).
+        let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
             desired_access: FileAccessMask::new(
@@ -645,31 +648,73 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
-            .await?;
+        // Build SET_INFO request with FileRenameInformation and sentinel FileId.
+        let setinfo_req = SetInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_RENAME_INFORMATION,
+            additional_information: 0,
+            file_id: FileId::SENTINEL,
+            buffer: build_rename_info_buffer(&to_normalized),
+        };
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
+        // Build CLOSE request with sentinel FileId.
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
 
-        if resp_header.status != NtStatus::SUCCESS {
+        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
+            (Command::Create, &create_req, CreditCharge(1)),
+            (Command::SetInfo, &setinfo_req, CreditCharge(1)),
+            (Command::Close, &close_req, CreditCharge(1)),
+        ];
+
+        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+        let responses = conn.receive_compound().await?;
+
+        if responses.len() != 3 {
+            return Err(Error::invalid_data(format!(
+                "expected 3 compound responses, got {}",
+                responses.len()
+            )));
+        }
+
+        let (create_header, create_body) = &responses[0];
+        let (setinfo_header, _setinfo_body) = &responses[1];
+        let (close_header, _close_body) = &responses[2];
+
+        // If CREATE failed, all ops cascade. No handle to clean up.
+        if create_header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: create_header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
-        let create_resp = CreateResponse::unpack(&mut cursor)?;
-        let file_id = create_resp.file_id;
+        // CREATE succeeded. If SET_INFO failed, CLOSE also cascaded.
+        // Issue standalone CLOSE to avoid leaking the handle.
+        if setinfo_header.status != NtStatus::SUCCESS {
+            let mut cursor = ReadCursor::new(create_body);
+            let create_resp = CreateResponse::unpack(&mut cursor)?;
+            warn!(
+                "tree: compound SET_INFO failed ({:?}), issuing standalone CLOSE",
+                setinfo_header.status
+            );
+            let _ = self.close_handle(conn, create_resp.file_id).await;
+            return Err(Error::Protocol {
+                status: setinfo_header.status,
+                command: Command::SetInfo,
+            });
+        }
 
-        // Build FileRenameInformation buffer.
-        let rename_result = self.set_rename_info(conn, file_id, &to_normalized).await;
+        // Check CLOSE response (non-fatal if it failed, rename already done).
+        if close_header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: compound CLOSE returned {:?} (non-fatal, rename already done)",
+                close_header.status,
+            );
+        }
 
-        // Close regardless.
-        let close_result = self.close_handle(conn, file_id).await;
-
-        rename_result?;
-        close_result?;
         info!(
             "tree: renamed from={} to={}",
             from_normalized, to_normalized
@@ -1833,54 +1878,6 @@ impl Tree {
         })
     }
 
-    /// Issue a SET_INFO with FileRenameInformation to rename a file.
-    async fn set_rename_info(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-        new_name: &str,
-    ) -> Result<()> {
-        // Build FileRenameInformation (MS-FSCC 2.4.34.2):
-        // - ReplaceIfExists (1 byte)
-        // - Reserved (7 bytes)
-        // - RootDirectory (8 bytes, 0 = same volume)
-        // - FileNameLength (4 bytes)
-        // - FileName (variable, UTF-16LE)
-        let name_u16: Vec<u16> = new_name.encode_utf16().collect();
-        let name_byte_len = name_u16.len() * 2;
-
-        let mut buffer = Vec::with_capacity(20 + name_byte_len);
-        buffer.push(0); // ReplaceIfExists = false
-        buffer.extend_from_slice(&[0u8; 7]); // Reserved
-        buffer.extend_from_slice(&0u64.to_le_bytes()); // RootDirectory
-        buffer.extend_from_slice(&(name_byte_len as u32).to_le_bytes()); // FileNameLength
-        for &u in &name_u16 {
-            buffer.extend_from_slice(&u.to_le_bytes());
-        }
-
-        let req = SetInfoRequest {
-            info_type: InfoType::File,
-            file_info_class: FILE_RENAME_INFORMATION,
-            additional_information: 0,
-            file_id,
-            buffer,
-        };
-
-        let (_, _) = conn
-            .send_request(Command::SetInfo, &req, Some(self.tree_id))
-            .await?;
-
-        let (resp_header, _, _) = conn.receive_response().await?;
-        if resp_header.status != NtStatus::SUCCESS {
-            return Err(Error::Protocol {
-                status: resp_header.status,
-                command: Command::SetInfo,
-            });
-        }
-
-        Ok(())
-    }
-
     /// Write data to a file in chunks.
     ///
     /// Kept for potential future use by callers that need per-chunk control
@@ -1932,6 +1929,22 @@ impl Tree {
 
         Ok(total_written)
     }
+}
+
+/// Build a FileRenameInformation buffer (MS-FSCC 2.4.34.2).
+fn build_rename_info_buffer(new_name: &str) -> Vec<u8> {
+    let name_u16: Vec<u16> = new_name.encode_utf16().collect();
+    let name_byte_len = name_u16.len() * 2;
+
+    let mut buf = Vec::with_capacity(20 + name_byte_len);
+    buf.push(0); // ReplaceIfExists = false
+    buf.extend_from_slice(&[0u8; 7]); // Reserved
+    buf.extend_from_slice(&0u64.to_le_bytes()); // RootDirectory
+    buf.extend_from_slice(&(name_byte_len as u32).to_le_bytes()); // FileNameLength
+    for &u in &name_u16 {
+        buf.extend_from_slice(&u.to_le_bytes());
+    }
+    buf
 }
 
 /// Normalize a file path: convert `/` to `\` and strip leading `\`.
@@ -2576,17 +2589,19 @@ mod tests {
     // ── Rename tests ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn rename_sends_create_setinfo_close() {
+    async fn rename_sends_compound_create_setinfo_close() {
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId {
             persistent: 0x11,
             volatile: 0x22,
         };
 
-        // RENAME = CREATE + SET_INFO + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
-        mock.queue_response(build_set_info_response());
-        mock.queue_response(build_close_response());
+        // RENAME = compound CREATE + SET_INFO + CLOSE
+        let create_resp = build_create_response(file_id, 0);
+        let setinfo_resp = build_set_info_response();
+        let close_resp = build_close_response();
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
+        mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -2597,7 +2612,9 @@ mod tests {
         };
 
         tree.rename(&mut conn, "old.txt", "new.txt").await.unwrap();
-        assert_eq!(mock.sent_count(), 3);
+
+        // One compound frame sent.
+        assert_eq!(mock.sent_count(), 1);
 
         // Verify the CREATE has DELETE access (required for rename)
         let sent = mock.sent_message(0).unwrap();
@@ -2605,6 +2622,124 @@ mod tests {
         let _header = Header::unpack(&mut cursor).unwrap();
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert!(req.desired_access.contains(FileAccessMask::DELETE));
+    }
+
+    #[tokio::test]
+    async fn rename_create_failure_returns_error() {
+        let mock = Arc::new(MockTransport::new());
+
+        // Build compound response where CREATE fails.
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_resp = pack_message(
+            &create_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut setinfo_hdr = Header::new_request(Command::SetInfo);
+        setinfo_hdr.flags.set_response();
+        setinfo_hdr.credits = 32;
+        setinfo_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let setinfo_resp = pack_message(
+            &setinfo_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let close_resp = pack_message(
+            &close_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.rename(&mut conn, "old.txt", "new.txt").await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().status(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        // Only the one compound frame, no standalone CLOSE needed.
+        assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rename_setinfo_failure_issues_standalone_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+
+        // Compound: CREATE succeeds, SET_INFO fails, CLOSE cascades failure.
+        let create_resp = build_create_response(file_id, 0);
+
+        let mut setinfo_hdr = Header::new_request(Command::SetInfo);
+        setinfo_hdr.flags.set_response();
+        setinfo_hdr.credits = 32;
+        setinfo_hdr.status = NtStatus::UNSUCCESSFUL;
+        let setinfo_resp = pack_message(
+            &setinfo_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::UNSUCCESSFUL;
+        let close_resp = pack_message(
+            &close_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
+        mock.queue_response(frame);
+
+        // Queue response for the standalone CLOSE retry.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.rename(&mut conn, "old.txt", "new.txt").await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status(), Some(NtStatus::UNSUCCESSFUL));
+        // Compound frame + standalone CLOSE = 2 messages sent.
+        assert_eq!(mock.sent_count(), 2);
     }
 
     // ── Create directory tests ───────────────────────────────────────
