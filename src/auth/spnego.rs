@@ -24,9 +24,17 @@ pub const OID_NTLMSSP: &[u8] = &[
     0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
 ];
 
-/// Kerberos OID: 1.2.840.113554.1.2.2
+/// Kerberos OID: 1.2.840.113554.1.2.2 (standard, RFC 4121)
 pub const OID_KERBEROS: &[u8] = &[
     0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+];
+
+/// Microsoft Kerberos OID: 1.2.840.48018.1.2.2 (MS-KILE, used by Windows SPNEGO)
+///
+/// Windows expects this OID as the primary mechanism in SPNEGO NegTokenInit.
+/// Using the standard Kerberos OID causes Windows to reject the AP-REQ.
+pub const OID_MS_KERBEROS: &[u8] = &[
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02,
 ];
 
 // ---------------------------------------------------------------------------

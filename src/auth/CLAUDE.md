@@ -101,6 +101,15 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **KDC_ERR_PREAUTH_REQUIRED handling (Kerberos)**: First AS-REQ without pre-auth gets error 25. The authenticator extracts supported etypes from the e-data (ETYPE-INFO2) and retries with pre-authentication.
 - **DER parsing duplicated (Kerberos)**: `authenticator.rs` has its own minimal DER helpers to avoid depending on `messages.rs` internals. Some duplication, but keeps the module self-contained.
 
+## Kerberos key design decisions (from end-to-end testing)
+
+- **MS Kerberos OID (`1.2.840.48018.1.2.2`)**: Windows AD requires the Microsoft Kerberos OID in SPNEGO NegTokenInit, not the standard RFC 4120 OID. Both are included in mechTypes, with MS OID first.
+- **Key usage 11 for SPNEGO AP-REQ Authenticator**: Standard RFC 4120 uses key usage 7 for AP-REQ Authenticator encryption. Windows expects key usage 11 when the AP-REQ is wrapped in SPNEGO (per MS-KILE). Using 7 causes `KRB_AP_ERR_MODIFIED`.
+- **RC4 session keys**: Even when AES-256 is used for Kerberos exchanges, the TGS may return an RC4-HMAC session key (etype 23). The authenticator detects the actual etype from the TGS-REP and uses the correct decryption.
+- **Raw ticket pass-through**: The service ticket bytes must be sent to the SMB server exactly as received from the KDC. Re-encoding the ticket from parsed fields produces different DER and causes `KRB_AP_ERR_MODIFIED`. The `Ticket` struct carries `raw_bytes` for this.
+- **GSS-API wrapping**: The AP-REQ in SPNEGO NegTokenInit must include the GSS-API OID header (`0x60 len OID ap-req`), not just the raw AP-REQ bytes.
+- **Mutual auth handling**: Windows AD returns `STATUS_MORE_PROCESSING_REQUIRED` with an SPNEGO `AcceptIncomplete` containing an AP-REP. The client processes the AP-REP but does NOT send a second SESSION_SETUP (Windows returns `STATUS_INVALID_PARAMETER` if you do).
+
 ## Known tech debt (Kerberos)
 
 - DER helpers duplicated between `spnego.rs` and `kerberos/messages.rs`

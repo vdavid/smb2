@@ -23,7 +23,7 @@ use crate::auth::kerberos::messages::{
     encode_tgs_req_body, parse_enc_kdc_rep_part, parse_kdc_rep, parse_krb_error, EncryptedData,
     PaData, PrincipalName, Ticket,
 };
-use crate::auth::spnego::{wrap_neg_token_init, OID_KERBEROS, OID_NTLMSSP};
+use crate::auth::spnego::{wrap_neg_token_init, OID_KERBEROS, OID_MS_KERBEROS};
 use crate::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -36,8 +36,16 @@ const KEY_USAGE_PA_ENC_TIMESTAMP: u32 = 1;
 /// Key usage for AS-REP EncKDCRepPart decryption.
 const KEY_USAGE_AS_REP_ENC_PART: u32 = 3;
 
-/// Key usage for AP-REQ Authenticator encryption.
+/// Key usage for AP-REQ Authenticator encryption (standard, RFC 4120).
+///
+/// Used for the PA-TGS-REQ authenticator in TGS exchanges.
 const KEY_USAGE_AP_REQ_AUTHENTICATOR: u32 = 7;
+
+/// Key usage for AP-REQ Authenticator encryption (MS-KILE/SPNEGO).
+///
+/// Windows servers expect key usage 11 for the AP-REQ Authenticator
+/// in SPNEGO-wrapped SMB SESSION_SETUP exchanges. Impacket uses this.
+const KEY_USAGE_AP_REQ_AUTHENTICATOR_SPNEGO: u32 = 11;
 
 /// Key usage for TGS-REP EncKDCRepPart decryption (sub-session key).
 ///
@@ -380,7 +388,10 @@ impl KerberosAuthenticator {
         };
 
         let nonce = generate_nonce();
-        let etypes = [self.etype];
+        // Request RC4-HMAC for the TGS session key. Windows KDCs assign
+        // the session key type from the TGS-REQ etypes list, and RC4 (16
+        // bytes) is what Windows SMB expects for the session key.
+        let etypes = [EncryptionType::Rc4Hmac];
 
         // Build the KDC-REQ-BODY first, so we can compute a checksum
         // over it for the Authenticator (required per RFC 4120 section 7.2.2).
@@ -425,7 +436,7 @@ impl KerberosAuthenticator {
             cipher: encrypted_authenticator,
         };
 
-        let tgt_ap_req = encode_ap_req(&tgt, &authenticator_enc_data);
+        let tgt_ap_req = encode_ap_req(&tgt, &authenticator_enc_data, false);
 
         let tgs_req = encode_tgs_req(realm, &sname, nonce, &etypes, &tgt_ap_req);
         let response = send_to_kdc(kdc_config, &tgs_req).await?;
@@ -444,6 +455,16 @@ impl KerberosAuthenticator {
 
         // Parse TGS-REP (APPLICATION [13] = 0x6d).
         let tgs_rep = parse_kdc_rep(&response)?;
+        debug!(
+            "kerberos: TGS-REP ticket etype={}, kvno={:?}, cipher_len={}",
+            tgs_rep.ticket.enc_part.etype,
+            tgs_rep.ticket.enc_part.kvno,
+            tgs_rep.ticket.enc_part.cipher.len()
+        );
+        debug!(
+            "kerberos: TGS-REP enc-part etype={}, kvno={:?}",
+            tgs_rep.enc_part.etype, tgs_rep.enc_part.kvno
+        );
         if tgs_rep.msg_type != 13 {
             return Err(Error::invalid_data(format!(
                 "Kerberos: expected TGS-REP (msg_type 13), got {}",
@@ -478,6 +499,26 @@ impl KerberosAuthenticator {
             enc_kdc_rep.key.keytype,
             enc_kdc_rep.key.keyvalue.len()
         );
+
+        // Log ticket raw bytes info.
+        debug!(
+            "kerberos: service ticket has raw_bytes={}, raw_len={:?}",
+            tgs_rep.ticket.raw_bytes.is_some(),
+            tgs_rep.ticket.raw_bytes.as_ref().map(|b| b.len())
+        );
+
+        // Use the session key's actual etype for Authenticator encryption.
+        let tgs_key_etype = match enc_kdc_rep.key.keytype {
+            18 => EncryptionType::Aes256CtsHmacSha196,
+            17 => EncryptionType::Aes128CtsHmacSha196,
+            23 => EncryptionType::Rc4Hmac,
+            other => {
+                return Err(Error::Auth {
+                    message: format!("TGS session key has unsupported etype {other}"),
+                });
+            }
+        };
+        self.etype = tgs_key_etype;
 
         self.service_ticket = Some(tgs_rep.ticket);
         self.tgs_session_key = Some(enc_kdc_rep.key.keyvalue.clone());
@@ -518,25 +559,18 @@ impl KerberosAuthenticator {
         // Build and encrypt the Authenticator.
         let (ctime, cusec) = current_kerberos_time();
 
-        // Include a subkey in the authenticator. The subkey becomes the
-        // session key for the SMB session when the server accepts it.
-        // Generate a random subkey of the appropriate size.
-        let subkey = generate_random_key(self.etype);
-        let subkey_type = self.etype as i32;
-
+        // Minimal Authenticator: no subkey, no seq-number, no checksum.
+        // This matches impacket's working implementation. Windows accepts
+        // this minimal format for SMB Kerberos authentication.
         let authenticator_plain = encode_authenticator(
-            realm,
-            &cname,
-            &ctime,
-            cusec,
-            Some((&subkey, subkey_type)),
-            Some(generate_nonce()),
-            None,
+            realm, &cname, &ctime, cusec, None, // no subkey
+            None, // no seq-number
+            None, // no checksum
         );
 
         let encrypted_authenticator = kerberos_encrypt(
             &tgs_session_key,
-            KEY_USAGE_AP_REQ_AUTHENTICATOR,
+            KEY_USAGE_AP_REQ_AUTHENTICATOR_SPNEGO,
             &authenticator_plain,
             self.etype,
         );
@@ -547,14 +581,140 @@ impl KerberosAuthenticator {
             cipher: encrypted_authenticator,
         };
 
-        let ap_req = encode_ap_req(&service_ticket, &authenticator_enc_data);
+        let ap_req = encode_ap_req(&service_ticket, &authenticator_enc_data, false);
 
-        // Wrap in SPNEGO NegTokenInit with Kerberos OID (preferred) and NTLM OID.
-        let spnego_token = wrap_neg_token_init(&[OID_KERBEROS, OID_NTLMSSP], &ap_req);
+        // Wrap the AP-REQ in a Kerberos GSS-API initial context token
+        // (RFC 1964): APPLICATION [0] { OID, 0x0100, AP-REQ }.
+        // Windows SPNEGO expects this wrapping in the NegTokenInit mechToken.
+        let gss_mech_token = {
+            // Standard Kerberos OID 1.2.840.113554.1.2.2 (for GSS inner token)
+            let oid_bytes: &[u8] = &OID_KERBEROS[2..]; // skip tag+length
+            let mut inner = Vec::new();
+            inner.push(0x06); // OID tag
+            inner.push(oid_bytes.len() as u8);
+            inner.extend_from_slice(oid_bytes);
+            inner.extend_from_slice(&[0x01, 0x00]); // KRB_AP_REQ token ID
+            inner.extend_from_slice(&ap_req);
 
-        // Update the session key to the subkey (the server will use this).
-        self.session_key = Some(subkey);
+            let mut token = Vec::new();
+            token.push(0x60); // APPLICATION [0]
+            if inner.len() < 128 {
+                token.push(inner.len() as u8);
+            } else if inner.len() < 256 {
+                token.push(0x81);
+                token.push(inner.len() as u8);
+            } else {
+                token.push(0x82);
+                token.push((inner.len() >> 8) as u8);
+                token.push((inner.len() & 0xff) as u8);
+            }
+            token.extend_from_slice(&inner);
+            token
+        };
+
+        // Wrap in SPNEGO NegTokenInit with MS Kerberos OID.
+        let spnego_token = wrap_neg_token_init(&[OID_MS_KERBEROS], &gss_mech_token);
+
+        // The SMB session key is the TGS session key.
+        self.session_key = Some(tgs_session_key);
         self.ap_req_bytes = Some(spnego_token);
+
+        Ok(())
+    }
+
+    /// Process the server's mutual authentication token from SPNEGO.
+    ///
+    /// The token may be GSS-API wrapped. After unwrapping, the 2-byte token ID
+    /// tells us what it is:
+    /// - `02 00`: AP-REP — contains optional server subkey
+    /// - `03 00`: KRB-ERROR — logged but not fatal (session may still be valid)
+    pub fn process_mutual_auth_token(&mut self, token_bytes: &[u8]) -> Result<()> {
+        use crate::auth::kerberos::messages::{
+            parse_ap_rep, parse_enc_ap_rep_part, parse_krb_error,
+        };
+
+        // Unwrap GSS-API APPLICATION [0] wrapper if present.
+        let inner = if !token_bytes.is_empty() && token_bytes[0] == 0x60 {
+            // Skip APPLICATION [0] header + OID
+            let (_, gss_inner, _) =
+                crate::auth::kerberos::messages::parse_gss_api_wrapper(token_bytes)?;
+            gss_inner
+        } else {
+            token_bytes.to_vec()
+        };
+
+        if inner.len() < 2 {
+            return Err(Error::invalid_data("Kerberos: mutual auth token too short"));
+        }
+
+        let token_id = [inner[0], inner[1]];
+        let krb_data = &inner[2..];
+
+        match token_id {
+            [0x02, 0x00] => {
+                // AP-REP
+                debug!("kerberos: processing AP-REP from server");
+                let ap_rep = parse_ap_rep(krb_data)?;
+
+                const KEY_USAGE_AP_REP_ENC_PART: u32 = 12;
+                let current_key = self.session_key.as_ref().ok_or_else(|| Error::Auth {
+                    message: "No session key available to decrypt AP-REP".to_string(),
+                })?;
+
+                let etype = match ap_rep.enc_part.etype {
+                    18 => EncryptionType::Aes256CtsHmacSha196,
+                    17 => EncryptionType::Aes128CtsHmacSha196,
+                    23 => EncryptionType::Rc4Hmac,
+                    other => {
+                        return Err(Error::Auth {
+                            message: format!("AP-REP: unsupported etype {other}"),
+                        })
+                    }
+                };
+
+                let plain = kerberos_decrypt(
+                    current_key,
+                    KEY_USAGE_AP_REP_ENC_PART,
+                    &ap_rep.enc_part.cipher,
+                    etype,
+                )?;
+
+                let enc_part = parse_enc_ap_rep_part(&plain)?;
+
+                if let Some(server_subkey) = enc_part.subkey {
+                    debug!(
+                        "kerberos: AP-REP server subkey, etype={}, len={}",
+                        server_subkey.keytype,
+                        server_subkey.keyvalue.len()
+                    );
+                    self.session_key = Some(server_subkey.keyvalue);
+                } else {
+                    debug!("kerberos: AP-REP has no server subkey");
+                }
+            }
+            [0x03, 0x00] => {
+                // KRB-ERROR — the server's Kerberos layer reported an error,
+                // but the SMB session may still be valid. Log and continue.
+                match parse_krb_error(krb_data) {
+                    Ok(err) => {
+                        debug!(
+                            "kerberos: mutual auth KRB-ERROR code={}, realm={}, sname={:?}, e_text={:?}, e_data={:02x?}",
+                            err.error_code, err.realm, err.sname, err.e_text,
+                            err.e_data.as_deref().unwrap_or(&[])
+                        );
+                    }
+                    Err(e) => {
+                        debug!("kerberos: failed to parse KRB-ERROR in mutual auth: {}", e);
+                    }
+                }
+            }
+            _ => {
+                debug!(
+                    "kerberos: unexpected mutual auth token ID: {:02x} {:02x}",
+                    token_id[0], token_id[1]
+                );
+            }
+        }
 
         Ok(())
     }
@@ -1052,6 +1212,7 @@ fn generate_nonce() -> u32 {
 }
 
 /// Generate a random key of the appropriate size for the given etype.
+#[cfg(test)]
 fn generate_random_key(etype: EncryptionType) -> Vec<u8> {
     let key_size = match etype {
         EncryptionType::Aes256CtsHmacSha196 => 32,
@@ -1087,6 +1248,7 @@ mod tests {
         encode_ap_req, encode_as_req, encode_authenticator, encode_pa_enc_timestamp, EncryptedData,
         PrincipalName, Ticket,
     };
+    use crate::auth::spnego::OID_NTLMSSP;
 
     // ── Time formatting tests ────────────────────────────────────────
 
@@ -1357,6 +1519,7 @@ mod tests {
                 kvno: Some(1),
                 cipher: vec![0xDE, 0xAD, 0xBE, 0xEF],
             },
+            raw_bytes: None,
         };
 
         let session_key = generate_random_key(EncryptionType::Aes256CtsHmacSha196);
@@ -1389,7 +1552,7 @@ mod tests {
             cipher: encrypted_auth,
         };
 
-        let ap_req = encode_ap_req(&ticket, &auth_enc_data);
+        let ap_req = encode_ap_req(&ticket, &auth_enc_data, false);
 
         // AP-REQ should start with APPLICATION [14] = 0x6e.
         assert_eq!(ap_req[0], 0x6e, "AP-REQ should start with APPLICATION [14]");

@@ -283,8 +283,10 @@ impl Session {
 
     /// Perform Kerberos-based SESSION_SETUP.
     ///
-    /// Unlike NTLM (multi-round-trip), Kerberos authenticates against the
-    /// KDC first, then sends a single SPNEGO-wrapped AP-REQ in SESSION_SETUP.
+    /// Authenticates against the KDC first (AS + TGS), then sends the
+    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP. Handles both single-round
+    /// (STATUS_SUCCESS) and mutual-auth (STATUS_MORE_PROCESSING_REQUIRED)
+    /// flows.
     ///
     /// The session key comes from the Kerberos TGS exchange, not from the
     /// SMB server response.
@@ -309,18 +311,7 @@ impl Session {
             })?
             .to_vec();
 
-        let session_key = auth
-            .session_key()
-            .ok_or_else(|| Error::Auth {
-                message: "Kerberos authentication produced no session key".to_string(),
-            })?
-            .to_vec();
-
-        debug!(
-            "session: Kerberos auth complete, token_len={}, session_key_len={}",
-            token.len(),
-            session_key.len()
-        );
+        debug!("session: Kerberos auth complete, token_len={}", token.len(),);
 
         // Clone the preauth hasher for this session.
         let mut session_hasher = conn.preauth_hasher().clone();
@@ -337,9 +328,10 @@ impl Session {
 
         let (_, req_raw) = conn.send_request(Command::SessionSetup, &req, None).await?;
 
+        // Hash the request (same as NTLM round 1).
         session_hasher.update(&req_raw);
 
-        let (resp_header, resp_body, _resp_raw) = conn.receive_response().await?;
+        let (resp_header, resp_body, resp_raw) = conn.receive_response().await?;
 
         if resp_header.command != Command::SessionSetup {
             return Err(Error::invalid_data(format!(
@@ -348,10 +340,6 @@ impl Session {
             )));
         }
 
-        // Kerberos typically completes in one round-trip (STATUS_SUCCESS).
-        // Some servers may return STATUS_MORE_PROCESSING_REQUIRED for
-        // mutual authentication — handle that case by ignoring the
-        // server's token (we don't need mutual auth for SMB).
         if resp_header.status != NtStatus::SUCCESS
             && !resp_header.status.is_more_processing_required()
         {
@@ -361,11 +349,61 @@ impl Session {
             });
         }
 
+        // The server assigned a session ID.
         let session_id = resp_header.session_id;
         conn.set_session_id(session_id);
 
         let mut cursor = ReadCursor::new(&resp_body);
         let setup_resp = SessionSetupResponse::unpack(&mut cursor)?;
+
+        if resp_header.status.is_more_processing_required() {
+            debug!(
+                "session: Kerberos got MORE_PROCESSING_REQUIRED, session_id={}",
+                session_id
+            );
+
+            // Hash the response per MS-SMB2 3.2.5.3.1.
+            session_hasher.update(&resp_raw);
+
+            if !setup_resp.security_buffer.is_empty() {
+                let spnego_resp =
+                    crate::auth::spnego::parse_neg_token_resp(&setup_resp.security_buffer)?;
+                debug!(
+                    "session: SPNEGO state={:?}, has_token={}, supported_mech={:02x?}",
+                    spnego_resp.neg_state,
+                    spnego_resp.response_token.is_some(),
+                    spnego_resp.supported_mech.as_deref().unwrap_or(&[]),
+                );
+
+                if let Some(ref token_bytes) = spnego_resp.response_token {
+                    auth.process_mutual_auth_token(token_bytes)?;
+                }
+            }
+
+            // The server returns STATUS_INVALID_PARAMETER for any second
+            // SESSION_SETUP, meaning it considers the session established
+            // after the first round despite SPNEGO AcceptIncomplete.
+        }
+
+        // Get the session key AFTER processing the AP-REP (the server's
+        // subkey may have overridden ours).
+        //
+        // Per MS-SMB2 3.2.5.3: "Session.SessionKey MUST be set to the first
+        // 16 bytes of the cryptographic key queried from the GSS protocol."
+        let full_key = auth.session_key().ok_or_else(|| Error::Auth {
+            message: "Kerberos authentication produced no session key".to_string(),
+        })?;
+        let session_key = if full_key.len() > 16 {
+            full_key[..16].to_vec()
+        } else {
+            full_key.to_vec()
+        };
+
+        debug!(
+            "session: Kerberos session_key_len={} (truncated from {})",
+            session_key.len(),
+            full_key.len()
+        );
 
         // Determine signing algorithm.
         let signing_algorithm = algorithm_for_dialect(params.dialect, params.gmac_negotiated);

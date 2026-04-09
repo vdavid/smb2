@@ -1547,3 +1547,76 @@ async fn kerberos_auth_against_docker_kdc() {
     let _ = tree.delete_file(&mut conn, "krb_test.txt").await;
     let _ = tree.disconnect(&mut conn).await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn kerberos_auth_against_aws_windows_ad() {
+    let _ = env_logger::try_init();
+
+    load_dotenv();
+    let server_ip = std::env::var("SMB2_TEST_AWS_AD_IP")
+        .expect("SMB2_TEST_AWS_AD_IP not set (public IP of the Windows AD DC)");
+    let server_hostname = std::env::var("SMB2_TEST_AWS_AD_HOSTNAME").expect(
+        "SMB2_TEST_AWS_AD_HOSTNAME not set (computer name of the DC, e.g. EC2AMAZ-XXXXXXX)",
+    );
+
+    println!("Connecting to AWS Windows AD at {}...", server_ip);
+
+    // Connect to the Windows Server SMB port.
+    let mut conn = Connection::connect(&format!("{}:445", server_ip), Duration::from_secs(10))
+        .await
+        .expect("failed to connect to AWS Windows AD");
+
+    conn.negotiate().await.expect("negotiate failed");
+
+    let params = conn.params().unwrap();
+    println!("Negotiated dialect: {}", params.dialect);
+    println!("Max read size: {}", params.max_read_size);
+    println!("Signing required: {}", params.signing_required);
+    println!("Server GUID: {:?}", params.server_guid);
+
+    // Kerberos auth against the Windows AD KDC.
+    let credentials = smb2::KerberosCredentials {
+        username: "smbtest".to_string(),
+        password: "Kerberos!Test1".to_string(),
+        realm: "TEST.LOCAL".to_string(),
+        kdc_address: format!("{}:88", server_ip),
+    };
+
+    // Try both FQDN and short hostname for SPN.
+    let spn_hostname = std::env::var("SMB2_TEST_AWS_AD_SPN")
+        .unwrap_or_else(|_| format!("{}.test.local", server_hostname.to_lowercase()));
+    println!("Using SPN: cifs/{}", spn_hostname);
+
+    let session = Session::setup_kerberos(&mut conn, &credentials, &spn_hostname)
+        .await
+        .expect("Kerberos session setup failed");
+
+    println!("Kerberos session established: {}", session.session_id);
+    println!("Signing: {}", session.should_sign);
+
+    // Connect to the test share.
+    let tree = smb2::Tree::connect(&mut conn, "testshare")
+        .await
+        .expect("tree connect to testshare failed");
+
+    println!("Tree connected: {}", tree.tree_id);
+
+    // Write and read a file to verify the session works.
+    let test_data = b"Kerberos auth works on real Windows AD!";
+    tree.write_file(&mut conn, "krb_test.txt", test_data)
+        .await
+        .expect("write failed");
+
+    let read_back = tree
+        .read_file(&mut conn, "krb_test.txt")
+        .await
+        .expect("read failed");
+
+    assert_eq!(read_back, test_data);
+    println!("Kerberos auth verified: wrote and read file on Windows AD");
+
+    // Cleanup.
+    let _ = tree.delete_file(&mut conn, "krb_test.txt").await;
+    let _ = tree.disconnect(&mut conn).await;
+}

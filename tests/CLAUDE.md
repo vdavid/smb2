@@ -93,6 +93,8 @@ For Kerberos end-to-end testing, we use AWS EC2 to spin up a Windows Server with
 
 **Important:** Terminate instances when testing is done. David has billing guards but don't leave things running.
 
+**Test:** `kerberos_auth_against_aws_windows_ad` in `integration.rs` -- connects to a Windows AD DC, authenticates via Kerberos (AS + TGS + AP-REQ), establishes an SMB session, writes and reads a file. Requires env vars: `SMB2_TEST_AWS_AD_IP`, `SMB2_TEST_AWS_AD_HOSTNAME`, and optionally `SMB2_TEST_AWS_AD_SPN`. Tested successfully against Windows Server 2022 with AD DS (2026-04-09).
+
 ## Writing new tests
 
 - **Protocol correctness** (does our Pack/Unpack match the spec?): unit test with known byte sequences

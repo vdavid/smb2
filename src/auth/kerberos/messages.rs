@@ -48,6 +48,10 @@ pub struct Ticket {
     pub sname: PrincipalName,
     /// Encrypted part (opaque).
     pub enc_part: EncryptedData,
+    /// Raw DER bytes of the ticket as received from the KDC.
+    /// Used to pass the ticket through to the AP-REQ verbatim,
+    /// avoiding re-encoding which could corrupt the encrypted data.
+    pub raw_bytes: Option<Vec<u8>>,
 }
 
 /// Generic encrypted data envelope.
@@ -111,6 +115,23 @@ pub struct EncryptionKey {
     pub keytype: i32,
     /// Key value bytes.
     pub keyvalue: Vec<u8>,
+}
+
+/// Parsed AP-REP (APPLICATION [15]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApRep {
+    /// Encrypted part (to be decrypted with the session key or subkey).
+    pub enc_part: EncryptedData,
+}
+
+/// Parsed decrypted EncAPRepPart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncApRepPart {
+    /// Optional sub-session key from the server. If present, this overrides
+    /// the client's subkey as the session key for the application (SMB).
+    pub subkey: Option<EncryptionKey>,
+    /// Optional sequence number.
+    pub seq_number: Option<u32>,
 }
 
 /// Parsed KRB-ERROR message.
@@ -515,14 +536,23 @@ fn parse_encrypted_data(data: &[u8]) -> Result<EncryptedData, Error> {
 }
 
 /// Parse a Ticket from DER bytes (expects APPLICATION [1] wrapper).
+///
+/// Stores the raw DER bytes so the ticket can be passed through to the
+/// AP-REQ verbatim. Re-encoding the ticket from parsed fields can produce
+/// different DER bytes (e.g., different length encoding, field order), which
+/// corrupts the encrypted data and causes the server to fail decryption.
 pub fn parse_ticket(data: &[u8]) -> Result<Ticket, Error> {
-    let (tag, inner, _) = parse_der_tlv(data)?;
+    let (tag, inner, total_consumed) = parse_der_tlv(data)?;
     // APPLICATION [1] = 0x61
     if tag != 0x61 {
         return Err(Error::invalid_data(format!(
             "Kerberos: expected APPLICATION [1] (0x61) for Ticket, got 0x{tag:02x}"
         )));
     }
+
+    // Store raw bytes for verbatim pass-through.
+    let raw_bytes = data[..total_consumed].to_vec();
+
     let (seq_tag, seq_data, _) = parse_der_tlv(inner)?;
     if seq_tag != TAG_SEQUENCE {
         return Err(Error::invalid_data(format!(
@@ -550,6 +580,7 @@ pub fn parse_ticket(data: &[u8]) -> Result<Ticket, Error> {
         sname: sname.ok_or_else(|| Error::invalid_data("Kerberos: missing sname in Ticket"))?,
         enc_part: enc_part
             .ok_or_else(|| Error::invalid_data("Kerberos: missing enc-part in Ticket"))?,
+        raw_bytes: Some(raw_bytes),
     })
 }
 
@@ -628,7 +659,14 @@ pub fn encode_tgs_req(
 }
 
 /// Encode a KRB_AP_REQ message (APPLICATION [14]).
-pub fn encode_ap_req(ticket: &Ticket, encrypted_authenticator: &EncryptedData) -> Vec<u8> {
+///
+/// When `mutual_required` is true, sets the mutual-required bit (bit 2) in
+/// AP-OPTIONS, requesting the server to prove its identity via an AP-REP.
+pub fn encode_ap_req(
+    ticket: &Ticket,
+    encrypted_authenticator: &EncryptedData,
+    mutual_required: bool,
+) -> Vec<u8> {
     // AP-REQ ::= [APPLICATION 14] SEQUENCE {
     //   pvno       [0] INTEGER (5),
     //   msg-type   [1] INTEGER (14),
@@ -638,10 +676,18 @@ pub fn encode_ap_req(ticket: &Ticket, encrypted_authenticator: &EncryptedData) -
     // }
     let pvno = der_context(0, &der_integer(5));
     let msg_type = der_context(1, &der_integer(14));
-    let ap_options = der_context(2, &der_bit_string(&[0x00, 0x00, 0x00, 0x00], 0));
-    let ticket_enc = der_context(3, &encode_ticket(ticket));
+    // AP-OPTIONS: bit 2 = mutual-required (0x20 in the first byte).
+    let opts_byte0 = if mutual_required { 0x20 } else { 0x00 };
+    let ap_options = der_context(2, &der_bit_string(&[opts_byte0, 0x00, 0x00, 0x00], 0));
+    // Use raw ticket bytes if available (preserves exact DER encoding from KDC).
+    // Re-encoding can produce different bytes and corrupt the encrypted ticket.
+    let ticket_raw = ticket
+        .raw_bytes
+        .as_ref()
+        .map(|b| der_context(3, b))
+        .unwrap_or_else(|| der_context(3, &encode_ticket(ticket)));
     let authenticator = der_context(4, &encode_encrypted_data(encrypted_authenticator));
-    let seq = der_sequence(&[&pvno, &msg_type, &ap_options, &ticket_enc, &authenticator]);
+    let seq = der_sequence(&[&pvno, &msg_type, &ap_options, &ticket_raw, &authenticator]);
     der_application(14, &seq)
 }
 
@@ -903,6 +949,111 @@ pub fn parse_krb_error(data: &[u8]) -> Result<KrbError, Error> {
         e_text,
         e_data,
     })
+}
+
+/// Unwrap a GSS-API token: APPLICATION [0] { OID, inner-data }.
+///
+/// Returns the inner data after the OID as a `Vec<u8>`.
+pub fn parse_gss_api_wrapper(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), Error> {
+    let (tag, inner, total) = parse_der_tlv(data)?;
+    if tag != 0x60 {
+        return Err(Error::invalid_data(format!(
+            "Kerberos: expected GSS-API wrapper (0x60), got 0x{tag:02x}"
+        )));
+    }
+    // Skip the OID TLV.
+    let (_oid_tag, oid_data, oid_consumed) = parse_der_tlv(inner)?;
+    let oid = oid_data.to_vec();
+    let rest = inner[oid_consumed..].to_vec();
+    Ok((oid, rest, total))
+}
+
+/// Parse a KRB_AP_REP message (APPLICATION [15]).
+///
+/// Handles both bare AP-REP and GSS-API wrapped tokens (APPLICATION [0]
+/// containing an OID followed by the AP-REP).
+pub fn parse_ap_rep(data: &[u8]) -> Result<ApRep, Error> {
+    let (tag, inner, _) = parse_der_tlv(data)?;
+
+    // If wrapped in GSS-API APPLICATION [0], unwrap first.
+    let inner = if tag == 0x60 {
+        // APPLICATION [0] { OID, AP-REP }
+        // Skip the OID TLV to get to the AP-REP.
+        let (_oid_tag, _oid_data, oid_consumed) = parse_der_tlv(inner)?;
+        let ap_rep_data = &inner[oid_consumed..];
+        let (ap_tag, ap_inner, _) = parse_der_tlv(ap_rep_data)?;
+        if ap_tag != 0x6f {
+            return Err(Error::invalid_data(format!(
+                "Kerberos: expected AP-REP (0x6f) inside GSS wrapper, got 0x{ap_tag:02x}"
+            )));
+        }
+        ap_inner
+    } else if tag == 0x6f {
+        inner
+    } else {
+        return Err(Error::invalid_data(format!(
+            "Kerberos: expected APPLICATION [15] (0x6f) or GSS wrapper (0x60) for AP-REP, got 0x{tag:02x}"
+        )));
+    };
+    let (seq_tag, seq_data, _) = parse_der_tlv(inner)?;
+    if seq_tag != TAG_SEQUENCE {
+        return Err(Error::invalid_data(format!(
+            "Kerberos: expected SEQUENCE in AP-REP, got 0x{seq_tag:02x}"
+        )));
+    }
+    let fields = parse_sequence_fields(seq_data)?;
+
+    let mut enc_part = None;
+    for (ftag, fvalue) in &fields {
+        // [0] pvno — skip, [1] msg-type — skip
+        if ftag == &0xa2 {
+            enc_part = Some(parse_encrypted_data(fvalue)?);
+        }
+    }
+
+    Ok(ApRep {
+        enc_part: enc_part
+            .ok_or_else(|| Error::invalid_data("Kerberos: missing enc-part in AP-REP"))?,
+    })
+}
+
+/// Parse the decrypted EncAPRepPart (APPLICATION [27]).
+pub fn parse_enc_ap_rep_part(data: &[u8]) -> Result<EncApRepPart, Error> {
+    let (tag, inner, _) = parse_der_tlv(data)?;
+    // APPLICATION [27] = 0x7b, or bare SEQUENCE
+    let seq_data = match tag {
+        0x7b => {
+            let (seq_tag, seq_data, _) = parse_der_tlv(inner)?;
+            if seq_tag != TAG_SEQUENCE {
+                return Err(Error::invalid_data(format!(
+                    "Kerberos: expected SEQUENCE in EncAPRepPart, got 0x{seq_tag:02x}"
+                )));
+            }
+            seq_data
+        }
+        TAG_SEQUENCE => inner,
+        _ => {
+            return Err(Error::invalid_data(format!(
+                "Kerberos: expected APPLICATION [27] or SEQUENCE for EncAPRepPart, got 0x{tag:02x}"
+            )));
+        }
+    };
+
+    let fields = parse_sequence_fields(seq_data)?;
+
+    let mut subkey = None;
+    let mut seq_number = None;
+    for (ftag, fvalue) in &fields {
+        match ftag {
+            // [0] ctime — skip
+            // [1] cusec — skip
+            0xa2 => subkey = Some(parse_encryption_key(fvalue)?),
+            0xa3 => seq_number = Some(parse_der_integer_u32(fvalue)?),
+            _ => {}
+        }
+    }
+
+    Ok(EncApRepPart { subkey, seq_number })
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,7 +1382,7 @@ mod tests {
             kvno: None,
             cipher: vec![0xaa, 0xbb],
         };
-        let encoded = encode_ap_req(&ticket, &auth);
+        let encoded = encode_ap_req(&ticket, &auth, false);
         // APPLICATION [14] = 0x6e
         assert_eq!(encoded[0], 0x6e, "AP-REQ must start with APPLICATION [14]");
     }
@@ -1244,7 +1395,7 @@ mod tests {
             kvno: None,
             cipher: vec![0xaa, 0xbb],
         };
-        let encoded = encode_ap_req(&ticket, &auth);
+        let encoded = encode_ap_req(&ticket, &auth, false);
         // pvno=5: a0 03 02 01 05
         let pvno_pattern = [0xa0, 0x03, 0x02, 0x01, 0x05];
         assert!(
@@ -1424,7 +1575,14 @@ mod tests {
         let ticket = make_test_ticket();
         let encoded = encode_ticket(&ticket);
         let parsed = parse_ticket(&encoded).unwrap();
-        assert_eq!(parsed, ticket);
+        // Compare fields (raw_bytes differs: None vs Some).
+        assert_eq!(parsed.tkt_vno, ticket.tkt_vno);
+        assert_eq!(parsed.realm, ticket.realm);
+        assert_eq!(parsed.sname, ticket.sname);
+        assert_eq!(parsed.enc_part, ticket.enc_part);
+        // Parsed ticket should have raw_bytes.
+        assert!(parsed.raw_bytes.is_some());
+        assert_eq!(parsed.raw_bytes.as_ref().unwrap(), &encoded);
     }
 
     // -----------------------------------------------------------------------
@@ -1450,6 +1608,7 @@ mod tests {
                 kvno: Some(2),
                 cipher: vec![0xde, 0xad, 0xbe, 0xef],
             },
+            raw_bytes: None,
         }
     }
 
