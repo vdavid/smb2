@@ -1,10 +1,17 @@
-//! DFS referral IOCTL helper.
+//! DFS referral IOCTL helper and path resolver with referral cache.
 //!
 //! Sends `FSCTL_DFS_GET_REFERRALS` via IOCTL to resolve DFS paths. Connects
 //! to IPC$ for the IOCTL exchange, similar to how `shares.rs` does for RPC.
+//!
+//! The [`DfsResolver`] caches referral responses with TTL and resolves UNC
+//! paths using longest-prefix matching. All string comparisons are
+//! case-insensitive (DFS paths are case-insensitive per MS-DFSC).
 
 // Not yet called from non-test code (wired in a later step).
 #![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use log::debug;
 
@@ -168,6 +175,211 @@ async fn tree_disconnect(conn: &mut Connection, tree_id: TreeId) -> Result<()> {
 
     debug!("dfs: disconnected from IPC$");
     Ok(())
+}
+
+// ── DFS resolver types ───────────────────────────────────────────────
+
+/// A resolved DFS path ready for connection.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedPath {
+    /// Server hostname (or IP) to connect to.
+    pub server: String,
+    /// Port to connect on (default 445).
+    pub port: u16,
+    /// Share name to tree-connect.
+    pub share: String,
+    /// Remaining path within the share (may be empty).
+    pub remaining_path: String,
+}
+
+/// A single DFS target from a referral response.
+#[derive(Debug, Clone)]
+struct DfsTarget {
+    /// Server hostname from the network_address field.
+    server: String,
+    /// Share name from the network_address field.
+    share: String,
+    /// Any remaining path suffix from the network_address.
+    remaining_prefix: String,
+}
+
+/// A cached DFS referral entry with TTL.
+#[derive(Debug, Clone)]
+struct CachedReferral {
+    /// The DFS path prefix this referral covers (lowercase for matching).
+    dfs_path_prefix: String,
+    /// Available targets (first is preferred).
+    targets: Vec<DfsTarget>,
+    /// When this entry expires.
+    expires_at: Instant,
+}
+
+/// DFS referral cache and path resolver.
+///
+/// Maintains a cache of DFS referral responses keyed by path prefix.
+/// Resolves UNC paths by longest-prefix matching against the cache,
+/// falling back to an IOCTL referral request on cache miss.
+pub(crate) struct DfsResolver {
+    cache: HashMap<String, CachedReferral>,
+}
+
+impl DfsResolver {
+    /// Create a new empty resolver.
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Resolve a UNC path by checking the cache first, then querying the server.
+    ///
+    /// `unc_path` should be like `\\server\share\path\to\file`.
+    /// `conn` is the connection to the server that returned `STATUS_PATH_NOT_COVERED`.
+    pub async fn resolve(
+        &mut self,
+        conn: &mut Connection,
+        unc_path: &str,
+    ) -> Result<Vec<ResolvedPath>> {
+        // 1. Check cache (longest prefix match)
+        if let Some(resolved) = self.resolve_from_cache(unc_path) {
+            debug!("dfs: cache hit for {:?}", unc_path);
+            return Ok(resolved);
+        }
+
+        // 2. Send referral request.
+        // Convert \\server\share\path to \server\share\path (single leading
+        // backslash for the IOCTL).
+        let referral_path = if unc_path.starts_with("\\\\") {
+            &unc_path[1..] // strip one leading backslash
+        } else {
+            unc_path
+        };
+
+        debug!("dfs: cache miss, sending referral for {:?}", referral_path);
+        let resp = get_dfs_referral(conn, referral_path).await?;
+
+        // 3. Cache the result
+        self.cache_referral(&resp);
+
+        // 4. Resolve from the freshly cached entry
+        self.resolve_from_cache(unc_path).ok_or_else(|| {
+            Error::invalid_data("DFS referral response did not match the requested path")
+        })
+    }
+
+    /// Try to resolve a path from the cache. Returns `None` on cache miss or
+    /// expiry. Returns a `Vec` of [`ResolvedPath`]s (multiple targets for
+    /// failover).
+    pub(crate) fn resolve_from_cache(&self, unc_path: &str) -> Option<Vec<ResolvedPath>> {
+        let normalized = unc_path.to_lowercase().replace('/', "\\");
+
+        // Longest prefix match
+        let mut best_match: Option<&CachedReferral> = None;
+        for entry in self.cache.values() {
+            if normalized.starts_with(&entry.dfs_path_prefix)
+                && entry.expires_at > Instant::now()
+                && best_match.is_none_or(|b| entry.dfs_path_prefix.len() > b.dfs_path_prefix.len())
+            {
+                best_match = Some(entry);
+            }
+        }
+
+        let entry = best_match?;
+
+        // Strip the consumed prefix and build ResolvedPaths
+        let remaining = &normalized[entry.dfs_path_prefix.len()..];
+        let remaining = remaining.trim_start_matches('\\');
+
+        let resolved: Vec<ResolvedPath> = entry
+            .targets
+            .iter()
+            .map(|target| {
+                let full_remaining = if target.remaining_prefix.is_empty() {
+                    remaining.to_string()
+                } else if remaining.is_empty() {
+                    target.remaining_prefix.clone()
+                } else {
+                    format!("{}\\{}", target.remaining_prefix, remaining)
+                };
+
+                ResolvedPath {
+                    server: target.server.clone(),
+                    port: 445,
+                    share: target.share.clone(),
+                    remaining_path: full_remaining,
+                }
+            })
+            .collect();
+
+        Some(resolved)
+    }
+
+    /// Store a referral response in the cache.
+    fn cache_referral(&mut self, resp: &RespGetDfsReferral) {
+        if resp.entries.is_empty() {
+            return;
+        }
+
+        // Use the dfs_path from the first entry as the cache key.
+        // Normalize to lowercase backslash form with `\\` prefix (UNC canonical).
+        let mut dfs_path_prefix = resp.entries[0].dfs_path.to_lowercase().replace('/', "\\");
+        if !dfs_path_prefix.starts_with("\\\\") {
+            if let Some(stripped) = dfs_path_prefix.strip_prefix('\\') {
+                dfs_path_prefix = format!("\\\\{stripped}");
+            }
+        }
+
+        // Parse targets from entries
+        let targets: Vec<DfsTarget> = resp
+            .entries
+            .iter()
+            .filter_map(|e| parse_unc_target(&e.network_address))
+            .collect();
+
+        if targets.is_empty() {
+            return;
+        }
+
+        let ttl = resp.entries[0].ttl.max(1); // At least 1 second
+
+        debug!(
+            "dfs: caching {:?} with {} targets, ttl={}s",
+            dfs_path_prefix,
+            targets.len(),
+            ttl
+        );
+
+        self.cache.insert(
+            dfs_path_prefix.clone(),
+            CachedReferral {
+                dfs_path_prefix,
+                targets,
+                expires_at: Instant::now() + Duration::from_secs(ttl as u64),
+            },
+        );
+    }
+}
+
+/// Parse a UNC network_address into server, share, and remaining path.
+///
+/// Input: `\\server\share` or `\\server\share\path`.
+/// Returns `None` if the format is invalid.
+fn parse_unc_target(network_address: &str) -> Option<DfsTarget> {
+    let path = network_address.trim_start_matches('\\');
+    let mut parts = path.splitn(3, '\\');
+    let server = parts.next()?.to_string();
+    let share = parts.next()?.to_string();
+    let remaining_prefix = parts.next().unwrap_or("").to_string();
+
+    if server.is_empty() || share.is_empty() {
+        return None;
+    }
+
+    Some(DfsTarget {
+        server,
+        share,
+        remaining_prefix,
+    })
 }
 
 #[cfg(test)]
@@ -395,5 +607,204 @@ mod tests {
 
         // Should still send TreeDisconnect even after IOCTL error
         assert_eq!(mock.sent_count(), 3);
+    }
+
+    // ── parse_unc_target tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_unc_target_basic() {
+        let t = parse_unc_target(r"\\server\share").unwrap();
+        assert_eq!(t.server, "server");
+        assert_eq!(t.share, "share");
+        assert_eq!(t.remaining_prefix, "");
+    }
+
+    #[test]
+    fn parse_unc_target_with_path() {
+        let t = parse_unc_target(r"\\server\share\path\to").unwrap();
+        assert_eq!(t.server, "server");
+        assert_eq!(t.share, "share");
+        assert_eq!(t.remaining_prefix, r"path\to");
+    }
+
+    #[test]
+    fn parse_unc_target_invalid() {
+        assert!(parse_unc_target(r"\\").is_none());
+        assert!(parse_unc_target("").is_none());
+        assert!(parse_unc_target(r"\\server").is_none());
+        // Single backslash + server but no share
+        assert!(parse_unc_target(r"\server").is_none());
+    }
+
+    // ── DfsResolver tests ────────────────────────────────────────────
+
+    /// Helper: build a RespGetDfsReferral for cache tests.
+    fn make_referral(
+        dfs_path: &str,
+        entries: &[(&str, u32)], // (network_address, ttl)
+    ) -> RespGetDfsReferral {
+        use crate::msg::dfs::DfsReferralEntry;
+
+        let referral_entries: Vec<DfsReferralEntry> = entries
+            .iter()
+            .map(|(net_addr, ttl)| DfsReferralEntry {
+                version: 3,
+                server_type: 0,
+                referral_entry_flags: 0,
+                ttl: *ttl,
+                dfs_path: dfs_path.to_string(),
+                dfs_alternate_path: dfs_path.to_string(),
+                network_address: net_addr.to_string(),
+            })
+            .collect();
+
+        RespGetDfsReferral {
+            path_consumed: 0,
+            header_flags: 0,
+            entries: referral_entries,
+        }
+    }
+
+    #[test]
+    fn resolver_cache_hit() {
+        let mut resolver = DfsResolver::new();
+
+        let resp = make_referral(r"\domain\dfs\docs", &[(r"\\server1\share", 600)]);
+        resolver.cache_referral(&resp);
+
+        let result = resolver.resolve_from_cache(r"\\domain\dfs\docs\file.txt");
+        assert!(result.is_some());
+        let paths = result.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].server, "server1");
+        assert_eq!(paths[0].share, "share");
+        assert_eq!(paths[0].port, 445);
+        assert_eq!(paths[0].remaining_path, "file.txt");
+    }
+
+    #[test]
+    fn resolver_cache_miss() {
+        let resolver = DfsResolver::new();
+
+        let result = resolver.resolve_from_cache(r"\\server\share\file.txt");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolver_cache_expired() {
+        let mut resolver = DfsResolver::new();
+
+        // Insert with TTL=0 -- cache_referral clamps to 1s, so we need to
+        // manually insert an already-expired entry.
+        let targets = vec![DfsTarget {
+            server: "srv".to_string(),
+            share: "data".to_string(),
+            remaining_prefix: String::new(),
+        }];
+        resolver.cache.insert(
+            r"\domain\dfs".to_string(),
+            CachedReferral {
+                dfs_path_prefix: r"\domain\dfs".to_string(),
+                targets,
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        let result = resolver.resolve_from_cache(r"\\domain\dfs\file.txt");
+        assert!(result.is_none(), "expired entry should not match");
+    }
+
+    #[test]
+    fn resolver_cache_longest_prefix() {
+        let mut resolver = DfsResolver::new();
+
+        // Insert a short prefix
+        let short = make_referral(r"\domain\dfs", &[(r"\\server1\root", 600)]);
+        resolver.cache_referral(&short);
+
+        // Insert a longer prefix
+        let long = make_referral(r"\domain\dfs\docs", &[(r"\\server2\docs", 600)]);
+        resolver.cache_referral(&long);
+
+        // Should match the longer prefix
+        let result = resolver
+            .resolve_from_cache(r"\\domain\dfs\docs\file.txt")
+            .unwrap();
+        assert_eq!(result[0].server, "server2");
+        assert_eq!(result[0].share, "docs");
+        assert_eq!(result[0].remaining_path, "file.txt");
+
+        // A path that only matches the short prefix
+        let result2 = resolver
+            .resolve_from_cache(r"\\domain\dfs\other\file.txt")
+            .unwrap();
+        assert_eq!(result2[0].server, "server1");
+        assert_eq!(result2[0].share, "root");
+        assert_eq!(result2[0].remaining_path, r"other\file.txt");
+    }
+
+    #[test]
+    fn resolver_multiple_targets() {
+        let mut resolver = DfsResolver::new();
+
+        let resp = make_referral(
+            r"\domain\dfs\docs",
+            &[(r"\\server1\share", 600), (r"\\server2\share", 300)],
+        );
+        resolver.cache_referral(&resp);
+
+        let result = resolver
+            .resolve_from_cache(r"\\domain\dfs\docs\file.txt")
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].server, "server1");
+        assert_eq!(result[1].server, "server2");
+        // Both should have the same remaining path
+        assert_eq!(result[0].remaining_path, "file.txt");
+        assert_eq!(result[1].remaining_path, "file.txt");
+    }
+
+    #[test]
+    fn resolver_path_normalization() {
+        let mut resolver = DfsResolver::new();
+
+        // Cache with backslash-separated DFS path
+        let resp = make_referral(r"\domain\dfs\docs", &[(r"\\server\share", 600)]);
+        resolver.cache_referral(&resp);
+
+        // Resolve with double-backslash prefix and mixed case
+        let result = resolver
+            .resolve_from_cache(r"\\DOMAIN\DFS\DOCS\Sub\File.txt")
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].server, "server");
+        assert_eq!(result[0].share, "share");
+        // remaining_path is lowercased because we normalize the full input
+        assert_eq!(result[0].remaining_path, r"sub\file.txt");
+
+        // Forward slashes should also work
+        let result2 = resolver
+            .resolve_from_cache(r"\\domain/dfs/docs/other.txt")
+            .unwrap();
+        assert_eq!(result2[0].remaining_path, "other.txt");
+    }
+
+    #[test]
+    fn resolver_remaining_prefix_from_target() {
+        let mut resolver = DfsResolver::new();
+
+        // Target has a remaining prefix (network_address includes a subpath)
+        let resp = make_referral(r"\domain\dfs\docs", &[(r"\\server\share\subdir", 600)]);
+        resolver.cache_referral(&resp);
+
+        // With additional path after the DFS prefix
+        let result = resolver
+            .resolve_from_cache(r"\\domain\dfs\docs\file.txt")
+            .unwrap();
+        assert_eq!(result[0].remaining_path, r"subdir\file.txt");
+
+        // Without additional path -- just the target's remaining prefix
+        let result2 = resolver.resolve_from_cache(r"\\domain\dfs\docs").unwrap();
+        assert_eq!(result2[0].remaining_path, "subdir");
     }
 }
