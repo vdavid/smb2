@@ -364,25 +364,24 @@ impl Session {
 
             // Hash the response per MS-SMB2 3.2.5.3.1.
             session_hasher.update(&resp_raw);
+        }
 
-            if !setup_resp.security_buffer.is_empty() {
-                let spnego_resp =
-                    crate::auth::spnego::parse_neg_token_resp(&setup_resp.security_buffer)?;
-                debug!(
-                    "session: SPNEGO state={:?}, has_token={}, supported_mech={:02x?}",
-                    spnego_resp.neg_state,
-                    spnego_resp.response_token.is_some(),
-                    spnego_resp.supported_mech.as_deref().unwrap_or(&[]),
-                );
+        // Process the SPNEGO response token (AP-REP or KRB-ERROR).
+        // This applies to both STATUS_SUCCESS and MORE_PROCESSING_REQUIRED —
+        // the server may include an AP-REP with a sub-session key in either.
+        if !setup_resp.security_buffer.is_empty() {
+            let spnego_resp =
+                crate::auth::spnego::parse_neg_token_resp(&setup_resp.security_buffer)?;
+            debug!(
+                "session: SPNEGO state={:?}, has_token={}, supported_mech={:02x?}",
+                spnego_resp.neg_state,
+                spnego_resp.response_token.is_some(),
+                spnego_resp.supported_mech.as_deref().unwrap_or(&[]),
+            );
 
-                if let Some(ref token_bytes) = spnego_resp.response_token {
-                    auth.process_mutual_auth_token(token_bytes)?;
-                }
+            if let Some(ref token_bytes) = spnego_resp.response_token {
+                auth.process_mutual_auth_token(token_bytes)?;
             }
-
-            // The server returns STATUS_INVALID_PARAMETER for any second
-            // SESSION_SETUP, meaning it considers the session established
-            // after the first round despite SPNEGO AcceptIncomplete.
         }
 
         // Get the session key AFTER processing the AP-REP (the server's

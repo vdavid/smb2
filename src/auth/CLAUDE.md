@@ -109,7 +109,7 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **Session key etype detection**: The TGS-REQ requests AES-256, AES-128, and RC4 (preference order). The KDC picks the session key type from this list — it may differ from the ticket encryption type. The authenticator detects the actual etype from the TGS-REP `EncKDCRepPart.key.keytype` and uses the matching cipher for Authenticator encryption.
 - **Raw ticket pass-through**: The service ticket bytes must be sent to the SMB server exactly as received from the KDC. Re-encoding the ticket from parsed fields produces different DER and causes `KRB_AP_ERR_MODIFIED`. The `Ticket` struct carries `raw_bytes` for this.
 - **GSS-API wrapping**: The AP-REQ in SPNEGO NegTokenInit must include the GSS-API OID header (`0x60 len OID ap-req`), not just the raw AP-REQ bytes.
-- **Mutual auth handling**: Windows AD returns `STATUS_MORE_PROCESSING_REQUIRED` with an SPNEGO `AcceptIncomplete` containing an AP-REP. The client processes the AP-REP but does NOT send a second SESSION_SETUP (Windows returns `STATUS_INVALID_PARAMETER` if you do).
+- **Mutual authentication**: AP-REQ sets the mutual-required flag. The server returns an AP-REP (in SPNEGO NegTokenResp) containing a server sub-session key. The client decrypts the AP-REP (key usage 12) to extract this subkey, which becomes the SMB session key. This provides cryptographic proof that the server possesses the service key. The AP-REP may arrive in a `STATUS_SUCCESS` response (not always `STATUS_MORE_PROCESSING_REQUIRED`).
 
 ## Known tech debt (Kerberos)
 

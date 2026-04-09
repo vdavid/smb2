@@ -584,7 +584,7 @@ impl KerberosAuthenticator {
             cipher: encrypted_authenticator,
         };
 
-        let ap_req = encode_ap_req(&service_ticket, &authenticator_enc_data, false);
+        let ap_req = encode_ap_req(&service_ticket, &authenticator_enc_data, true);
 
         // Wrap the AP-REQ in a Kerberos GSS-API initial context token
         // (RFC 1964): APPLICATION [0] { OID, 0x0100, AP-REQ }.
