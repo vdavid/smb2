@@ -311,7 +311,7 @@ impl Session {
             })?
             .to_vec();
 
-        debug!("session: Kerberos auth complete, token_len={}", token.len(),);
+        debug!("session: Kerberos auth complete, token_len={}", token.len());
 
         // Clone the preauth hasher for this session.
         let mut session_hasher = conn.preauth_hasher().clone();
