@@ -10,8 +10,6 @@ RUN apk add --no-cache \
 
 # Kerberos realm config
 ENV KRB5_REALM=TEST.LOCAL
-ENV KRB5_KDC=localhost
-ENV KRB5_ADMIN_SERVER=localhost
 
 # Create krb5.conf
 RUN cat > /etc/krb5.conf << 'EOF'
@@ -46,38 +44,45 @@ kdb5_util create -s -P masterpassword 2>/dev/null || true
 # Create admin principal
 kadmin.local -q "addprinc -pw adminpass admin/admin@TEST.LOCAL" 2>/dev/null || true
 
-# Create test user
-kadmin.local -q "addprinc -pw testpass testuser@TEST.LOCAL" 2>/dev/null || true
+# Create test user (with pre-auth required)
+kadmin.local -q "addprinc -pw testpass +requires_preauth testuser@TEST.LOCAL" 2>/dev/null || true
 
-# Create service principal for Samba (cifs/localhost)
+# Create service principal for Samba
+# Use both cifs/localhost and host/localhost
 kadmin.local -q "addprinc -randkey cifs/localhost@TEST.LOCAL" 2>/dev/null || true
+kadmin.local -q "addprinc -randkey host/localhost@TEST.LOCAL" 2>/dev/null || true
 
-# Export keytab for Samba
+# Export keytab for Samba (both service principals)
 kadmin.local -q "ktadd -k /etc/samba/samba.keytab cifs/localhost@TEST.LOCAL" 2>/dev/null || true
+kadmin.local -q "ktadd -k /etc/samba/samba.keytab host/localhost@TEST.LOCAL" 2>/dev/null || true
+
+chmod 600 /etc/samba/samba.keytab
 
 echo "KDC setup complete"
 SCRIPT
 RUN chmod +x /setup-kdc.sh
 
-# Configure Samba for Kerberos
+# Configure Samba with Kerberos
 RUN cat > /etc/samba/smb.conf << 'EOF'
 [global]
     workgroup = TESTLOCAL
     realm = TEST.LOCAL
-    security = ads
-    kerberos method = dedicated keytab
-    dedicated keytab file = /etc/samba/samba.keytab
-    server signing = mandatory
-
-    # Use standalone mode (no actual AD join needed)
+    netbios name = LOCALHOST
     security = user
     server role = standalone server
 
-    # Accept Kerberos auth via SPNEGO
-    auth methods = guest sam
+    # Kerberos auth via keytab
+    kerberos method = dedicated keytab
+    dedicated keytab file = /etc/samba/samba.keytab
+
+    # Signing
+    server signing = mandatory
+
+    # Map Kerberos principal to local user
+    username map = /etc/samba/smbusers
 
     # Logging
-    log level = 2
+    log level = 3 auth:10
     log file = /var/log/samba/log.%m
 
 [public]
@@ -86,13 +91,16 @@ RUN cat > /etc/samba/smb.conf << 'EOF'
     guest ok = no
     create mask = 0666
     directory mask = 0777
+    valid users = testuser
 EOF
 
-# Create share directory
-RUN mkdir -p /srv/share /var/log/samba && \
-    chmod 777 /srv/share
+# Create username mapping (Kerberos principal -> local user)
+RUN echo "testuser = testuser@TEST.LOCAL" > /etc/samba/smbusers
 
-# Create Samba user matching the Kerberos principal
+# Create share directory
+RUN mkdir -p /srv/share /var/log/samba && chmod 777 /srv/share
+
+# Create local user and Samba user
 RUN adduser -D -H testuser && \
     echo -e "testpass\ntestpass" | smbpasswd -a -s testuser
 
@@ -106,11 +114,11 @@ set -e
 
 # Start KDC
 krb5kdc
-echo "KDC started"
+echo "KDC started on port 88"
 
 # Start Samba
 smbd --foreground --no-process-group &
-echo "Samba started"
+echo "Samba started on port 445"
 
 # Wait for services
 sleep 1
@@ -124,6 +132,6 @@ RUN chmod +x /entrypoint.sh
 EXPOSE 88/udp 88/tcp 445/tcp
 
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s \
-    CMD smbclient -L localhost -U testuser%testpass -N 2>/dev/null || exit 1
+    CMD smbclient -L localhost -U testuser%testpass 2>/dev/null || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
