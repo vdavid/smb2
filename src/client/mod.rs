@@ -6,6 +6,7 @@
 //! for batched concurrent operations.
 
 pub mod connection;
+pub(crate) mod dfs;
 pub mod pipeline;
 pub mod session;
 pub mod shares;
