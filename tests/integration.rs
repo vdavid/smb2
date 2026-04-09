@@ -1491,3 +1491,59 @@ async fn watch_directory_on_nas() {
         })
         .await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn kerberos_auth_against_docker_kdc() {
+    let _ = env_logger::try_init();
+
+    // Connect to the Docker Samba server with Kerberos
+    let mut conn = Connection::connect("127.0.0.1:10462", Duration::from_secs(5))
+        .await
+        .expect("failed to connect to Docker Samba");
+
+    conn.negotiate().await.expect("negotiate failed");
+
+    let params = conn.params().unwrap();
+    println!("Negotiated dialect: {}", params.dialect);
+
+    // Kerberos auth via Docker KDC
+    let credentials = smb2::KerberosCredentials {
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        realm: "TEST.LOCAL".to_string(),
+        kdc_address: "127.0.0.1:10088".to_string(),
+    };
+
+    let session = Session::setup_kerberos(&mut conn, &credentials, "localhost")
+        .await
+        .expect("Kerberos session setup failed");
+
+    println!("Kerberos session established: {}", session.session_id);
+    println!("Signing: {}", session.should_sign);
+
+    // Connect to the share
+    let tree = smb2::Tree::connect(&mut conn, "public")
+        .await
+        .expect("tree connect failed");
+
+    println!("Tree connected: {}", tree.tree_id);
+
+    // Write and read a file to verify the session works
+    let test_data = b"Kerberos auth works!";
+    tree.write_file(&mut conn, "krb_test.txt", test_data)
+        .await
+        .expect("write failed");
+
+    let read_back = tree
+        .read_file(&mut conn, "krb_test.txt")
+        .await
+        .expect("read failed");
+
+    assert_eq!(read_back, test_data);
+    println!("Kerberos auth verified: wrote and read file successfully");
+
+    // Cleanup
+    let _ = tree.delete_file(&mut conn, "krb_test.txt").await;
+    let _ = tree.disconnect(&mut conn).await;
+}

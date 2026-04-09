@@ -712,15 +712,16 @@ pub fn parse_kdc_rep(data: &[u8]) -> Result<KdcRep, Error> {
 
     for (ftag, fvalue) in &fields {
         match ftag {
-            0xa1 => {
-                // pvno [1] — we skip validation, just note it
+            // RFC 4120 section 5.4.2: KDC-REP fields
+            0xa0 => {
+                // pvno [0] — skip validation
             }
-            0xa2 => msg_type = Some(parse_der_integer(fvalue)?),
-            // [3] padata — skip
-            0xa4 => crealm = Some(parse_der_general_string(fvalue)?),
-            0xa5 => cname = Some(parse_principal_name(fvalue)?),
-            0xa6 => ticket = Some(parse_ticket(fvalue)?),
-            0xa7 => enc_part = Some(parse_encrypted_data(fvalue)?),
+            0xa1 => msg_type = Some(parse_der_integer(fvalue)?),
+            // [2] padata — skip
+            0xa3 => crealm = Some(parse_der_general_string(fvalue)?),
+            0xa4 => cname = Some(parse_principal_name(fvalue)?),
+            0xa5 => ticket = Some(parse_ticket(fvalue)?),
+            0xa6 => enc_part = Some(parse_encrypted_data(fvalue)?),
             _ => {}
         }
     }
@@ -1402,24 +1403,25 @@ mod tests {
 
     /// Build a test KDC-REP (AS-REP or TGS-REP) in DER.
     fn build_test_kdc_rep(msg_type_val: i32) -> Vec<u8> {
-        let pvno = der_context(1, &der_integer(5));
-        let msg_type = der_context(2, &der_integer(msg_type_val));
-        let crealm = der_context(4, &der_general_string("EXAMPLE.COM"));
+        // RFC 4120 section 5.4.2: KDC-REP fields start at [0]
+        let pvno = der_context(0, &der_integer(5));
+        let msg_type = der_context(1, &der_integer(msg_type_val));
+        let crealm = der_context(3, &der_general_string("EXAMPLE.COM"));
 
         let cname_inner = encode_principal_name(&PrincipalName {
             name_type: 1,
             name_string: vec!["user".to_string()],
         });
-        let cname = der_context(5, &cname_inner);
+        let cname = der_context(4, &cname_inner);
 
-        let ticket = der_context(6, &encode_ticket(&make_test_ticket()));
+        let ticket = der_context(5, &encode_ticket(&make_test_ticket()));
 
         let enc_part_inner = encode_encrypted_data(&EncryptedData {
             etype: 18,
             kvno: Some(1),
             cipher: vec![0xca, 0xfe],
         });
-        let enc_part = der_context(7, &enc_part_inner);
+        let enc_part = der_context(6, &enc_part_inner);
 
         let seq = der_sequence(&[&pvno, &msg_type, &crealm, &cname, &ticket, &enc_part]);
 

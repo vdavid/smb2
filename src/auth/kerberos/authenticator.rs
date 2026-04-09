@@ -76,6 +76,7 @@ const PA_PAC_REQUEST: i32 = 128;
 // ---------------------------------------------------------------------------
 
 /// Credentials for Kerberos authentication.
+#[derive(Debug, Clone)]
 pub struct KerberosCredentials {
     /// Username (without realm).
     pub username: String,
@@ -208,6 +209,10 @@ impl KerberosAuthenticator {
         let response = send_to_kdc(kdc_config, &as_req).await?;
 
         // Check if we got a KRB-ERROR (APPLICATION [30] = 0x7e).
+        trace!(
+            "kerberos: AS response first 32 bytes: {:02x?}",
+            &response[..response.len().min(32)]
+        );
         let response = if !response.is_empty() && response[0] == 0x7e {
             let krb_error = parse_krb_error(&response)?;
 
@@ -295,10 +300,26 @@ impl KerberosAuthenticator {
 
         // Update etype from what the KDC actually chose.
         self.etype = etype_from_i32(as_rep.enc_part.etype)?;
+        debug!(
+            "kerberos: AS-REP etype={}, kvno={:?}, cipher_len={}, crealm={}, cname={:?}",
+            as_rep.enc_part.etype,
+            as_rep.enc_part.kvno,
+            as_rep.enc_part.cipher.len(),
+            as_rep.crealm,
+            as_rep.cname.name_string,
+        );
 
         // Derive the user's long-term key (may have been derived already,
         // but etype might have changed based on the KDC response).
         let user_key = self.derive_user_key();
+        debug!(
+            "kerberos: user_key len={}, etype={:?}, salt={}{}, key_prefix={:02x?}",
+            user_key.len(),
+            self.etype,
+            &self.credentials.realm,
+            &self.credentials.username,
+            &user_key[..user_key.len().min(8)],
+        );
 
         // Decrypt the enc-part to get the session key.
         let enc_part_plain = kerberos_decrypt(

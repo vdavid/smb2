@@ -280,6 +280,164 @@ impl Session {
             should_encrypt,
         })
     }
+
+    /// Perform Kerberos-based SESSION_SETUP.
+    ///
+    /// Unlike NTLM (multi-round-trip), Kerberos authenticates against the
+    /// KDC first, then sends a single SPNEGO-wrapped AP-REQ in SESSION_SETUP.
+    ///
+    /// The session key comes from the Kerberos TGS exchange, not from the
+    /// SMB server response.
+    pub async fn setup_kerberos(
+        conn: &mut Connection,
+        credentials: &crate::auth::kerberos::KerberosCredentials,
+        server_hostname: &str,
+    ) -> Result<Session> {
+        let params = conn
+            .params()
+            .ok_or_else(|| Error::invalid_data("negotiate must complete before session setup"))?
+            .clone();
+
+        // Step 1: Authenticate against the KDC (AS + TGS exchanges).
+        let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
+        auth.authenticate(server_hostname).await?;
+
+        let token = auth
+            .token()
+            .ok_or_else(|| Error::Auth {
+                message: "Kerberos authentication produced no token".to_string(),
+            })?
+            .to_vec();
+
+        let session_key = auth
+            .session_key()
+            .ok_or_else(|| Error::Auth {
+                message: "Kerberos authentication produced no session key".to_string(),
+            })?
+            .to_vec();
+
+        debug!(
+            "session: Kerberos auth complete, token_len={}, session_key_len={}",
+            token.len(),
+            session_key.len()
+        );
+
+        // Clone the preauth hasher for this session.
+        let mut session_hasher = conn.preauth_hasher().clone();
+
+        // Step 2: Send SPNEGO-wrapped AP-REQ in SESSION_SETUP.
+        let req = SessionSetupRequest {
+            flags: SessionSetupRequestFlags(0),
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
+            capabilities: Capabilities::default(),
+            channel: 0,
+            previous_session_id: 0,
+            security_buffer: token,
+        };
+
+        let (_, req_raw) = conn.send_request(Command::SessionSetup, &req, None).await?;
+
+        session_hasher.update(&req_raw);
+
+        let (resp_header, resp_body, _resp_raw) = conn.receive_response().await?;
+
+        if resp_header.command != Command::SessionSetup {
+            return Err(Error::invalid_data(format!(
+                "expected SessionSetup response, got {:?}",
+                resp_header.command
+            )));
+        }
+
+        // Kerberos typically completes in one round-trip (STATUS_SUCCESS).
+        // Some servers may return STATUS_MORE_PROCESSING_REQUIRED for
+        // mutual authentication — handle that case by ignoring the
+        // server's token (we don't need mutual auth for SMB).
+        if resp_header.status != NtStatus::SUCCESS
+            && !resp_header.status.is_more_processing_required()
+        {
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::SessionSetup,
+            });
+        }
+
+        let session_id = resp_header.session_id;
+        conn.set_session_id(session_id);
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let setup_resp = SessionSetupResponse::unpack(&mut cursor)?;
+
+        // Determine signing algorithm.
+        let signing_algorithm = algorithm_for_dialect(params.dialect, params.gmac_negotiated);
+        debug!(
+            "session: Kerberos signing_algo={:?}, dialect={}",
+            signing_algorithm, params.dialect
+        );
+
+        // Derive keys for SMB 3.x using the Kerberos session key.
+        let (signing_key, encryption_key, decryption_key) = match params.dialect {
+            Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
+                let keys = derive_session_keys(&session_key, params.dialect, None, 128);
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
+            }
+            Dialect::Smb3_1_1 => {
+                let key_len_bits = match params.cipher {
+                    Some(crate::crypto::encryption::Cipher::Aes256Ccm)
+                    | Some(crate::crypto::encryption::Cipher::Aes256Gcm) => 256,
+                    _ => 128,
+                };
+                let keys = derive_session_keys(
+                    &session_key,
+                    Dialect::Smb3_1_1,
+                    Some(session_hasher.value()),
+                    key_len_bits,
+                );
+                (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                )
+            }
+            _ => (session_key.clone(), None, None),
+        };
+
+        let should_sign = params.signing_required
+            || !setup_resp.session_flags.is_guest() && !setup_resp.session_flags.is_null();
+
+        let should_encrypt = setup_resp.session_flags.encrypt_data();
+
+        if should_sign {
+            conn.activate_signing(signing_key.clone(), signing_algorithm);
+        }
+
+        if should_encrypt {
+            let cipher = params
+                .cipher
+                .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
+            if let (Some(ref enc_key), Some(ref dec_key)) = (&encryption_key, &decryption_key) {
+                conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
+            }
+        }
+
+        info!(
+            "session: Kerberos established, session_id={}, sign={}, encrypt={}",
+            session_id, should_sign, should_encrypt
+        );
+
+        Ok(Session {
+            session_id,
+            signing_key,
+            encryption_key,
+            decryption_key,
+            signing_algorithm,
+            should_sign,
+            should_encrypt,
+        })
+    }
 }
 
 #[cfg(test)]
