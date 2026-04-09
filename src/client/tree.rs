@@ -114,6 +114,11 @@ pub struct Tree {
     pub tree_id: TreeId,
     /// The share name.
     pub share_name: String,
+    /// The server name (hostname or IP) this tree is connected to.
+    ///
+    /// Used by `SmbClient` to route operations through the correct
+    /// connection when DFS referrals point to different servers.
+    pub server: String,
     /// Whether the share is a DFS share.
     pub is_dfs: bool,
     /// Whether the share requires encryption.
@@ -176,6 +181,7 @@ impl Tree {
         Ok(Tree {
             tree_id,
             share_name: share_name.to_string(),
+            server: server.clone(),
             is_dfs,
             encrypt_data,
         })
@@ -2964,6 +2970,7 @@ mod tests {
         let tree = Tree {
             tree_id,
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -2998,6 +3005,7 @@ mod tests {
         let tree = Tree {
             tree_id,
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3039,6 +3047,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(99),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3144,6 +3153,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3199,6 +3209,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3246,6 +3257,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3280,6 +3292,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3324,6 +3337,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3378,6 +3392,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3435,6 +3450,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3481,6 +3497,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3561,6 +3578,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3585,6 +3603,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3614,6 +3633,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3679,6 +3699,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3738,6 +3759,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3775,6 +3797,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3860,6 +3883,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3892,6 +3916,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3918,6 +3943,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3954,6 +3980,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -3993,6 +4020,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4054,6 +4082,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4111,6 +4140,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4131,6 +4161,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4253,6 +4284,7 @@ mod tests {
         let tree = Tree {
             tree_id,
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4304,6 +4336,7 @@ mod tests {
         let tree = Tree {
             tree_id,
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4333,6 +4366,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4377,6 +4411,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4473,6 +4508,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4554,6 +4590,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4620,6 +4657,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4685,6 +4723,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4739,6 +4778,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4786,6 +4826,7 @@ mod tests {
         let tree = Tree {
             tree_id,
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -4831,6 +4872,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(20),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };
@@ -5421,6 +5463,7 @@ mod tests {
         let tree = Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         };

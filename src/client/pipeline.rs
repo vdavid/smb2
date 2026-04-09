@@ -175,6 +175,7 @@ mod tests {
         Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
+            server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
         }

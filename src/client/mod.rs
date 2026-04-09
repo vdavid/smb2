@@ -28,11 +28,13 @@ pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 // Re-export high-level client types.
 // (SmbClient, ClientConfig, and connect are defined below in this file.)
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
 use log::info;
 
+use crate::client::dfs::DfsResolver;
 use crate::error::Result;
 use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
@@ -70,6 +72,18 @@ pub struct ClientConfig {
     pub compression: bool,
 }
 
+/// A connection to a specific server with its authenticated session.
+///
+/// Used for DFS cross-server referrals where the client needs connections
+/// to multiple servers simultaneously.
+#[allow(dead_code)]
+pub(crate) struct ConnectionEntry {
+    /// The connection to the server.
+    pub conn: Connection,
+    /// The authenticated session on this connection.
+    pub session: Session,
+}
+
 /// High-level SMB2 client with reconnection support.
 ///
 /// Wraps a [`Connection`] + [`Session`] and provides methods for connecting
@@ -82,6 +96,13 @@ pub struct SmbClient {
     config: ClientConfig,
     conn: Connection,
     session: Session,
+    /// Server name of the primary connection (from `conn.server_name()`).
+    primary_server: String,
+    /// Extra connections for DFS cross-server targets, keyed by server name.
+    extra_connections: HashMap<String, ConnectionEntry>,
+    /// DFS referral resolver with TTL-based cache.
+    #[allow(dead_code)]
+    dfs_resolver: DfsResolver,
 }
 
 impl SmbClient {
@@ -109,20 +130,29 @@ impl SmbClient {
             conn.compression_enabled()
         );
 
+        let primary_server = conn.server_name().to_string();
+
         Ok(SmbClient {
             config,
             conn,
             session,
+            primary_server,
+            extra_connections: HashMap::new(),
+            dfs_resolver: DfsResolver::new(),
         })
     }
 
     /// Connect using an existing connection and session (for testing).
     #[cfg(test)]
     pub(crate) fn from_parts(config: ClientConfig, conn: Connection, session: Session) -> Self {
+        let primary_server = conn.server_name().to_string();
         SmbClient {
             config,
             conn,
             session,
+            primary_server,
+            extra_connections: HashMap::new(),
+            dfs_resolver: DfsResolver::new(),
         }
     }
 
@@ -193,8 +223,10 @@ impl SmbClient {
         )
         .await?;
 
+        self.primary_server = conn.server_name().to_string();
         self.conn = conn;
         self.session = session;
+        self.extra_connections.clear();
 
         info!(
             "smb_client: reconnected, new session_id={}",
@@ -237,6 +269,23 @@ impl SmbClient {
         &mut self.conn
     }
 
+    /// Get a mutable reference to the connection that owns the given tree.
+    ///
+    /// Routes through the primary connection when the tree's server matches,
+    /// or through an extra connection established for a DFS cross-server
+    /// referral.
+    pub(crate) fn connection_for_tree(&mut self, tree: &Tree) -> &mut Connection {
+        if tree.server == self.primary_server {
+            &mut self.conn
+        } else {
+            &mut self
+                .extra_connections
+                .get_mut(&tree.server)
+                .expect("no connection for tree server")
+                .conn
+        }
+    }
+
     // ── Convenience methods that delegate to Tree ──────────────────────
 
     /// List files in a directory on the given share.
@@ -244,12 +293,14 @@ impl SmbClient {
     /// This is a convenience wrapper around [`Tree::list_directory`] that
     /// saves you from threading `connection_mut()` through every call.
     pub async fn list_directory(&mut self, tree: &Tree, path: &str) -> Result<Vec<DirectoryEntry>> {
-        tree.list_directory(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.list_directory(conn, path).await
     }
 
     /// Read a file from the given share.
     pub async fn read_file(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
-        tree.read_file(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.read_file(conn, path).await
     }
 
     /// Read a small file using a compound CREATE+READ+CLOSE request.
@@ -258,17 +309,20 @@ impl SmbClient {
     /// round-trips from 3 to 1. Best for files that fit in a single
     /// READ (up to MaxReadSize, typically 8 MB).
     pub async fn read_file_compound(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
-        tree.read_file_compound(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.read_file_compound(conn, path).await
     }
 
     /// Read a file using pipelined I/O (faster for large files).
     pub async fn read_file_pipelined(&mut self, tree: &Tree, path: &str) -> Result<Vec<u8>> {
-        tree.read_file_pipelined(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.read_file_pipelined(conn, path).await
     }
 
     /// Write data to a file on the given share (create or overwrite).
     pub async fn write_file(&mut self, tree: &Tree, path: &str, data: &[u8]) -> Result<u64> {
-        tree.write_file(&mut self.conn, path, data).await
+        let conn = self.connection_for_tree(tree);
+        tree.write_file(conn, path, data).await
     }
 
     /// Write a small file using a compound CREATE+WRITE+FLUSH+CLOSE request.
@@ -283,7 +337,8 @@ impl SmbClient {
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        tree.write_file_compound(&mut self.conn, path, data).await
+        let conn = self.connection_for_tree(tree);
+        tree.write_file_compound(conn, path, data).await
     }
 
     /// Write data to a file using pipelined I/O (faster for large files).
@@ -293,7 +348,8 @@ impl SmbClient {
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        tree.write_file_pipelined(&mut self.conn, path, data).await
+        let conn = self.connection_for_tree(tree);
+        tree.write_file_pipelined(conn, path, data).await
     }
 
     /// Query file system space information for the given share.
@@ -301,12 +357,14 @@ impl SmbClient {
     /// Returns total capacity, free space, and allocation unit sizes.
     /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
     pub async fn fs_info(&mut self, tree: &Tree) -> Result<tree::FsInfo> {
-        tree.fs_info(&mut self.conn).await
+        let conn = self.connection_for_tree(tree);
+        tree.fs_info(conn).await
     }
 
     /// Delete a file on the given share.
     pub async fn delete_file(&mut self, tree: &Tree, path: &str) -> Result<()> {
-        tree.delete_file(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.delete_file(conn, path).await
     }
 
     /// Delete multiple files on the given share in a single batch.
@@ -314,12 +372,14 @@ impl SmbClient {
     /// Sends all requests before waiting for responses, minimizing
     /// round-trips. Returns results in the same order as the input paths.
     pub async fn delete_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<()>> {
-        tree.delete_files(&mut self.conn, paths).await
+        let conn = self.connection_for_tree(tree);
+        tree.delete_files(conn, paths).await
     }
 
     /// Get file metadata (size, timestamps, whether it's a directory).
     pub async fn stat(&mut self, tree: &Tree, path: &str) -> Result<FileInfo> {
-        tree.stat(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.stat(conn, path).await
     }
 
     /// Stat multiple files on the given share in a single batch.
@@ -327,12 +387,14 @@ impl SmbClient {
     /// Sends all requests before waiting for responses, minimizing
     /// round-trips. Returns results in the same order as the input paths.
     pub async fn stat_files(&mut self, tree: &Tree, paths: &[&str]) -> Vec<Result<FileInfo>> {
-        tree.stat_files(&mut self.conn, paths).await
+        let conn = self.connection_for_tree(tree);
+        tree.stat_files(conn, paths).await
     }
 
     /// Rename a file or directory on the given share.
     pub async fn rename(&mut self, tree: &Tree, from: &str, to: &str) -> Result<()> {
-        tree.rename(&mut self.conn, from, to).await
+        let conn = self.connection_for_tree(tree);
+        tree.rename(conn, from, to).await
     }
 
     /// Rename multiple files on the given share in a single batch.
@@ -340,17 +402,20 @@ impl SmbClient {
     /// Sends all requests before waiting for responses, minimizing
     /// round-trips. Returns results in the same order as the input pairs.
     pub async fn rename_files(&mut self, tree: &Tree, renames: &[(&str, &str)]) -> Vec<Result<()>> {
-        tree.rename_files(&mut self.conn, renames).await
+        let conn = self.connection_for_tree(tree);
+        tree.rename_files(conn, renames).await
     }
 
     /// Create a directory on the given share.
     pub async fn create_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
-        tree.create_directory(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.create_directory(conn, path).await
     }
 
     /// Delete an empty directory on the given share.
     pub async fn delete_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
-        tree.delete_directory(&mut self.conn, path).await
+        let conn = self.connection_for_tree(tree);
+        tree.delete_directory(conn, path).await
     }
 
     /// Start a streaming file download (memory-efficient for large files).
@@ -483,7 +548,8 @@ impl SmbClient {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
-        tree.read_file_pipelined_with_progress(&mut self.conn, path, on_progress)
+        let conn = self.connection_for_tree(tree);
+        tree.read_file_pipelined_with_progress(conn, path, on_progress)
             .await
     }
 
@@ -631,7 +697,8 @@ impl SmbClient {
     /// Use this if you need to flush a handle obtained through the
     /// low-level API.
     pub async fn flush_file(&mut self, tree: &Tree, file_id: FileId) -> Result<()> {
-        tree.flush_handle(&mut self.conn, file_id).await
+        let conn = self.connection_for_tree(tree);
+        tree.flush_handle(conn, file_id).await
     }
 
     /// Watch a directory for changes.
@@ -655,7 +722,8 @@ impl SmbClient {
 
     /// Disconnect from a share.
     pub async fn disconnect_share(&mut self, tree: &Tree) -> Result<()> {
-        tree.disconnect(&mut self.conn).await
+        let conn = self.connection_for_tree(tree);
+        tree.disconnect(conn).await
     }
 }
 

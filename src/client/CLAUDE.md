@@ -22,9 +22,11 @@ SmbClient  (owns Connection + Session, stores credentials for reconnect)
   Connection  (TCP transport, credits, message IDs, signing, encryption)
     Session   (NTLM auth, key derivation -- setup mutates Connection)
       Tree    (share-level ops, borrows &mut Connection for each call)
+  extra_connections  (HashMap<String, ConnectionEntry> for DFS cross-server)
+  dfs_resolver       (DfsResolver with TTL-based referral cache)
 ```
 
-All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenience methods thread this through automatically.
+All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenience methods use `connection_for_tree(tree)` to route through the correct connection (primary or DFS extra connection) based on the tree's `server` field.
 
 ## Connection and credits
 
