@@ -37,18 +37,22 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 - Reconnection after network failures
 - Auto-flush on writes (data safety for family photos and company docs)
 
-## What it doesn't do (yet)
+## Limitations
 
-If you need any of these, check the [`smb`](https://crates.io/crates/smb) crate which supports them:
+Not yet supported:
 
-- **Multi-channel**: multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
-- **QUIC transport**: SMB over QUIC for Azure Files and Windows Server 2022+ over the internet
-- **RDMA transport**: datacenter-only, ultra-low-latency storage
+- **Domain-based DFS**: standalone DFS links work; AD domain-based namespaces aren't supported yet
+- **DFS target failback**: uses the first reachable target; no automatic failback to preferred targets
+- **Multi-channel**: single TCP connection per client
+- **QUIC/RDMA transport**: TCP only (covers ~99% of use cases)
 
-These aren't planned:
+If you need multi-channel or QUIC, check the [`smb`](https://crates.io/crates/smb) crate.
+
+Not planned:
 
 - Server implementation (this is a client library)
 - SMB1 (deprecated, insecure)
+- LZNT1 compression (LZ4 is supported; LZNT1 is legacy)
 
 ## Quick start
 
@@ -66,21 +70,21 @@ async fn main() -> Result<(), smb2::Error> {
     }
 
     // Connect to a share
-    let share = client.connect_share("Documents").await?;
+    let mut share = client.connect_share("Documents").await?;
 
     // List files
-    let entries = client.list_directory(&share, "projects/").await?;
+    let entries = client.list_directory(&mut share, "projects/").await?;
     for entry in &entries {
         println!("{} ({} bytes)", entry.name, entry.size);
     }
 
     // Read a file
-    let data = client.read_file(&share, "report.pdf").await?;
+    let data = client.read_file(&mut share, "report.pdf").await?;
     std::fs::write("report.pdf", data)?;
 
     // Write a file
     let content = std::fs::read("local_file.txt")?;
-    client.write_file(&share, "remote_file.txt", &content).await?;
+    client.write_file(&mut share, "remote_file.txt", &content).await?;
 
     // Clean up
     client.disconnect_share(&share).await?;
@@ -96,7 +100,7 @@ The pipeline is the core feature. It lets you batch multiple operations and exec
 ```rust
 use smb2::{Pipeline, Op, OpResult};
 
-# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
     let mut pipeline = Pipeline::new(client.connection_mut(), &share);
 
     let results = pipeline.execute(vec![
@@ -123,10 +127,10 @@ use smb2::{Pipeline, Op, OpResult};
 For large file I/O, use the pipelined variants which fill the credit window:
 
 ```rust
-# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
     // Pipelined I/O with sliding window for large files
-    let data = client.read_file_pipelined(&share, "big_file.iso").await?;
-    client.write_file_pipelined(&share, "copy.iso", &data).await?;
+    let data = client.read_file_pipelined(&mut share, "big_file.iso").await?;
+    client.write_file_pipelined(&mut share, "copy.iso", &data).await?;
     # Ok(())
     #
 }
@@ -162,9 +166,9 @@ use tokio::io::AsyncWriteExt;
 ```rust
 use std::ops::ControlFlow;
 
-# async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
     let data = std::fs::read("big_file.bin")?;
-    client.write_file_with_progress(&share, "remote.bin", &data, |progress| {
+    client.write_file_with_progress(&mut share, "remote.bin", &data, |progress| {
         println!("{:.1}%", progress.percent());
         ControlFlow::Continue(()) // return ControlFlow::Break(()) to cancel
     }).await?;
@@ -203,21 +207,21 @@ For when you want to do one thing and get the result:
 - `SmbClient::connect()` -- connect with full config
 - `client.list_shares()` -- list available shares
 - `client.connect_share()` -- connect to a share
-- `client.list_directory(&share, path)` -- list a directory
-- `client.read_file(&share, path)` -- download a file
-- `client.write_file(&share, path, data)` -- upload a file
-- `client.delete_file(&share, path)` -- delete a file
-- `client.delete_files(&share, &paths)` -- batch delete (all requests sent before waiting)
-- `client.stat(&share, path)` -- get file metadata
-- `client.stat_files(&share, &paths)` -- batch stat
-- `client.rename(&share, from, to)` -- rename a file
-- `client.rename_files(&share, &renames)` -- batch rename
-- `client.create_directory(&share, path)` -- create a directory
-- `client.delete_directory(&share, path)` -- remove a directory
+- `client.list_directory(&mut share, path)` -- list a directory
+- `client.read_file(&mut share, path)` -- download a file
+- `client.write_file(&mut share, path, data)` -- upload a file
+- `client.delete_file(&mut share, path)` -- delete a file
+- `client.delete_files(&mut share, &paths)` -- batch delete (all requests sent before waiting)
+- `client.stat(&mut share, path)` -- get file metadata
+- `client.stat_files(&mut share, &paths)` -- batch stat
+- `client.rename(&mut share, from, to)` -- rename a file
+- `client.rename_files(&mut share, &renames)` -- batch rename
+- `client.create_directory(&mut share, path)` -- create a directory
+- `client.delete_directory(&mut share, path)` -- remove a directory
 - `client.download(&share, path)` -- streaming download with progress (memory-efficient)
 - `client.upload(&share, path, data)` -- streaming upload with progress
 - `client.watch(&share, path, recursive)` -- watch for file changes (CHANGE_NOTIFY)
-- `client.fs_info(&share)` -- disk space (total, free, used)
+- `client.fs_info(&mut share)` -- disk space (total, free, used)
 - `client.reconnect()` -- reconnect after network failure
 - `client.credits()` -- current available credits
 - `client.estimated_rtt()` -- round-trip time from negotiate
@@ -280,26 +284,12 @@ performance.
 
 The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-benchmark --release`.
 
-## Known limitations
-
-| Limitation            | Details                                                           |
-|-----------------------|-------------------------------------------------------------------|
-| No credential cache   | Kerberos tickets are fetched fresh each connection (no ccache)    |
-| No domain-based DFS   | Standalone DFS links work; AD domain-based DFS namespaces are not supported |
-| No DFS target failback | Uses the first reachable target; no automatic failback to preferred targets |
-| No multi-channel      | Single TCP connection per client                                  |
-| No QUIC/RDMA          | TCP only (covers ~99% of use cases)                               |
-| SMB1 not supported    | SMB2/3 only (SMB1 is deprecated and insecure)                     |
-| LZ4 only              | No LZNT1 compression (LZ4 is the modern choice, LZNT1 is legacy)  |
-
 ## Comparison with existing libraries
 
 ### vs `smb` crate
 
-The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 option right now. It covers more features
-than `smb2` (multi-channel, QUIC, RDMA). If you need those, use it.
-
-But for the common case (connect to a NAS, move files around), `smb2` is a better fit:
+The [`smb`](https://crates.io/crates/smb) crate supports multi-channel, QUIC, and RDMA transport. If you need those, use
+it. For everything else, `smb2` is a better fit:
 
 - **Compound + pipelined I/O**: `smb` sends one request at a time; smb2 uses compound requests and pipelined reads with
   sliding window
