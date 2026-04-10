@@ -68,6 +68,9 @@ getrandom = "0.4"
 # Compression
 lz4_flex = "0.13"
 
+[features]
+testing = []  # Enables smb2::testing module for Docker-based test servers
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 proptest = "1"

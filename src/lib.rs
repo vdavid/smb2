@@ -52,6 +52,8 @@ pub mod error;
 pub mod msg;
 pub mod pack;
 pub mod rpc;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod transport;
 pub mod types;
 
