@@ -73,6 +73,15 @@ test-docker:
         (echo "[*] Stopping Docker containers..." && ./tests/docker/stop.sh && echo "[+] Docker integration tests passed") || \
         (echo "[*] Stopping Docker containers..." && ./tests/docker/stop.sh && exit 1)
 
+# Run consumer integration tests (starts/stops containers automatically)
+test-consumer:
+    @echo "[*] Starting consumer containers..."
+    @./tests/docker/start.sh consumer
+    @echo "[*] Running consumer integration tests..."
+    @cargo test --features testing --test consumer_integration -- --ignored --quiet && \
+        (echo "[*] Stopping consumer containers..." && ./tests/docker/stop.sh && echo "[+] Consumer integration tests passed") || \
+        (echo "[*] Stopping consumer containers..." && ./tests/docker/stop.sh && exit 1)
+
 # Build documentation
 doc:
     @echo "[*] Building docs..."
