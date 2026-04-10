@@ -10,7 +10,7 @@
 use log::{debug, trace};
 
 use crate::Error;
-use digest::Digest;
+use digest::{Digest, KeyInit};
 use hmac::{Hmac, Mac};
 
 type HmacMd5 = Hmac<md5::Md5>;

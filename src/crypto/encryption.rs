@@ -6,8 +6,8 @@
 //! per-session counter to prevent catastrophic nonce reuse in AES-GCM.
 
 use aes::{Aes128, Aes256};
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::{AeadInPlace, KeyInit};
+use aes_gcm::aead::{array::Array, inout::InOutBuf, AeadInOut};
+use aes_gcm::KeyInit;
 use ccm::consts::{U11, U16};
 
 use crate::msg::transform::{TransformHeader, SMB2_TRANSFORM_HEADER_FLAG_ENCRYPTED};
@@ -33,9 +33,6 @@ type Aes128Ccm = ccm::Ccm<Aes128, U16, U11>;
 
 /// AES-256-CCM with 16-byte tag and 11-byte nonce (SMB 3.1.1).
 type Aes256Ccm = ccm::Ccm<Aes256, U16, U11>;
-
-/// GCM nonce size (12 bytes).
-type U12 = aes::cipher::consts::U12;
 
 // ── Cipher enum ──────────────────────────────────────────────────────
 
@@ -213,13 +210,10 @@ pub fn decrypt_message(
 
 // ── Raw encrypt/decrypt helpers ──────────────────────────────────────
 
-/// Copy a generic-array auth tag into a fixed-size `[u8; 16]` array.
-fn tag_to_array<N>(tag: GenericArray<u8, N>) -> [u8; 16]
-where
-    N: aes_gcm::aead::generic_array::ArrayLength<u8>,
-{
+/// Copy an auth tag array into a fixed-size `[u8; 16]` array.
+fn tag_to_array<N: aes_gcm::aead::array::ArraySize>(tag: Array<u8, N>) -> [u8; 16] {
     let mut arr = [0u8; 16];
-    arr.copy_from_slice(&tag);
+    arr.copy_from_slice(tag.as_slice());
     arr
 }
 
@@ -232,33 +226,34 @@ fn encrypt_raw(
     buffer: &mut [u8],
 ) -> Result<[u8; 16], Error> {
     let map_err = |_| Error::invalid_data("encryption failed");
+    let buf = InOutBuf::from(buffer);
 
     let tag = match cipher {
         Cipher::Aes128Ccm => {
-            let c = Aes128Ccm::new(GenericArray::from_slice(key));
-            let n = GenericArray::from_slice(nonce);
-            c.encrypt_in_place_detached(n, aad, buffer)
+            let c = Aes128Ccm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.encrypt_inout_detached(n, aad, buf)
                 .map(tag_to_array)
                 .map_err(map_err)?
         }
         Cipher::Aes128Gcm => {
-            let c = aes_gcm::Aes128Gcm::new(GenericArray::from_slice(key));
-            let n: &GenericArray<u8, U12> = GenericArray::from_slice(nonce);
-            c.encrypt_in_place_detached(n, aad, buffer)
+            let c = aes_gcm::Aes128Gcm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.encrypt_inout_detached(n, aad, buf)
                 .map(tag_to_array)
                 .map_err(map_err)?
         }
         Cipher::Aes256Ccm => {
-            let c = Aes256Ccm::new(GenericArray::from_slice(key));
-            let n = GenericArray::from_slice(nonce);
-            c.encrypt_in_place_detached(n, aad, buffer)
+            let c = Aes256Ccm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.encrypt_inout_detached(n, aad, buf)
                 .map(tag_to_array)
                 .map_err(map_err)?
         }
         Cipher::Aes256Gcm => {
-            let c = aes_gcm::Aes256Gcm::new(GenericArray::from_slice(key));
-            let n: &GenericArray<u8, U12> = GenericArray::from_slice(nonce);
-            c.encrypt_in_place_detached(n, aad, buffer)
+            let c = aes_gcm::Aes256Gcm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.encrypt_inout_detached(n, aad, buf)
                 .map(tag_to_array)
                 .map_err(map_err)?
         }
@@ -277,35 +272,29 @@ fn decrypt_raw(
     buffer: &mut [u8],
 ) -> Result<(), Error> {
     let map_err = |_| Error::invalid_data("decryption failed: authentication tag mismatch");
+    let buf = InOutBuf::from(buffer);
+    let t: &Array<u8, _> = tag.into();
 
     match cipher {
         Cipher::Aes128Ccm => {
-            let c = Aes128Ccm::new(GenericArray::from_slice(key));
-            let n = GenericArray::from_slice(nonce);
-            let t = GenericArray::from_slice(tag);
-            c.decrypt_in_place_detached(n, aad, buffer, t)
-                .map_err(map_err)
+            let c = Aes128Ccm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.decrypt_inout_detached(n, aad, buf, t).map_err(map_err)
         }
         Cipher::Aes128Gcm => {
-            let c = aes_gcm::Aes128Gcm::new(GenericArray::from_slice(key));
-            let n: &GenericArray<u8, U12> = GenericArray::from_slice(nonce);
-            let t = GenericArray::from_slice(tag);
-            c.decrypt_in_place_detached(n, aad, buffer, t)
-                .map_err(map_err)
+            let c = aes_gcm::Aes128Gcm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.decrypt_inout_detached(n, aad, buf, t).map_err(map_err)
         }
         Cipher::Aes256Ccm => {
-            let c = Aes256Ccm::new(GenericArray::from_slice(key));
-            let n = GenericArray::from_slice(nonce);
-            let t = GenericArray::from_slice(tag);
-            c.decrypt_in_place_detached(n, aad, buffer, t)
-                .map_err(map_err)
+            let c = Aes256Ccm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.decrypt_inout_detached(n, aad, buf, t).map_err(map_err)
         }
         Cipher::Aes256Gcm => {
-            let c = aes_gcm::Aes256Gcm::new(GenericArray::from_slice(key));
-            let n: &GenericArray<u8, U12> = GenericArray::from_slice(nonce);
-            let t = GenericArray::from_slice(tag);
-            c.decrypt_in_place_detached(n, aad, buffer, t)
-                .map_err(map_err)
+            let c = aes_gcm::Aes256Gcm::new(key.try_into().expect("key length validated"));
+            let n = nonce.try_into().expect("nonce length validated");
+            c.decrypt_inout_detached(n, aad, buf, t).map_err(map_err)
         }
     }
 }

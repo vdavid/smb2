@@ -12,6 +12,7 @@
 //! - MS-KILE: Kerberos Protocol Extensions
 
 use crate::Error;
+use digest::KeyInit;
 
 // ---------------------------------------------------------------------------
 // Encryption type enum
@@ -529,7 +530,7 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
 
 /// AES-ECB encrypt a single 16-byte block.
 fn aes_ecb_encrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
     let mut output = [0u8; 16];
     output.copy_from_slice(block);
@@ -537,15 +538,11 @@ fn aes_ecb_encrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
     match key.len() {
         16 => {
             let cipher = aes::Aes128::new_from_slice(key).expect("valid key");
-            cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-                &mut output,
-            ));
+            cipher.encrypt_block((&mut output).into());
         }
         32 => {
             let cipher = aes::Aes256::new_from_slice(key).expect("valid key");
-            cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-                &mut output,
-            ));
+            cipher.encrypt_block((&mut output).into());
         }
         _ => panic!("AES key must be 16 or 32 bytes, got {}", key.len()),
     }
@@ -554,7 +551,7 @@ fn aes_ecb_encrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
 
 /// AES-ECB decrypt a single 16-byte block.
 fn aes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
-    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::cipher::{BlockCipherDecrypt, KeyInit};
 
     let mut output = [0u8; 16];
     output.copy_from_slice(block);
@@ -562,15 +559,11 @@ fn aes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
     match key.len() {
         16 => {
             let cipher = aes::Aes128::new_from_slice(key).expect("valid key");
-            cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-                &mut output,
-            ));
+            cipher.decrypt_block((&mut output).into());
         }
         32 => {
             let cipher = aes::Aes256::new_from_slice(key).expect("valid key");
-            cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-                &mut output,
-            ));
+            cipher.decrypt_block((&mut output).into());
         }
         _ => panic!("AES key must be 16 or 32 bytes, got {}", key.len()),
     }

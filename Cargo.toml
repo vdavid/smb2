@@ -1,5 +1,7 @@
 [workspace]
-members = [".", "benchmarks/smb"]
+# benchmarks/smb excluded: sspi crate pins digest =0.11.0-rc.5 which conflicts with digest 0.11.2
+members = ["."]
+exclude = ["benchmarks/smb"]
 
 [package]
 name = "smb2"
@@ -44,28 +46,27 @@ num_enum = "0.7"
 tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
 
 # Crypto -- signing, encryption, key derivation
-hmac = "0.12"
-sha2 = "0.10"
-aes = "0.8"
-aes-gcm = "0.10"
-ccm = "0.5"
-cmac = "0.7"
-digest = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
+aes = "=0.9.0-rc.4"
+aes-gcm = "=0.11.0-rc.3"
+ccm = "=0.6.0-rc.3"
+cmac = "=0.8.0-rc.5"
+digest = "0.11"
 
 # NTLM authentication (MS-NLMP)
-md-5 = "0.10"
-md4 = "0.10"
+md-5 = "0.11"
+md4 = "0.11"
 
 # Kerberos key derivation (AES string-to-key)
-pbkdf2 = "0.12"
-sha1 = "0.10"
+pbkdf2 = "=0.13.0-rc.10"
+sha1 = "0.11"
 
-# Cryptographically secure random (direct dependency; transitive copies
-# at different major versions come in via aes-gcm and rand)
-getrandom = "0.3"
+# Cryptographically secure random
+getrandom = "0.4"
 
 # Compression
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }

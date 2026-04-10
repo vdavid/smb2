@@ -8,7 +8,7 @@
 //! which feeds into the KDF as the "context" parameter.
 
 use crate::types::Dialect;
-use digest::Digest;
+use digest::{Digest, KeyInit};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512};
 

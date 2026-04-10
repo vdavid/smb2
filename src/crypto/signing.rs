@@ -171,6 +171,7 @@ fn compute_signature(
 
 /// HMAC-SHA256, truncated to 16 bytes. Key must be 16 bytes.
 fn compute_hmac_sha256(message: &[u8], key: &[u8]) -> Result<[u8; 16], Error> {
+    use digest::KeyInit;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -191,6 +192,7 @@ fn compute_hmac_sha256(message: &[u8], key: &[u8]) -> Result<[u8; 16], Error> {
 fn compute_aes_cmac(message: &[u8], key: &[u8]) -> Result<[u8; 16], Error> {
     use aes::Aes128;
     use cmac::{Cmac, Mac};
+    use digest::KeyInit;
 
     type AesCmac = Cmac<Aes128>;
 
@@ -240,9 +242,13 @@ fn compute_aes_gmac(
     }
     nonce_bytes[8] = flags_byte;
 
-    let cipher = Aes128Gcm::new_from_slice(key)
-        .map_err(|e| Error::invalid_data(format!("AES-128-GMAC key error: {e}")))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher = Aes128Gcm::new(key.try_into().map_err(|_| {
+        Error::invalid_data(format!(
+            "AES-128-GMAC requires a 16-byte key, got {} bytes",
+            key.len()
+        ))
+    })?);
+    let nonce: &Nonce<_> = (&nonce_bytes).into();
 
     // GMAC mode: encrypt empty plaintext with the message as AAD.
     // The "ciphertext" is empty; the auth tag IS the signature.
@@ -395,6 +401,7 @@ mod tests {
         let mut zeroed = msg.clone();
         zeroed[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].fill(0);
         let expected = {
+            use digest::KeyInit;
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
             type H = Hmac<Sha256>;
@@ -472,6 +479,7 @@ mod tests {
         let expected = {
             use aes::Aes128;
             use cmac::{Cmac, Mac};
+            use digest::KeyInit;
             type C = Cmac<Aes128>;
             let mut mac = C::new_from_slice(&key).unwrap();
             mac.update(&zeroed);
@@ -547,8 +555,8 @@ mod tests {
             nonce_bytes[0..8].copy_from_slice(&message_id.to_le_bytes());
             // not cancel, client role -> byte 8 = 0
 
-            let cipher = Aes128Gcm::new_from_slice(&key).unwrap();
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            let cipher = Aes128Gcm::new((&key).into());
+            let nonce: &Nonce<_> = (&nonce_bytes).into();
             let payload = Payload {
                 msg: &[],
                 aad: &zeroed,

@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 smb2 = { path = "../.." }
 smb = "0.11.1"
-sspi = "=0.18.7"
+sspi = "0.19"
 smb-rpc = "=0.11.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
