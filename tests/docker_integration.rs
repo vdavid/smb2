@@ -7,6 +7,7 @@
 //!   just test-docker                      # starts containers, runs, stops
 //!   cargo test --test docker_integration -- --ignored   # if containers are already running
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
@@ -23,6 +24,8 @@ const ENCRYPTION_ADDR: &str = "127.0.0.1:10452";
 const SHARES50_ADDR: &str = "127.0.0.1:10453";
 const MAXREAD_ADDR: &str = "127.0.0.1:10454";
 const ENCRYPTION_AES128_ADDR: &str = "127.0.0.1:10455";
+const DFS_ROOT_ADDR: &str = "127.0.0.1:10456";
+const DFS_TARGET_ADDR: &str = "127.0.0.1:10457";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -53,6 +56,7 @@ async fn guest_client() -> SmbClient {
         auto_reconnect: false,
         compression: false,
         dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
     })
     .await
     .expect("SmbClient::connect to smb-guest failed")
@@ -69,6 +73,7 @@ async fn auth_client() -> SmbClient {
         auto_reconnect: false,
         compression: false,
         dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
     })
     .await
     .expect("SmbClient::connect to smb-auth failed")
@@ -454,6 +459,7 @@ async fn auth_wrong_password_fails_cleanly() {
         auto_reconnect: false,
         compression: false,
         dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
     })
     .await;
 
@@ -1058,6 +1064,7 @@ async fn encryption_client() -> SmbClient {
         auto_reconnect: false,
         compression: false,
         dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
     })
     .await
     .expect("SmbClient::connect to smb-encryption failed")
@@ -1163,6 +1170,7 @@ async fn encryption_aes128_ccm_connect_and_operate() {
         auto_reconnect: false,
         compression: false,
         dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
     })
     .await
     .expect("connect failed");
@@ -1259,6 +1267,7 @@ async fn flaky_error_is_clean_not_hang() {
             auto_reconnect: false,
             compression: false,
             dfs_enabled: true,
+            dfs_target_overrides: HashMap::new(),
         })
         .await
         {
@@ -1512,6 +1521,7 @@ async fn maxread_streaming_download() {
         auto_reconnect: false,
         compression: false,
         dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
     })
     .await
     .expect("connect failed");
@@ -1559,4 +1569,165 @@ async fn maxread_streaming_download() {
         .disconnect_share(&tree)
         .await
         .expect("disconnect failed");
+}
+
+// ── DFS tests (smb-dfs-root:10456 -> smb-dfs-target:10457) ─────────
+
+/// Helper: SmbClient connected to the DFS root server.
+///
+/// The DFS link in the root share points to `smb-dfs-target\files` (Docker
+/// internal hostname). Since the test runs on the host, we override
+/// `smb-dfs-target` to `127.0.0.1:10457` (the port-mapped address).
+async fn dfs_client() -> SmbClient {
+    let mut overrides = HashMap::new();
+    overrides.insert("smb-dfs-target".to_string(), DFS_TARGET_ADDR.to_string());
+    SmbClient::connect(ClientConfig {
+        addr: DFS_ROOT_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: overrides,
+    })
+    .await
+    .expect("SmbClient::connect to smb-dfs-root failed")
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_tree_connect_reports_dfs_capability() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+
+    assert!(tree.is_dfs, "expected DFS root share to report is_dfs=true");
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_read_file_through_link() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+
+    // "data/hello.txt" goes through the DFS link to smb-dfs-target's "files" share.
+    let data = client
+        .read_file(&mut tree, "data/hello.txt")
+        .await
+        .expect("read_file through DFS link failed");
+
+    let text = String::from_utf8(data).expect("not UTF-8");
+    assert_eq!(text.trim(), "Hello from DFS target!");
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_list_directory_through_link() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+
+    // List the "data/" directory, which is a DFS link to smb-dfs-target's "files" share.
+    let entries = client
+        .list_directory(&mut tree, "data")
+        .await
+        .expect("list_directory through DFS link failed");
+
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"hello.txt"),
+        "expected hello.txt in DFS-linked directory, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"subdir"),
+        "expected subdir in DFS-linked directory, got: {:?}",
+        names
+    );
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_write_and_read_roundtrip() {
+    let _ = env_logger::try_init();
+
+    let test_path = "data/docker_dfs_roundtrip.tmp";
+    let test_data = b"DFS roundtrip test data 1234567890";
+
+    // Write through DFS link using a fresh client.
+    {
+        let mut client = dfs_client().await;
+        let mut tree = client
+            .connect_share("dfs")
+            .await
+            .expect("connect_share('dfs') failed");
+
+        client
+            .write_file(&mut tree, test_path, test_data)
+            .await
+            .expect("write_file through DFS link failed");
+
+        client
+            .disconnect_share(&tree)
+            .await
+            .expect("disconnect failed");
+    }
+
+    // Read back through DFS link using a fresh client (separate DFS resolution).
+    {
+        let mut client = dfs_client().await;
+        let mut tree = client
+            .connect_share("dfs")
+            .await
+            .expect("connect_share('dfs') failed");
+
+        let data = client
+            .read_file(&mut tree, test_path)
+            .await
+            .expect("read_file through DFS link failed");
+        assert_eq!(data, test_data);
+
+        // Clean up: after the DFS redirect, the tree now points to the
+        // target share directly. Use the target-relative path (without
+        // the "data/" DFS link prefix) for cleanup.
+        client
+            .delete_file(&mut tree, "docker_dfs_roundtrip.tmp")
+            .await
+            .expect("delete_file on target failed");
+
+        client
+            .disconnect_share(&tree)
+            .await
+            .expect("disconnect failed");
+    }
 }

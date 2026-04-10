@@ -12,7 +12,7 @@ One sub-module per SMB2 command. Each defines request and response structs with 
 | `create.rs` | CREATE request/response with create contexts |
 | `transform.rs` | `TransformHeader` (encryption, protocol ID `0xFD`), `CompressionTransformHeader` (`0xFC`) |
 
-19 command modules total: negotiate, session_setup, logoff, tree_connect, tree_disconnect, create, close, flush, read, write, lock, ioctl, query_directory, change_notify, query_info, set_info, echo, cancel, oplock_break.
+19 command modules total: negotiate, session_setup, logoff, tree_connect, tree_disconnect, create, close, flush, read, write, lock, ioctl, query_directory, change_notify, query_info, set_info, echo, cancel, oplock_break. Plus `dfs.rs` for DFS referral request/response wire format (used by IOCTL FSCTL_DFS_GET_REFERRALS).
 
 ## Patterns
 

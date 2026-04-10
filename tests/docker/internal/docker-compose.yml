@@ -66,3 +66,15 @@ services:
       context: smb-maxreadsize
     ports:
       - "10454:445"
+
+  smb-dfs-root:
+    build:
+      context: smb-dfs-root
+    ports:
+      - "10456:445"
+
+  smb-dfs-target:
+    build:
+      context: smb-dfs-target
+    ports:
+      - "10457:445"

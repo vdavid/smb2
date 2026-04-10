@@ -26,6 +26,7 @@ pub async fn connect(target: &Target) -> Result<(SmbClient, Tree), String> {
         auto_reconnect: false,
         compression: true,
         dfs_enabled: true,
+        dfs_target_overrides: std::collections::HashMap::new(),
     };
 
     let mut client = SmbClient::connect(config)

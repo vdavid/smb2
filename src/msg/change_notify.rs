@@ -5,7 +5,6 @@
 //! describing the changes that occurred.
 
 use crate::error::Result;
-use crate::msg::header::Header;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::FileId;
 use crate::Error;
@@ -157,14 +156,14 @@ impl ChangeNotifyResponse {
 
 impl Pack for ChangeNotifyResponse {
     fn pack(&self, cursor: &mut WriteCursor) {
-        let header_offset = cursor.position() as u32;
+        let start = cursor.position();
         // StructureSize (2 bytes)
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
 
         let output_len = self.output_data.len() as u32;
         // Offset is from the beginning of the SMB2 header per spec.
         let output_offset = if output_len > 0 {
-            (Header::SIZE as u32) + header_offset + Self::FIXED_SIZE
+            (start as u32) + Self::FIXED_SIZE
         } else {
             0
         };

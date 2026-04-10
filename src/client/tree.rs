@@ -187,6 +187,29 @@ impl Tree {
         })
     }
 
+    /// Normalize and format a path for this tree.
+    ///
+    /// When `is_dfs` is true, the server expects the path to include the
+    /// `server\share\` prefix (MS-SMB2 3.2.4.3: "the client MUST pass a
+    /// DFS path containing the server, share, and path to the open").
+    /// The server strips the first two path components to get the local path,
+    /// and if the resulting path starts with a DFS link name, it returns
+    /// `STATUS_PATH_NOT_COVERED` so the client can resolve the referral.
+    fn format_path(&self, path: &str) -> String {
+        let normalized = normalize_path(path);
+        if self.is_dfs {
+            // Extract hostname (strip port if present) for the DFS path prefix.
+            let hostname = self.server.split(':').next().unwrap_or(&self.server);
+            if normalized.is_empty() {
+                format!("{}\\{}", hostname, self.share_name)
+            } else {
+                format!("{}\\{}\\{}", hostname, self.share_name, normalized)
+            }
+        } else {
+            normalized
+        }
+    }
+
     /// List files in a directory.
     ///
     /// Opens the directory with CREATE, queries entries with QUERY_DIRECTORY
@@ -196,7 +219,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
         debug!("tree: list_directory path={}", normalized);
 
         // Open the directory.
@@ -223,7 +246,7 @@ impl Tree {
     ///
     /// For files larger than MaxReadSize, use `read_file_pipelined` instead.
     pub async fn read_file_compound(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         debug!(
             "tree: read_file_compound path={}, max_read={}",
@@ -407,7 +430,7 @@ impl Tree {
         path: &str,
         recursive: bool,
     ) -> Result<crate::client::watcher::Watcher<'a>> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
         debug!(
             "tree: watch path={}, recursive={}, tree_id={}",
             normalized, recursive, self.tree_id
@@ -450,7 +473,7 @@ impl Tree {
         let mut send_error: Option<Error> = None;
 
         for path in paths {
-            let normalized = normalize_path(path);
+            let normalized = self.format_path(path);
             let create_req = CreateRequest {
                 requested_oplock_level: OplockLevel::None,
                 impersonation_level: ImpersonationLevel::Impersonation,
@@ -567,7 +590,7 @@ impl Tree {
     /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
     /// QUERY_INFO (FileStandardInformation) + CLOSE as a single compound message.
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
         debug!("tree: stat (compound) path={}", normalized);
 
         // BUILD CREATE request for reading attributes.
@@ -760,7 +783,7 @@ impl Tree {
         let mut send_error: Option<Error> = None;
 
         for path in paths {
-            let normalized = normalize_path(path);
+            let normalized = self.format_path(path);
 
             let create_req = CreateRequest {
                 requested_oplock_level: OplockLevel::None,
@@ -1108,7 +1131,7 @@ impl Tree {
     /// Sends CREATE + SET_INFO (FileRenameInformation) + CLOSE as a single
     /// compound message.
     pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
-        let from_normalized = normalize_path(from);
+        let from_normalized = self.format_path(from);
         let to_normalized = normalize_path(to);
         debug!(
             "tree: rename (compound) from={} to={}",
@@ -1228,7 +1251,7 @@ impl Tree {
         let mut send_error: Option<Error> = None;
 
         for (from, to) in renames {
-            let from_normalized = normalize_path(from);
+            let from_normalized = self.format_path(from);
             let to_normalized = normalize_path(to);
 
             let create_req = CreateRequest {
@@ -1370,7 +1393,7 @@ impl Tree {
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
         debug!(
             "tree: write_file_compound path={}, len={}",
             normalized,
@@ -1536,7 +1559,7 @@ impl Tree {
     /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
     /// The window is capped at 32 in-flight requests (2 MB).
     pub async fn read_file_pipelined(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
 
         // Open the file.
         let (file_id, file_size) = self.open_file(conn, &normalized).await?;
@@ -1622,7 +1645,7 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
 
         let (file_id, file_size) = self.open_file(conn, &normalized).await?;
 
@@ -1692,7 +1715,7 @@ impl Tree {
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
 
         if data.is_empty() {
             debug!(
@@ -1784,7 +1807,7 @@ impl Tree {
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
     /// option, then immediately closes the handle.
     pub async fn create_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
         debug!("tree: create_directory path={}", normalized);
 
         let req = CreateRequest {
@@ -1850,7 +1873,7 @@ impl Tree {
         type_option: u32,
         kind: &str,
     ) -> Result<()> {
-        let normalized = normalize_path(path);
+        let normalized = self.format_path(path);
         debug!("tree: delete_{} (compound) path={}", kind, normalized);
 
         let create_req = CreateRequest {
@@ -3020,6 +3043,54 @@ mod tests {
         assert_eq!(normalize_path("/leading/slash"), "leading\\slash");
         assert_eq!(normalize_path("\\leading\\backslash"), "leading\\backslash");
         assert_eq!(normalize_path("no_change"), "no_change");
+    }
+
+    #[tokio::test]
+    async fn format_path_prepends_dfs_prefix() {
+        let tree = Tree {
+            tree_id: TreeId(1),
+            share_name: "dfs".to_string(),
+            server: "server1".to_string(),
+            is_dfs: true,
+            encrypt_data: false,
+        };
+        assert_eq!(
+            tree.format_path("data/hello.txt"),
+            "server1\\dfs\\data\\hello.txt"
+        );
+        assert_eq!(tree.format_path(""), "server1\\dfs");
+        assert_eq!(
+            tree.format_path("nested/path"),
+            "server1\\dfs\\nested\\path"
+        );
+    }
+
+    #[tokio::test]
+    async fn format_path_strips_port_from_dfs_prefix() {
+        let tree = Tree {
+            tree_id: TreeId(1),
+            share_name: "dfs".to_string(),
+            server: "server1:10456".to_string(),
+            is_dfs: true,
+            encrypt_data: false,
+        };
+        assert_eq!(
+            tree.format_path("data/hello.txt"),
+            "server1\\dfs\\data\\hello.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn format_path_no_prefix_when_not_dfs() {
+        let tree = Tree {
+            tree_id: TreeId(1),
+            share_name: "public".to_string(),
+            server: "server1".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+        assert_eq!(tree.format_path("data/hello.txt"), "data\\hello.txt");
+        assert_eq!(tree.format_path(""), "");
     }
 
     #[tokio::test]

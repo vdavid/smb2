@@ -4,7 +4,6 @@
 //! data. The response returns output data from the control operation.
 
 use crate::error::Result;
-use crate::msg::header::Header;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::FileId;
 use crate::Error;
@@ -78,7 +77,7 @@ impl IoctlRequest {
 
 impl Pack for IoctlRequest {
     fn pack(&self, cursor: &mut WriteCursor) {
-        let header_offset = cursor.position() as u32;
+        let start = cursor.position();
         // StructureSize (2 bytes)
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
         // Reserved (2 bytes)
@@ -91,8 +90,11 @@ impl Pack for IoctlRequest {
 
         let input_count = self.input_data.len() as u32;
         // Offset is from the beginning of the SMB2 header per spec.
+        // `start` is the cursor position at the beginning of the body;
+        // in a standalone request this equals Header::SIZE, in a compound
+        // it includes the preceding sub-requests.
         let input_offset = if input_count > 0 {
-            (Header::SIZE as u32) + header_offset + Self::FIXED_SIZE
+            (start as u32) + Self::FIXED_SIZE
         } else {
             0
         };
@@ -201,7 +203,7 @@ impl IoctlResponse {
 
 impl Pack for IoctlResponse {
     fn pack(&self, cursor: &mut WriteCursor) {
-        let header_offset = cursor.position() as u32;
+        let start = cursor.position();
         // StructureSize (2 bytes)
         cursor.write_u16_le(Self::STRUCTURE_SIZE);
         // Reserved (2 bytes)
@@ -215,7 +217,7 @@ impl Pack for IoctlResponse {
         let output_count = self.output_data.len() as u32;
         // Offset is from the beginning of the SMB2 header per spec.
         let output_offset = if output_count > 0 {
-            (Header::SIZE as u32) + header_offset + Self::FIXED_SIZE
+            (start as u32) + Self::FIXED_SIZE
         } else {
             0
         };

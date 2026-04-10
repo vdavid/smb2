@@ -78,6 +78,16 @@ pub struct ClientConfig {
     /// connect to the target server, and retry the operation.
     /// Default: true.
     pub dfs_enabled: bool,
+    /// Override addresses for DFS target servers.
+    ///
+    /// Maps server hostnames (as they appear in DFS referrals) to
+    /// `host:port` socket addresses. Useful when DFS targets use
+    /// internal hostnames that the client can't resolve, or when
+    /// port mapping is needed (for example, Docker test environments).
+    ///
+    /// Default: empty (use the server hostname from the referral
+    /// with port 445).
+    pub dfs_target_overrides: std::collections::HashMap<String, String>,
 }
 
 /// A connection to a specific server with its authenticated session.
@@ -137,7 +147,7 @@ impl SmbClient {
             conn.compression_enabled()
         );
 
-        let primary_server = conn.server_name().to_string();
+        let primary_server = config.addr.clone();
 
         Ok(SmbClient {
             config,
@@ -152,7 +162,7 @@ impl SmbClient {
     /// Connect using an existing connection and session (for testing).
     #[cfg(test)]
     pub(crate) fn from_parts(config: ClientConfig, conn: Connection, session: Session) -> Self {
-        let primary_server = conn.server_name().to_string();
+        let primary_server = config.addr.clone();
         SmbClient {
             config,
             conn,
@@ -178,7 +188,8 @@ impl SmbClient {
     /// and encryption is not already active, encryption is activated
     /// using the session's keys.
     pub async fn connect_share(&mut self, share_name: &str) -> Result<Tree> {
-        let tree = Tree::connect(&mut self.conn, share_name).await?;
+        let mut tree = Tree::connect(&mut self.conn, share_name).await?;
+        tree.server = self.primary_server.clone();
 
         // Activate encryption if the share requires it and it's not already active.
         // Fall back to AES-128-CCM if the server didn't send an encryption
@@ -230,7 +241,7 @@ impl SmbClient {
         )
         .await?;
 
-        self.primary_server = conn.server_name().to_string();
+        self.primary_server = self.config.addr.clone();
         self.conn = conn;
         self.session = session;
         self.extra_connections.clear();
@@ -305,9 +316,16 @@ impl SmbClient {
         tree: &mut Tree,
         original_path: &str,
     ) -> Result<String> {
-        let server = tree.server.clone();
+        // Extract hostname (strip port) for UNC path construction.
+        let hostname = tree
+            .server
+            .split(':')
+            .next()
+            .unwrap_or(&tree.server)
+            .to_string();
         let share = tree.share_name.clone();
-        let unc_path = format!("\\\\{}\\{}\\{}", server, share, original_path);
+        let normalized = original_path.replace('/', "\\");
+        let unc_path = format!("\\\\{}\\{}\\{}", hostname, share, normalized);
 
         debug!("dfs: resolving {}", unc_path);
 
@@ -329,7 +347,12 @@ impl SmbClient {
         // Try each target (multi-target failover).
         let mut last_error = None;
         for resolved in &resolved_list {
-            let target_addr = format!("{}:{}", resolved.server, resolved.port);
+            let target_addr = self
+                .config
+                .dfs_target_overrides
+                .get(&resolved.server)
+                .cloned()
+                .unwrap_or_else(|| format!("{}:{}", resolved.server, resolved.port));
 
             // Get or create connection to target server.
             match self.ensure_connection(&target_addr).await {
@@ -402,7 +425,12 @@ impl SmbClient {
                 .conn
         };
 
-        Tree::connect(conn, share).await
+        let mut tree = Tree::connect(conn, share).await?;
+        // Override server to the full addr:port so connection_for_tree
+        // can distinguish targets that share the same hostname but
+        // use different ports (for example, Docker port-mapped containers).
+        tree.server = target_addr.to_string();
+        Ok(tree)
     }
 
     /// Check whether a DFS retry should be attempted for the given error.
@@ -1023,6 +1051,7 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
         auto_reconnect: false,
         compression: true,
         dfs_enabled: true,
+        dfs_target_overrides: std::collections::HashMap::new(),
     })
     .await
 }
@@ -1175,6 +1204,7 @@ mod tests {
             auto_reconnect: false,
             compression: true,
             dfs_enabled: true,
+            dfs_target_overrides: std::collections::HashMap::new(),
         };
 
         SmbClient::from_parts(config, conn, session)
@@ -1293,6 +1323,7 @@ mod tests {
             auto_reconnect: true,
             compression: true,
             dfs_enabled: true,
+            dfs_target_overrides: std::collections::HashMap::new(),
         };
 
         let client = SmbClient::from_parts(config, conn, session);

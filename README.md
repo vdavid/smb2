@@ -33,6 +33,7 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 - Streaming downloads and uploads with progress reporting and cancellation
 - File watching (CHANGE_NOTIFY for live directory updates)
 - Disk space queries (total, free, used)
+- DFS path resolution (standalone DFS with transparent referral follow-through)
 - Reconnection after network failures
 - Auto-flush on writes (data safety for family photos and company docs)
 
@@ -40,8 +41,6 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 
 If you need any of these, check the [`smb`](https://crates.io/crates/smb) crate which supports them:
 
-- **DFS path resolution**: returns `Error::DfsReferralRequired` with the path so you can handle it yourself. Full
-  automatic DFS follow-through is planned for post-1.0.
 - **Multi-channel**: multiple TCP connections to the same server for higher throughput. Planned for post-1.0.
 - **QUIC transport**: SMB over QUIC for Azure Files and Windows Server 2022+ over the internet
 - **RDMA transport**: datacenter-only, ultra-low-latency storage
@@ -183,7 +182,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.1"
+smb2 = "0.2"
 ```
 
 You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is
@@ -286,7 +285,8 @@ The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-
 | Limitation            | Details                                                           |
 |-----------------------|-------------------------------------------------------------------|
 | No credential cache   | Kerberos tickets are fetched fresh each connection (no ccache)    |
-| No DFS follow-through | Returns `Error::DfsReferralRequired` with the path, you handle it |
+| No domain-based DFS   | Standalone DFS links work; AD domain-based DFS namespaces are not supported |
+| No DFS target failback | Uses the first reachable target; no automatic failback to preferred targets |
 | No multi-channel      | Single TCP connection per client                                  |
 | No QUIC/RDMA          | TCP only (covers ~99% of use cases)                               |
 | SMB1 not supported    | SMB2/3 only (SMB1 is deprecated and insecure)                     |
@@ -297,7 +297,7 @@ The benchmark tool is included at `benchmarks/smb/`. Run with `cargo run -p smb-
 ### vs `smb` crate
 
 The [`smb`](https://crates.io/crates/smb) crate is the most complete Rust SMB2 option right now. It covers more features
-than `smb2` (DFS, multi-channel, QUIC, RDMA). If you need those, use it.
+than `smb2` (multi-channel, QUIC, RDMA). If you need those, use it.
 
 But for the common case (connect to a NAS, move files around), `smb2` is a better fit:
 

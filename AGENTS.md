@@ -52,6 +52,7 @@ src/
     cancel.rs             # CancelRequest
     oplock_break.rs       # OplockBreakNotification/Acknowledgment
     transform.rs          # TransformHeader (encryption), CompressionTransformHeader
+    dfs.rs                # DFS referral request/response wire format
 
   transport/              # Transport abstraction
     mod.rs                # Transport trait (split send/receive)
@@ -81,6 +82,7 @@ src/
     pipeline.rs           # Unified operation pipeline
     directory.rs          # Directory listing helpers
     shares.rs             # Share enumeration (IPC$ + srvsvc RPC)
+    dfs.rs                # DFS referral IOCTL, DfsResolver with TTL cache
 
 tests/
   pack_roundtrip.rs       # Property-based tests for pack/unpack
@@ -205,7 +207,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 
 ### Docker test containers
 
-12 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+13 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
@@ -220,6 +222,8 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 | smb-50shares          | 10453 | 50 shares, RPC enumeration at scale           |
 | smb-maxreadsize       | 10454 | 64 KB max read/write, chunking edge cases     |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
+| smb-dfs-root          | 10456 | DFS namespace root with msdfs link            |
+| smb-dfs-target        | 10457 | DFS target server with actual files            |
 
 ### Tested hardware
 
