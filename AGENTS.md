@@ -10,6 +10,7 @@ Pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. S
 | `just check-live` | Fast checks + integration tests on real servers (~6s) |
 | `just fix`        | Auto-fix formatting and clippy warnings               |
 | `just check-all`  | Include MSRV check, security audit, and license check |
+| `just test-consumer` | Consumer integration tests (needs Docker, ~30s)    |
 | `cargo test`      | Run unit tests (mock transport, no server needed)     |
 
 ## Project structure
@@ -73,6 +74,10 @@ src/
     mod.rs                # RPC PDU types, NDR encoding/decoding
     srvsvc.rs             # NetShareEnumAll (list shares on a server)
 
+  testing/                # Consumer test harness (feature-gated: `testing`)
+    mod.rs                # TestServers API, embedded Docker infrastructure
+    CLAUDE.md
+
   client/                 # High-level client API
     mod.rs                # SmbClient (entry point)
     connection.rs         # Connection state, credit management, response demux
@@ -90,7 +95,9 @@ tests/
   protocol_flow.rs        # Negotiate -> session -> tree -> file flows (mock)
   integration.rs          # Tests against real NAS/Pi (#[ignore])
   docker_integration.rs   # Tests against Docker Samba containers (#[ignore])
+  consumer_integration.rs # Tests against consumer Docker containers (#[ignore])
   docker/                 # Docker infrastructure (Dockerfiles, compose, scripts)
+    consumer/             # Consumer test harness containers (14 containers)
 
 examples/
   list_shares.rs          # Connect and enumerate shares
@@ -204,6 +211,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 - `just check` — fmt + clippy + tests + doc
 - `cargo test --test integration -- --ignored` — real NAS/Pi tests (needs `.env`)
 - `just test-docker` — Docker container tests (needs Docker, ~28s locally)
+- `just test-consumer` — Consumer integration tests (needs Docker, ~30s locally)
 
 ### Docker test containers
 
@@ -225,6 +233,27 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 | smb-dfs-root          | 10456 | DFS namespace root with msdfs link            |
 | smb-dfs-target        | 10457 | DFS target server with actual files            |
 
+### Consumer test containers
+
+14 Samba containers in `tests/docker/consumer/`, used by apps that depend on smb2 to test their SMB integration. Exposed via the `smb2::testing` module (requires `testing` feature flag).
+
+| Container              | Port  | What it tests                                 |
+|------------------------|-------|-----------------------------------------------|
+| smb-consumer-guest     | 10480 | Guest access, basic operations                |
+| smb-consumer-auth      | 10481 | Login flow                                    |
+| smb-consumer-both      | 10482 | Mixed auth: guest + authenticated shares      |
+| smb-consumer-50shares  | 10483 | Share list UI, scrolling, search              |
+| smb-consumer-unicode   | 10484 | CJK, emoji, accented chars                    |
+| smb-consumer-longnames | 10485 | 200+ char filenames                           |
+| smb-consumer-deepnest  | 10486 | 50-level deep tree                            |
+| smb-consumer-manyfiles | 10487 | 10k+ files in one dir                         |
+| smb-consumer-readonly  | 10488 | Read-only share, write errors                 |
+| smb-consumer-windows   | 10489 | Windows-like server string                    |
+| smb-consumer-synology  | 10490 | Synology-like server string + TimeMachine     |
+| smb-consumer-linux     | 10491 | Default Linux Samba server                    |
+| smb-consumer-flaky     | 10492 | Error recovery UI, reconnect handling         |
+| smb-consumer-slow      | 10493 | Loading spinners, progress bars, timeouts     |
+
 ### Tested hardware
 
 Integration tests (`tests/integration.rs`) run against real hardware:
@@ -242,6 +271,7 @@ Code.
 gotchas. Keep them current.
 
 ```
+src/testing/CLAUDE.md   # Consumer test harness, TestServers API, embedded Docker infra
 src/client/CLAUDE.md    # SmbClient, Connection, compound, pipelining
 src/crypto/CLAUDE.md    # Signing, encryption, KDF, preauth hash
 src/msg/CLAUDE.md       # Wire format, Pack/Unpack, offsets, compounds

@@ -71,6 +71,61 @@ cargo test --test docker_integration -- --ignored   # repeat (~8s)
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target |
 | smb-dfs-target | 10457 | DFS target server with test files (hello.txt, subdir/nested.txt) |
 
+## Consumer integration tests (`tests/consumer_integration.rs`)
+
+Tests against 14 Docker-based Samba containers designed for apps that depend on smb2. These test app-level SMB integration (browsing, listing, error handling), not protocol internals.
+
+**Three-layer testing model:**
+
+1. **Layer 1: Rust integration tests** -- `TestServers` API provides pre-connected `SmbClient` instances. What `consumer_integration.rs` uses.
+2. **Layer 2: E2E tests** -- Playwright, Cypress, etc. connect to containers at known ports. Use `TestServers::write_compose_files()` to extract embedded compose files.
+3. **Layer 3: Manual QA** -- Extract compose files, run `docker compose up`, browse virtual servers in your app.
+
+**Running consumer tests:**
+
+```sh
+# One command does everything (~30s locally):
+just test-consumer
+
+# For faster iteration, keep containers running between runs:
+./tests/docker/start.sh consumer    # once
+cargo test --test consumer_integration -- --ignored   # repeat
+./tests/docker/stop.sh              # when done
+```
+
+**Feature flag:** The `smb2::testing` module requires `--features testing` to compile. The consumer integration tests enable this automatically. Consumer apps add `smb2 = { features = ["testing"] }` to their `[dev-dependencies]`.
+
+**Containers and what they exercise:**
+
+| Container | Port | Focus |
+|-----------|------|-------|
+| smb-consumer-guest | 10480 | Guest access, basic operations |
+| smb-consumer-auth | 10481 | Login flow |
+| smb-consumer-both | 10482 | Mixed auth: guest + authenticated shares |
+| smb-consumer-50shares | 10483 | Share list UI, scrolling, search |
+| smb-consumer-unicode | 10484 | CJK, emoji, accented chars |
+| smb-consumer-longnames | 10485 | 200+ char filenames |
+| smb-consumer-deepnest | 10486 | 50-level deep tree |
+| smb-consumer-manyfiles | 10487 | 10k+ files in one dir |
+| smb-consumer-readonly | 10488 | Read-only share, write errors |
+| smb-consumer-windows | 10489 | Windows-like server string |
+| smb-consumer-synology | 10490 | Synology-like server string + TimeMachine |
+| smb-consumer-linux | 10491 | Default Linux Samba server |
+| smb-consumer-flaky | 10492 | Error recovery UI, reconnect handling |
+| smb-consumer-slow | 10493 | Loading spinners, progress bars, timeouts |
+
+**Using containers without Rust (Layers 2/3):**
+
+```rust
+// Extract embedded compose files (one-time)
+smb2::testing::TestServers::write_compose_files(Path::new("./test-infra")).unwrap();
+```
+
+```sh
+cd test-infra && docker compose up -d
+# Containers available at localhost:10480-10493
+```
+
 ## How to run
 
 | Command | What it runs | Needs |
@@ -80,6 +135,7 @@ cargo test --test docker_integration -- --ignored   # repeat (~8s)
 | `cargo test --test integration -- --ignored` | Real NAS/Pi tests | NAS + Pi + .env |
 | `cargo test --test wire_format_captures -- --ignored` | Wire format vs real server | NAS + .env |
 | `just test-docker` | Docker integration tests | Docker |
+| `just test-consumer` | Consumer integration tests | Docker |
 
 ## AWS integration tests (Kerberos)
 

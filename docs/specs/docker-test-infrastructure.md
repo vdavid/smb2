@@ -586,24 +586,24 @@ Windows, Synology -- everything speaks it. Share listing against Docker Samba wo
 
 ## Implementation order
 
-### Phase 1: smb2 CI tests (immediate value)
+### Phase 1: smb2 CI tests (immediate value) -- DONE
 
-1. Create base Dockerfile (Alpine + Samba)
-2. Create internal containers: smb-guest, smb-auth, smb-signing, smb-readonly
-3. Write `tests/docker_integration.rs` covering basic ops, auth, signing, read-only errors
-4. Add CI job to run Docker tests on every PR
-5. Verify: all Docker tests pass, CI green
-6. Add remaining internal containers (smb-ancient, smb-flaky, smb-slow, smb-encryption, smb-50shares, smb-maxreadsize)
-7. Add tests for those containers
+1. ✅ Create base Dockerfile (Alpine + Samba)
+2. ✅ Create internal containers: smb-guest, smb-auth, smb-signing, smb-readonly
+3. ✅ Write `tests/docker_integration.rs` covering basic ops, auth, signing, read-only errors
+4. ✅ Add CI job to run Docker tests on every PR
+5. ✅ Verify: all Docker tests pass, CI green
+6. ✅ Add remaining internal containers (smb-ancient, smb-flaky, smb-slow, smb-encryption, smb-50shares, smb-maxreadsize)
+7. ✅ Add tests for those containers
 
-### Phase 2: Consumer test harness (after client API settles)
+### Phase 2: Consumer test harness (after client API settles) -- DONE
 
-8. Create consumer compose file with env-var port patterns and core containers (guest, auth, both, readonly)
-9. Add remaining containers (50shares, unicode, longnames, deepnest, manyfiles, windows, synology, linux, flaky, slow)
-10. Add data-population scripts (sample files, unicode names, deep trees, 10k files, 50 shares) and wire them into container startup
-11. Verify all 14 containers work standalone via `docker compose up` (Layer 3: manual QA)
-12. Build `smb2::testing` module (TestServers struct, embedded compose files, hardcoded port constants with env-var overrides, `start_blocking()` for LazyLock)
-13. Document `docker-compose.override.yml` pattern for consumer-specific additions
+8. ✅ Create consumer compose file with env-var port patterns and core containers (guest, auth, both, readonly)
+9. ✅ Add remaining containers (50shares, unicode, longnames, deepnest, manyfiles, windows, synology, linux, flaky, slow)
+10. ✅ Add data-population scripts (sample files, unicode names, deep trees, 10k files, 50 shares) and wire them into container startup
+11. ✅ Verify all 14 containers work standalone via `docker compose up` (Layer 3: manual QA)
+12. ✅ Build `smb2::testing` module (TestServers struct, embedded compose files, hardcoded port constants with env-var overrides, `start_blocking()` for LazyLock)
+13. ✅ Document `docker-compose.override.yml` pattern for consumer-specific additions
 14. Help Cmdr migrate from its own Docker infra to the three-layer model
 
 Phase 2 depends on the client API being stable enough that consumers aren't coupling to a moving target. Phase 1 has no
