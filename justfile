@@ -87,6 +87,7 @@ msrv:
         exit 1; \
     fi
     @RUSTFLAGS="-D warnings" cargo +1.85.0 check --quiet
+    @cargo +1.85.0 clippy --all-targets --quiet -- -D warnings
     @echo "[+] MSRV check passed"
 
 # Run security audit (requires cargo-audit)

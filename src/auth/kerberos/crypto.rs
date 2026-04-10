@@ -464,7 +464,7 @@ fn nfold(input: &[u8], output_len: usize) -> Vec<u8> {
         if s == 0 {
             input[b]
         } else {
-            ((input[b] as u16) << s | (input[(b + 1) % in_len] as u16) >> (8 - s)) as u8
+            (((input[b] as u16) << s) | ((input[(b + 1) % in_len] as u16) >> (8 - s))) as u8
         }
     };
 

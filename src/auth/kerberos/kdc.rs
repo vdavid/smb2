@@ -308,23 +308,27 @@ fn read_der_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
     }
 
     let first = data[pos];
-    if first < 0x80 {
-        // Short form: length is the byte itself.
-        Some((first as usize, pos + 1))
-    } else if first == 0x80 {
-        // Indefinite length, not used in DER.
-        None
-    } else {
-        // Long form: first byte & 0x7f = number of subsequent length bytes.
-        let num_bytes = (first & 0x7f) as usize;
-        if num_bytes > 4 || pos + 1 + num_bytes > data.len() {
-            return None;
+    match first.cmp(&0x80) {
+        std::cmp::Ordering::Less => {
+            // Short form: length is the byte itself.
+            Some((first as usize, pos + 1))
         }
-        let mut length: usize = 0;
-        for i in 0..num_bytes {
-            length = (length << 8) | (data[pos + 1 + i] as usize);
+        std::cmp::Ordering::Equal => {
+            // Indefinite length, not used in DER.
+            None
         }
-        Some((length, pos + 1 + num_bytes))
+        std::cmp::Ordering::Greater => {
+            // Long form: first byte & 0x7f = number of subsequent length bytes.
+            let num_bytes = (first & 0x7f) as usize;
+            if num_bytes > 4 || pos + 1 + num_bytes > data.len() {
+                return None;
+            }
+            let mut length: usize = 0;
+            for i in 0..num_bytes {
+                length = (length << 8) | (data[pos + 1 + i] as usize);
+            }
+            Some((length, pos + 1 + num_bytes))
+        }
     }
 }
 
