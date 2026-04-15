@@ -81,6 +81,49 @@ pub(crate) fn build_close_response() -> Vec<u8> {
     pack_message(&h, &body)
 }
 
+/// Build a WRITE response with the given byte count.
+pub(crate) fn build_write_response(count: u32) -> Vec<u8> {
+    use crate::msg::write::WriteResponse;
+    let mut h = Header::new_request(Command::Write);
+    h.flags.set_response();
+    h.credits = 32;
+
+    let body = WriteResponse {
+        count,
+        remaining: 0,
+        write_channel_info_offset: 0,
+        write_channel_info_length: 0,
+    };
+
+    pack_message(&h, &body)
+}
+
+/// Build a WRITE response with a non-success status (for error tests).
+pub(crate) fn build_write_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
+    use crate::msg::header::ErrorResponse;
+    let mut h = Header::new_request(Command::Write);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+
+    let body = ErrorResponse {
+        error_context_count: 0,
+        error_data: vec![],
+    };
+
+    pack_message(&h, &body)
+}
+
+/// Build a FLUSH response.
+pub(crate) fn build_flush_response() -> Vec<u8> {
+    let mut h = Header::new_request(Command::Flush);
+    h.flags.set_response();
+    h.credits = 32;
+
+    let body = crate::msg::flush::FlushResponse;
+    pack_message(&h, &body)
+}
+
 /// Build a TREE_CONNECT response with the given tree ID and share type.
 pub(crate) fn build_tree_connect_response(tree_id: TreeId, share_type: ShareType) -> Vec<u8> {
     let mut h = Header::new_request(Command::TreeConnect);

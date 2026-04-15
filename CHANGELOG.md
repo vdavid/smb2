@@ -5,6 +5,18 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-04-15
+
+### Added
+
+- `FileWriter` — push-based streaming write API with pipelined I/O. Consumer drives the loop, pushing chunks via
+  `write_chunk()` with automatic backpressure (sliding window, credit-aware). Complement to `FileDownload` for reads.
+  Created via `SmbClient::create_file_writer()`.
+- 13 new Docker integration tests: basic, large (5 MB), empty, single byte, overwrite, equivalence with
+  `write_file_pipelined`, binary data integrity, 64 KB max-write-size, signing, encryption, read-only rejection,
+  100 MB stress (guest), 100 MB stress (200ms latency)
+- 10 new unit tests for `FileWriter` pipelining, backpressure, chunk splitting, error handling
+
 ## [0.6.0] - 2026-04-15
 
 ### Added

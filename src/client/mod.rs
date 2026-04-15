@@ -21,7 +21,7 @@ pub use connection::{Connection, NegotiatedParams};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
-pub use stream::{FileDownload, FileUpload, Progress};
+pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
 pub use tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
@@ -839,6 +839,31 @@ impl SmbClient {
                 chunk_size,
             ))
         }
+    }
+
+    /// Create a push-based pipelined streaming file writer.
+    ///
+    /// Opens (or creates) the file for writing and returns a [`FileWriter`]
+    /// that the caller drives by pushing data chunks. No DFS retry (the
+    /// returned handle borrows the tree for its lifetime).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// let mut writer = client.create_file_writer(&share, "output.bin").await?;
+    /// writer.write_chunk(b"hello").await?;
+    /// writer.write_chunk(b" world").await?;
+    /// let total = writer.finish().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn create_file_writer<'a>(
+        &'a mut self,
+        tree: &'a Tree,
+        path: &str,
+    ) -> Result<stream::FileWriter<'a>> {
+        tree.create_file_writer(&mut self.conn, path).await
     }
 
     /// Read a file with progress reporting and cancellation.

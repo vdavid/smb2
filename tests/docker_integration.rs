@@ -2422,3 +2422,676 @@ async fn guest_streamed_write_alternating_sizes() {
         .await
         .expect("disconnect failed");
 }
+
+// ── FileWriter (push-based streaming writes) ──────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_basic() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_basic.bin";
+    let chunk1 = b"Hello, ";
+    let chunk2 = b"FileWriter ";
+    let chunk3 = b"world!";
+    let expected: Vec<u8> = [&chunk1[..], &chunk2[..], &chunk3[..]].concat();
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    writer
+        .write_chunk(chunk1)
+        .await
+        .expect("write_chunk 1 failed");
+    writer
+        .write_chunk(chunk2)
+        .await
+        .expect("write_chunk 2 failed");
+    writer
+        .write_chunk(chunk3)
+        .await
+        .expect("write_chunk 3 failed");
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, expected.len() as u64);
+
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(data, expected, "content mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_large() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_large.bin";
+    let chunk_size = 1024 * 1024; // 1 MB
+    let num_chunks = 5;
+    let total_size = chunk_size * num_chunks;
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 199) as u8).collect();
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = start + chunk_size;
+        writer
+            .write_chunk(&test_data[start..end])
+            .await
+            .expect("write_chunk failed");
+    }
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, total_size as u64);
+
+    let data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data.len(), test_data.len(), "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_empty_file() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_empty.bin";
+
+    let writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, 0);
+
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert!(data.is_empty(), "expected empty file");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_single_byte() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_single_byte.bin";
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    writer
+        .write_chunk(&[0x42])
+        .await
+        .expect("write_chunk failed");
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, 1);
+
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(data, vec![0x42]);
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_overwrite() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_overwrite.bin";
+
+    // Write a 10 KB file first.
+    let big_data: Vec<u8> = (0..10240).map(|i| (i % 251) as u8).collect();
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed (first write)");
+    writer
+        .write_chunk(&big_data)
+        .await
+        .expect("write_chunk failed (first write)");
+    let written1 = writer.finish().await.expect("finish failed (first write)");
+    assert_eq!(written1, 10240);
+
+    // Overwrite with a 1 KB file.
+    let small_data: Vec<u8> = (0..1024).map(|i| (i % 173) as u8).collect();
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed (overwrite)");
+    writer
+        .write_chunk(&small_data)
+        .await
+        .expect("write_chunk failed (overwrite)");
+    let written2 = writer.finish().await.expect("finish failed (overwrite)");
+    assert_eq!(written2, 1024);
+
+    // Read back -- must be exactly 1 KB, no leftover from old file.
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(data.len(), 1024, "expected 1 KB, got {} bytes", data.len());
+    assert_eq!(data, small_data, "content mismatch after overwrite");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_equivalence_with_pipelined() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_data: Vec<u8> = (0..512 * 1024).map(|i| (i % 199) as u8).collect();
+
+    // Write via write_file_pipelined.
+    let pipelined_path = "smb2_test_fw_equiv_pipelined.bin";
+    client
+        .write_file_pipelined(&mut tree, pipelined_path, &test_data)
+        .await
+        .expect("write_file_pipelined failed");
+
+    // Write via FileWriter.
+    let writer_path = "smb2_test_fw_equiv_writer.bin";
+    let chunk_size = 64 * 1024;
+    let mut writer = client
+        .create_file_writer(&tree, writer_path)
+        .await
+        .expect("create_file_writer failed");
+    for chunk in test_data.chunks(chunk_size) {
+        writer.write_chunk(chunk).await.expect("write_chunk failed");
+    }
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, test_data.len() as u64);
+
+    // Read both back and compare.
+    let pipelined_data = client
+        .read_file_pipelined(&mut tree, pipelined_path)
+        .await
+        .expect("read pipelined file failed");
+    let writer_data = client
+        .read_file_pipelined(&mut tree, writer_path)
+        .await
+        .expect("read writer file failed");
+
+    assert_eq!(pipelined_data.len(), writer_data.len(), "size mismatch");
+    assert_eq!(
+        pipelined_data, writer_data,
+        "FileWriter output differs from write_file_pipelined"
+    );
+
+    client
+        .delete_file(&mut tree, pipelined_path)
+        .await
+        .expect("delete pipelined file failed");
+    client
+        .delete_file(&mut tree, writer_path)
+        .await
+        .expect("delete writer file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_binary_data() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_binary.bin";
+
+    // Build data containing all 256 byte values, repeated for good measure.
+    let mut test_data = Vec::with_capacity(256 * 4);
+    for round in 0..4u8 {
+        for byte in 0..=255u8 {
+            test_data.push(byte.wrapping_add(round.wrapping_mul(37)));
+        }
+    }
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    // Write in two chunks to exercise boundary handling.
+    let mid = test_data.len() / 2;
+    writer
+        .write_chunk(&test_data[..mid])
+        .await
+        .expect("write_chunk 1 failed");
+    writer
+        .write_chunk(&test_data[mid..])
+        .await
+        .expect("write_chunk 2 failed");
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, test_data.len() as u64);
+
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(data, test_data, "binary data mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn maxread_file_writer() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: MAXREAD_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: false,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect failed");
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_maxread.bin";
+    let total_size = 200 * 1024usize; // 200 KB
+    let chunk_size = 50 * 1024; // 50 KB chunks
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 199) as u8).collect();
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    for chunk in test_data.chunks(chunk_size) {
+        writer.write_chunk(chunk).await.expect("write_chunk failed");
+    }
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, total_size as u64);
+
+    let data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data.len(), test_data.len(), "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn signing_file_writer() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: SIGNING_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: false,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect failed");
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_signing.bin";
+    let test_data: Vec<u8> = (0..128 * 1024).map(|i| (i % 199) as u8).collect();
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    for chunk in test_data.chunks(32 * 1024) {
+        writer.write_chunk(chunk).await.expect("write_chunk failed");
+    }
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, test_data.len() as u64);
+
+    let data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data, test_data, "content mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn encryption_file_writer() {
+    let _ = env_logger::try_init();
+
+    let mut client = encryption_client().await;
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_encryption.bin";
+    let test_data: Vec<u8> = (0..128 * 1024).map(|i| (i % 199) as u8).collect();
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    for chunk in test_data.chunks(32 * 1024) {
+        writer.write_chunk(chunk).await.expect("write_chunk failed");
+    }
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, test_data.len() as u64);
+
+    let data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data, test_data, "content mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn readonly_file_writer_error() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: READONLY_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: false,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect failed");
+    let tree = client
+        .connect_share("readonly")
+        .await
+        .expect("connect_share failed");
+
+    let is_err = client
+        .create_file_writer(&tree, "smb2_test_file_writer_readonly.bin")
+        .await
+        .is_err();
+
+    assert!(
+        is_err,
+        "expected create_file_writer to fail on readonly share"
+    );
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+// ── FileWriter stress tests ──────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_writer_stress_100mb() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_stress_100mb.bin";
+    let chunk_size = 1024 * 1024; // 1 MB
+    let num_chunks = 100;
+    let total_size = chunk_size * num_chunks;
+
+    // Build deterministic data
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = start + chunk_size;
+        writer
+            .write_chunk(&test_data[start..end])
+            .await
+            .expect("write_chunk failed");
+    }
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, total_size as u64);
+
+    let data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data.len(), total_size, "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn slow_file_writer_stress_100mb() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: SLOW_ADDR.to_string(),
+        timeout: Duration::from_secs(30),
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: false,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("connect failed");
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_slow_stress.bin";
+    let chunk_size = 512 * 1024; // 512 KB chunks to test more pipelining cycles
+    let num_chunks = 200; // 100 MB total
+    let total_size = chunk_size * num_chunks;
+
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 173) as u8).collect();
+
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = start + chunk_size;
+        writer
+            .write_chunk(&test_data[start..end])
+            .await
+            .expect("write_chunk failed");
+    }
+
+    let bytes_written = writer.finish().await.expect("finish failed");
+    assert_eq!(bytes_written, total_size as u64);
+
+    let data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data.len(), total_size, "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}

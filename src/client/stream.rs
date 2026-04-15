@@ -1,7 +1,8 @@
 //! Streaming file I/O with progress reporting.
 //!
 //! Provides [`FileDownload`] for memory-efficient large file downloads,
-//! [`FileUpload`] for streaming uploads with progress, and [`Progress`]
+//! [`FileUpload`] for streaming uploads with progress,
+//! [`FileWriter`] for push-based pipelined writes, and [`Progress`]
 //! for tracking transfer progress.
 
 use std::ops::ControlFlow;
@@ -17,6 +18,10 @@ use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
 use crate::types::{Command, FileId};
 use crate::Error;
+
+/// Maximum number of pipelined write requests in flight.
+/// Matches `MAX_PIPELINE_WINDOW` in `tree.rs`.
+const MAX_PIPELINE_WINDOW: usize = 32;
 
 /// Progress information for a file transfer.
 #[derive(Debug, Clone, Copy)]
@@ -492,9 +497,600 @@ impl Drop for FileUpload<'_> {
     }
 }
 
+/// A push-based pipelined streaming file writer.
+///
+/// The consumer pushes data chunks at their own pace. Writes are pipelined
+/// using a sliding window (up to 32 in-flight requests)
+/// for high throughput. Chunks larger than `max_write_size` are split
+/// internally into wire-level WRITE requests.
+///
+/// Call [`finish`](FileWriter::finish) when done to flush, close the handle,
+/// and get the total confirmed byte count.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// let mut writer = client.create_file_writer(&share, "output.bin").await?;
+/// writer.write_chunk(b"first part").await?;
+/// writer.write_chunk(b"second part").await?;
+/// let total = writer.finish().await?;
+/// println!("Wrote {total} bytes");
+/// # Ok(())
+/// # }
+/// ```
+pub struct FileWriter<'a> {
+    tree: &'a Tree,
+    conn: &'a mut Connection,
+    file_id: FileId,
+    max_write_size: u32,
+    /// Next write offset in the file.
+    offset: u64,
+    /// Number of pipelined WRITE requests awaiting responses.
+    in_flight: usize,
+    /// Confirmed bytes (from WRITE responses).
+    total_written: u64,
+    /// Buffer for leftover data when a push chunk is larger than `max_write_size`.
+    pending_data: Vec<u8>,
+    /// Read position within `pending_data`.
+    pending_offset: usize,
+    /// Chunk that was pulled but couldn't be sent due to credit exhaustion.
+    stashed_chunk: Option<Vec<u8>>,
+    /// Whether the writer has been finalized (handle closed).
+    done: bool,
+}
+
+impl<'a> FileWriter<'a> {
+    /// Create a new push-based streaming writer.
+    pub(crate) fn new(
+        tree: &'a Tree,
+        conn: &'a mut Connection,
+        file_id: FileId,
+        max_write_size: u32,
+    ) -> Self {
+        Self {
+            tree,
+            conn,
+            file_id,
+            max_write_size,
+            offset: 0,
+            in_flight: 0,
+            total_written: 0,
+            pending_data: Vec::new(),
+            pending_offset: 0,
+            stashed_chunk: None,
+            done: false,
+        }
+    }
+
+    /// Push a data chunk to the writer.
+    ///
+    /// The data is split into wire-level WRITE requests (each up to
+    /// `max_write_size` bytes) and sent pipelined. When the sliding window
+    /// is full, this method drains one in-flight response before sending,
+    /// providing backpressure.
+    ///
+    /// Empty chunks are no-ops.
+    pub async fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        // Append to pending buffer. If there's already pending data, extend it;
+        // otherwise set the new chunk as pending.
+        if self.pending_offset < self.pending_data.len() {
+            let leftover = self.pending_data[self.pending_offset..].to_vec();
+            self.pending_data = leftover;
+            self.pending_offset = 0;
+            self.pending_data.extend_from_slice(data);
+        } else {
+            self.pending_data = data.to_vec();
+            self.pending_offset = 0;
+        }
+
+        // Flush any stashed chunk from a previous call before processing new data.
+        self.flush_stash().await?;
+
+        // Send as many wire chunks as the window allows.
+        while let Some(wire_chunk) = self.next_pending_chunk() {
+            if !self.send_or_stash(wire_chunk).await? {
+                return Ok(()); // Stashed — will be sent on next call or finish()
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finish the writer: drain all in-flight responses, flush, and close.
+    ///
+    /// Returns the total number of confirmed bytes written. Consumes `self`
+    /// to prevent write-after-close at compile time.
+    pub async fn finish(mut self) -> Result<u64> {
+        // Flush stash and drain all remaining pending data. Unlike write_chunk,
+        // finish() must send everything — it loops send_or_stash until the stash
+        // is empty, draining responses to free credits as needed.
+        self.flush_stash().await?;
+
+        while let Some(wire_chunk) = self.next_pending_chunk() {
+            // send_or_stash may stash if credits are exhausted. Keep flushing
+            // until everything is sent. This terminates because drain_one frees
+            // a credit, and we have finite data.
+            if !self.send_or_stash(wire_chunk).await? {
+                self.flush_stash().await?;
+            }
+        }
+
+        // Drain all in-flight responses.
+        self.drain_all().await?;
+
+        // Flush to ensure data is persisted.
+        self.tree.flush_handle(self.conn, self.file_id).await?;
+
+        // Close the handle.
+        self.tree.close_handle(self.conn, self.file_id).await?;
+
+        self.done = true;
+        Ok(self.total_written)
+    }
+
+    /// Confirmed bytes written (from server WRITE responses).
+    #[must_use]
+    pub fn bytes_written(&self) -> u64 {
+        self.total_written
+    }
+
+    /// Current transfer progress.
+    ///
+    /// `total_bytes` is always `None` because push-based writers don't
+    /// know the total size upfront.
+    #[must_use]
+    pub fn progress(&self) -> Progress {
+        Progress {
+            bytes_transferred: self.total_written,
+            total_bytes: None,
+        }
+    }
+
+    /// Get the next wire-level chunk from the pending buffer.
+    fn next_pending_chunk(&mut self) -> Option<Vec<u8>> {
+        if self.pending_offset >= self.pending_data.len() {
+            return None;
+        }
+
+        let end = (self.pending_offset + self.max_write_size as usize).min(self.pending_data.len());
+        let slice = self.pending_data[self.pending_offset..end].to_vec();
+        self.pending_offset = end;
+
+        if self.pending_offset >= self.pending_data.len() {
+            self.pending_data.clear();
+            self.pending_offset = 0;
+        }
+
+        Some(slice)
+    }
+
+    /// Send one wire-level WRITE request.
+    async fn send_wire_chunk(&mut self, data: Vec<u8>) -> Result<()> {
+        let data_len = data.len() as u64;
+        let credit_charge = data_len.div_ceil(65536).max(1) as u16;
+
+        let req = WriteRequest {
+            data_offset: 0x70,
+            offset: self.offset,
+            file_id: self.file_id,
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data,
+        };
+
+        self.conn
+            .send_request_with_credits(Command::Write, &req, Some(self.tree.tree_id), credit_charge)
+            .await?;
+
+        self.offset += data_len;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// Receive one in-flight WRITE response.
+    async fn drain_one(&mut self) -> Result<()> {
+        if self.in_flight == 0 {
+            return Ok(());
+        }
+
+        let (resp_header, resp_body, _) = self.conn.receive_response().await?;
+        self.in_flight -= 1;
+
+        if resp_header.status != NtStatus::SUCCESS {
+            // Drain remaining in-flight (best-effort), then close handle.
+            for _ in 0..self.in_flight {
+                let _ = self.conn.receive_response().await;
+            }
+            self.in_flight = 0;
+            // Best-effort close.
+            let _ = self.tree.close_handle(self.conn, self.file_id).await;
+            self.done = true;
+            return Err(Error::Protocol {
+                status: resp_header.status,
+                command: Command::Write,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&resp_body);
+        let resp = WriteResponse::unpack(&mut cursor)?;
+        self.total_written += resp.count as u64;
+
+        Ok(())
+    }
+
+    /// Drain all in-flight WRITE responses.
+    async fn drain_all(&mut self) -> Result<()> {
+        while self.in_flight > 0 {
+            self.drain_one().await?;
+        }
+        Ok(())
+    }
+
+    /// Check whether we have enough credits to send a chunk of this size.
+    fn can_send(&self, data: &[u8]) -> bool {
+        let credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
+        let credits_available = self.conn.credits() as usize / credit_charge.max(1) as usize;
+        credits_available > 0 && self.in_flight < MAX_PIPELINE_WINDOW
+    }
+
+    /// Try to send a wire chunk. If the window is full or credits are exhausted,
+    /// drain one response and retry. If still unable, stash the chunk and return
+    /// `Ok(false)` (caller decides whether to wait or return).
+    async fn send_or_stash(&mut self, data: Vec<u8>) -> Result<bool> {
+        // Make room if the window is full.
+        if self.in_flight >= MAX_PIPELINE_WINDOW {
+            self.drain_one().await?;
+        }
+
+        if self.can_send(&data) {
+            self.send_wire_chunk(data).await?;
+            return Ok(true);
+        }
+
+        // No credits — drain one response to reclaim credits and retry.
+        if self.in_flight > 0 {
+            self.drain_one().await?;
+            if self.can_send(&data) {
+                self.send_wire_chunk(data).await?;
+                return Ok(true);
+            }
+        }
+
+        // Still can't send. Stash for later.
+        self.stashed_chunk = Some(data);
+        Ok(false)
+    }
+
+    /// Send any stashed chunk, draining responses as needed to free credits.
+    async fn flush_stash(&mut self) -> Result<()> {
+        if let Some(stashed) = self.stashed_chunk.take() {
+            // Make room if needed.
+            if self.in_flight > 0 && !self.can_send(&stashed) {
+                self.drain_one().await?;
+            }
+            if self.can_send(&stashed) {
+                self.send_wire_chunk(stashed).await?;
+            } else {
+                // Re-stash — caller must drain more or give up.
+                self.stashed_chunk = Some(stashed);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FileWriter<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            debug!(
+                "stream: FileWriter dropped without finish(), file handle may leak \
+                 (bytes_written={})",
+                self.total_written
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::test_helpers::{
+        build_close_response, build_create_response, build_flush_response,
+        build_write_error_response, build_write_response, setup_connection,
+    };
+    use crate::transport::MockTransport;
+    use crate::types::status::NtStatus;
+    use crate::types::{FileId, TreeId};
+    use std::sync::Arc;
+
+    fn test_tree() -> Tree {
+        Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        }
+    }
+
+    fn test_file_id() -> FileId {
+        FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        }
+    }
+
+    // ── FileWriter tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_writer_single_chunk() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        // Queue: CREATE + WRITE(100) + FLUSH + CLOSE
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+        assert_eq!(writer.bytes_written(), 0); // Not yet drained
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, 100);
+    }
+
+    #[tokio::test]
+    async fn file_writer_multiple_chunks() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[1u8; 100]).await.unwrap();
+        writer.write_chunk(&[2u8; 100]).await.unwrap();
+        writer.write_chunk(&[3u8; 100]).await.unwrap();
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, 300);
+    }
+
+    #[tokio::test]
+    async fn file_writer_empty_finish() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        // Queue: CREATE + FLUSH + CLOSE (no WRITE)
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let writer = tree
+            .create_file_writer(&mut conn, "empty.bin")
+            .await
+            .unwrap();
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, 0);
+
+        // Verify: CREATE + FLUSH + CLOSE = 3 sent messages.
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn file_writer_empty_chunk_noop() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        // Queue: CREATE + WRITE(50) + FLUSH + CLOSE
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(50));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[]).await.unwrap(); // No-op
+        writer.write_chunk(&[0u8; 50]).await.unwrap();
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, 50);
+
+        // CREATE + WRITE + FLUSH + CLOSE = 4 (no extra WRITE for empty chunk).
+        assert_eq!(mock.sent_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn file_writer_chunk_splitting() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        // max_write_size = 65536, send 200KB = 3 x 65536 + 1 x 8192.
+        // 200 * 1024 = 204800. 204800 / 65536 = 3.125 -> 4 wire writes.
+        let chunk_size = 200 * 1024;
+        let wire_1 = 65536u32;
+        let wire_2 = 65536u32;
+        let wire_3 = 65536u32;
+        let wire_4 = (chunk_size - 3 * 65536) as u32; // 8192
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(wire_1));
+        mock.queue_response(build_write_response(wire_2));
+        mock.queue_response(build_write_response(wire_3));
+        mock.queue_response(build_write_response(wire_4));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "big.bin").await.unwrap();
+        writer.write_chunk(&vec![0u8; chunk_size]).await.unwrap();
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, (wire_1 + wire_2 + wire_3 + wire_4) as u64);
+
+        // CREATE + 4 WRITEs + FLUSH + CLOSE = 7
+        assert_eq!(mock.sent_count(), 7);
+    }
+
+    #[tokio::test]
+    async fn file_writer_progress_none_total() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let progress = writer.progress();
+        assert!(progress.total_bytes.is_none());
+        assert_eq!(progress.bytes_transferred, 0);
+        writer.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_writer_bytes_written_tracks_confirmed() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_write_response(200));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+
+        // After pushing but before finish, bytes_written reflects only drained responses.
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+        assert_eq!(writer.bytes_written(), 0); // Not yet drained
+
+        writer.write_chunk(&[0u8; 200]).await.unwrap();
+        assert_eq!(writer.bytes_written(), 0); // Still not drained
+
+        // finish() drains all.
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, 300);
+    }
+
+    #[tokio::test]
+    async fn file_writer_backpressure() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+
+        // Queue MAX_PIPELINE_WINDOW + 1 write responses.
+        for _ in 0..MAX_PIPELINE_WINDOW + 1 {
+            mock.queue_response(build_write_response(64));
+        }
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+
+        // Fill the window.
+        for _ in 0..MAX_PIPELINE_WINDOW {
+            writer.write_chunk(&[0u8; 64]).await.unwrap();
+        }
+
+        // This write must drain one response before sending (backpressure).
+        writer.write_chunk(&[0u8; 64]).await.unwrap();
+
+        // At least one response was drained by backpressure.
+        assert!(writer.bytes_written() >= 64);
+
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, (MAX_PIPELINE_WINDOW as u64 + 1) * 64);
+    }
+
+    #[tokio::test]
+    async fn file_writer_server_error() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        // Return error for the WRITE.
+        mock.queue_response(build_write_error_response(NtStatus::DISK_FULL));
+        // CLOSE after error cleanup.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+        let result = writer.finish().await;
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("DISK_FULL"),
+            "expected DISK_FULL, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_writer_finish_drains_all() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(50));
+        mock.queue_response(build_write_response(75));
+        mock.queue_response(build_write_response(25));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[0u8; 50]).await.unwrap();
+        writer.write_chunk(&[0u8; 75]).await.unwrap();
+        writer.write_chunk(&[0u8; 25]).await.unwrap();
+
+        // None drained yet.
+        assert_eq!(writer.bytes_written(), 0);
+
+        // finish() must drain all 3.
+        let total = writer.finish().await.unwrap();
+        assert_eq!(total, 150);
+    }
+
+    // ── Progress tests ─────────────────────────────────────────────────
 
     #[test]
     fn progress_calculations() {

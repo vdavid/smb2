@@ -1907,6 +1907,27 @@ impl Tree {
         Ok(bytes_written)
     }
 
+    /// Create a push-based pipelined streaming writer.
+    ///
+    /// Opens (or creates) the file for writing and returns a [`FileWriter`]
+    /// that accepts pushed chunks. The caller drives writes at their own pace
+    /// and calls [`FileWriter::finish`] to flush and close.
+    pub(crate) async fn create_file_writer<'a>(
+        &'a self,
+        conn: &'a mut Connection,
+        path: &str,
+    ) -> Result<super::stream::FileWriter<'a>> {
+        let normalized = self.format_path(path);
+        debug!("tree: create_file_writer path={}", normalized);
+
+        let file_id = self.open_file_for_write(conn, &normalized).await?;
+        let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+
+        Ok(super::stream::FileWriter::new(
+            self, conn, file_id, max_write,
+        ))
+    }
+
     /// Create a directory.
     ///
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
