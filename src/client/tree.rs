@@ -1802,6 +1802,106 @@ impl Tree {
         Ok(bytes_written)
     }
 
+    /// Write a file from a streaming source using pipelined I/O.
+    ///
+    /// Pulls data on demand from a callback, so you never need the full
+    /// file in memory. Ideal for writing from a network stream, a
+    /// channel, or any producer that generates data incrementally.
+    ///
+    /// # Callback contract
+    ///
+    /// Each call to `next_chunk` must return one of:
+    /// - `Some(Ok(data))` — the next chunk to write (any size; chunks
+    ///   larger than `MaxWriteSize` are split automatically)
+    /// - `Some(Err(e))` — an I/O error from the source; aborts the
+    ///   write, drains in-flight responses, and propagates the error
+    /// - `None` — end of stream; all remaining in-flight writes are
+    ///   completed before returning
+    ///
+    /// An empty `Vec<u8>` in `Some(Ok(vec![]))` is treated the same as
+    /// `None` (end of stream).
+    ///
+    /// # Behavior
+    ///
+    /// - Returns the total number of bytes the server acknowledged.
+    /// - The file handle is always closed, even on error.
+    /// - If `next_chunk` returns `None` on the first call, an empty file
+    ///   is created.
+    /// - On early termination (callback error or server error), a partial
+    ///   file may remain on the server. The caller is responsible for
+    ///   cleanup (for example, calling [`delete_file`](Self::delete_file)).
+    ///
+    /// # Performance
+    ///
+    /// Uses a sliding window of up to 32 in-flight WRITE requests (same
+    /// approach as [`write_file_pipelined`](Self::write_file_pipelined)),
+    /// so throughput stays high even on high-latency links. Memory usage
+    /// is bounded to the sliding window, not the full file size.
+    ///
+    /// # When to use which write method
+    ///
+    /// | Method | Best for |
+    /// |--------|----------|
+    /// | [`write_file`](Self::write_file) | Small files that fit in a single compound (one round-trip) |
+    /// | [`write_file_pipelined`](Self::write_file_pipelined) | Large files already in a `&[u8]` buffer |
+    /// | `write_file_streamed` | Data produced incrementally (streams, channels, generators) |
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(tree: &smb2::client::Tree, conn: &mut smb2::client::Connection) -> smb2::Result<()> {
+    /// let chunks = vec![b"hello ".to_vec(), b"world".to_vec()];
+    /// let mut iter = chunks.into_iter();
+    /// let mut next = || iter.next().map(Ok);
+    ///
+    /// let bytes_written = tree.write_file_streamed(conn, "greeting.txt", &mut next).await?;
+    /// assert_eq!(bytes_written, 11);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_file_streamed<F>(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        next_chunk: &mut F,
+    ) -> Result<u64>
+    where
+        F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
+    {
+        let normalized = self.format_path(path);
+        debug!("tree: write_file_streamed path={}", normalized);
+
+        // Open (or create) the file for writing.
+        let file_id = self.open_file_for_write(conn, &normalized).await?;
+
+        let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+
+        let start = std::time::Instant::now();
+        let result = self
+            .write_streamed_loop(conn, file_id, next_chunk, max_write)
+            .await;
+
+        // Close the handle (always, even on error).
+        let close_result = self.close_handle(conn, file_id).await;
+
+        let bytes_written = result?;
+        close_result?;
+
+        let elapsed = start.elapsed();
+        let mb = bytes_written as f64 / (1024.0 * 1024.0);
+        let mbps = if elapsed.as_secs_f64() > 0.0 {
+            mb / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        debug!(
+            "tree: write_file_streamed done, wrote {} bytes in {:.2?} ({:.1} MB/s)",
+            bytes_written, elapsed, mbps
+        );
+
+        Ok(bytes_written)
+    }
+
     /// Create a directory.
     ///
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
@@ -2609,6 +2709,206 @@ impl Tree {
                     chunks_sent += 1;
                 }
             }
+        }
+
+        Ok(total_written)
+    }
+
+    /// Inner loop for streamed writes with a sliding window.
+    ///
+    /// Pulls chunks from the callback, splits them if larger than
+    /// `max_write`, and sends WRITE requests. Uses a sliding window
+    /// of in-flight requests for throughput.
+    async fn write_streamed_loop<F>(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        next_chunk: &mut F,
+        max_write: u32,
+    ) -> Result<u64>
+    where
+        F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
+    {
+        let mut offset = 0u64;
+        let mut in_flight = 0usize;
+        let mut total_written = 0u64;
+        let mut done = false; // callback exhausted or errored
+        let mut callback_err: Option<std::io::Error> = None;
+
+        // Buffer for leftover data when a callback chunk is larger than max_write.
+        let mut pending_data: Vec<u8> = Vec::new();
+        let mut pending_offset = 0usize;
+
+        // Helper: try to get the next wire-level chunk (up to max_write bytes).
+        // Returns Some(data) or None if no more data available.
+        let next_wire_chunk = |pending_data: &mut Vec<u8>,
+                               pending_offset: &mut usize,
+                               done: &mut bool,
+                               callback_err: &mut Option<std::io::Error>,
+                               next_chunk: &mut F|
+         -> Option<Vec<u8>> {
+            // First, drain any pending leftover from a previous large chunk.
+            if *pending_offset < pending_data.len() {
+                let end = (*pending_offset + max_write as usize).min(pending_data.len());
+                let slice = pending_data[*pending_offset..end].to_vec();
+                *pending_offset = end;
+                if *pending_offset >= pending_data.len() {
+                    pending_data.clear();
+                    *pending_offset = 0;
+                }
+                return Some(slice);
+            }
+
+            if *done {
+                return None;
+            }
+
+            // Pull from the callback.
+            match next_chunk() {
+                None => {
+                    *done = true;
+                    None
+                }
+                Some(Err(e)) => {
+                    *done = true;
+                    *callback_err = Some(e);
+                    None
+                }
+                Some(Ok(data)) => {
+                    if data.is_empty() {
+                        // Treat empty chunk as end of stream.
+                        *done = true;
+                        return None;
+                    }
+                    if data.len() <= max_write as usize {
+                        Some(data)
+                    } else {
+                        // Split: return first max_write bytes, buffer the rest.
+                        let first = data[..max_write as usize].to_vec();
+                        *pending_data = data;
+                        *pending_offset = max_write as usize;
+                        Some(first)
+                    }
+                }
+            }
+        };
+
+        // Initial fill: send up to window_size writes.
+        loop {
+            let credit_charge_per = max_write.div_ceil(65536).max(1) as u16;
+            let max_from_credits = conn.credits() as usize / credit_charge_per.max(1) as usize;
+            let can_send = max_from_credits.min(MAX_PIPELINE_WINDOW.saturating_sub(in_flight));
+
+            if can_send == 0 {
+                break;
+            }
+
+            let chunk = next_wire_chunk(
+                &mut pending_data,
+                &mut pending_offset,
+                &mut done,
+                &mut callback_err,
+                next_chunk,
+            );
+
+            match chunk {
+                None => break,
+                Some(data) => {
+                    let credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
+                    let req = WriteRequest {
+                        data_offset: 0x70,
+                        offset,
+                        file_id,
+                        channel: 0,
+                        remaining_bytes: 0,
+                        write_channel_info_offset: 0,
+                        write_channel_info_length: 0,
+                        flags: 0,
+                        data: data.clone(),
+                    };
+
+                    let (_, _) = conn
+                        .send_request_with_credits(
+                            Command::Write,
+                            &req,
+                            Some(self.tree_id),
+                            credit_charge,
+                        )
+                        .await?;
+
+                    offset += data.len() as u64;
+                    in_flight += 1;
+                }
+            }
+        }
+
+        // Sliding loop: receive one response, send next chunk (if any).
+        while in_flight > 0 {
+            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            in_flight -= 1;
+
+            if resp_header.status != NtStatus::SUCCESS {
+                // Drain remaining in-flight responses (best-effort).
+                for _ in 0..in_flight {
+                    let _ = conn.receive_response().await;
+                }
+                return Err(Error::Protocol {
+                    status: resp_header.status,
+                    command: Command::Write,
+                });
+            }
+
+            let mut cursor = ReadCursor::new(&resp_body);
+            let resp = WriteResponse::unpack(&mut cursor)?;
+            total_written += resp.count as u64;
+
+            // Send the next chunk if available and we don't have a pending error.
+            if callback_err.is_none() {
+                let chunk = next_wire_chunk(
+                    &mut pending_data,
+                    &mut pending_offset,
+                    &mut done,
+                    &mut callback_err,
+                    next_chunk,
+                );
+
+                if let Some(data) = chunk {
+                    let credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
+                    let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
+
+                    if credits_available > 0 {
+                        let req = WriteRequest {
+                            data_offset: 0x70,
+                            offset,
+                            file_id,
+                            channel: 0,
+                            remaining_bytes: 0,
+                            write_channel_info_offset: 0,
+                            write_channel_info_length: 0,
+                            flags: 0,
+                            data: data.clone(),
+                        };
+
+                        let (_, _) = conn
+                            .send_request_with_credits(
+                                Command::Write,
+                                &req,
+                                Some(self.tree_id),
+                                credit_charge,
+                            )
+                            .await?;
+
+                        offset += data.len() as u64;
+                        in_flight += 1;
+                    }
+                }
+            }
+        }
+
+        // If the callback returned an error, propagate it now
+        // (after all in-flight responses have been drained).
+        if let Some(io_err) = callback_err {
+            return Err(Error::Io(io_err));
         }
 
         Ok(total_written)
@@ -5546,5 +5846,177 @@ mod tests {
         assert_eq!(info.created, FileTime(132_000_000_000_000_000));
         // One compound frame sent.
         assert_eq!(mock.sent_count(), 1);
+    }
+
+    // ── Streamed write tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_file_streamed_basic() {
+        // Provide 3 small chunks, verify CREATE + 3 WRITEs + CLOSE.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+
+        let chunk1 = vec![0x01; 100];
+        let chunk2 = vec![0x02; 200];
+        let chunk3 = vec![0x03; 150];
+        let chunks = vec![Ok(chunk1.clone()), Ok(chunk2.clone()), Ok(chunk3.clone())];
+        let mut chunk_iter = chunks.into_iter();
+
+        // Queue: CREATE, 3x WRITE, CLOSE.
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_write_response(200));
+        mock.queue_response(build_write_response(150));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(30),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut next_chunk =
+            move || -> Option<std::result::Result<Vec<u8>, std::io::Error>> { chunk_iter.next() };
+
+        let written = tree
+            .write_file_streamed(&mut conn, "streamed.bin", &mut next_chunk)
+            .await
+            .unwrap();
+
+        assert_eq!(written, 450); // 100 + 200 + 150
+
+        // Verify CREATE + 3 WRITEs + CLOSE = 5 messages.
+        assert_eq!(mock.sent_count(), 5);
+
+        // Verify WRITE offsets and data.
+        // Message 0 = CREATE, 1..3 = WRITEs, 4 = CLOSE.
+        let sent1 = mock.sent_message(1).unwrap();
+        let mut cursor1 = ReadCursor::new(&sent1);
+        let _ = Header::unpack(&mut cursor1).unwrap();
+        let req1 = WriteRequest::unpack(&mut cursor1).unwrap();
+        assert_eq!(req1.offset, 0);
+        assert_eq!(req1.data, chunk1);
+
+        let sent2 = mock.sent_message(2).unwrap();
+        let mut cursor2 = ReadCursor::new(&sent2);
+        let _ = Header::unpack(&mut cursor2).unwrap();
+        let req2 = WriteRequest::unpack(&mut cursor2).unwrap();
+        assert_eq!(req2.offset, 100);
+        assert_eq!(req2.data, chunk2);
+
+        let sent3 = mock.sent_message(3).unwrap();
+        let mut cursor3 = ReadCursor::new(&sent3);
+        let _ = Header::unpack(&mut cursor3).unwrap();
+        let req3 = WriteRequest::unpack(&mut cursor3).unwrap();
+        assert_eq!(req3.offset, 300);
+        assert_eq!(req3.data, chunk3);
+
+        // Verify last message is CLOSE.
+        let sent4 = mock.sent_message(4).unwrap();
+        let mut cursor4 = ReadCursor::new(&sent4);
+        let h4 = Header::unpack(&mut cursor4).unwrap();
+        assert_eq!(h4.command, Command::Close);
+    }
+
+    #[tokio::test]
+    async fn write_file_streamed_empty() {
+        // Callback returns None immediately -> CREATE + CLOSE (empty file).
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xCC,
+            volatile: 0xDD,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(31),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut next_chunk = || -> Option<std::result::Result<Vec<u8>, std::io::Error>> { None };
+
+        let written = tree
+            .write_file_streamed(&mut conn, "empty_stream.bin", &mut next_chunk)
+            .await
+            .unwrap();
+
+        assert_eq!(written, 0);
+        // CREATE + CLOSE = 2 messages.
+        assert_eq!(mock.sent_count(), 2);
+
+        // Verify CREATE then CLOSE.
+        let sent0 = mock.sent_message(0).unwrap();
+        let mut c0 = ReadCursor::new(&sent0);
+        let h0 = Header::unpack(&mut c0).unwrap();
+        assert_eq!(h0.command, Command::Create);
+
+        let sent1 = mock.sent_message(1).unwrap();
+        let mut c1 = ReadCursor::new(&sent1);
+        let h1 = Header::unpack(&mut c1).unwrap();
+        assert_eq!(h1.command, Command::Close);
+    }
+
+    #[tokio::test]
+    async fn write_file_streamed_callback_error() {
+        // Callback returns Ok on first call, Err on second.
+        // Verify: handle is closed (CLOSE sent) and error is propagated.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xEE,
+            volatile: 0xFF,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(64));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(32),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut call_count = 0u32;
+        let mut next_chunk = move || -> Option<std::result::Result<Vec<u8>, std::io::Error>> {
+            call_count += 1;
+            match call_count {
+                1 => Some(Ok(vec![0x42; 64])),
+                2 => Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "source stream broke",
+                ))),
+                _ => None,
+            }
+        };
+
+        let result = tree
+            .write_file_streamed(&mut conn, "error_stream.bin", &mut next_chunk)
+            .await;
+
+        assert!(result.is_err(), "expected error from callback to propagate");
+
+        // Verify CLOSE was still sent (handle cleanup).
+        // Messages: CREATE + WRITE + CLOSE = 3.
+        assert_eq!(mock.sent_count(), 3);
+
+        let sent_last = mock.sent_message(2).unwrap();
+        let mut cl = ReadCursor::new(&sent_last);
+        let hl = Header::unpack(&mut cl).unwrap();
+        assert_eq!(hl.command, Command::Close);
     }
 }

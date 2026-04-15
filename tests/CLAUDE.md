@@ -57,16 +57,16 @@ cargo test --test docker_integration -- --ignored   # repeat (~8s)
 
 | Container | Port | Focus |
 |-----------|------|-------|
-| smb-guest | 10445 | Guest auth, CRUD, compound, pipelined, streaming, progress, cancel, fs_info, reconnect, file watching |
+| smb-guest | 10445 | Guest auth, CRUD, compound, pipelined, streamed write, streaming, progress, cancel, fs_info, reconnect, file watching |
 | smb-auth | 10446 | NTLM auth, wrong-password rejection |
-| smb-signing | 10447 | Mandatory signing: write/read, compound, pipelined 512 KB |
-| smb-readonly | 10448 | Read-only share: list/read/stat succeed, write/delete/mkdir fail cleanly |
+| smb-signing | 10447 | Mandatory signing: write/read, compound, pipelined 512 KB, streamed write |
+| smb-readonly | 10448 | Read-only share: list/read/stat succeed, write/delete/mkdir/streamed-write fail cleanly |
 | smb-ancient | 10449 | SMB1-only server: negotiate fails cleanly (not hang) |
 | smb-flaky | 10450 | 5s up / 5s down: connect during up, get clean error when down |
 | smb-slow | 10451 | 200ms latency: operations still work, pipelining under delay |
-| smb-encryption | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1): write/read, pipelined, share listing |
+| smb-encryption | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1): write/read, pipelined, streamed write, share listing |
 | smb-50shares | 10453 | 50 shares: RPC enumeration returns all 50 |
-| smb-maxreadsize | 10454 | 64 KB max read/write: pipelined 512 KB, streaming download chunk count |
+| smb-maxreadsize | 10454 | 64 KB max read/write: pipelined 512 KB, streamed write, streaming download chunk count |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2): different cipher family |
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target |
 | smb-dfs-target | 10457 | DFS target server with test files (hello.txt, subdir/nested.txt) |

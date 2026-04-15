@@ -1703,3 +1703,138 @@ async fn kerberos_auth_from_ccache() {
     let _ = tree.delete_file(&mut conn, "ccache_test.txt").await;
     let _ = tree.disconnect(&mut conn).await;
 }
+
+// ── Streamed write tests ────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn streamed_write_on_nas() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+
+    let test_path = "smb2_test_streamed_write.tmp";
+    let total_size = 10 * 1024 * 1024usize; // 10 MB
+    let chunk_size = 256 * 1024;
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 199) as u8).collect();
+
+    let mut offset = 0usize;
+    let data_ref = &test_data;
+    let mut next_chunk = move || -> Option<Result<Vec<u8>, std::io::Error>> {
+        if offset >= data_ref.len() {
+            return None;
+        }
+        let end = (offset + chunk_size).min(data_ref.len());
+        let chunk = data_ref[offset..end].to_vec();
+        offset = end;
+        Some(Ok(chunk))
+    };
+
+    let start = std::time::Instant::now();
+    let written = tree
+        .write_file_streamed(&mut conn, test_path, &mut next_chunk)
+        .await
+        .expect("write_file_streamed failed");
+    let elapsed = start.elapsed();
+
+    assert_eq!(written, total_size as u64);
+    println!(
+        "Streamed write: {} bytes in {:.2?} ({:.1} MB/s)",
+        written,
+        elapsed,
+        written as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+    );
+
+    // Read back and verify.
+    let data = tree
+        .read_file_pipelined(&mut conn, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(data.len(), test_data.len(), "size mismatch");
+    assert_eq!(data, test_data, "content mismatch");
+
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn streamed_write_performance_vs_pipelined() {
+    let _ = env_logger::try_init();
+
+    let total_size = 10 * 1024 * 1024usize; // 10 MB
+    let chunk_size = 256 * 1024;
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 199) as u8).collect();
+
+    // Streamed write.
+    let (mut conn1, tree1) = connect_to_nas().await;
+    let streamed_path = "smb2_test_streamed_perf.tmp";
+
+    let mut offset = 0usize;
+    let data_ref = &test_data;
+    let mut next_chunk = move || -> Option<Result<Vec<u8>, std::io::Error>> {
+        if offset >= data_ref.len() {
+            return None;
+        }
+        let end = (offset + chunk_size).min(data_ref.len());
+        let chunk = data_ref[offset..end].to_vec();
+        offset = end;
+        Some(Ok(chunk))
+    };
+
+    let start_streamed = std::time::Instant::now();
+    let written_streamed = tree1
+        .write_file_streamed(&mut conn1, streamed_path, &mut next_chunk)
+        .await
+        .expect("write_file_streamed failed");
+    let elapsed_streamed = start_streamed.elapsed();
+
+    tree1
+        .delete_file(&mut conn1, streamed_path)
+        .await
+        .expect("delete_file failed");
+    tree1
+        .disconnect(&mut conn1)
+        .await
+        .expect("disconnect failed");
+
+    // Pipelined write.
+    let (mut conn2, tree2) = connect_to_nas().await;
+    let pipelined_path = "smb2_test_pipelined_perf.tmp";
+
+    let start_pipelined = std::time::Instant::now();
+    let written_pipelined = tree2
+        .write_file_pipelined(&mut conn2, pipelined_path, &test_data)
+        .await
+        .expect("write_file_pipelined failed");
+    let elapsed_pipelined = start_pipelined.elapsed();
+
+    tree2
+        .delete_file(&mut conn2, pipelined_path)
+        .await
+        .expect("delete_file failed");
+    tree2
+        .disconnect(&mut conn2)
+        .await
+        .expect("disconnect failed");
+
+    let streamed_mbps =
+        written_streamed as f64 / (1024.0 * 1024.0) / elapsed_streamed.as_secs_f64();
+    let pipelined_mbps =
+        written_pipelined as f64 / (1024.0 * 1024.0) / elapsed_pipelined.as_secs_f64();
+
+    println!(
+        "Streamed:  {} bytes in {:.2?} ({:.1} MB/s)",
+        written_streamed, elapsed_streamed, streamed_mbps
+    );
+    println!(
+        "Pipelined: {} bytes in {:.2?} ({:.1} MB/s)",
+        written_pipelined, elapsed_pipelined, pipelined_mbps
+    );
+    println!(
+        "Ratio: streamed is {:.1}x vs pipelined",
+        streamed_mbps / pipelined_mbps
+    );
+}

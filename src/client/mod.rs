@@ -999,6 +999,28 @@ impl SmbClient {
         Ok(total_written)
     }
 
+    /// Write a file from a streaming source using pipelined I/O.
+    ///
+    /// Pulls data on demand from a callback, so you never need the full
+    /// file in memory. See [`Tree::write_file_streamed`] for the full
+    /// callback contract, performance characteristics, and usage guide.
+    ///
+    /// DFS retry is not supported for streamed writes (the callback is
+    /// consumed by the first attempt). If the share uses DFS, resolve
+    /// the tree first using a simpler method.
+    pub async fn write_file_streamed<F>(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        next_chunk: &mut F,
+    ) -> Result<u64>
+    where
+        F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
+    {
+        let conn = self.connection_for_tree(tree);
+        tree.write_file_streamed(conn, path, next_chunk).await
+    }
+
     /// Flush a file to ensure data is persisted on the server.
     ///
     /// This sends an SMB2 FLUSH request for the given file handle.

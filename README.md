@@ -220,6 +220,7 @@ For when you want to do one thing and get the result:
 - `client.delete_directory(&mut share, path)` -- remove a directory
 - `client.download(&share, path)` -- streaming download with progress (memory-efficient)
 - `client.upload(&share, path, data)` -- streaming upload with progress
+- `client.write_file_streamed(&mut share, path, callback)` -- write from a streaming source (memory-efficient, pipelined)
 - `client.watch(&share, path, recursive)` -- watch for file changes (CHANGE_NOTIFY)
 - `client.fs_info(&mut share)` -- disk space (total, free, used)
 - `client.reconnect()` -- reconnect after network failure

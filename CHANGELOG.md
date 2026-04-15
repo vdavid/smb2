@@ -5,6 +5,13 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `write_file_streamed` — write files from a streaming callback source with pipelined I/O, bounded memory usage
+  (sliding window, not full file), automatic chunk splitting at `MaxWriteSize`, works with signing and encryption
+
 ## [0.5.0] - 2026-04-10
 
 ### Added
