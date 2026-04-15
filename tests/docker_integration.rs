@@ -2175,3 +2175,250 @@ async fn guest_streamed_write_early_stop() {
         .await
         .expect("disconnect failed");
 }
+
+// ── Streamed write stress tests ──────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn guest_streamed_write_stress_100mb() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_streamed_stress_100mb.tmp";
+    let total_size = 100 * 1024 * 1024usize; // 100 MB
+    let chunk_size = 1024 * 1024; // 1 MB chunks
+
+    // Build deterministic data.
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
+
+    let mut offset = 0usize;
+    let data_ref = &test_data;
+    let mut next_chunk = move || -> Option<Result<Vec<u8>, std::io::Error>> {
+        if offset >= data_ref.len() {
+            return None;
+        }
+        let end = (offset + chunk_size).min(data_ref.len());
+        let chunk = data_ref[offset..end].to_vec();
+        offset = end;
+        Some(Ok(chunk))
+    };
+
+    let start = std::time::Instant::now();
+    let written = client
+        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .await
+        .expect("write_file_streamed failed");
+    let write_elapsed = start.elapsed();
+    assert_eq!(written, total_size as u64);
+
+    println!(
+        "Stress write: {} MB in {:.2?} ({:.1} MB/s)",
+        total_size / (1024 * 1024),
+        write_elapsed,
+        written as f64 / (1024.0 * 1024.0) / write_elapsed.as_secs_f64()
+    );
+
+    // Read back and verify integrity.
+    let read_data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(read_data.len(), test_data.len(), "size mismatch");
+    assert_eq!(
+        read_data, test_data,
+        "content mismatch in 100 MB stress test"
+    );
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_streamed_write_rapid_sequential_50_files() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let file_count = 50;
+    let file_size = 1024usize; // 1 KB each
+
+    for i in 0..file_count {
+        let test_path = format!("smb2_test_rapid_seq_{:03}.tmp", i);
+        let test_data: Vec<u8> = (0..file_size).map(|j| ((j + i * 7) % 251) as u8).collect();
+
+        let mut called = false;
+        let data_clone = test_data.clone();
+        let mut next_chunk = move || -> Option<Result<Vec<u8>, std::io::Error>> {
+            if called {
+                return None;
+            }
+            called = true;
+            Some(Ok(data_clone.clone()))
+        };
+
+        let written = client
+            .write_file_streamed(&mut tree, &test_path, &mut next_chunk)
+            .await
+            .unwrap_or_else(|e| panic!("write_file_streamed failed on file {}: {}", i, e));
+        assert_eq!(written, file_size as u64, "wrong byte count for file {}", i);
+    }
+
+    // Read back all 50 files and verify.
+    for i in 0..file_count {
+        let test_path = format!("smb2_test_rapid_seq_{:03}.tmp", i);
+        let expected: Vec<u8> = (0..file_size).map(|j| ((j + i * 7) % 251) as u8).collect();
+
+        let data = client
+            .read_file(&mut tree, &test_path)
+            .await
+            .unwrap_or_else(|e| panic!("read_file failed on file {}: {}", i, e));
+        assert_eq!(data, expected, "content mismatch on file {}", i);
+    }
+
+    // Cleanup.
+    for i in 0..file_count {
+        let test_path = format!("smb2_test_rapid_seq_{:03}.tmp", i);
+        client
+            .delete_file(&mut tree, &test_path)
+            .await
+            .unwrap_or_else(|e| panic!("delete_file failed on file {}: {}", i, e));
+    }
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_streamed_write_large_single_chunk() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_streamed_large_chunk.tmp";
+    let total_size = 5 * 1024 * 1024usize; // 5 MB as a single chunk
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
+
+    // Deliver the entire 5 MB in one callback call. This forces the
+    // chunk-splitting logic to split against max_write_size.
+    let mut called = false;
+    let data_clone = test_data.clone();
+    let mut next_chunk = move || -> Option<Result<Vec<u8>, std::io::Error>> {
+        if called {
+            return None;
+        }
+        called = true;
+        Some(Ok(data_clone.clone()))
+    };
+
+    let written = client
+        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .await
+        .expect("write_file_streamed failed");
+    assert_eq!(written, total_size as u64);
+
+    let read_data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(read_data.len(), test_data.len(), "size mismatch");
+    assert_eq!(
+        read_data, test_data,
+        "content mismatch in large single-chunk test"
+    );
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_streamed_write_alternating_sizes() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_streamed_alternating.tmp";
+
+    // Build chunks alternating between 1 byte and 1 MB.
+    let small_size = 1usize;
+    let large_size = 1024 * 1024usize;
+    let num_pairs = 5; // 5 pairs of (1 byte, 1 MB)
+
+    let mut expected_data = Vec::new();
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    for pair in 0..num_pairs {
+        // Small chunk: 1 byte.
+        let small = vec![(pair * 2) as u8; small_size];
+        expected_data.extend_from_slice(&small);
+        chunks.push(small);
+
+        // Large chunk: 1 MB with deterministic pattern.
+        let large: Vec<u8> = (0..large_size)
+            .map(|j| ((j + pair * 13) % 251) as u8)
+            .collect();
+        expected_data.extend_from_slice(&large);
+        chunks.push(large);
+    }
+
+    let mut chunk_iter = chunks.into_iter();
+    let mut next_chunk =
+        move || -> Option<Result<Vec<u8>, std::io::Error>> { chunk_iter.next().map(Ok) };
+
+    let written = client
+        .write_file_streamed(&mut tree, test_path, &mut next_chunk)
+        .await
+        .expect("write_file_streamed failed");
+    assert_eq!(written, expected_data.len() as u64);
+
+    let read_data = client
+        .read_file_pipelined(&mut tree, test_path)
+        .await
+        .expect("read_file_pipelined failed");
+    assert_eq!(read_data.len(), expected_data.len(), "size mismatch");
+    assert_eq!(
+        read_data, expected_data,
+        "content mismatch in alternating sizes test"
+    );
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}

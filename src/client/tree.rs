@@ -1881,6 +1881,11 @@ impl Tree {
             .write_streamed_loop(conn, file_id, next_chunk, max_write)
             .await;
 
+        // Flush to ensure data is persisted on the server.
+        if result.is_ok() {
+            self.flush_handle(conn, file_id).await?;
+        }
+
         // Close the handle (always, even on error).
         let close_result = self.close_handle(conn, file_id).await;
 
@@ -2739,6 +2744,10 @@ impl Tree {
         let mut pending_data: Vec<u8> = Vec::new();
         let mut pending_offset = 0usize;
 
+        // Chunk that was pulled but couldn't be sent due to credit exhaustion.
+        // Re-checked before pulling the next chunk from the callback.
+        let mut stashed_chunk: Option<Vec<u8>> = None;
+
         // Helper: try to get the next wire-level chunk (up to max_write bytes).
         // Returns Some(data) or None if no more data available.
         let next_wire_chunk = |pending_data: &mut Vec<u8>,
@@ -2814,7 +2823,8 @@ impl Tree {
             match chunk {
                 None => break,
                 Some(data) => {
-                    let credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
+                    let data_len = data.len() as u64;
+                    let credit_charge = data_len.div_ceil(65536).max(1) as u16;
                     let req = WriteRequest {
                         data_offset: 0x70,
                         offset,
@@ -2824,7 +2834,7 @@ impl Tree {
                         write_channel_info_offset: 0,
                         write_channel_info_length: 0,
                         flags: 0,
-                        data: data.clone(),
+                        data,
                     };
 
                     let (_, _) = conn
@@ -2836,7 +2846,7 @@ impl Tree {
                         )
                         .await?;
 
-                    offset += data.len() as u64;
+                    offset += data_len;
                     in_flight += 1;
                 }
             }
@@ -2863,7 +2873,7 @@ impl Tree {
             total_written += resp.count as u64;
 
             // Send the next chunk if available and we don't have a pending error.
-            if callback_err.is_none() {
+            if callback_err.is_none() && stashed_chunk.is_none() {
                 let chunk = next_wire_chunk(
                     &mut pending_data,
                     &mut pending_offset,
@@ -2873,7 +2883,8 @@ impl Tree {
                 );
 
                 if let Some(data) = chunk {
-                    let credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
+                    let data_len = data.len() as u64;
+                    let credit_charge = data_len.div_ceil(65536).max(1) as u16;
                     let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
 
                     if credits_available > 0 {
@@ -2886,7 +2897,7 @@ impl Tree {
                             write_channel_info_offset: 0,
                             write_channel_info_length: 0,
                             flags: 0,
-                            data: data.clone(),
+                            data,
                         };
 
                         let (_, _) = conn
@@ -2898,9 +2909,47 @@ impl Tree {
                             )
                             .await?;
 
-                        offset += data.len() as u64;
+                        offset += data_len;
                         in_flight += 1;
+                    } else {
+                        // Can't send yet -- stash the chunk for the next iteration.
+                        stashed_chunk = Some(data);
                     }
+                }
+            } else if let Some(data) = stashed_chunk.take() {
+                // Retry a previously stashed chunk now that we received a response
+                // (which should have returned credits).
+                let data_len = data.len() as u64;
+                let credit_charge = data_len.div_ceil(65536).max(1) as u16;
+                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
+
+                if credits_available > 0 {
+                    let req = WriteRequest {
+                        data_offset: 0x70,
+                        offset,
+                        file_id,
+                        channel: 0,
+                        remaining_bytes: 0,
+                        write_channel_info_offset: 0,
+                        write_channel_info_length: 0,
+                        flags: 0,
+                        data,
+                    };
+
+                    let (_, _) = conn
+                        .send_request_with_credits(
+                            Command::Write,
+                            &req,
+                            Some(self.tree_id),
+                            credit_charge,
+                        )
+                        .await?;
+
+                    offset += data_len;
+                    in_flight += 1;
+                } else {
+                    // Still no credits -- re-stash and wait for the next response.
+                    stashed_chunk = Some(data);
                 }
             }
         }
@@ -5865,11 +5914,12 @@ mod tests {
         let chunks = vec![Ok(chunk1.clone()), Ok(chunk2.clone()), Ok(chunk3.clone())];
         let mut chunk_iter = chunks.into_iter();
 
-        // Queue: CREATE, 3x WRITE, CLOSE.
+        // Queue: CREATE, 3x WRITE, FLUSH, CLOSE.
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_write_response(100));
         mock.queue_response(build_write_response(200));
         mock.queue_response(build_write_response(150));
+        mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
@@ -5891,11 +5941,11 @@ mod tests {
 
         assert_eq!(written, 450); // 100 + 200 + 150
 
-        // Verify CREATE + 3 WRITEs + CLOSE = 5 messages.
-        assert_eq!(mock.sent_count(), 5);
+        // Verify CREATE + 3 WRITEs + FLUSH + CLOSE = 6 messages.
+        assert_eq!(mock.sent_count(), 6);
 
         // Verify WRITE offsets and data.
-        // Message 0 = CREATE, 1..3 = WRITEs, 4 = CLOSE.
+        // Message 0 = CREATE, 1..3 = WRITEs, 4 = FLUSH, 5 = CLOSE.
         let sent1 = mock.sent_message(1).unwrap();
         let mut cursor1 = ReadCursor::new(&sent1);
         let _ = Header::unpack(&mut cursor1).unwrap();
@@ -5918,15 +5968,15 @@ mod tests {
         assert_eq!(req3.data, chunk3);
 
         // Verify last message is CLOSE.
-        let sent4 = mock.sent_message(4).unwrap();
-        let mut cursor4 = ReadCursor::new(&sent4);
-        let h4 = Header::unpack(&mut cursor4).unwrap();
-        assert_eq!(h4.command, Command::Close);
+        let sent5 = mock.sent_message(5).unwrap();
+        let mut cursor5 = ReadCursor::new(&sent5);
+        let h5 = Header::unpack(&mut cursor5).unwrap();
+        assert_eq!(h5.command, Command::Close);
     }
 
     #[tokio::test]
     async fn write_file_streamed_empty() {
-        // Callback returns None immediately -> CREATE + CLOSE (empty file).
+        // Callback returns None immediately -> CREATE + FLUSH + CLOSE (empty file).
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId {
             persistent: 0xCC,
@@ -5934,6 +5984,7 @@ mod tests {
         };
 
         mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
@@ -5953,10 +6004,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(written, 0);
-        // CREATE + CLOSE = 2 messages.
-        assert_eq!(mock.sent_count(), 2);
+        // CREATE + FLUSH + CLOSE = 3 messages.
+        assert_eq!(mock.sent_count(), 3);
 
-        // Verify CREATE then CLOSE.
+        // Verify CREATE then FLUSH then CLOSE.
         let sent0 = mock.sent_message(0).unwrap();
         let mut c0 = ReadCursor::new(&sent0);
         let h0 = Header::unpack(&mut c0).unwrap();
@@ -5965,7 +6016,12 @@ mod tests {
         let sent1 = mock.sent_message(1).unwrap();
         let mut c1 = ReadCursor::new(&sent1);
         let h1 = Header::unpack(&mut c1).unwrap();
-        assert_eq!(h1.command, Command::Close);
+        assert_eq!(h1.command, Command::Flush);
+
+        let sent2 = mock.sent_message(2).unwrap();
+        let mut c2 = ReadCursor::new(&sent2);
+        let h2 = Header::unpack(&mut c2).unwrap();
+        assert_eq!(h2.command, Command::Close);
     }
 
     #[tokio::test]
