@@ -6075,4 +6075,195 @@ mod tests {
         let hl = Header::unpack(&mut cl).unwrap();
         assert_eq!(hl.command, Command::Close);
     }
+
+    #[tokio::test]
+    async fn write_file_streamed_callback_error_is_not_connection_lost() {
+        // A callback error is a consumer issue, not a connection failure.
+        // The error kind should NOT be ConnectionLost — the connection is
+        // still usable after write_file_streamed drains in-flight responses.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(64));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(40),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut call_count = 0u32;
+        let mut next_chunk = move || -> Option<std::result::Result<Vec<u8>, std::io::Error>> {
+            call_count += 1;
+            match call_count {
+                1 => Some(Ok(vec![0x42; 64])),
+                2 => Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "user cancelled",
+                ))),
+                _ => None,
+            }
+        };
+
+        let err = tree
+            .write_file_streamed(&mut conn, "cancel_test.bin", &mut next_chunk)
+            .await
+            .unwrap_err();
+
+        // The error should NOT be classified as ConnectionLost.
+        // A callback cancellation doesn't break the SMB connection — all
+        // in-flight responses were drained and the handle was closed cleanly.
+        assert_ne!(
+            err.kind(),
+            crate::ErrorKind::ConnectionLost,
+            "callback error should not be classified as ConnectionLost; the connection is still healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_streamed_callback_error_connection_still_usable() {
+        // After a callback error in write_file_streamed, the connection should
+        // be in a clean state: all in-flight WRITE responses drained, handle
+        // CLOSEd. A subsequent operation (read_file) should work.
+        let mock = Arc::new(MockTransport::new());
+        let write_file_id = FileId {
+            persistent: 0x33,
+            volatile: 0x44,
+        };
+        let read_file_id = FileId {
+            persistent: 0x55,
+            volatile: 0x66,
+        };
+
+        // Phase 1: Streamed write that errors after 2 chunks.
+        // With max_write=65536, 2 small chunks fit in the initial window.
+        mock.queue_response(build_create_response(write_file_id, 0));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_write_response(200));
+        mock.queue_response(build_close_response());
+
+        // Phase 2: A subsequent read_file (compound: CREATE+READ+CLOSE).
+        let read_data = b"hello from the server";
+        mock.queue_response(build_compound_read_response(
+            read_file_id,
+            read_data.to_vec(),
+        ));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(41),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        // Streamed write: 2 chunks succeed, then callback errors.
+        let mut call_count = 0u32;
+        let mut next_chunk = move || -> Option<std::result::Result<Vec<u8>, std::io::Error>> {
+            call_count += 1;
+            match call_count {
+                1 => Some(Ok(vec![0xAA; 100])),
+                2 => Some(Ok(vec![0xBB; 200])),
+                3 => Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled by user",
+                ))),
+                _ => None,
+            }
+        };
+
+        let write_result = tree
+            .write_file_streamed(&mut conn, "partial.bin", &mut next_chunk)
+            .await;
+        assert!(
+            write_result.is_err(),
+            "write should fail due to callback error"
+        );
+
+        // Now verify the connection still works: read a file.
+        let data = tree
+            .read_file_compound(&mut conn, "other.txt")
+            .await
+            .unwrap();
+        assert_eq!(data, read_data);
+    }
+
+    /// Builds a compound CREATE+READ+CLOSE response (single transport frame)
+    /// for use with `read_file_compound`.
+    fn build_compound_read_response(file_id: FileId, data: Vec<u8>) -> Vec<u8> {
+        use crate::msg::read::ReadResponse;
+
+        // CREATE response (chained: next_command points to READ response)
+        let mut h1 = Header::new_request(Command::Create);
+        h1.flags.set_response();
+        h1.credits = 32;
+        let create_body = CreateResponse {
+            oplock_level: OplockLevel::None,
+            flags: 0u8,
+            create_action: CreateAction::FileOpened,
+            creation_time: crate::pack::FileTime(0),
+            last_access_time: crate::pack::FileTime(0),
+            last_write_time: crate::pack::FileTime(0),
+            change_time: crate::pack::FileTime(0),
+            allocation_size: 0,
+            end_of_file: data.len() as u64,
+            file_attributes: 0x80,
+            file_id,
+            create_contexts: vec![],
+        };
+        let create_bytes = pack_message(&h1, &create_body);
+
+        // READ response (chained: next_command points to CLOSE response)
+        let mut h2 = Header::new_request(Command::Read);
+        h2.flags.set_response();
+        h2.credits = 32;
+        let read_body = ReadResponse {
+            data_offset: 0x50,
+            data: data.clone(),
+            data_remaining: 0,
+            flags: 0,
+        };
+        let read_bytes = pack_message(&h2, &read_body);
+
+        // CLOSE response (last in chain)
+        let close_bytes = build_close_response();
+
+        // Patch next_command offsets for compounding
+        let mut frame = Vec::new();
+
+        let mut create_buf = create_bytes;
+        let create_len = create_buf.len();
+        // Align to 8 bytes
+        let padded_create_len = (create_len + 7) & !7;
+        create_buf.resize(padded_create_len, 0);
+        // Set NextCommand in header (offset 20, 4 bytes LE)
+        let next_cmd = padded_create_len as u32;
+        create_buf[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+        // Set RELATED_OPERATIONS flag on subsequent headers? No — compound READ
+        // uses the same file_id from CREATE, but read_file_compound sends
+        // FileId::SENTINEL which gets filled in by the server. For mock,
+        // we just need the responses to parse correctly.
+        frame.extend_from_slice(&create_buf);
+
+        let mut read_buf = read_bytes;
+        let read_len = read_buf.len();
+        let padded_read_len = (read_len + 7) & !7;
+        read_buf.resize(padded_read_len, 0);
+        let next_cmd2 = padded_read_len as u32;
+        read_buf[20..24].copy_from_slice(&next_cmd2.to_le_bytes());
+        frame.extend_from_slice(&read_buf);
+
+        frame.extend_from_slice(&close_bytes);
+
+        frame
+    }
 }

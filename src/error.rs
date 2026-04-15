@@ -152,6 +152,12 @@ pub enum ErrorKind {
     DfsReferral,
     /// Invalid data or malformed response.
     InvalidData,
+    /// An I/O error (transport or callback). Not necessarily a connection loss.
+    ///
+    /// Distinct from `ConnectionLost`: the connection may still be usable.
+    /// For example, a callback error in `write_file_streamed` produces `Io`,
+    /// but the connection is still in a clean state.
+    Io,
     /// A protocol error not covered by other variants.
     ///
     /// Use [`Error::status()`] to get the raw NTSTATUS code.
@@ -167,7 +173,8 @@ impl Error {
         match self {
             Error::InvalidData { .. } => ErrorKind::InvalidData,
             Error::Auth { .. } => ErrorKind::AuthRequired,
-            Error::Io(_) | Error::Disconnected => ErrorKind::ConnectionLost,
+            Error::Io(_) => ErrorKind::Io,
+            Error::Disconnected => ErrorKind::ConnectionLost,
             Error::Timeout => ErrorKind::TimedOut,
             Error::Cancelled => ErrorKind::Cancelled,
             Error::SessionExpired => ErrorKind::SessionExpired,
@@ -300,6 +307,24 @@ mod tests {
             .kind(),
             ErrorKind::AuthRequired
         );
+    }
+
+    #[test]
+    fn kind_maps_io_error_to_io_not_connection_lost() {
+        // Error::Io from callback errors (like write_file_streamed cancellation)
+        // should NOT be ConnectionLost — the connection may still be usable.
+        let err = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ));
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert_ne!(err.kind(), ErrorKind::ConnectionLost);
+    }
+
+    #[test]
+    fn kind_disconnected_is_connection_lost() {
+        // Error::Disconnected (transport EOF) IS a connection loss.
+        assert_eq!(Error::Disconnected.kind(), ErrorKind::ConnectionLost);
     }
 
     #[test]
