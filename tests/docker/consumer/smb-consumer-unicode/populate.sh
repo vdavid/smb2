@@ -1,5 +1,13 @@
 #!/bin/sh
-# Create files and directories with unicode names.
+# Create files and directories with unicode names. Also creates directories for
+# the unicode-named shares defined in smb.conf (公開, café, 文档) so clients can
+# exercise UTF-8 share-name enumeration too.
+for dir in /shares/kokai /shares/cafe /shares/wendang; do
+    mkdir -p "$dir"
+    printf "content inside unicode-named share\n" > "$dir/README.txt"
+done
+chmod -R 777 /shares/kokai /shares/cafe /shares/wendang
+
 BASE="/shares/public"
 mkdir -p "$BASE"
 
