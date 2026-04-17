@@ -304,15 +304,9 @@ impl Tree {
 
         let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
 
-        // Receive compound response.
-        let responses = conn.receive_compound().await?;
-
-        if responses.len() != 3 {
-            return Err(Error::invalid_data(format!(
-                "expected 3 compound responses, got {}",
-                responses.len()
-            )));
-        }
+        // Receive compound response. If the server split the compound
+        // chain across frames, `receive_compound_expected` gathers them.
+        let responses = conn.receive_compound_expected(3).await?;
 
         let (create_header, create_body) = &responses[0];
         let (read_header, read_body) = &responses[1];
@@ -516,16 +510,8 @@ impl Tree {
         let mut cleanup_handles: Vec<FileId> = Vec::new();
 
         for (i, path) in paths.iter().enumerate().take(sent_count) {
-            match conn.receive_compound().await {
+            match conn.receive_compound_expected(2).await {
                 Ok(responses) => {
-                    if responses.len() != 2 {
-                        results.push(Err(Error::invalid_data(format!(
-                            "expected 2 compound responses, got {}",
-                            responses.len()
-                        ))));
-                        continue;
-                    }
-
                     let (create_header, create_body) = &responses[0];
                     let (close_header, _) = &responses[1];
 
@@ -648,14 +634,7 @@ impl Tree {
         ];
 
         let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
-        let responses = conn.receive_compound().await?;
-
-        if responses.len() != 4 {
-            return Err(Error::invalid_data(format!(
-                "expected 4 compound responses, got {}",
-                responses.len()
-            )));
-        }
+        let responses = conn.receive_compound_expected(4).await?;
 
         let (create_header, create_body) = &responses[0];
         let (basic_header, basic_body) = &responses[1];
@@ -849,7 +828,7 @@ impl Tree {
         let mut cleanup_handles: Vec<FileId> = Vec::new();
 
         for i in 0..sent_count {
-            match conn.receive_compound().await {
+            match conn.receive_compound_expected(4).await {
                 Ok(responses) => {
                     results.push(self.parse_stat_batch_response(&responses, &mut cleanup_handles));
                     if results[i].is_ok() {
@@ -892,17 +871,20 @@ impl Tree {
     }
 
     /// Parse a single stat compound response for the batch stat method.
+    ///
+    /// Expects exactly four sub-responses (CREATE, QUERY_INFO basic,
+    /// QUERY_INFO standard, CLOSE). The caller must guarantee this by
+    /// gathering responses via `receive_compound_expected(4)`.
     fn parse_stat_batch_response(
         &self,
         responses: &[(crate::msg::header::Header, Vec<u8>)],
         cleanup_handles: &mut Vec<FileId>,
     ) -> Result<FileInfo> {
-        if responses.len() != 4 {
-            return Err(Error::invalid_data(format!(
-                "expected 4 compound responses, got {}",
-                responses.len()
-            )));
-        }
+        debug_assert_eq!(
+            responses.len(),
+            4,
+            "stat compound must have 4 sub-responses"
+        );
 
         let (create_header, create_body) = &responses[0];
         let (basic_header, basic_body) = &responses[1];
@@ -1041,15 +1023,9 @@ impl Tree {
 
         let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
 
-        // Receive compound response.
-        let responses = conn.receive_compound().await?;
-
-        if responses.len() != 3 {
-            return Err(Error::invalid_data(format!(
-                "expected 3 compound responses, got {}",
-                responses.len()
-            )));
-        }
+        // Receive compound response. If the server split the compound
+        // chain across frames, `receive_compound_expected` gathers them.
+        let responses = conn.receive_compound_expected(3).await?;
 
         let (create_header, _create_body) = &responses[0];
         let (query_header, query_body) = &responses[1];
@@ -1179,14 +1155,7 @@ impl Tree {
         ];
 
         let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
-        let responses = conn.receive_compound().await?;
-
-        if responses.len() != 3 {
-            return Err(Error::invalid_data(format!(
-                "expected 3 compound responses, got {}",
-                responses.len()
-            )));
-        }
+        let responses = conn.receive_compound_expected(3).await?;
 
         let (create_header, create_body) = &responses[0];
         let (setinfo_header, _setinfo_body) = &responses[1];
@@ -1305,16 +1274,8 @@ impl Tree {
         let mut cleanup_handles: Vec<FileId> = Vec::new();
 
         for (i, (from, to)) in renames.iter().enumerate().take(sent_count) {
-            match conn.receive_compound().await {
+            match conn.receive_compound_expected(3).await {
                 Ok(responses) => {
-                    if responses.len() != 3 {
-                        results.push(Err(Error::invalid_data(format!(
-                            "expected 3 compound responses, got {}",
-                            responses.len()
-                        ))));
-                        continue;
-                    }
-
                     let (create_header, create_body) = &responses[0];
                     let (setinfo_header, _) = &responses[1];
                     let (close_header, _) = &responses[2];
@@ -1457,15 +1418,9 @@ impl Tree {
 
         let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
 
-        // Receive compound response.
-        let responses = conn.receive_compound().await?;
-
-        if responses.len() != 4 {
-            return Err(Error::invalid_data(format!(
-                "expected 4 compound responses, got {}",
-                responses.len()
-            )));
-        }
+        // Receive compound response. If the server split the compound
+        // chain across frames, `receive_compound_expected` gathers them.
+        let responses = conn.receive_compound_expected(4).await?;
 
         let (create_header, create_body) = &responses[0];
         let (write_header, write_body) = &responses[1];
@@ -2031,14 +1986,7 @@ impl Tree {
         ];
 
         let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
-        let responses = conn.receive_compound().await?;
-
-        if responses.len() != 2 {
-            return Err(Error::invalid_data(format!(
-                "expected 2 compound responses, got {}",
-                responses.len()
-            )));
-        }
+        let responses = conn.receive_compound_expected(2).await?;
 
         let (create_header, create_body) = &responses[0];
         let (close_header, _close_body) = &responses[1];

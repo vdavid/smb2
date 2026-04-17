@@ -809,10 +809,93 @@ impl Connection {
     ///
     /// Splits the response by `NextCommand` offsets and returns each
     /// sub-response as `(Header, body_bytes)`.
+    ///
+    /// **Note:** per MS-SMB2 section 3.3.4.1.3, the server only SHOULD
+    /// compound responses -- it MAY send them as separate frames even when
+    /// the client compounded the request. This method returns whatever
+    /// arrives in the next frame. Callers that sent N related sub-requests
+    /// and need to collect all N responses should use
+    /// [`Self::receive_compound_expected`] instead, which transparently
+    /// gathers additional frames when the server splits.
     pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>> {
-        // Loop to skip unsolicited oplock/lease break notifications that
-        // may arrive before the compound response we're waiting for.
-        let (resp_bytes, was_encrypted) = loop {
+        let (resp_bytes, was_encrypted) = self.receive_and_preprocess_frame().await?;
+        let results = self.parse_compound_frame(&resp_bytes, was_encrypted)?;
+        if self.credits == 0 {
+            warn!("recv_compound: zero credits remaining -- credit starvation");
+        }
+        Ok(results)
+    }
+
+    /// Receive exactly `expected` compound sub-responses, transparently
+    /// gathering additional transport frames if the server split the
+    /// compound chain across multiple sends.
+    ///
+    /// Per MS-SMB2 section 3.3.4.1.3, the server MAY choose to not compound
+    /// responses even when the client compounded the request (Samba is
+    /// known to do this in some scenarios). In that case each response
+    /// arrives in its own frame. This method reads additional frames until
+    /// `expected` sub-responses have been collected, logging at DEBUG the
+    /// first time it notices a split.
+    ///
+    /// Returns `Err(Error::invalid_data)` if a frame contains more
+    /// sub-responses than remain expected -- that would indicate a
+    /// protocol error (the server sent responses for requests we didn't
+    /// make, or our bookkeeping is wrong).
+    pub async fn receive_compound_expected(
+        &mut self,
+        expected: usize,
+    ) -> Result<Vec<(Header, Vec<u8>)>> {
+        if expected == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut results = self.receive_compound().await?;
+
+        if results.len() > expected {
+            return Err(Error::invalid_data(format!(
+                "split compound response overflow: expected {} sub-responses total, \
+                 but first frame has {}",
+                expected,
+                results.len(),
+            )));
+        }
+
+        if results.len() < expected {
+            debug!(
+                "recv_compound: server split compound response; got {} of {}, reading remaining frames",
+                results.len(),
+                expected,
+            );
+        }
+
+        while results.len() < expected {
+            let (resp_bytes, was_encrypted) = self.receive_and_preprocess_frame().await?;
+            let more = self.parse_compound_frame(&resp_bytes, was_encrypted)?;
+            if results.len() + more.len() > expected {
+                return Err(Error::invalid_data(format!(
+                    "split compound response overflow: expected {} sub-responses total, \
+                     already collected {}, but next frame has {} more",
+                    expected,
+                    results.len(),
+                    more.len(),
+                )));
+            }
+            results.extend(more);
+        }
+
+        if self.credits == 0 {
+            warn!("recv_compound: zero credits remaining -- credit starvation");
+        }
+
+        Ok(results)
+    }
+
+    /// Receive one frame from the transport, transparently decrypting,
+    /// decompressing, and skipping unsolicited oplock/lease break
+    /// notifications. Returns the preprocessed frame bytes and whether
+    /// the frame was encrypted on the wire.
+    async fn receive_and_preprocess_frame(&mut self) -> Result<(Vec<u8>, bool)> {
+        loop {
             let raw = self.receiver.receive().await?;
             trace!("recv_compound: raw response {} bytes", raw.len());
 
@@ -843,9 +926,18 @@ impl Connection {
                 }
             }
 
-            break (decompressed, was_encrypted);
-        };
+            return Ok((decompressed, was_encrypted));
+        }
+    }
 
+    /// Parse a single preprocessed frame into one or more sub-responses,
+    /// splitting on `NextCommand` offsets, verifying signatures, and
+    /// updating credits.
+    fn parse_compound_frame(
+        &mut self,
+        resp_bytes: &[u8],
+        was_encrypted: bool,
+    ) -> Result<Vec<(Header, Vec<u8>)>> {
         let mut results = Vec::new();
         let mut offset = 0usize;
 
@@ -944,10 +1036,6 @@ impl Connection {
                 break;
             }
             offset += next_command as usize;
-        }
-
-        if self.credits == 0 {
-            warn!("recv_compound: zero credits remaining -- credit starvation");
         }
 
         Ok(results)
@@ -1742,6 +1830,161 @@ mod tests {
         let mut cursor = ReadCursor::new(&responses[1].1);
         let read_body = ReadResponse::unpack(&mut cursor).unwrap();
         assert_eq!(read_body.data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_expected_gathers_from_one_frame() {
+        // Well-behaved server path: all N responses arrive in a single
+        // compound frame. Should complete after one transport read.
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        let data = vec![0xAA, 0xBB];
+        let create = build_test_create_response(file_id, data.len() as u64);
+        let read = build_test_read_response(data);
+        let close = build_test_close_response();
+
+        let frame = build_compound_response_frame(&[create, read, close]);
+        mock.queue_response(frame);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let responses = conn.receive_compound_expected(3).await.unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].0.command, Command::Create);
+        assert_eq!(responses[1].0.command, Command::Read);
+        assert_eq!(responses[2].0.command, Command::Close);
+        // Only one transport frame was consumed.
+        assert_eq!(mock.received_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_expected_gathers_across_split_frames() {
+        // Server-split path: Samba (and thus QNAP) sometimes sends each
+        // response as a standalone frame even when the client compounded
+        // the request. We must read all three frames and present them as
+        // if they had been compounded.
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        // Three separate frames, each with NextCommand=0 (standalone).
+        let create = build_test_create_response(file_id, data.len() as u64);
+        let read = build_test_read_response(data.clone());
+        let close = build_test_close_response();
+
+        mock.queue_response(create);
+        mock.queue_response(read);
+        mock.queue_response(close);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let responses = conn.receive_compound_expected(3).await.unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].0.command, Command::Create);
+        assert_eq!(responses[1].0.command, Command::Read);
+        assert_eq!(responses[2].0.command, Command::Close);
+
+        // Verify the READ body still round-trips data correctly.
+        let mut cursor = ReadCursor::new(&responses[1].1);
+        let read_body = ReadResponse::unpack(&mut cursor).unwrap();
+        assert_eq!(read_body.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Three transport frames were consumed to gather 3 sub-responses.
+        assert_eq!(mock.received_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_expected_gathers_mixed_partial_split() {
+        // Hybrid split: server sent the first two responses compounded
+        // in one frame, then the third as a standalone frame.
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        let create = build_test_create_response(file_id, 0);
+        let read = build_test_read_response(vec![]);
+        let close = build_test_close_response();
+
+        // Frame 1: CREATE + READ compounded.
+        let frame1 = build_compound_response_frame(&[create, read]);
+        // Frame 2: CLOSE alone (standalone).
+        let frame2 = close;
+
+        mock.queue_response(frame1);
+        mock.queue_response(frame2);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        let responses = conn.receive_compound_expected(3).await.unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].0.command, Command::Create);
+        assert_eq!(responses[1].0.command, Command::Read);
+        assert_eq!(responses[2].0.command, Command::Close);
+        // Two transport frames consumed: one compounded (CREATE+READ) and
+        // one standalone (CLOSE).
+        assert_eq!(mock.received_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_expected_rejects_overflow() {
+        // Defensive check: if a frame carries more sub-responses than we
+        // expect, that's a protocol error -- bail out rather than silently
+        // accept extras.
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        let create = build_test_create_response(file_id, 0);
+        let read = build_test_read_response(vec![]);
+        let close = build_test_close_response();
+
+        let frame = build_compound_response_frame(&[create, read, close]);
+        mock.queue_response(frame);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        // We ask for 2 but the frame contains 3 -- should error.
+        let err = conn.receive_compound_expected(2).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("split compound response overflow")
+                || format!("{err}").contains("overflow"),
+            "unexpected error: {err}",
+        );
     }
 
     #[tokio::test]

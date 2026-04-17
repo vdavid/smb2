@@ -5,6 +5,22 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Connection::receive_compound_expected(n)` -- gathers exactly `n` compound sub-responses, transparently
+  reading additional transport frames when the server splits the chain. All compound-using methods
+  (`read_file_compound`, `write_file_compound`, `fs_info`, `stat`, `rename`, `delete_file`/`delete_directory`,
+  and the batch `delete_files`/`rename_files`/`stat_files`) now use it.
+
+### Fixed
+
+- Compound requests no longer error with `invalid_data: expected N compound responses, got M` when the
+  server sends responses as separate frames instead of one compounded frame. Per MS-SMB2 3.3.4.1.3 the
+  server SHOULD compound but MAY split, and Samba (including QNAP NAS firmware built on Samba) splits
+  in some scenarios. Hit in the wild via `fs_info` against a QNAP NAS.
+
 ## [0.7.0] - 2026-04-15
 
 ### Added

@@ -45,7 +45,17 @@ All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenienc
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
 - **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.
 - **Stat compound**: CREATE + QUERY_INFO (basic) + QUERY_INFO (standard) + CLOSE (4 ops, 1 round-trip). Default for `stat`.
+- **Fs-info compound**: CREATE + QUERY_INFO (FileFsFullSizeInformation) + CLOSE (3 ops, 1 round-trip). Default for `fs_info`.
 - If CREATE succeeds but a later op fails, the client issues a standalone CLOSE to avoid leaking the handle.
+
+### Receiving compound responses
+
+Two methods on `Connection`:
+
+- `receive_compound()` -- returns whatever sub-responses arrive in the next frame. Use when you don't know (or care) how many to expect.
+- `receive_compound_expected(n)` -- collects exactly `n` sub-responses, reading additional transport frames if the server split the chain. Use this in every compound-using method that knows its shape.
+
+Per MS-SMB2 section 3.3.4.1.3, the server MAY compound responses -- it is not required to. Samba (including QNAP NAS firmware, which uses Samba) has been observed splitting compound chains in some cases; Windows Server does too under certain conditions. `receive_compound_expected` handles this transparently: a hot path that stays one round-trip when the server cooperates, and a fallback that gathers the remaining frames when it doesn't.
 
 ## Batch operations
 
@@ -128,3 +138,4 @@ Tree-level encryption: `connect_share()` checks the share's encrypt flag and act
 - **DFS paths must include server\share prefix**: When `SMB2_FLAGS_DFS_OPERATIONS` is set, the server expects the path to start with `server\share\` (MS-SMB2 3.2.4.3). `Tree::format_path()` handles this automatically for DFS shares. Without the prefix, Samba strips the first two path components, leading to wrong file opens.
 - **DFS redirect changes the tree in-place**: After a DFS redirect, `tree.server`, `tree.share_name`, and `tree.tree_id` all change. Subsequent operations on the same tree use the target server directly -- they must use target-relative paths, not the original DFS paths.
 - **tree.server stores addr:port**: The `server` field on `Tree` stores the full `addr:port` string (not just hostname) so `connection_for_tree` can distinguish servers that share the same hostname but use different ports.
+- **Servers MAY split compound responses**: MS-SMB2 section 3.3.4.1.3 says the server SHOULD compound responses but is not required to. Samba (and QNAP firmware built on it) is known to split compound chains into separate frames in some scenarios; Windows Server does too under certain conditions. Compound-using methods (`read_file_compound`, `write_file_compound`, `fs_info`, `stat`, `rename`, `delete_file`, batch `*_files`) call `Connection::receive_compound_expected(n)` instead of `receive_compound()`, which transparently gathers additional frames if the server splits. Logged at DEBUG, not WARN -- it's a spec edge case, not a problem.
