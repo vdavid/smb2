@@ -9,6 +9,11 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `FileWriter::abort()` -- fast-cancel companion to `finish()`. Discards any unsent data, drains in-flight
+  WRITE responses to keep credits and message IDs in sync, skips the server-side FLUSH (fsync), and does a
+  best-effort CLOSE. Errors during drain/close are swallowed so callers can exit quickly. Use on
+  cancellation or error paths where the partial remote file is going to be deleted anyway -- it saves the
+  fsync round-trip vs. calling `finish()`. The caller is responsible for deleting the partial file.
 - `Connection::receive_compound_expected(n)` -- gathers exactly `n` compound sub-responses, transparently
   reading additional transport frames when the server splits the chain. All compound-using methods
   (`read_file_compound`, `write_file_compound`, `fs_info`, `stat`, `rename`, `delete_file`/`delete_directory`,

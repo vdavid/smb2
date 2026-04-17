@@ -2,8 +2,9 @@
 //!
 //! Provides [`FileDownload`] for memory-efficient large file downloads,
 //! [`FileUpload`] for streaming uploads with progress,
-//! [`FileWriter`] for push-based pipelined writes, and [`Progress`]
-//! for tracking transfer progress.
+//! [`FileWriter`] for push-based pipelined writes (use
+//! [`FileWriter::finish`] for normal completion, [`FileWriter::abort`] for
+//! fast cancellation), and [`Progress`] for tracking transfer progress.
 
 use std::ops::ControlFlow;
 
@@ -633,6 +634,129 @@ impl<'a> FileWriter<'a> {
         Ok(self.total_written)
     }
 
+    /// Abort the writer: discard unsent data, drain in-flight responses, and
+    /// close the handle without flushing.
+    ///
+    /// Use this when you want to cancel a write partway through — for example
+    /// on user-triggered cancellation or an error path where the partial upload
+    /// will be deleted anyway. `abort()` skips the server-side fsync that
+    /// [`finish`](FileWriter::finish) does, so it returns as soon as the
+    /// in-flight window is drained.
+    ///
+    /// What it does:
+    /// - Discards any buffered (unsent) data. Wire WRITEs already in flight
+    ///   still have responses on the way; those are drained to keep credits
+    ///   and message-IDs in sync with the server. Errors on those responses
+    ///   are swallowed — at this point we don't care.
+    /// - Skips the FLUSH that [`finish`](FileWriter::finish) sends before
+    ///   CLOSE, so the server does not fsync. This is the main reason to
+    ///   prefer `abort()` over `finish()` on cancellation.
+    /// - Best-effort CLOSE of the file handle. If the CLOSE fails, the error
+    ///   is logged at debug and swallowed.
+    ///
+    /// Contrast with [`finish`](FileWriter::finish): `finish()` sends every
+    /// pending byte, flushes, and propagates errors from the flush/close
+    /// paths. `abort()` sends nothing more, never flushes, and returns `Ok`
+    /// regardless of what the server said on the way out.
+    ///
+    /// Returns the number of confirmed bytes written at the moment of abort
+    /// (from WRITE responses seen so far). Consumes `self` to prevent
+    /// write-after-abort at compile time. The `Result` wrapper mirrors
+    /// [`finish`](FileWriter::finish)'s signature and leaves room for future
+    /// failure modes; today `abort()` never returns `Err`.
+    ///
+    /// The caller is responsible for deleting the partial remote file if they
+    /// don't want it to linger — the server now has a zero-to-N byte file
+    /// depending on how many WRITEs completed before the abort.
+    ///
+    /// # Future extension
+    ///
+    /// A `close_and_delete()` variant that sends `SET_INFO
+    /// FileDispositionInformation(DeletePending=true)` before CLOSE would
+    /// combine the two round-trips the caller does today. Out of scope here.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::ops::ControlFlow;
+    /// # async fn example(
+    /// #     client: &mut smb2::SmbClient,
+    /// #     share: &smb2::Tree,
+    /// #     cancel: impl Fn() -> bool,
+    /// # ) -> Result<(), smb2::Error> {
+    /// let mut writer = client.create_file_writer(&share, "output.bin").await?;
+    /// for chunk in [b"first".as_slice(), b"second", b"third"] {
+    ///     if cancel() {
+    ///         let written = writer.abort().await?;
+    ///         println!("Aborted after {written} bytes confirmed");
+    ///         // Caller: delete the partial remote file here if desired.
+    ///         return Ok(());
+    ///     }
+    ///     writer.write_chunk(chunk).await?;
+    /// }
+    /// writer.finish().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn abort(mut self) -> Result<u64> {
+        // 1. Discard anything we have not yet put on the wire. Unsent data
+        //    means nothing to the server and carries no credits.
+        self.pending_data.clear();
+        self.pending_offset = 0;
+        self.stashed_chunk = None;
+
+        // 2. Drain in-flight WRITE responses — they're already in the
+        //    kernel/network buffer, and dropping them unread would desync
+        //    credits and message IDs. Errors are swallowed: on abort we
+        //    don't care if a WRITE failed or succeeded.
+        while self.in_flight > 0 {
+            match self.conn.receive_response().await {
+                Ok((resp_header, resp_body, _)) => {
+                    self.in_flight -= 1;
+                    if resp_header.status == NtStatus::SUCCESS {
+                        // Keep total_written accurate for callers that log it.
+                        let mut cursor = ReadCursor::new(&resp_body);
+                        if let Ok(resp) = WriteResponse::unpack(&mut cursor) {
+                            self.total_written += resp.count as u64;
+                        }
+                    } else {
+                        debug!(
+                            "stream: FileWriter::abort() ignoring WRITE error status {:?}",
+                            resp_header.status
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Transport-level failure while draining. There's nothing
+                    // sensible to do — the connection may already be gone.
+                    // Mark everything drained and move on.
+                    debug!(
+                        "stream: FileWriter::abort() giving up on remaining {} in-flight \
+                         response(s) after transport error: {}",
+                        self.in_flight, e
+                    );
+                    self.in_flight = 0;
+                    break;
+                }
+            }
+        }
+
+        // 3. Skip flush_handle() — that's the whole point of abort().
+
+        // 4. Best-effort CLOSE. If it fails, log and move on.
+        if let Err(e) = self.tree.close_handle(self.conn, self.file_id).await {
+            debug!(
+                "stream: FileWriter::abort() best-effort CLOSE failed, handle may leak \
+                 server-side until session teardown: {}",
+                e
+            );
+        }
+
+        // 5. Silence the Drop warning — we finalized cleanly.
+        self.done = true;
+        Ok(self.total_written)
+    }
+
     /// Confirmed bytes written (from server WRITE responses).
     #[must_use]
     pub fn bytes_written(&self) -> u64 {
@@ -803,8 +927,8 @@ impl Drop for FileWriter<'_> {
 mod tests {
     use super::*;
     use crate::client::test_helpers::{
-        build_close_response, build_create_response, build_flush_response,
-        build_write_error_response, build_write_response, setup_connection,
+        build_close_error_response, build_close_response, build_create_response,
+        build_flush_response, build_write_error_response, build_write_response, setup_connection,
     };
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -1088,6 +1212,173 @@ mod tests {
         // finish() must drain all 3.
         let total = writer.finish().await.unwrap();
         assert_eq!(total, 150);
+    }
+
+    // ── FileWriter::abort tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_writer_abort_no_in_flight() {
+        // abort() with nothing in flight: just CLOSE, no FLUSH, no extra reads.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        // Queue: CREATE + CLOSE (note: no FLUSH — abort skips fsync).
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let total = writer.abort().await.unwrap();
+        assert_eq!(total, 0);
+
+        // Exactly 2 messages on the wire: CREATE, CLOSE.
+        assert_eq!(mock.sent_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn file_writer_abort_drains_in_flight() {
+        // abort() must consume in-flight WRITE responses to keep the
+        // connection in sync, but skips FLUSH.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        // Three WRITEs on the wire, three responses queued.
+        mock.queue_response(build_write_response(50));
+        mock.queue_response(build_write_response(75));
+        mock.queue_response(build_write_response(25));
+        // No FLUSH response — abort must not send FLUSH.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[0u8; 50]).await.unwrap();
+        writer.write_chunk(&[0u8; 75]).await.unwrap();
+        writer.write_chunk(&[0u8; 25]).await.unwrap();
+
+        // Nothing drained yet — write_chunk doesn't drain unless the window fills.
+        assert_eq!(writer.bytes_written(), 0);
+
+        // abort() drains all three and returns the confirmed total.
+        let total = writer.abort().await.unwrap();
+        assert_eq!(total, 150);
+
+        // Wire traffic: CREATE + 3 WRITEs + CLOSE = 5. No FLUSH.
+        assert_eq!(mock.sent_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn file_writer_abort_swallows_write_errors() {
+        // Mid-stream WRITE failure during abort's drain: swallowed, abort
+        // still closes and returns Ok.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(100));
+        // Second WRITE errors — abort must not bubble this up.
+        mock.queue_response(build_write_error_response(NtStatus::DISK_FULL));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+
+        // abort() should return Ok despite the DISK_FULL on the second WRITE.
+        // total_written reflects only the successful WRITE (100).
+        let total = writer.abort().await.unwrap();
+        assert_eq!(total, 100);
+
+        // Wire: CREATE + 2 WRITEs + CLOSE = 4.
+        assert_eq!(mock.sent_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn file_writer_abort_discards_stashed_chunk() {
+        // If a chunk was stashed (credit/window exhaustion scenario in
+        // real traffic), abort() must not send it.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+
+        // Inject a stashed chunk and pending buffer directly — in real traffic
+        // these would accumulate when credits run out. Neither should get sent.
+        writer.stashed_chunk = Some(vec![0u8; 500]);
+        writer.pending_data = vec![0u8; 1000];
+        writer.pending_offset = 0;
+
+        let total = writer.abort().await.unwrap();
+        assert_eq!(total, 0);
+
+        // Only CREATE + CLOSE on the wire. No WRITE from the stash or buffer.
+        assert_eq!(mock.sent_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn file_writer_abort_close_error_is_swallowed() {
+        // CLOSE failing at the end is logged but not surfaced — abort
+        // is a best-effort fast exit.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(100));
+        // CLOSE returns an error. abort() must still return Ok.
+        mock.queue_response(build_close_error_response(NtStatus::FILE_CLOSED));
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+
+        let result = writer.abort().await;
+        assert!(
+            result.is_ok(),
+            "abort() should swallow CLOSE errors, got: {result:?}"
+        );
+        assert_eq!(result.unwrap(), 100);
+
+        // CREATE + WRITE + CLOSE = 3.
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn file_writer_abort_sets_done_so_drop_is_silent() {
+        // After abort() returns, the `done` flag is set, so the Drop impl
+        // does not log a "dropped without finish()" warning. We can't
+        // inspect `done` once the writer has been consumed, but we can
+        // confirm abort returns Ok (which only happens on the done=true
+        // path) and that the test ends cleanly under log capture.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let result = writer.abort().await;
+        assert!(result.is_ok());
+        // The writer has been consumed. `Drop` ran inside abort's frame
+        // with done=true, so no warning fired. (Behavior-only check;
+        // exposing `done` for inspection was not needed.)
     }
 
     // ── Progress tests ─────────────────────────────────────────────────

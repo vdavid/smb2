@@ -114,6 +114,22 @@ pub(crate) fn build_write_error_response(status: crate::types::status::NtStatus)
     pack_message(&h, &body)
 }
 
+/// Build a CLOSE response with a non-success status (for error tests).
+pub(crate) fn build_close_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
+    use crate::msg::header::ErrorResponse;
+    let mut h = Header::new_request(Command::Close);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+
+    let body = ErrorResponse {
+        error_context_count: 0,
+        error_data: vec![],
+    };
+
+    pack_message(&h, &body)
+}
+
 /// Build a FLUSH response.
 pub(crate) fn build_flush_response() -> Vec<u8> {
     let mut h = Header::new_request(Command::Flush);
