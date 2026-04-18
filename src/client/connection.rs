@@ -2985,6 +2985,325 @@ mod tests {
         assert_eq!(mock.pending_responses(), 0);
     }
 
+    // ── Phase 2 (actor + oneshot routing) red tests ─────────────────
+    //
+    // These tests pin the invariants the Phase 2 refactor must establish.
+    // They target the cancellation-by-drop failure mode that Phase 1's
+    // `HashSet<MessageId>` demux cannot solve: when a caller's future is
+    // dropped mid-flight (for example, by `tokio::task::JoinHandle::abort()`),
+    // the in-flight MessageIds stay in `pending`; server responses for those
+    // ids then get handed to the next caller as if they were legitimate.
+    //
+    // Post-Phase-2, each in-flight request carries its own `oneshot::Sender`;
+    // when the caller's `Receiver` is dropped (future aborted), the receiver
+    // task discards the response silently on arrival.
+    //
+    // These tests fail against current code (Phase 1). They must pass after
+    // Phase 2 lands. See `docs/specs/connection-actor.md`.
+
+    #[tokio::test]
+    async fn phase2_dropped_caller_future_does_not_corrupt_next_op() {
+        // Scenario (cmdr `listing_task.abort()` reproduction):
+        //
+        // 1. Task A sent Create msg_id=4, then was aborted before it could
+        //    call receive_response. Its future dropped; msg_id=4 is in
+        //    `pending` (Phase 1) or `waiters` (Phase 2) with a dead Receiver.
+        // 2. Task B acquires the connection, sends its own Create msg_id=5,
+        //    then calls receive_response.
+        // 3. A's response arrives on the wire BEFORE B's.
+        //
+        // Phase 1 behavior (buggy): B's receive_response reads A's frame,
+        // sees msg_id=4 in pending, returns it to B. B gets the wrong
+        // file_id and proceeds to corrupt the wire further.
+        //
+        // Phase 2 behavior (correct): receiver task looks up msg_id=4's
+        // Sender, Send succeeds-or-fails silently (Receiver gone), frame
+        // is discarded. When msg_id=5 arrives, it routes to B's Sender.
+        // B's receive_response returns msg_id=5. ✓
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+
+        // Simulate Task A: sent Create msg_id=4, then was aborted.
+        // `test_mark_pending` adds msg_id=4 to the in-flight set (Phase 1)
+        // or registers a dead waiter in the map (Phase 2 evolution).
+        conn.next_message_id = 4;
+        conn.test_mark_pending(MessageId(4));
+
+        // Task A's response arrives late on the wire.
+        mock.queue_response(build_create_response_with_msg_id(
+            FileId {
+                persistent: 0xAAAA,
+                volatile: 0xBBBB,
+            },
+            MessageId(4),
+        ));
+
+        // Task B: allocate msg_id=5 (simulating the send that would happen).
+        // In Phase 1, the next send_request would set next_message_id=5 → 6.
+        // We manipulate directly to keep the test surgical.
+        conn.next_message_id = 6;
+        conn.test_mark_pending(MessageId(5));
+
+        // B's response (its own Create).
+        mock.queue_response(build_create_response_with_msg_id(
+            FileId {
+                persistent: 0x1111,
+                volatile: 0x2222,
+            },
+            MessageId(5),
+        ));
+
+        // B calls receive_response — must get ITS OWN response (msg_id=5).
+        let (header, _body, _raw) = conn
+            .receive_response()
+            .await
+            .expect("B's receive_response should succeed");
+
+        assert_eq!(
+            header.message_id,
+            MessageId(5),
+            "B received A's aborted-then-arrived response (msg_id=4) instead of its own \
+             (msg_id=5). This is the cancellation-by-drop corruption that Phase 2 fixes."
+        );
+        assert_eq!(header.command, Command::Create);
+
+        // A's late response should have been consumed off the wire and
+        // discarded (not left sitting there to pollute the next op).
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn phase2_multiple_in_flight_msgs_route_to_correct_waiter() {
+        // Scenario (compound + out-of-order wire delivery):
+        //
+        // 1. Caller sends Create msg_id=4 and Create msg_id=5 (e.g. as part
+        //    of a compound or a pipelined pair).
+        // 2. The server responds in a DIFFERENT order: msg_id=5's response
+        //    arrives first, then msg_id=4's.
+        // 3. Caller calls receive_response twice, expecting the first call
+        //    to return msg_id=4 (matching send order) and the second
+        //    msg_id=5.
+        //
+        // Phase 1 behavior: receive_response returns frames in wire order,
+        // regardless of send order. First call returns msg_id=5. FAILS.
+        //
+        // Phase 2 behavior: each caller's oneshot is keyed by the msg_id
+        // it registered. Out-of-order wire delivery routes correctly —
+        // each oneshot receives its matching frame. First receive_response
+        // pops the msg_id=4 receiver and awaits it; the receiver task
+        // sees msg_id=5 first, routes it to msg_id=5's Sender (buffered),
+        // then sees msg_id=4, routes it to msg_id=4's Sender, which
+        // unblocks the first receive_response. Second receive_response
+        // gets msg_id=5's buffered response. ✓
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+        conn.next_message_id = 4;
+
+        // Caller sent two Creates (msg_id=4 and msg_id=5).
+        conn.test_mark_pending(MessageId(4));
+        conn.test_mark_pending(MessageId(5));
+
+        // Server responds out of order: msg_id=5 first, then msg_id=4.
+        mock.queue_response(build_create_response_with_msg_id(
+            FileId {
+                persistent: 0x5555,
+                volatile: 0x5555,
+            },
+            MessageId(5),
+        ));
+        mock.queue_response(build_create_response_with_msg_id(
+            FileId {
+                persistent: 0x4444,
+                volatile: 0x4444,
+            },
+            MessageId(4),
+        ));
+
+        // First receive_response: caller expects msg_id=4 (the first op they sent).
+        let (first, _, _) = conn
+            .receive_response()
+            .await
+            .expect("first receive_response should succeed");
+        assert_eq!(
+            first.message_id,
+            MessageId(4),
+            "first receive_response returned msg_id={} but caller's first-sent was msg_id=4 \
+             — responses must route to the waiter that sent them, not follow wire order",
+            first.message_id.0
+        );
+
+        // Second receive_response: caller expects msg_id=5.
+        let (second, _, _) = conn
+            .receive_response()
+            .await
+            .expect("second receive_response should succeed");
+        assert_eq!(second.message_id, MessageId(5));
+
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn phase2_dropped_caller_frame_still_updates_credits() {
+        // Scenario: Task A was aborted with msg_id=4 in flight. A's
+        // response arrives carrying a credit grant of +100. Task B then
+        // sends msg_id=5 and checks `conn.credits()`.
+        //
+        // Invariant (both phases): credits apply to EVERY received frame,
+        // including those routed to dead waiters. Throughput must not
+        // regress under cancellation churn.
+        //
+        // Phase 1: the buggy path happens to apply credits (because it
+        // treats A's frame as legitimate and returns it to B, applying
+        // credits along the way). But B receives A's frame — the real
+        // bug. This test asserts both: credits applied AND B got its
+        // own response.
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+        conn.next_message_id = 4;
+
+        // Task A: sent, aborted. msg_id=4 left in pending.
+        conn.test_mark_pending(MessageId(4));
+
+        // A's late response — carries +100 credits in the header.
+        let a_frame = {
+            let mut h = Header::new_request(Command::Create);
+            h.flags.set_response();
+            h.credits = 100; // big credit grant
+            h.message_id = MessageId(4);
+            let body = CreateResponse {
+                oplock_level: OplockLevel::None,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: 0,
+                file_attributes: 0,
+                file_id: FileId {
+                    persistent: 0xAA,
+                    volatile: 0xBB,
+                },
+                create_contexts: vec![],
+            };
+            pack_message(&h, &body)
+        };
+        mock.queue_response(a_frame);
+
+        // B sends msg_id=5.
+        conn.next_message_id = 6;
+        conn.test_mark_pending(MessageId(5));
+        mock.queue_response(build_create_response_with_msg_id(
+            FileId {
+                persistent: 0x11,
+                volatile: 0x22,
+            },
+            MessageId(5),
+        ));
+
+        // B's receive_response must return msg_id=5 (not A's msg_id=4).
+        let (header, _, _) = conn.receive_response().await.unwrap();
+        assert_eq!(
+            header.message_id,
+            MessageId(5),
+            "B received A's aborted response instead of its own"
+        );
+
+        // Credits must have ticked forward for BOTH frames (A's +100 and
+        // B's +10). Starting from 10, minus 1 per consumed frame:
+        //   10 + 100 - 1 (A) + 10 - 1 (B) = 118
+        // Allow some slack if exact credit math differs slightly post-refactor;
+        // the invariant is "credits went UP significantly, not stayed at 10".
+        let final_credits = conn.credits();
+        assert!(
+            final_credits >= 100,
+            "credits={} — A's dropped-caller frame failed to apply its credit grant. \
+             Phase 2 must still update credits for orphaned-by-drop frames so throughput \
+             doesn't regress under cancellation.",
+            final_credits
+        );
+
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn phase2_malformed_frame_does_not_kill_connection() {
+        // Scenario: the server (or network) delivers a malformed frame.
+        // The connection must keep working — the bad frame gets logged
+        // and skipped, and subsequent valid frames route correctly.
+        //
+        // Phase 2 invariant: the receiver task does NOT panic or exit
+        // on a parse failure. Single-frame corruption doesn't poison
+        // the whole connection.
+
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+        conn.next_message_id = 4;
+        conn.test_mark_pending(MessageId(4));
+
+        // Queue a malformed frame (too short to be a valid SMB2 header),
+        // then a valid Create response.
+        mock.queue_response(vec![0xFE, 0x53, 0x4D]); // truncated "FEMB2" magic — fewer than 64 bytes
+        mock.queue_response(build_create_response_with_msg_id(
+            FileId {
+                persistent: 0x11,
+                volatile: 0x22,
+            },
+            MessageId(4),
+        ));
+
+        // receive_response should skip the malformed frame (or return
+        // an error-and-continue internally) and deliver the valid one.
+        // Post-Phase-2 the receiver task handles this; Phase 1 may bubble
+        // the parse error up. Either way: the connection stays usable.
+        //
+        // We assert the eventual successful delivery — possibly after
+        // one "bad frame" error that the caller retries past. For Phase 2
+        // the first receive_response call directly succeeds.
+        let result = conn.receive_response().await;
+        match result {
+            Ok((header, _, _)) => {
+                assert_eq!(header.message_id, MessageId(4));
+                assert_eq!(header.command, Command::Create);
+            }
+            Err(_) => {
+                // Phase 1 path: the first call returns an error. A retry
+                // should find the valid frame.
+                let (header, _, _) = conn
+                    .receive_response()
+                    .await
+                    .expect("after skipping malformed frame, valid frame should arrive");
+                assert_eq!(header.message_id, MessageId(4));
+            }
+        }
+
+        mock.assert_fully_consumed();
+    }
+
     // ── CANCEL tests (pitfall #7) ────────────────────────────────────
 
     #[tokio::test]
