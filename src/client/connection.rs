@@ -327,10 +327,10 @@ impl Connection {
 
         for ctx in &resp.negotiate_contexts {
             match ctx {
-                NegotiateContext::Signing { algorithms } => {
-                    if algorithms.contains(&SIGNING_AES_GMAC) {
-                        gmac_negotiated = true;
-                    }
+                NegotiateContext::Signing { algorithms }
+                    if algorithms.contains(&SIGNING_AES_GMAC) =>
+                {
+                    gmac_negotiated = true;
                 }
                 NegotiateContext::Encryption { ciphers } => {
                     // Server picks one cipher in the response.
@@ -344,10 +344,10 @@ impl Connection {
                         };
                     }
                 }
-                NegotiateContext::Compression { algorithms, .. } => {
-                    if algorithms.contains(&COMPRESSION_LZ4) {
-                        compression_supported = true;
-                    }
+                NegotiateContext::Compression { algorithms, .. }
+                    if algorithms.contains(&COMPRESSION_LZ4) =>
+                {
+                    compression_supported = true;
                 }
                 _ => {}
             }
