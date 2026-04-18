@@ -76,6 +76,33 @@ impl MockTransport {
     pub fn received_count(&self) -> usize {
         *self.receive_count.lock().unwrap()
     }
+
+    /// How many responses are still queued and unread.
+    ///
+    /// Useful in tests that want to assert the code-under-test consumed
+    /// every response it was expected to, without leaking any to a
+    /// later test or leaving stale state that could mask a bug.
+    pub fn pending_responses(&self) -> usize {
+        self.responses.lock().unwrap().len()
+    }
+
+    /// Assert that every queued response has been consumed.
+    ///
+    /// Panics with a descriptive message if any responses remain in the
+    /// queue. Use at the end of a test to catch the "caller forgot to
+    /// receive" pattern that produces response-pipe pollution in
+    /// real usage.
+    #[track_caller]
+    pub fn assert_fully_consumed(&self) {
+        let remaining = self.pending_responses();
+        assert_eq!(
+            remaining, 0,
+            "MockTransport has {} queued response(s) the code-under-test never read. \
+             This usually means a caller sent a request but never received its response, \
+             which in real usage leaves an orphan on the wire and corrupts the next op.",
+            remaining
+        );
+    }
 }
 
 impl Default for MockTransport {

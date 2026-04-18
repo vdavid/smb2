@@ -2587,6 +2587,187 @@ mod tests {
         assert_eq!(mock.received_count(), 2);
     }
 
+    // ── Orphan-response tests (MessageId demux) ──────────────────────
+    //
+    // Observed in the wild against a QNAP NAS: two back-to-back list_directory
+    // calls on the same connection, where the second call's receive_response()
+    // returned the Close response left over from the first (cancelled / late)
+    // call. The caller unpacked the Close body (StructureSize=60) as a
+    // CreateResponse (StructureSize=89) and errored cryptically. See
+    // docs/specs/connection-actor.md for the full story.
+    //
+    // These tests pin the invariant: receive_response() and
+    // receive_compound_expected() must return the response whose MessageId
+    // matches the caller's most recent send, skipping orphaned frames with
+    // unrelated MessageIds. Today they do NOT — these tests fail until the
+    // actor-based Connection lands.
+
+    /// Build a Close response with a caller-chosen MessageId. Used to
+    /// simulate orphans left behind by earlier (cancelled or lost) ops.
+    fn build_close_response_with_msg_id(msg_id: MessageId) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Close);
+        h.flags.set_response();
+        h.credits = 10;
+        h.message_id = msg_id;
+
+        let body = crate::msg::close::CloseResponse {
+            flags: 0,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: FileTime::ZERO,
+            change_time: FileTime::ZERO,
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: 0,
+        };
+
+        pack_message(&h, &body)
+    }
+
+    /// Build a Create response with a caller-chosen MessageId.
+    fn build_create_response_with_msg_id(file_id: FileId, msg_id: MessageId) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Create);
+        h.flags.set_response();
+        h.credits = 10;
+        h.message_id = msg_id;
+
+        let body = CreateResponse {
+            oplock_level: OplockLevel::None,
+            flags: 0,
+            create_action: CreateAction::FileOpened,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: FileTime::ZERO,
+            change_time: FileTime::ZERO,
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: 0,
+            file_id,
+            create_contexts: vec![],
+        };
+
+        pack_message(&h, &body)
+    }
+
+    #[tokio::test]
+    async fn receive_response_skips_orphan_with_unknown_message_id() {
+        // Scenario: a previous operation's Close response was never consumed
+        // (e.g. the operation was cancelled mid-flight). A new operation
+        // sends a Create and awaits its response. The orphan sits in the
+        // pipe ahead of the real response.
+        //
+        // Expected: receive_response skips the orphan (its MessageId is not
+        // one we're waiting on) and returns the Create response.
+        //
+        // Today: receive_response returns whatever arrives next off the
+        // wire, so it returns the orphan Close, the caller tries to unpack
+        // a Close body as a CreateResponse, and fails.
+
+        let mock = Arc::new(MockTransport::new());
+
+        // Orphan from a prior op: Close with MessageId we never sent.
+        mock.queue_response(build_close_response_with_msg_id(MessageId(999)));
+
+        // The real response for the Create we're about to send.
+        let file_id = FileId {
+            persistent: 0x1,
+            volatile: 0x2,
+        };
+        mock.queue_response(build_create_response_with_msg_id(file_id, MessageId(4)));
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+        conn.next_message_id = 4;
+
+        // Simulate having just sent a Create with msg_id=4.
+        // (In the actor-based design, send_request registers a waiter for
+        // MessageId(4); receive_response drops frames whose msg_id isn't
+        // registered.)
+
+        let (header, _body, _raw) = conn.receive_response().await.unwrap();
+
+        assert_eq!(
+            header.command,
+            Command::Create,
+            "receive_response returned the orphan Close instead of the Create we were waiting for"
+        );
+        assert_eq!(header.message_id, MessageId(4));
+
+        // The orphan should have been consumed off the wire (not left there
+        // to corrupt the next op).
+        assert_eq!(mock.pending_responses(), 0);
+    }
+
+    #[tokio::test]
+    async fn receive_compound_expected_skips_orphan_frame_before_gathering() {
+        // Scenario: a prior operation's Create response orphan is still in
+        // the pipe. The next operation sends a 3-op compound (Create +
+        // QueryInfo + Close) and calls receive_compound_expected(3).
+        //
+        // Expected: the orphan is skipped, the 3-op compound response is
+        // collected correctly.
+        //
+        // Today: the orphan is consumed as the first of 3 sub-responses,
+        // then the real compound frame is read and the overflow check
+        // fires: "split compound response overflow: expected 3 sub-responses
+        // total, already collected 1, but next frame has 3 more".
+
+        let mock = Arc::new(MockTransport::new());
+
+        // Orphan: a lone Create response from a prior, aborted op.
+        let ghost_file_id = FileId {
+            persistent: 0xDEAD,
+            volatile: 0xBEEF,
+        };
+        mock.queue_response(build_create_response_with_msg_id(ghost_file_id, MessageId(8)));
+
+        // The real 3-op compound response (fs_info shape).
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        let create_resp = build_test_create_response(file_id, 0);
+        let query_info_resp = {
+            let mut h = Header::new_request(Command::QueryInfo);
+            h.flags.set_response();
+            h.credits = 10;
+            h.message_id = MessageId(10);
+            let body = crate::msg::query_info::QueryInfoResponse {
+                output_buffer: vec![0u8; 24],
+            };
+            pack_message(&h, &body)
+        };
+        let close_resp = build_test_close_response();
+        let frame = build_compound_response_frame(&[create_resp, query_info_resp, close_resp]);
+        mock.queue_response(frame);
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.credits = 10;
+        conn.next_message_id = 9;
+
+        // Caller sent 3 ops: Create (msg_id=9), QueryInfo (10), Close (11).
+        let responses = conn
+            .receive_compound_expected(3)
+            .await
+            .expect("compound receive should skip the orphan and collect all 3 sub-responses");
+
+        assert_eq!(responses.len(), 3, "expected all 3 sub-responses");
+        assert_eq!(responses[0].0.command, Command::Create);
+        assert_eq!(responses[1].0.command, Command::QueryInfo);
+        assert_eq!(responses[2].0.command, Command::Close);
+
+        // The orphan should have been consumed off the wire.
+        assert_eq!(mock.pending_responses(), 0);
+    }
+
     // ── CANCEL tests (pitfall #7) ────────────────────────────────────
 
     #[tokio::test]
