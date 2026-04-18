@@ -100,6 +100,29 @@ pub struct Connection {
     should_encrypt: bool,
     /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
     dfs_trees: HashSet<TreeId>,
+    /// MessageIds of in-flight requests awaiting a response.
+    ///
+    /// Populated by `send_request` / `send_compound` after a successful send,
+    /// consulted by `receive_response` / `receive_compound` to reject orphaned
+    /// frames whose MessageId matches no in-flight request (left over by a
+    /// cancelled op, mid-flight error, or server oddity). Without this set,
+    /// an orphan would be handed to whichever caller next called receive,
+    /// corrupting their operation and every subsequent op on the connection.
+    ///
+    /// See `docs/specs/connection-actor.md` for the full story. In the
+    /// follow-up actor refactor this moves into the receiver task's state.
+    pending: HashSet<MessageId>,
+    /// Whether to drop responses whose MessageId isn't in `pending`.
+    ///
+    /// Always `true` in production — that's the whole point of this
+    /// refactor. Crate-private tests that build mock responses with
+    /// default `MessageId(0)` headers (via the `build_*_response`
+    /// helpers) turn it off via `setup_connection`, because mock msg_ids
+    /// don't track the caller's `next_message_id` advance. The direct
+    /// receive-path tests that exercise the filter (with explicit msg_ids
+    /// via `build_*_with_msg_id`) keep the default, so the filter is
+    /// still under test.
+    orphan_filter_enabled: bool,
 }
 
 impl Connection {
@@ -130,6 +153,8 @@ impl Connection {
             nonce_gen: None,
             should_encrypt: false,
             dfs_trees: HashSet::new(),
+            pending: HashSet::new(),
+            orphan_filter_enabled: true,
         }
     }
 
@@ -164,6 +189,8 @@ impl Connection {
             nonce_gen: None,
             should_encrypt: false,
             dfs_trees: HashSet::new(),
+            pending: HashSet::new(),
+            orphan_filter_enabled: true,
         })
     }
 
@@ -412,6 +439,7 @@ impl Connection {
             // Encrypt: no signing, AEAD provides authentication.
             let encrypted = self.encrypt_bytes(&msg_bytes)?;
             self.sender.send(&encrypted).await?;
+            self.pending.insert(msg_id);
             debug!(
                 "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, encrypted, len={} (plaintext {})",
                 command, msg_id.0, credit_charge, tree_id, encrypted.len(), msg_bytes.len()
@@ -430,6 +458,7 @@ impl Connection {
             if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
                 let framed = build_compressed_frame(&compressed);
                 self.sender.send(&framed).await?;
+                self.pending.insert(msg_id);
                 debug!(
                     "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
                     command, msg_id.0, credit_charge, tree_id, self.should_sign,
@@ -440,6 +469,7 @@ impl Connection {
         }
 
         self.sender.send(&msg_bytes).await?;
+        self.pending.insert(msg_id);
         debug!(
             "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, len={}",
             command,
@@ -568,6 +598,31 @@ impl Connection {
             );
             if self.credits == 0 {
                 warn!("recv: zero credits remaining -- credit starvation");
+            }
+
+            // Orphan check: if this MessageId isn't one we're waiting on, drop
+            // the frame. Can happen after a cancelled/aborted op leaves its
+            // response in the pipe, or if the server sends something we
+            // didn't ask for. Credits have been applied (grant + consume),
+            // so throughput stays correct. Without this, the orphan would be
+            // handed to the caller and corrupt their operation — and every
+            // subsequent op on the connection. See docs/specs/connection-actor.md.
+            //
+            // `pending.remove()` returns true iff the id was present, so
+            // `!remove()` = "not expected" = orphan. In the normal path
+            // it removes the entry and continues to the return below.
+            //
+            // Gated on `orphan_filter_enabled` so the mass of existing
+            // unit tests that use the `build_*_response` helpers (which
+            // hardcode `MessageId(0)`) keep working without per-test
+            // msg_id threading. `setup_connection` in `test_helpers.rs`
+            // flips it off; production leaves it on.
+            if self.orphan_filter_enabled && !self.pending.remove(&header.message_id) {
+                debug!(
+                    "recv: orphan response dropped, msg_id={}, cmd={:?}, status={:?}",
+                    header.message_id.0, header.command, header.status
+                );
+                continue;
             }
 
             // STATUS_NETWORK_SESSION_EXPIRED: the session timed out on the
@@ -802,6 +857,13 @@ impl Connection {
             );
         }
 
+        // Register every sub-request MessageId as in-flight. A compound with
+        // N ops has N MessageIds; each gets its own response (possibly split
+        // across frames by the server — see receive_compound_expected).
+        for id in &message_ids {
+            self.pending.insert(*id);
+        }
+
         Ok(message_ids)
     }
 
@@ -818,12 +880,46 @@ impl Connection {
     /// [`Self::receive_compound_expected`] instead, which transparently
     /// gathers additional frames when the server splits.
     pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>> {
-        let (resp_bytes, was_encrypted) = self.receive_and_preprocess_frame().await?;
-        let results = self.parse_compound_frame(&resp_bytes, was_encrypted)?;
-        if self.credits == 0 {
-            warn!("recv_compound: zero credits remaining -- credit starvation");
+        loop {
+            let (resp_bytes, was_encrypted) = self.receive_and_preprocess_frame().await?;
+            let results = self.parse_compound_frame(&resp_bytes, was_encrypted)?;
+
+            // Orphan check: if the first sub-response's MessageId isn't one
+            // we're waiting on, the whole frame is leftover from a cancelled
+            // or aborted operation. Drop it. Credits were already applied
+            // inside parse_compound_frame, so throughput stays correct.
+            //
+            // Compound responses always correspond 1:1 with the sub-requests
+            // that produced them, with consecutive MessageIds matching what
+            // the caller sent. So checking the first is sufficient; the
+            // rest either match or represent a misbehaving server (in which
+            // case we still drop the frame cleanly rather than hand stale
+            // data to the next caller).
+            //
+            // Gated on `orphan_filter_enabled` — same reason as in
+            // receive_response (test ergonomics for the mass of
+            // build_*_response-based tests).
+            if self.orphan_filter_enabled {
+                if let Some((first_header, _)) = results.first() {
+                    if !self.pending.contains(&first_header.message_id) {
+                        debug!(
+                            "recv_compound: orphan frame dropped, first msg_id={}, cmd={:?}",
+                            first_header.message_id.0, first_header.command
+                        );
+                        continue;
+                    }
+                }
+                // Remove all returned sub-response MessageIds from the set.
+                for (header, _) in &results {
+                    self.pending.remove(&header.message_id);
+                }
+            }
+
+            if self.credits == 0 {
+                warn!("recv_compound: zero credits remaining -- credit starvation");
+            }
+            return Ok(results);
         }
-        Ok(results)
     }
 
     /// Receive exactly `expected` compound sub-responses, transparently
@@ -871,6 +967,26 @@ impl Connection {
         while results.len() < expected {
             let (resp_bytes, was_encrypted) = self.receive_and_preprocess_frame().await?;
             let more = self.parse_compound_frame(&resp_bytes, was_encrypted)?;
+
+            // Orphan filter: any frame arriving during a split response whose
+            // first sub-response isn't one we're still waiting on is leftover
+            // from a previous cancelled op. Drop it and keep reading. Same
+            // flag-gated semantics as receive_compound / receive_response.
+            if self.orphan_filter_enabled {
+                if let Some((first_header, _)) = more.first() {
+                    if !self.pending.contains(&first_header.message_id) {
+                        debug!(
+                            "recv_compound: orphan frame dropped during gather, first msg_id={}, cmd={:?}",
+                            first_header.message_id.0, first_header.command
+                        );
+                        continue;
+                    }
+                }
+                for (header, _) in &more {
+                    self.pending.remove(&header.message_id);
+                }
+            }
+
             if results.len() + more.len() > expected {
                 return Err(Error::invalid_data(format!(
                     "split compound response overflow: expected {} sub-responses total, \
@@ -1188,6 +1304,33 @@ impl Connection {
     pub(crate) fn set_test_params(&mut self, params: NegotiatedParams) {
         self.params = Some(params);
     }
+
+    /// Mark a MessageId as in-flight (test-only).
+    ///
+    /// Normally `send_request` / `send_compound` populate the `pending` set
+    /// automatically. Tests that feed canned responses to `receive_response`
+    /// directly — without going through the send path — use this to simulate
+    /// "we sent a request with this MessageId and are awaiting its response".
+    ///
+    /// Without this, the orphan filter in `receive_response` would drop the
+    /// test's response as unexpected.
+    #[cfg(test)]
+    pub(crate) fn test_mark_pending(&mut self, msg_id: MessageId) {
+        self.pending.insert(msg_id);
+    }
+
+    /// Enable or disable the orphan-response filter (test-only).
+    ///
+    /// Production: always on (set at construction). Tests that rely on the
+    /// `build_*_response` helpers — which hardcode `MessageId(0)` and don't
+    /// track the caller's `next_message_id` advance — call this with `false`
+    /// in their setup helpers so responses aren't dropped as orphans.
+    /// Orphan-filter coverage lives in dedicated tests that assign explicit
+    /// MessageIds (see the orphan-response tests in this file).
+    #[cfg(test)]
+    pub(crate) fn set_orphan_filter_enabled(&mut self, enabled: bool) {
+        self.orphan_filter_enabled = enabled;
+    }
 }
 
 /// Pack a header + body into raw SMB2 message bytes (no transport framing).
@@ -1353,6 +1496,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
 
         let params = conn.params().unwrap();
@@ -1373,6 +1517,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
 
         // Server granted 32 credits, minus 1 consumed for our request.
@@ -1389,6 +1534,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         assert_eq!(conn.next_message_id(), 0);
         conn.negotiate().await.unwrap();
         assert_eq!(conn.next_message_id(), 1);
@@ -1404,6 +1550,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         let initial_hash = *conn.preauth_hasher().value();
         conn.negotiate().await.unwrap();
         assert_ne!(conn.preauth_hasher().value(), &initial_hash);
@@ -1438,6 +1585,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         let result = conn.negotiate().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("MaxReadSize"));
@@ -1451,6 +1599,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
 
         // Manually set past negotiate.
         conn.next_message_id = 5;
@@ -1473,6 +1622,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
 
         // Activate signing.
         let key = vec![0xAA; 16];
@@ -1505,6 +1655,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
 
         let params = conn.params().unwrap();
@@ -1523,6 +1674,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
 
         // Verify the sent request contains all 5 dialects.
@@ -1645,6 +1797,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
 
         let create_req = CreateRequest {
@@ -1734,6 +1887,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
 
         let create_req = CreateRequest {
@@ -1817,6 +1971,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let responses = conn.receive_compound().await.unwrap();
@@ -1855,6 +2010,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let responses = conn.receive_compound_expected(3).await.unwrap();
@@ -1895,6 +2051,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let responses = conn.receive_compound_expected(3).await.unwrap();
@@ -1940,6 +2097,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let responses = conn.receive_compound_expected(3).await.unwrap();
@@ -1976,6 +2134,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         // We ask for 2 but the frame contains 3 -- should error.
@@ -1995,6 +2154,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
 
         let create_req = CreateRequest {
@@ -2061,6 +2221,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 3;
 
         let _responses = conn.receive_compound().await.unwrap();
@@ -2125,6 +2286,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
 
         let params = conn.params().unwrap();
@@ -2142,6 +2304,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
 
         let params = conn.params().unwrap();
@@ -2159,6 +2322,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.set_compression_requested(false);
         conn.negotiate().await.unwrap();
 
@@ -2178,6 +2342,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         // compression_requested defaults to true.
         conn.negotiate().await.unwrap();
 
@@ -2207,6 +2372,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.set_compression_requested(false);
         conn.negotiate().await.unwrap();
 
@@ -2233,6 +2399,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
         conn.compression_enabled = true;
 
@@ -2291,6 +2458,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
         conn.compression_enabled = false; // Compression disabled.
 
@@ -2364,6 +2532,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let (header, body, raw) = conn.receive_response().await.unwrap();
@@ -2396,6 +2565,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let (header, _body, raw) = conn.receive_response().await.unwrap();
@@ -2515,6 +2685,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let (header, _body, _raw) = conn.receive_response().await.unwrap();
@@ -2542,6 +2713,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let (header, _body, _raw) = conn.receive_response().await.unwrap();
@@ -2574,6 +2746,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let responses = conn.receive_compound().await.unwrap();
@@ -2681,12 +2854,12 @@ mod tests {
             "test-server",
         );
         conn.credits = 10;
-        conn.next_message_id = 4;
+        conn.next_message_id = 5;
 
-        // Simulate having just sent a Create with msg_id=4.
-        // (In the actor-based design, send_request registers a waiter for
-        // MessageId(4); receive_response drops frames whose msg_id isn't
-        // registered.)
+        // Simulate having just sent a Create with msg_id=4: mark it as the
+        // MessageId we're waiting on. receive_response must return this
+        // response, not the orphan Close queued ahead of it.
+        conn.test_mark_pending(MessageId(4));
 
         let (header, _body, _raw) = conn.receive_response().await.unwrap();
 
@@ -2723,14 +2896,38 @@ mod tests {
             persistent: 0xDEAD,
             volatile: 0xBEEF,
         };
-        mock.queue_response(build_create_response_with_msg_id(ghost_file_id, MessageId(8)));
+        mock.queue_response(build_create_response_with_msg_id(
+            ghost_file_id,
+            MessageId(8),
+        ));
 
-        // The real 3-op compound response (fs_info shape).
+        // The real 3-op compound response (fs_info shape), with MessageIds
+        // matching the 3 ops we're pretending to have sent.
         let file_id = FileId {
             persistent: 0x11,
             volatile: 0x22,
         };
-        let create_resp = build_test_create_response(file_id, 0);
+        let create_resp = {
+            let mut h = Header::new_request(Command::Create);
+            h.flags.set_response();
+            h.credits = 10;
+            h.message_id = MessageId(9);
+            let body = CreateResponse {
+                oplock_level: OplockLevel::None,
+                flags: 0,
+                create_action: CreateAction::FileOpened,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: 0,
+                file_attributes: 0,
+                file_id,
+                create_contexts: vec![],
+            };
+            pack_message(&h, &body)
+        };
         let query_info_resp = {
             let mut h = Header::new_request(Command::QueryInfo);
             h.flags.set_response();
@@ -2741,7 +2938,23 @@ mod tests {
             };
             pack_message(&h, &body)
         };
-        let close_resp = build_test_close_response();
+        let close_resp = {
+            let mut h = Header::new_request(Command::Close);
+            h.flags.set_response();
+            h.credits = 10;
+            h.message_id = MessageId(11);
+            let body = crate::msg::close::CloseResponse {
+                flags: 0,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                end_of_file: 0,
+                file_attributes: 0,
+            };
+            pack_message(&h, &body)
+        };
         let frame = build_compound_response_frame(&[create_resp, query_info_resp, close_resp]);
         mock.queue_response(frame);
 
@@ -2751,9 +2964,13 @@ mod tests {
             "test-server",
         );
         conn.credits = 10;
-        conn.next_message_id = 9;
+        conn.next_message_id = 12;
 
         // Caller sent 3 ops: Create (msg_id=9), QueryInfo (10), Close (11).
+        conn.test_mark_pending(MessageId(9));
+        conn.test_mark_pending(MessageId(10));
+        conn.test_mark_pending(MessageId(11));
+
         let responses = conn
             .receive_compound_expected(3)
             .await
@@ -2778,6 +2995,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.next_message_id = 10;
         conn.credits = 5;
 
@@ -2797,6 +3015,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.session_id = SessionId(0xAAAA);
 
         conn.send_cancel(MessageId(42), None).await.unwrap();
@@ -2826,6 +3045,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.session_id = SessionId(0xBBBB);
 
         let async_id = 0x1234_5678_9ABC_DEF0u64;
@@ -2854,6 +3074,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
 
         let key = vec![0xCC; 16];
         conn.activate_signing(key, SigningAlgorithm::HmacSha256);
@@ -2903,6 +3124,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 10;
 
         let result = conn.receive_response().await;
@@ -2928,6 +3150,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 3;
 
         let _ = conn.receive_response().await;
@@ -2945,6 +3168,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.set_test_params(NegotiatedParams {
             dialect: Dialect::Smb3_1_1,
             max_read_size: 65536,
@@ -3167,6 +3391,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.set_test_params(NegotiatedParams {
             dialect: Dialect::Smb3_1_1,
             max_read_size: 65536,
@@ -3204,6 +3429,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
 
         assert!(!conn.should_encrypt());
 
@@ -3273,6 +3499,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
 
         let tree_id = TreeId(7);
@@ -3302,6 +3529,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
 
         use crate::msg::echo::EchoRequest;
@@ -3327,6 +3555,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
 
         let tree_id = TreeId(7);
@@ -3356,6 +3585,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.credits = 256;
 
         let tree_id = TreeId(42);

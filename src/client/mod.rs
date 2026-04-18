@@ -1237,6 +1237,9 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // Mock responses use default MessageId(0); orphan filter would drop
+        // them after the first. See setup_connection in test_helpers.rs.
+        conn.set_orphan_filter_enabled(false);
 
         conn.negotiate().await.unwrap();
 
@@ -1310,11 +1313,12 @@ mod tests {
         let new_session_id = SessionId(0x2222);
         queue_negotiate_and_session(mock2.as_ref(), new_session_id);
 
-        let new_conn = Connection::from_transport(
+        let mut new_conn = Connection::from_transport(
             Box::new(mock2.clone()),
             Box::new(mock2.clone()),
             "test-server",
         );
+        new_conn.set_orphan_filter_enabled(false);
 
         client.reconnect_with(new_conn).await.unwrap();
 
@@ -1334,11 +1338,12 @@ mod tests {
         let mock2 = Arc::new(MockTransport::new());
         queue_negotiate_and_session(mock2.as_ref(), SessionId(0x2222));
 
-        let new_conn = Connection::from_transport(
+        let mut new_conn = Connection::from_transport(
             Box::new(mock2.clone()),
             Box::new(mock2.clone()),
             "test-server",
         );
+        new_conn.set_orphan_filter_enabled(false);
 
         client.reconnect_with(new_conn).await.unwrap();
 
@@ -1358,6 +1363,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
         let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
 

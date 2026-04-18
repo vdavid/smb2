@@ -582,6 +582,7 @@ pub(crate) mod tests {
             compression_supported: false,
         });
         conn.set_session_id(SessionId(0x1234));
+        conn.set_orphan_filter_enabled(false);
 
         queue_share_listing_responses(&mock, &[("share1", STYPE_DISKTREE, "")]);
 

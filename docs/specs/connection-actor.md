@@ -4,6 +4,16 @@ Design for making `Connection` own a receiver task that demultiplexes SMB2 respo
 
 This doc is the single source of truth during the refactor. Decisions are pinned here; when in doubt, update this doc rather than drifting from it.
 
+## Staging
+
+Done as two phases on `main`, landed in order:
+
+1. **Phase 1 — Demux invariant (this PR).** Add `pending: HashSet<MessageId>` to `Connection`. `send_request` / `send_compound` insert the base MessageId; `receive_response` / `receive_compound_expected` loop over frames and skip any whose MessageId isn't in the set (crediting them so throughput stays correct, logging at DEBUG). Zero public API change, zero caller change, ~100 LOC. Makes the field bug go away. Pins the "frames are routed by MessageId" invariant that the actor task will build on.
+
+2. **Phase 2 — Actor tasks + Clone connection + `execute()` API (follow-up PR).** Lift the pending set and send/receive paths into dedicated tasks behind an `Arc<ConnectionInner>`. Expose `execute()` / `execute_compound()` / `submit()`. Migrate callers. This is the "100 tiny files in parallel" unlock. Scope and risk justify its own PR and its own review.
+
+The rest of this doc describes the Phase 2 endpoint. Phase 1 is a strict subset: the `HashSet<MessageId>` it introduces is *the same set* Phase 2 uses internally — it just gets wrapped in an `Arc<Mutex<...>>` and accessed from the tasks. No work thrown away.
+
 ## Why
 
 Today, `Connection::receive_response()` returns the next frame off the wire without matching it to the request that asked for it. If any operation leaves a response unconsumed — cancellation, mid-flight error, fire-and-forget cleanup, server oddity — the orphan sits in the socket, and the next operation picks it up as its own. One glitch corrupts every subsequent op on that connection.
@@ -26,8 +36,8 @@ Beyond correctness, this unlocks:
 
 | # | Decision | Choice | Why |
 |---|----------|--------|-----|
-| D1 | `Connection` cloneability | `Clone`, backed by `Arc<ConnectionInner>` | Parallel op submission from many tasks. Cheap to clone. |
-| D2 | Public method signature | `fn execute(&self, ...) -> Future` (no `&mut`) | Concurrent callers don't need exclusive access. |
+| D1 | `Connection` cloneability | **Phase 3 (this PR): stays `&mut`-only** (no `Clone` yet). The actor's internals are `Arc`-based so the upgrade to `Clone` is a follow-up flip. | Keeps Phase 3 focused on correctness. Concurrent-ops-per-connection is a future perf feature; enabling it requires migrating callers to `execute()` which is out of scope here. |
+| D2 | Public method signature | **Phase 3: `&mut self` on send/receive shims** (matches today). Atomics and Mutex-wrapped state make `&self` trivially achievable later. | Single decision to flip when migrating to `execute()`. |
 | D3 | Caller–actor transport | `mpsc::UnboundedSender<ActorCommand>` | Unbounded is fine: one item per in-flight op, capped by credits upstream. Simpler than bounded + backpressure plumbing. |
 | D4 | Response delivery | Per-request `oneshot::Sender<Result<Frame>>` registered in `HashMap<MessageId, Sender>` | Classic demux. `oneshot` is the right fit for "exactly one response". |
 | D5 | Number of actor tasks | Two: sender + receiver, sharing `Arc<Mutex<Waiters>>` and `Arc<State>` | Lets large frame reads not block new sends. Clean lifecycle: receiver drives connection liveness; sender follows. |
@@ -36,7 +46,7 @@ Beyond correctness, this unlocks:
 | D8 | Pre-encode request bodies | Yes. Caller packs the body to `Vec<u8>` before submitting the command. | Keeps actor generic over message types. Signing operates on bytes anyway. |
 | D9 | Pipelined read/write location | Stays in `tree.rs`. Each chunk becomes one `execute()` call; futures drive the sliding window via `FuturesUnordered`. | Lets `Tree` own the "N chunks of one file" semantics. Actor just routes. Credits are still enforced by the caller loop, same as today. |
 | D10 | Compound handling | `execute_compound(ops) -> Future<Vec<Result<Frame>>>`. Internally: one frame sent, N oneshots registered, N responses routed (server may split — each sub-response finds its oneshot by MessageId regardless). | No special "batch" machinery in actor. The split-compound tolerance we already added (commit `7f79392`) continues to work because routing is per-MessageId. |
-| D11 | `send_request` + `receive_response` removal | Remove from public API. Internal helpers only, used by the actor. | The split is what caused the bug. Keeping it as a shim invites re-introduction. |
+| D11 | `send_request` + `receive_response` shim-then-removal | **Phase 3 (this PR): preserve as thin shims over the actor's demux.** The shim's `receive_response()` returns the next response that matches an in-flight waiter (orphans are dropped inside the actor, never reach the caller). Sequential callers see identical semantics; pipelined callers (which already match by MessageId in the header) also see identical semantics. Phase 3+N: migrate call sites to `execute()` / `submit()`, then remove the shim. | Two-step migration keeps the bug fix small and low-risk; caller churn happens in a separate PR where it can be reviewed on its own merits. The shim is sound because all current callers fit one of two patterns the shim supports: sequential (one-at-a-time) or pipelined-by-msg-id (caller matches in header). |
 | D12 | MockTransport changes | None. Existing `Arc<MockTransport>` already works across tasks via `std::sync::Mutex`. | Test setup gets a helper `setup_connection_with_actor(mock)` that spawns the tasks. |
 | D13 | Cancellation protocol | Dropping the caller's future closes the oneshot. On the next frame for that MessageId, the actor finds the `Sender` gone and discards the response (credits still applied). For explicit mid-op abort, callers use `conn.cancel(op_handle)` which sends SMB CANCEL. | Safe by default; explicit when needed. |
 | D14 | Session expiry | Receiver task detects `STATUS_NETWORK_SESSION_EXPIRED`, sends `Err(Error::SessionExpired)` to the matched oneshot, keeps running. Other ops continue; caller is expected to reconnect. | Matches today's behavior. No blast-radius change. |

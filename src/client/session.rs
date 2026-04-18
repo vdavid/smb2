@@ -755,5 +755,8 @@ mod tests {
             cipher: None,
             compression_supported: false,
         });
+        // Mock responses use default MessageId(0) and don't track caller's
+        // next_message_id advance, so the orphan filter would drop them.
+        conn.set_orphan_filter_enabled(false);
     }
 }

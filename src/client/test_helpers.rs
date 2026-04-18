@@ -15,6 +15,12 @@ use crate::types::flags::{Capabilities, ShareCapabilities, ShareFlags};
 use crate::types::{Command, Dialect, FileId, OplockLevel, SessionId, TreeId};
 
 /// Create a mock-backed connection with standard negotiated params.
+///
+/// Disables the orphan-response filter because the `build_*_response` helpers
+/// hardcode `MessageId(0)` and don't track the caller's `next_message_id`
+/// advance — with the filter on, every response after the first would be
+/// dropped as an orphan. The filter is still exercised by the dedicated
+/// orphan-response tests in `connection.rs` that assign explicit MessageIds.
 pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
     let mut conn = Connection::from_transport(
         Box::new(mock.clone()),
@@ -34,6 +40,7 @@ pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
         compression_supported: false,
     });
     conn.set_session_id(SessionId(0x1234));
+    conn.set_orphan_filter_enabled(false);
     conn
 }
 
