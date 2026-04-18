@@ -1,254 +1,198 @@
 # Connection actor refactor
 
-Design for making `Connection` own a receiver task that demultiplexes SMB2 responses by `MessageId`, exposing a simple `execute()` API to callers. Replaces the current `send_request` + `receive_response` split, which is unsafe under any glitch that leaves a response unconsumed on the wire.
+Design for moving `Connection`'s demux from "synchronous HashSet over one thread" to "receiver task + per-request `oneshot::Sender` routing". Fixes a correctness gap that lets cancelled-by-drop in-flight requests corrupt subsequent operations on the same connection.
 
 This doc is the single source of truth during the refactor. Decisions are pinned here; when in doubt, update this doc rather than drifting from it.
 
 ## Staging
 
-Done as two phases on `main`, landed in order:
+Three phases on `main`, each landed as a separate PR:
 
-1. **Phase 1 — Demux invariant (this PR).** Add `pending: HashSet<MessageId>` to `Connection`. `send_request` / `send_compound` insert the base MessageId; `receive_response` / `receive_compound_expected` loop over frames and skip any whose MessageId isn't in the set (crediting them so throughput stays correct, logging at DEBUG). Zero public API change, zero caller change, ~100 LOC. Makes the field bug go away. Pins the "frames are routed by MessageId" invariant that the actor task will build on.
+1. **Phase 1 — `HashSet<MessageId>` demux (done, commit `750e07a`).** `Connection` tracks in-flight `MessageId`s in a `pending: HashSet<MessageId>`. `send_request` / `send_compound` insert; `receive_response` / `receive_compound_expected` skip frames whose MessageId isn't in the set (crediting them so throughput stays correct, logging at DEBUG). Zero public API change, zero caller change, ~260 LOC. Fixes the observed field bug for strictly-sequential callers.
 
-2. **Phase 2 — Actor tasks + Clone connection + `execute()` API (follow-up PR).** Lift the pending set and send/receive paths into dedicated tasks behind an `Arc<ConnectionInner>`. Expose `execute()` / `execute_compound()` / `submit()`. Migrate callers. This is the "100 tiny files in parallel" unlock. Scope and risk justify its own PR and its own review.
+2. **Phase 2 — Actor task + `oneshot`-per-request routing (this PR).** Spawn a receiver task on `Connection::connect` that owns the read half of the transport and routes each frame to the `oneshot::Sender` registered for its `MessageId`. `send_request` / `send_compound` now register an `oneshot::Receiver` in a caller-local FIFO before returning; `receive_response` / `receive_compound_expected` pop from that FIFO and await the next response. Public API signatures unchanged. No `Connection: Clone`, no `execute()` API — those are Phase 3. **The key semantic improvement: dropping a caller's future (`tokio::spawn`'d task aborted, `select!` arm cancelled, etc.) no longer corrupts the wire — the `oneshot::Receiver` closes, the frame is discarded on arrival.**
 
-The rest of this doc describes the Phase 2 endpoint. Phase 1 is a strict subset: the `HashSet<MessageId>` it introduces is *the same set* Phase 2 uses internally — it just gets wrapped in an `Arc<Mutex<...>>` and accessed from the tasks. No work thrown away.
+3. **Phase 3 — Public `execute()` API + `Connection: Clone` + caller migration (future PR).** Expose `execute()` / `execute_compound()` for callers that want concurrent ops per connection. `Connection` becomes `Clone` (wraps the existing `Arc<Inner>`). Callers in `tree.rs` migrate from `send_request` + `receive_response` to `execute()`. Pipelined loops in `tree.rs` become `FuturesUnordered` over `execute_with_credits()` calls. Unlocks "100 tiny files in parallel" and similar. Strictly additive — Phase 2's public API stays valid during and after Phase 3.
+
+Each phase is a strict subset of the next. Work from Phase 1 carries into Phase 2 (the `HashSet` becomes a `HashMap<MessageId, oneshot::Sender>`); Phase 2's actor is what Phase 3 exposes.
 
 ## Why
 
-Today, `Connection::receive_response()` returns the next frame off the wire without matching it to the request that asked for it. If any operation leaves a response unconsumed — cancellation, mid-flight error, fire-and-forget cleanup, server oddity — the orphan sits in the socket, and the next operation picks it up as its own. One glitch corrupts every subsequent op on that connection.
+Today (pre-Phase-2), `Connection::receive_response()` returns the next frame off the wire whose MessageId is in `pending`, then removes it from the set. This is correct for strictly-sequential callers — but breaks under any caller that drops its future mid-flight.
 
-Observed symptom: two back-to-back `list_directory` calls against a QNAP NAS, where the second one's `CreateResponse.StructureSize` check fails with `expected 89, got 60` — the second call consumed the first call's Close response. The fs_info compound that followed then mis-grouped responses. See the April 2026 conversation in the cmdr repo for the log.
+Scenario hit in the field (logged against cmdr's `listing_task.abort()` at `apps/desktop/src-tauri/src/file_system/listing/streaming.rs:429`):
 
-The library's `AGENTS.md` already claims that "Only ONE task reads from the transport. Multiple pipelines on the same connection share a single receive task that demultiplexes by `MessageId`." This refactor makes the code match that claim.
+1. `tokio::spawn`'d task A holds the `SmbVolume` mutex, has sent `Create msg_id=4` over smb2. `msg_id=4` is in `pending`.
+2. The task is aborted by `listing_task.abort()`. The spawned future drops. The `MutexGuard` drops. `msg_id=4` stays in `pending` (nothing unregisters it — abort is protocol-unaware).
+3. Task B takes the newly-available mutex, sends `Create msg_id=5`, calls `receive_response()`.
+4. Server's response for msg_id=4 arrives first. `msg_id=4 ∈ pending` → returned to B. B parses it as its own CreateResponse and gets a corrupted file_id; or B calls receive_response for a QueryDirectoryResponse and gets `msg_id=4`'s CreateResponse (`expected 9, got 89`).
 
-Beyond correctness, this unlocks:
-- True concurrent operations on one connection (N `execute()` calls in parallel) — needed for cmdr's "100 tiny files" copy goal.
-- Clean cancellation via SMB CANCEL when a caller's future is dropped.
-- Pause/resume of transfers as actor state, not caller-scattered state.
-- Centralized credit discipline across all in-flight ops on a connection.
+Phase 1's `HashSet` drops *never-sent* orphans. It doesn't distinguish "we're still waiting for this response" from "we once were but the caller is gone". Phase 2 closes that gap: a `oneshot::Sender` is registered per request, and when the corresponding `oneshot::Receiver` is dropped (because the caller's future was dropped), the `Sender::send` fails silently on arrival — the frame is discarded, credits are still applied, no wire corruption.
 
-## The design in one paragraph
+### Beyond correctness
 
-`Connection` owns a pair of background tasks: a sender task that drains a command queue (callers submit `ActorCommand` via an `mpsc` channel), and a receiver task that reads frames from the transport and routes each sub-response to the `oneshot::Sender` registered for its `MessageId`. Callers interact with `Connection` through `execute()` (single op) and `execute_compound()` (one frame, N sub-responses). Connection state is split: frequently-read data (`credits`, `params`, `should_encrypt`, etc.) is behind `Arc<AtomicU*>` or `Arc<OnceLock>` for lock-free reads; state mutated only during handshake is behind a short-lived `Arc<Mutex<HandshakeState>>`. `Connection` is `Clone` (just an `Arc` clone of the inner handle), so spawning 100 parallel `execute()` calls across as many tasks is the normal case.
+This refactor is also the foundation Phase 3 needs. Once responses route by `MessageId`, multiple callers can safely interleave on one connection — which is what cmdr's "100 tiny files in parallel" copy goal requires. Phase 2 lays the mechanism; Phase 3 exposes it via `execute()`.
+
+The library's `AGENTS.md` already claims: "Only ONE task reads from the transport. Multiple pipelines on the same connection share a single receive task that demultiplexes by `MessageId`." Phase 2 makes the code match that claim.
+
+## In one paragraph (Phase 2 scope)
+
+`Connection::connect` spawns a receiver task that owns the transport's read half. On each received frame, the receiver task decrypts/decompresses/verifies/handles PENDING+oplock-break+session-expiry, updates credits atomically, and looks up the frame's `MessageId` in a shared `waiters: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Frame>>>>` map — sending the frame to the matched `Sender` if it exists, dropping the frame (with an orphan-drop log) if not. Callers still call `send_request(...)` / `receive_response()` exactly as before: `send_request` allocates a `MessageId` (from a shared `AtomicU64`), registers a `oneshot::Sender` in `waiters`, pushes the `oneshot::Receiver` onto a `Connection`-local `VecDeque<Receiver>`, and sends the framed bytes through the transport's write half (still guarded by its existing `tokio::sync::Mutex`). `receive_response` pops the front receiver and awaits it. No public API change, no caller change.
 
 ## Decisions
 
 | # | Decision | Choice | Why |
 |---|----------|--------|-----|
-| D1 | `Connection` cloneability | **Phase 3 (this PR): stays `&mut`-only** (no `Clone` yet). The actor's internals are `Arc`-based so the upgrade to `Clone` is a follow-up flip. | Keeps Phase 3 focused on correctness. Concurrent-ops-per-connection is a future perf feature; enabling it requires migrating callers to `execute()` which is out of scope here. |
-| D2 | Public method signature | **Phase 3: `&mut self` on send/receive shims** (matches today). Atomics and Mutex-wrapped state make `&self` trivially achievable later. | Single decision to flip when migrating to `execute()`. |
-| D3 | Caller–actor transport | `mpsc::UnboundedSender<ActorCommand>` | Unbounded is fine: one item per in-flight op, capped by credits upstream. Simpler than bounded + backpressure plumbing. |
-| D4 | Response delivery | Per-request `oneshot::Sender<Result<Frame>>` registered in `HashMap<MessageId, Sender>` | Classic demux. `oneshot` is the right fit for "exactly one response". |
-| D5 | Number of actor tasks | Two: sender + receiver, sharing `Arc<Mutex<Waiters>>` and `Arc<State>` | Lets large frame reads not block new sends. Clean lifecycle: receiver drives connection liveness; sender follows. |
-| D6 | State layout | `Arc<ConnectionState>` with `AtomicU32` credits, `OnceLock<NegotiatedParams>`, `Arc<Mutex<Crypto>>` for signing/nonce | Hot reads are lock-free; mutation is rare and scoped. |
-| D7 | Credits discipline | Caller pre-checks via `conn.credits()`; actor honors `credit_charge` in message ID advance and consumes credits on response. No semaphore, no queuing inside actor. | Matches today's pattern exactly. Callers already do this. Keeps actor simple. |
-| D8 | Pre-encode request bodies | Yes. Caller packs the body to `Vec<u8>` before submitting the command. | Keeps actor generic over message types. Signing operates on bytes anyway. |
-| D9 | Pipelined read/write location | Stays in `tree.rs`. Each chunk becomes one `execute()` call; futures drive the sliding window via `FuturesUnordered`. | Lets `Tree` own the "N chunks of one file" semantics. Actor just routes. Credits are still enforced by the caller loop, same as today. |
-| D10 | Compound handling | `execute_compound(ops) -> Future<Vec<Result<Frame>>>`. Internally: one frame sent, N oneshots registered, N responses routed (server may split — each sub-response finds its oneshot by MessageId regardless). | No special "batch" machinery in actor. The split-compound tolerance we already added (commit `7f79392`) continues to work because routing is per-MessageId. |
-| D11 | `send_request` + `receive_response` shim-then-removal | **Phase 3 (this PR): preserve as thin shims over the actor's demux.** The shim's `receive_response()` returns the next response that matches an in-flight waiter (orphans are dropped inside the actor, never reach the caller). Sequential callers see identical semantics; pipelined callers (which already match by MessageId in the header) also see identical semantics. Phase 3+N: migrate call sites to `execute()` / `submit()`, then remove the shim. | Two-step migration keeps the bug fix small and low-risk; caller churn happens in a separate PR where it can be reviewed on its own merits. The shim is sound because all current callers fit one of two patterns the shim supports: sequential (one-at-a-time) or pipelined-by-msg-id (caller matches in header). |
-| D12 | MockTransport changes | None. Existing `Arc<MockTransport>` already works across tasks via `std::sync::Mutex`. | Test setup gets a helper `setup_connection_with_actor(mock)` that spawns the tasks. |
-| D13 | Cancellation protocol | Dropping the caller's future closes the oneshot. On the next frame for that MessageId, the actor finds the `Sender` gone and discards the response (credits still applied). For explicit mid-op abort, callers use `conn.cancel(op_handle)` which sends SMB CANCEL. | Safe by default; explicit when needed. |
-| D14 | Session expiry | Receiver task detects `STATUS_NETWORK_SESSION_EXPIRED`, sends `Err(Error::SessionExpired)` to the matched oneshot, keeps running. Other ops continue; caller is expected to reconnect. | Matches today's behavior. No blast-radius change. |
-| D15 | Transport failure | Receiver task fans `Err(Error::Disconnected)` (or the actual I/O error, cloned) to every pending oneshot, signals the sender task to stop accepting new commands, both tasks exit. Subsequent `execute()` on the dropped connection returns `Err(Error::Disconnected)` from the closed mpsc channel. | One clear unhealthy state. No half-dead connections. |
-| D16 | `Connection::disconnect()` | Sends `ActorCommand::Shutdown` to sender, which flushes pending, closes the transport, signals the receiver to exit. Both tasks `await` cleanly. | Graceful teardown for `on_unmount` and similar. |
-| D17 | `Watcher` | No special handling needed. `conn.execute(CHANGE_NOTIFY, ...)` returns a future; the oneshot sits in the map for as long as the server takes. Drop = cancel. | One less thing to think about. |
-| D18 | Public API stability | Deprecate-and-break: the internal-level API changes, but `SmbClient` / `Tree` / `FileWriter` / `Pipeline` public surface stays the same. Consumers of the high-level API (cmdr) don't notice. | Minimizes downstream churn. |
-| D19 | Runtime requirement | tokio is a hard requirement (formalized). `async_trait` stays. | Already de-facto true — only tokio transports exist. Formalize in the README. |
+| D1 | `Connection` cloneability | **Phase 2: stays owning; `&mut` on send/receive.** Internals are `Arc`-based so Phase 3's `Clone` flip is trivial. | Scope discipline. Phase 2 is purely correctness, not concurrency. |
+| D2 | Public method signatures | **Phase 2: unchanged.** `send_request`, `send_request_with_credits`, `send_compound`, `receive_response`, `receive_compound`, `receive_compound_expected` all keep today's signatures and semantics. | Zero caller churn, zero cmdr-side change beyond the `Cargo.lock` bump. |
+| D3 | Number of actor tasks | **One: a receiver task.** Send path stays caller-driven (caller locks transport write half, signs, sends) — no sender task needed in Phase 2. | Half the moving parts. The receiver is where the routing bug lives; the sender path is already fine. Phase 3 may add a sender task if `execute()` benefits from it. |
+| D4 | Response delivery | Per-request `oneshot::Sender<Result<Frame>>` registered in `Arc<Mutex<HashMap<MessageId, Sender>>>` | Classic demux. `oneshot` is the right fit for "exactly one response per request". |
+| D5 | Caller-local pending queue | `VecDeque<oneshot::Receiver<Result<Frame>>>` on `Connection` (caller thread only) | Preserves today's "send N then receive_response N times in order" API. `send_request` pushes back, `receive_response` pops front. |
+| D6 | State layout | `state: Arc<ConnectionState>` with `AtomicU32` credits, `AtomicU64` next_msg_id, `OnceLock<NegotiatedParams>`, `Mutex<CryptoState>` for signing/encryption/preauth | Hot reads are lock-free; sender and receiver share via `Arc`. Mutation during handshake only (rare, short, sequential). |
+| D7 | MessageId allocation | Caller-thread atomic `fetch_add(credit_charge)` on `state.next_msg_id` **before** inserting waiter and sending. Frame then carries the pre-allocated id. | No actor round-trip for id allocation. Send order = allocation order = msg_id order (mpsc+single-writer preserves it). |
+| D8 | Credits accounting | Receiver task updates `state.credits` atomically on every frame (orphans included). Caller-thread reads `state.credits.load()` for pre-send checks. | Orphans don't starve throughput. Same invariant as Phase 1. |
+| D9 | Handshake mutators | `session.rs` still calls `conn.activate_signing(...)`, `conn.set_session_id(...)`, etc. These now take `&state.crypto.lock()`. | No semantic change; internal plumbing only. |
+| D10 | Preauth hash updates | Receiver task updates preauth hash on the chosen frames (SESSION_SETUP responses except final SUCCESS). Sender path (caller thread) updates on send. | Matches today's split. |
+| D11 | Cancellation-by-drop | Caller's `oneshot::Receiver` drops → `Sender::send` fails silently on arrival → frame is discarded, credits still applied, waiter map entry removed. | The primary correctness win of Phase 2. No special API; works through normal Rust drop. |
+| D12 | Transport failure | Receiver task fans `Err(Error::Disconnected)` (or the actual I/O error) to every pending waiter, clears the map, exits. Subsequent caller ops get `Err(Disconnected)` from a closed waiter channel or the next transport send. | One clear dead-state. No half-dead connections. |
+| D13 | Session expiry | Receiver task detects `STATUS_NETWORK_SESSION_EXPIRED`, sends `Err(Error::SessionExpired)` to the matched waiter only. Other waiters keep running (they'll hit the same error on their own responses, or succeed if the session recovers quickly). | Minimum-blast-radius. Caller is expected to reconnect. |
+| D14 | STATUS_PENDING (interim responses) | Receiver task keeps the waiter registered, does NOT forward the interim response. Caller sees only the final response. | Matches today's behavior exactly. CHANGE_NOTIFY and other long-poll ops "just work". |
+| D15 | Oplock breaks (MessageId=0xFFFF...) | Receiver task logs at DEBUG, skips. No waiter lookup. | Matches today. |
+| D16 | Malformed frame | Receiver task logs at WARN, skips, keeps running. Does NOT panic or stop routing. | Robustness invariant — one bad frame doesn't kill the connection. |
+| D17 | `Connection::disconnect()` (teardown) | Drop closes the transport write half, which triggers the receiver task to exit and fan `Err(Disconnected)` to remaining waiters. Explicit `disconnect()` stays for symmetry but does the same thing. | Graceful + panic-safe. |
+| D18 | `MockTransport` changes | None beyond Phase 1's `assert_fully_consumed()` helper. Tests that bypass `send_request` (direct `mock.queue_response` + `conn.receive_response`) continue to work — the receiver task reads from the mock's queue normally. | No test-infra churn. |
+| D19 | Test-fixture orphan-filter toggle | The existing `conn.set_orphan_filter_enabled(false)` (Phase 1, used by `setup_connection`) keeps working. The actor-based demux respects it: when disabled, the receiver task returns any frame via a single "broadcast" waiter. (Implementation detail: when disabled, the `Connection` exposes a single always-present receiver that the actor forwards to.) | Preserves ~300 existing unit tests that use hardcoded MessageId(0). |
+| D20 | Runtime requirement | tokio is formalized as a hard requirement (de-facto already true — no other transport exists). `async_trait` stays. Documented in `AGENTS.md` + `README`. | Clarity. No new dependency. |
 
-## Public API
-
-What external consumers see. (Internal types like `ActorCommand` or `Waiters` are crate-private.)
-
-### `Connection`
-
-```rust
-/// A connected, authenticated SMB2 connection to a server.
-///
-/// `Connection` is cheap to clone — every clone is a shared handle to the
-/// same underlying TCP connection and actor tasks. Clone freely to share
-/// a connection across tasks; the actor serializes sends and demultiplexes
-/// responses by `MessageId`.
-///
-/// When the last `Connection` handle is dropped, the actor tasks shut down
-/// and the TCP connection is closed. For graceful shutdown, call
-/// [`disconnect()`](Self::disconnect) to flush pending operations first.
-#[derive(Clone)]
-pub struct Connection { /* Arc<ConnectionInner> */ }
-
-impl Connection {
-    /// Connect to an SMB server over TCP. Spawns the actor tasks.
-    pub async fn connect(addr: impl ToSocketAddrs, timeout: Duration) -> Result<Self>;
-
-    /// Send one request, await one response. The primary API for most callers.
-    ///
-    /// The frame is signed and/or encrypted according to the connection's
-    /// negotiated state. The response is delivered when the server replies
-    /// to this specific MessageId — other operations' responses can arrive
-    /// interleaved without affecting this call.
-    pub async fn execute(
-        &self,
-        command: Command,
-        body: &impl Pack,
-        tree_id: Option<TreeId>,
-    ) -> Result<Frame>;
-
-    /// Like [`execute`](Self::execute), but charges `credit_charge` credits
-    /// against the connection's credit pool — required for large READ and
-    /// WRITE requests whose payload exceeds 64 KB.
-    pub async fn execute_with_credits(
-        &self,
-        command: Command,
-        body: &impl Pack,
-        tree_id: Option<TreeId>,
-        credit_charge: CreditCharge,
-    ) -> Result<Frame>;
-
-    /// Send a compounded chain of related requests in a single frame.
-    /// Returns one `Result<Frame>` per sub-op, in the submitted order.
-    ///
-    /// The server MAY split the response across multiple frames
-    /// (MS-SMB2 3.3.4.1.3). This method is transparent to that — each
-    /// sub-response is routed by its `MessageId` regardless of framing.
-    ///
-    /// Partial failure: each sub-op's `Result` is independent. If CREATE
-    /// succeeds but READ fails, the caller still gets the FileId from
-    /// CREATE and can issue a standalone CLOSE.
-    pub async fn execute_compound(
-        &self,
-        ops: &[(Command, &dyn Pack, Option<TreeId>, CreditCharge)],
-    ) -> Result<Vec<Result<Frame>>>;
-
-    /// Send an SMB CANCEL for an in-flight MessageId. Fire-and-forget.
-    ///
-    /// Typical use: attach a `CancelHandle` to a long-running operation,
-    /// and on user-initiated cancel, call `handle.cancel()` which
-    /// internally calls this.
-    pub async fn cancel(
-        &self,
-        target_msg_id: MessageId,
-        async_id: Option<u64>,
-    ) -> Result<()>;
-
-    /// Graceful shutdown: stop accepting new commands, drain in-flight,
-    /// close the transport, join the actor tasks.
-    pub async fn disconnect(self) -> Result<()>;
-
-    // ── Fast read-only accessors (lock-free) ────────────────────────
-
-    pub fn credits(&self) -> u16;
-    pub fn params(&self) -> Option<&NegotiatedParams>;
-    pub fn should_encrypt(&self) -> bool;
-    pub fn should_sign(&self) -> bool;
-    pub fn session_id(&self) -> SessionId;
-    pub fn server_name(&self) -> &str;
-    pub fn compression_enabled(&self) -> bool;
-    pub fn estimated_rtt(&self) -> Option<Duration>;
-
-    // ── Handshake state mutators (used by session.rs during setup) ──
-
-    pub async fn negotiate(&self) -> Result<()>;
-    pub async fn activate_signing(&self, key: Vec<u8>, algorithm: SigningAlgorithm) -> Result<()>;
-    pub async fn activate_encryption(&self, enc_key: Vec<u8>, dec_key: Vec<u8>, cipher: Cipher) -> Result<()>;
-    pub async fn set_session_id(&self, id: SessionId) -> Result<()>;
-
-    // ── DFS tree registration ───────────────────────────────────────
-
-    pub async fn register_dfs_tree(&self, tree_id: TreeId) -> Result<()>;
-    pub async fn deregister_dfs_tree(&self, tree_id: TreeId) -> Result<()>;
-
-    // ── Preauth hash access (for session setup key derivation) ──────
-
-    pub async fn preauth_hash(&self) -> PreauthHashValue;
-    pub async fn update_preauth_hash(&self, bytes: &[u8]) -> Result<()>;
-}
-```
-
-### `Frame`
-
-```rust
-/// A successfully received SMB2 response frame, post-decrypt/decompress/verify.
-pub struct Frame {
-    pub header: Header,
-    pub body: Vec<u8>,
-    /// Raw bytes of the frame after decryption but before signature verification.
-    /// Used for preauth hash updates during session setup.
-    pub raw: Vec<u8>,
-}
-```
-
-### Breaking changes for direct `Connection` users
-
-Anyone using `Connection` directly (not via `SmbClient` / `Tree`) sees these changes:
-
-- `send_request`, `send_request_with_credits`, `send_compound`, `receive_response`, `receive_compound`, `receive_compound_expected`: **removed**. Replace with `execute*`.
-- `Connection::from_transport(...)` still exists for testing but returns a started-actor connection.
-- `&mut Connection` → `&Connection` throughout. Downstream: `Tree` methods that took `&mut Connection` now take `&Connection`. `SmbClient` methods that took `&mut self` for connection access can often take `&self` too.
-
-For the current (only) user — cmdr — no public API change: `SmbClient::read_file_pipelined(...)` etc. look the same.
-
-## Internal architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                          Connection                             │
-│                      (Arc<ConnectionInner>)                     │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ ConnectionInner {                                       │    │
-│  │   cmd_tx: mpsc::UnboundedSender<ActorCommand>,          │    │
-│  │   state: Arc<ConnectionState>,                          │    │
-│  │   shutdown: watch::Sender<bool>,                        │    │
-│  │ }                                                       │    │
-│  └─────────────────────────────────────────────────────────┘    │
+│                         Connection                               │
+│                       (owned, &mut on ops)                       │
+│                                                                  │
+│  pending_fifo: VecDeque<oneshot::Receiver<Result<Frame>>>        │
+│  inner: Arc<ConnectionInner>                                     │
 └─────────────────────────────────────────────────────────────────┘
-                │                                    ▲
-                │ ActorCommand                       │ Frame
-                ▼                                    │
-┌──────────────────────────────┐         ┌──────────────────────────┐
-│ Sender task                  │         │ Receiver task            │
-│                              │         │                          │
-│ loop {                       │         │ loop {                   │
-│   cmd = cmd_rx.recv()        │         │   frame = xport.recv()   │
-│   build_header(credits++)    │         │   decrypt/decompress     │
-│   sign/encrypt               │         │   parse by NextCommand   │
-│   xport.send(bytes)          │         │   for each sub:          │
-│   waiters.insert(msg_id, tx) │         │     update credits       │
-│ }                            │         │     find waiter(msg_id)  │
-└──────────────────────────────┘         │     tx.send(frame)       │
-                │                        │ }                        │
-                │                        └──────────────────────────┘
-                ▼                                    ▲
-           ┌──────────────────────────────────────────┐
-           │ Transport (TcpTransport or MockTransport) │
-           │   send_half: Mutex<OwnedWriteHalf>        │
-           │   recv_half: Mutex<OwnedReadHalf>         │
-           └──────────────────────────────────────────┘
+                        │
+                        │ Arc share
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     ConnectionInner                              │
+│                                                                  │
+│  state: Arc<ConnectionState>        (atomics + OnceLock + Mutex) │
+│  waiters: Arc<Mutex<WaitersMap>>    (HashMap<MsgId, OnceTx>)     │
+│  transport_send: Arc<dyn TransportSend>                          │
+│  receiver_task: JoinHandle<()>      (drops = aborts task)        │
+└─────────────────────────────────────────────────────────────────┘
+         │                                       ▲
+         │ transport.send(frame_bytes)           │ transport.receive()
+         ▼                                       │
+┌───────────────────────────────────────────────────────────────────┐
+│    Transport (TcpTransport or MockTransport) — split halves       │
+│    send_half: Mutex<OwnedWriteHalf>    recv_half: owned by receiver│
+└───────────────────────────────────────────────────────────────────┘
+                                                 ▲
+                                                 │
+                                     ┌───────────────────────┐
+                                     │  Receiver task        │
+                                     │                       │
+                                     │  loop {               │
+                                     │    frame = recv()     │
+                                     │    decrypt/decompress │
+                                     │    parse sub-frames   │
+                                     │    for each sub:      │
+                                     │      update credits   │
+                                     │      handle PENDING   │
+                                     │      handle oplock    │
+                                     │      verify sig       │
+                                     │      match msg_id →   │
+                                     │        waiter.send()  │
+                                     │      else → log+drop  │
+                                     │  }                    │
+                                     └───────────────────────┘
 ```
 
-Shared state:
-- `waiters: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Result<Frame>>>>>`
-- `state: Arc<ConnectionState>` — see below
-
-### `ConnectionState`
+### Caller flow (`send_request` + `receive_response`)
 
 ```rust
+// send_request
+let msg_id = state.next_msg_id.fetch_add(credit_charge, Ordering::SeqCst);
+let (tx, rx) = oneshot::channel();
+waiters.lock().insert(msg_id, tx);
+let frame_bytes = build_and_sign_frame(msg_id, ...);
+transport.send(&frame_bytes).await?;   // transport's own Mutex still protects write half
+self.pending_fifo.push_back(rx);
+Ok((msg_id, header_stub))
+
+// receive_response
+let rx = self.pending_fifo.pop_front().ok_or(Error::invalid_data("no in-flight request"))?;
+let frame = rx.await.map_err(|_| Error::Disconnected)??;
+Ok((frame.header, frame.body, frame.raw))
+```
+
+### Caller flow (`send_compound` + `receive_compound_expected(N)`)
+
+```rust
+// send_compound — for each of N sub-ops:
+for op in ops {
+    let msg_id = state.next_msg_id.fetch_add(credit_charge, ...);
+    let (tx, rx) = oneshot::channel();
+    waiters.lock().insert(msg_id, tx);
+    self.pending_fifo.push_back(rx);
+}
+transport.send(&compound_bytes).await?;
+
+// receive_compound_expected(n):
+let mut sub_responses = Vec::with_capacity(n);
+for _ in 0..n {
+    let rx = self.pending_fifo.pop_front()...;
+    sub_responses.push(rx.await??);
+}
+Ok(sub_responses)
+```
+
+Note: in Phase 2 the receiver task itself splits server-compounded frames into sub-responses as it parses the frame. Each sub-response gets routed independently to its matching waiter. This replaces Phase 1's "gather N frames then hand to caller" logic — the receiver does the gather internally by matching `MessageId`s.
+
+### Cancellation-by-drop flow
+
+```
+Caller task: send_request(...) → waiter inserted, receiver pushed onto pending_fifo
+Caller task: runs other await points (e.g., other ops, yielded to scheduler)
+External: listing_task.abort() → Caller task's future is dropped
+Drop propagates: pending_fifo drops → Receivers drop → waiters' Senders are still in map
+... server's response arrives ...
+Receiver task: looks up msg_id in waiters → finds Sender → send(frame) fails silently (no Receiver)
+Receiver task: removes entry from map, logs at TRACE "late arrival for dropped waiter"
+Credits were already applied earlier in the receiver loop.
+```
+
+The `oneshot::Sender::send(frame)` call returns `Err(frame)` when the Receiver is dropped. Receiver task discards the returned frame. Map entry is removed unconditionally. No leaks.
+
+## Internal types
+
+```rust
+pub(crate) struct ConnectionInner {
+    state: Arc<ConnectionState>,
+    waiters: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Result<Frame>>>>>,
+    transport_send: Arc<dyn TransportSend>,
+    receiver_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
 pub(crate) struct ConnectionState {
-    // Hot read-only (after handshake). Set via OnceLock.
+    // Negotiated once at handshake, then read-only.
     pub params: OnceLock<NegotiatedParams>,
     pub server_name: String,
-    pub estimated_rtt: Mutex<Option<Duration>>,  // Measured during negotiate, then read-only.
 
-    // Hot, read by many, mutated by receiver task only. Atomic for lock-free reads.
-    pub credits: AtomicU32,  // u32 because u16 atomic isn't stable; cast on read.
+    // Hot, updated by receiver task only, read by callers for pre-send checks.
+    pub credits: AtomicU32,  // u32 because AtomicU16 wasn't stable at project-MSRV.
+    pub next_msg_id: AtomicU64,
 
-    // Handshake state — only mutated during session setup, otherwise read-only.
-    // Mutex because the mutations happen infrequently and sequentially.
-    pub crypto: Mutex<CryptoState>,
+    // Handshake state — mutations are rare and sequential.
+    pub crypto: std::sync::Mutex<CryptoState>,
 
-    // Sender-task-local state — not shared. Lives in the sender task closure:
-    //   - next_message_id: u64
-    //   - nonce_gen: Option<NonceGenerator>
+    // Feature toggles set at construction (test support).
+    pub orphan_filter_enabled: AtomicBool,
 }
 
 pub(crate) struct CryptoState {
@@ -264,229 +208,259 @@ pub(crate) struct CryptoState {
     pub session_id: SessionId,
     pub preauth_hasher: PreauthHasher,
     pub dfs_trees: HashSet<TreeId>,
-}
-```
-
-The split: **atomics for per-message-cycle reads**, **Mutex for handshake reads**. The sender task is the only writer of `next_message_id` and `nonce_gen`, so those live as locals in the task.
-
-### `ActorCommand`
-
-```rust
-pub(crate) enum ActorCommand {
-    SendRequest {
-        command: Command,
-        body: Vec<u8>,  // pre-encoded by caller
-        tree_id: Option<TreeId>,
-        credit_charge: CreditCharge,
-        reply: oneshot::Sender<Result<Frame>>,
-    },
-    SendCompound {
-        ops: Vec<CompoundOp>,  // each with its own reply oneshot
-    },
-    SendCancel {
-        target_msg_id: MessageId,
-        async_id: Option<u64>,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    UpdatePreauthHash {
-        bytes: Vec<u8>,
-        reply: oneshot::Sender<()>,
-    },
-    ReadPreauthHash {
-        reply: oneshot::Sender<PreauthHashValue>,
-    },
-    Shutdown {
-        reply: oneshot::Sender<()>,
-    },
+    pub nonce_counter: u64,
 }
 
-pub(crate) struct CompoundOp {
-    pub command: Command,
+/// A successfully received SMB2 sub-response.
+pub struct Frame {
+    pub header: Header,
     pub body: Vec<u8>,
-    pub tree_id: Option<TreeId>,
-    pub credit_charge: CreditCharge,
-    pub reply: oneshot::Sender<Result<Frame>>,
+    pub raw: Vec<u8>,
 }
 ```
 
-Crypto state mutators (`activate_signing`, `activate_encryption`, `set_session_id`) don't need commands — they lock `state.crypto` directly. They only happen at handshake time so contention with the sender task is negligible.
+## Receiver task loop (pseudocode)
 
-DFS tree registration similarly locks directly.
-
-### Sender task loop
-
-```
-loop {
-    cmd = cmd_rx.recv().await
-    match cmd {
-      SendRequest { command, body, tree_id, credit_charge, reply } => {
-        let msg_id = next_message_id;
-        next_message_id += credit_charge;
-        let bytes = build_frame(command, body, tree_id, credit_charge, msg_id, &state);
-        waiters.lock().insert(msg_id, reply);
-        transport.send(&bytes).await?; // on error, fan error and exit
-      }
-      SendCompound { ops } => {
-        // Build one compounded frame, one waiter per op.
-        for op in &ops { waiters.insert(msg_id_for_op, op.reply); }
-        transport.send(&compound_bytes).await?;
-      }
-      SendCancel { target_msg_id, async_id, reply } => {
-        // Build CANCEL frame (no credit consumed, no msg_id advance).
-        transport.send(&cancel_bytes).await?;
-        let _ = reply.send(Ok(()));
-      }
-      UpdatePreauthHash { bytes, reply } => {
-        state.crypto.lock().preauth_hasher.update(&bytes);
-        let _ = reply.send(());
-      }
-      ReadPreauthHash { reply } => {
-        let _ = reply.send(state.crypto.lock().preauth_hasher.finish());
-      }
-      Shutdown { reply } => {
-        // Drain waiters, fan Error::Disconnected, close transport, exit.
-        break;
-      }
-    }
-}
-```
-
-### Receiver task loop
-
-```
-loop {
-    frame_bytes = transport.receive().await  // on error, fan error, exit
-
-    // Decrypt if TRANSFORM_HEADER
-    // Decompress if COMPRESSION_HEADER
-    // Split into sub-responses by NextCommand offsets
-
-    for each sub_response in frame {
-        let header = parse(sub_response)
-        let msg_id = header.message_id
-
-        credits.store(credits.load() + header.credits - 1, Ordering::Release)
-
-        if header.is_oplock_break(msg_id) { log+skip; continue }
-
-        if header.status == STATUS_PENDING {
-            // Keep the waiter registered; continue waiting for the final response.
-            continue
-        }
-
-        // Verify signature if signed and not was_encrypted
-        if signing_active && should_verify { verify_signature(sub_response)? }
-
-        if header.status == STATUS_NETWORK_SESSION_EXPIRED {
-            // Fan to this op's waiter; do not disturb other waiters.
-            if let Some(tx) = waiters.lock().remove(&msg_id) {
-                let _ = tx.send(Err(Error::SessionExpired));
+```rust
+async fn receiver_loop(
+    transport_recv: Box<dyn TransportReceive>,
+    state: Arc<ConnectionState>,
+    waiters: Arc<Mutex<WaitersMap>>,
+) {
+    loop {
+        let frame_bytes = match transport_recv.receive().await {
+            Ok(b) => b,
+            Err(e) => {
+                // Fan to all pending waiters and exit.
+                let drained: Vec<_> = waiters.lock().drain().collect();
+                for (_msg_id, tx) in drained {
+                    let _ = tx.send(Err(e.clone_or_disconnected()));
+                }
+                return;
             }
-            continue
-        }
+        };
 
-        if let Some(tx) = waiters.lock().remove(&msg_id) {
-            let _ = tx.send(Ok(Frame { header, body, raw }))
-        } else {
-            // Orphan: no waiter. Could be a late response after cancel. Log at DEBUG.
-            debug!("orphan response, msg_id={}, cmd={:?}", msg_id, header.command);
+        // Decrypt if TRANSFORM_HEADER; decompress if COMPRESSION_HEADER.
+        let (decoded, was_encrypted) = match preprocess(&frame_bytes, &state) {
+            Ok(x) => x,
+            Err(e) => { log::warn!("malformed frame: {e}"); continue; }
+        };
+
+        // Split into sub-responses by NextCommand offsets.
+        let sub_responses = match split_compound(&decoded) {
+            Ok(subs) => subs,
+            Err(e) => { log::warn!("compound parse: {e}"); continue; }
+        };
+
+        for sub in sub_responses {
+            let header = match parse_header(&sub) { Ok(h) => h, Err(e) => { log::warn!(...); continue; } };
+
+            // Credits first — always applied.
+            update_credits(&state, &header);
+
+            if header.is_oplock_break() { log::debug!(...); continue; }
+
+            if header.status == STATUS_PENDING {
+                // Keep the waiter; interim response, don't forward.
+                continue;
+            }
+
+            if state.should_sign_receive() && !was_encrypted {
+                if let Err(e) = verify_signature(&sub, &state) {
+                    // Signature bad: send to waiter as error; do not poison connection.
+                    if let Some(tx) = waiters.lock().remove(&header.message_id) {
+                        let _ = tx.send(Err(e));
+                    }
+                    continue;
+                }
+            }
+
+            let frame = Frame { header, body: sub[HEADER_SIZE..].to_vec(), raw: sub };
+
+            // Special case: session expired — send error to waiter, don't poison others.
+            let result = if frame.header.status == STATUS_NETWORK_SESSION_EXPIRED {
+                Err(Error::SessionExpired)
+            } else {
+                Ok(frame)
+            };
+
+            match waiters.lock().remove(&header.message_id) {
+                Some(tx) => {
+                    let _ = tx.send(result); // ignore send failure (caller dropped)
+                }
+                None => {
+                    if state.orphan_filter_enabled() {
+                        log::debug!("orphan msg_id={}, cmd={:?}", header.message_id, header.command);
+                    } else {
+                        // Test mode: we'd need a fallback broadcast receiver here.
+                        // (Details in §"Test-fixture compatibility".)
+                    }
+                }
+            }
         }
     }
 }
 ```
 
-## Migration plan
+### Test-fixture compatibility
 
-### Phase 2 — Red tests
-1. `receive_response_ignores_orphaned_response_with_unrelated_message_id` in `connection.rs`. Queue a stale Close with MessageId 999, then the real Create for MessageId 4. Current code returns the Close body (60 bytes) to a caller unpacking it as CreateResponse (expected 89). Fails today.
-2. `concurrent_ops_on_one_connection_do_not_cross_talk`. Two `execute()` calls on the same connection, submitted in parallel. Each gets its own response. Can't be written against current API; write as stub that's `#[ignore]`d until the actor lands.
-3. `dropping_execute_future_does_not_corrupt_pipe`. Submit an execute, drop the future before the response arrives, submit another — second one succeeds. Also `#[ignore]`d until actor.
-4. `session_expiry_fans_to_specific_waiter_not_all`. Only the affected waiter gets `Err(SessionExpired)`. Others keep running.
-5. Add `MockTransport::assert_fully_consumed()` helper.
+Phase 1 added `Connection::set_orphan_filter_enabled(bool)` to let tests that call `mock.queue_response(...)` + `conn.receive_response()` directly (without going through `send_request`) keep working. Roughly 550 unit tests rely on this.
 
-Commit as red.
+In Phase 2, when the filter is *disabled*, the Connection maintains a single "broadcast waiter" that receives any otherwise-unmatched frame. `receive_response` pops from `pending_fifo` if present, else from the broadcast waiter. This is a narrow test-only path; production always has the filter enabled.
 
-### Phase 3 — Actor core
-- Introduce `ConnectionInner`, `ConnectionState`, `CryptoState`, `ActorCommand`, `CompoundOp`, `Waiters` types.
-- `Connection::from_transport()` spawns both tasks.
-- `execute()`, `execute_with_credits()`, `execute_compound()`, `cancel()`, `disconnect()` implemented.
-- Handshake mutators (`activate_signing`, etc.) become state-lock operations (no command needed).
-- Fast accessors read atomics / OnceLock directly.
+Implementation: an internal `std::sync::Mutex<Option<mpsc::UnboundedSender<Result<Frame>>>>` on `ConnectionInner`, set up by `set_orphan_filter_enabled(false)`. `receive_response` uses `tokio::select!` to await whichever arrives first.
 
-Old API (`send_request`, `receive_response`, etc.) removed in the same commit.
+## Phase 2 public API (unchanged from today)
 
-### Phase 4 — Caller migration
-All call sites in `src/client/*.rs` update from:
 ```rust
-let (msg_id, _sent) = conn.send_request(cmd, &body, tree_id).await?;
-let (header, body, raw) = conn.receive_response().await?;
+impl Connection {
+    pub async fn connect(addr: impl ToSocketAddrs, timeout: Duration) -> Result<Self>;
+    pub fn from_transport(send: Box<dyn TransportSend>, recv: Box<dyn TransportReceive>, server_name: &str) -> Self;
+
+    pub async fn negotiate(&mut self) -> Result<NegotiatedParams>;
+
+    pub async fn send_request(&mut self, command: Command, body: &impl Pack, tree_id: Option<TreeId>) -> Result<(MessageId, ())>;
+    pub async fn send_request_with_credits(&mut self, command: Command, body: &impl Pack, tree_id: Option<TreeId>, credit_charge: u16) -> Result<(MessageId, ())>;
+    pub async fn send_compound(&mut self, ops: &[(Command, &dyn Pack, CreditCharge)], tree_id: TreeId) -> Result<Vec<MessageId>>;
+    pub async fn send_cancel(&mut self, target_msg_id: MessageId, async_id: Option<u64>) -> Result<()>;
+
+    pub async fn receive_response(&mut self) -> Result<(Header, Vec<u8>, Vec<u8>)>;
+    pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>>;
+    pub async fn receive_compound_expected(&mut self, expected: usize) -> Result<Vec<(Header, Vec<u8>)>>;
+
+    // Handshake mutators (used by session.rs)
+    pub fn activate_signing(&self, key: Vec<u8>, algorithm: SigningAlgorithm);
+    pub fn activate_encryption(&self, enc_key: Vec<u8>, dec_key: Vec<u8>, cipher: Cipher);
+    pub fn set_session_id(&self, id: SessionId);
+    pub fn set_compression_requested(&self, requested: bool);
+    pub fn register_dfs_tree(&self, tree_id: TreeId);
+    pub fn deregister_dfs_tree(&self, tree_id: TreeId);
+
+    // Lock-free accessors
+    pub fn credits(&self) -> u16;
+    pub fn params(&self) -> Option<NegotiatedParams>;
+    pub fn should_encrypt(&self) -> bool;
+    pub fn should_sign(&self) -> bool;
+    pub fn session_id(&self) -> SessionId;
+    pub fn server_name(&self) -> &str;
+    pub fn compression_enabled(&self) -> bool;
+
+    // Test support
+    pub(crate) fn set_orphan_filter_enabled(&self, enabled: bool);
+}
 ```
-to:
-```rust
-let frame = conn.execute(cmd, &body, tree_id).await?;
-```
 
-Compound call sites similarly collapse from `send_compound` + `receive_compound_expected(N)` to `execute_compound(ops)`.
+Differences from pre-Phase-2:
+- Handshake mutators can take `&self` instead of `&mut self` (state is behind atomics / Mutex). Call sites in `session.rs` change `conn.activate_signing(...)` from `&mut conn` to `&conn`. This is the only source-level change in callers.
+- Fast accessors also go from `&self` with interior access — no change for readers.
 
-Pipelined loops in `tree.rs`: each chunk becomes `conn.execute_with_credits(...)`; the loop collects `N` futures into a `FuturesUnordered`; credit discipline on the caller side stays as-is (reading `conn.credits()` before submitting).
+## Test plan
 
-`Watcher` becomes a thin wrapper around `conn.execute(CHANGE_NOTIFY, ...)`, no special lifecycle.
+### Red tests (committed red before impl)
 
-### Phase 5 — Test migration
-Unit tests in `src/client/*.rs`:
-- ~80% are "queue response(s), call high-level method, assert" — mechanical swap of `conn.send_request + conn.receive_response` → `conn.execute`.
-- ~20% inspect raw sent bytes or call the low-level API directly — need restructuring. In most cases, the assertion can shift to inspecting `mock.sent_messages()` after `conn.execute()` returns.
-- `MockTransport::assert_fully_consumed()` is applied to every `connection.rs` and `tree.rs` test to catch any leaks.
+These go in `src/client/connection.rs` tests (a new `actor_routing` test module):
 
-Wire-format tests (`pack_roundtrip.rs`, `msg_wire_format.rs`): untouched.
+1. **`dropped_caller_future_does_not_corrupt_next_op`** — simulates the streaming-listing abort. Send a request A, drop the caller future before receive_response runs, simulate the late frame arrival (via mock), send a new request B, assert B's receive_response returns B's response correctly. **Fails on pre-Phase-2.**
 
-Docker / consumer / real-NAS integration tests: unchanged (black-box against `SmbClient` / `Tree`). These are the safety net.
+2. **`concurrent_ops_on_one_connection_route_correctly`** — once Phase 3's `execute()` lands this becomes useful for parallel; in Phase 2, since `&mut` still serializes callers, this test is written as "two sequential send_request calls, responses queued out of order on the mock, each `receive_response` gets the right one" which tests the demux routing. **Fails on pre-Phase-2 without the `assert_fully_consumed` helper catching the leak.**
 
-### Phase 6 — Docs
-- `src/client/CLAUDE.md`: rewrite "Connection" section to describe the actor design.
-- `src/transport/CLAUDE.md`: note that the transport's `send()` and `recv()` may be called from different tasks concurrently (was de-facto true; now formalized).
-- `AGENTS.md`: the "Only ONE task reads from the transport" paragraph stays — it's now accurate.
+3. **`dropped_caller_credits_still_applied`** — send a request, drop before receive, simulate late frame arrival, assert `conn.credits()` ticks forward as if the response were consumed. **Fails on pre-Phase-2 (credits only applied at the receive_response call site).**
 
-### Phase 7 — Checks
-- `just check-all`
-- `just test-docker`
-- `cargo test --test integration -- --ignored` against QNAP
-- Manual run of the original failing scenario (two back-to-back `list_directory` on main connection).
+4. **`receiver_task_survives_malformed_frame`** — queue a garbage frame (invalid header), then a valid frame for an in-flight msg_id, assert the valid frame arrives. **Fails on pre-Phase-2 (the first bad parse kills the receive loop for the calling op).**
+
+### Robustness tests (alongside impl)
+
+5. **`transport_drop_errors_all_pending_waiters`** — send 3 requests, close the mock transport, assert all 3 `receive_response` awaits return `Err(Disconnected)`.
+
+6. **`stress_concurrent_ops_with_random_drops`** — 1000 iterations of: spawn a random number of listings on one connection, drop a random subset mid-flight, verify the survivors complete correctly. Guards against subtle timing issues in the receiver task.
+
+### Integration (Docker, real-NAS)
+
+- `just test-docker` (13 internal containers)
+- `just test-consumer` (14 consumer containers, cmdr's contract surface)
+- `cargo test --test integration -- --ignored` against QNAP + Pi manually before push
+
+### `MockTransport::assert_fully_consumed()` adoption
+
+Phase 1 added this helper. Phase 2 is the right time to actually wire it into every test that calls `conn.receive_response()`. Catches test-level regressions where responses are queued but never consumed (which was the latent shape that let the bug hide for this long).
+
+## Migration (Phase 2 only)
+
+### Code changes
+
+1. `src/client/connection.rs`:
+   - Introduce `ConnectionInner`, `ConnectionState`, `CryptoState`, `WaitersMap`.
+   - `Connection::from_transport(send, recv, server_name)` spawns the receiver task.
+   - `send_request(_with_credits)`: allocate msg_id atomically, register waiter, push receiver, send frame.
+   - `send_compound`: same loop per sub-op.
+   - `send_cancel`: no waiter, just transport.send.
+   - `receive_response`: pop from pending_fifo, await.
+   - `receive_compound_expected(n)`: pop n receivers, await all.
+   - Handshake mutators switch from `&mut self` to `&self` (interior mutability).
+   - All existing inline signing/decryption/compound-parsing logic moves into receiver task helpers.
+
+2. `src/client/session.rs`:
+   - `Session::setup()` callers of `conn.activate_signing(...)` etc. stop needing `&mut conn`. One-line touch.
+
+3. `src/client/tree.rs`:
+   - `Tree::*` methods still take `&mut Connection` (Phase 3 flips these to `&Connection`).
+   - `read_pipelined_loop_with_progress` and friends continue to work unchanged — they already match responses to requests by MessageId on the caller side; with Phase 2 they'll simply stop seeing other callers' frames.
+
+4. `src/transport/tcp.rs`, `src/transport/mock.rs`:
+   - No changes beyond what Phase 1 already has.
+
+### Test migration
+
+Expected impact:
+- Roughly 80% of `connection.rs` and `tree.rs` unit tests work unchanged (they go through `send_request` + `receive_response` and don't inspect internals).
+- Tests that directly manipulate `conn.credits = N;` or `conn.next_message_id = M;` as field writes: replace with the atomic-setter helpers. ~35 sites.
+- Tests that call `receive_response()` directly after `mock.queue_response()` without a preceding `send_request`: these rely on `set_orphan_filter_enabled(false)` (Phase 1). With Phase 2 they route through the broadcast-waiter fallback. ~550 sites — no per-site change needed if the helper is maintained.
+
+### Docs
+
+- Update `src/client/CLAUDE.md` with the new architecture sketch and the cancellation-by-drop invariant.
+- Update `AGENTS.md` "Only ONE task reads from the transport" paragraph to point at the receiver task as the implementation of that invariant.
 
 ## Risks and non-risks
 
 **Not risky:**
 - Wire format: unchanged.
-- Transport: already split; no trait changes.
-- Docker integration: black-box, unaffected.
-- High-level API (SmbClient, Tree, Pipeline, FileWriter): stays.
+- Transport trait: unchanged.
+- High-level API (SmbClient, Tree, FileWriter, Pipeline): unchanged.
+- Docker and consumer integration tests: unchanged (black-box against SmbClient).
 
-**Risky:**
-- Credit discipline in concurrent-ops scenarios. Today's callers are serial. When many tasks submit `execute()` in parallel, they all read `credits()` and may all decide "plenty available" simultaneously — then all send, exceeding credits. For v1, this is acceptable: SMB servers return `STATUS_INSUFFICIENT_RESOURCES` if exceeded; we'd need to add retry. For today's cmdr usage (single-op-at-a-time via SmbVolume mutex), no regression. When we actually parallelize (the 100-files goal), add a credit semaphore then.
-- Actor teardown on `Connection::drop`. If callers drop the connection with in-flight ops, the oneshots should receive `Err(Disconnected)`. Needs explicit test.
-- `next_message_id` starts at 0, but after handshake advances. Tests that bypass handshake and manipulate it directly (~30 tests) need `setup_connection` to also initialize the sender task's starting `next_message_id`. Easy but must not be missed.
+**Risky (but mitigated):**
+- **Receiver task panic safety.** A panic in the receiver task would strand every caller forever. Mitigation: every `parse_header`/`verify_signature`/`decrypt` path uses `Result`, logged-and-continue on `Err`. No `unwrap` on frame content. Test `receiver_task_survives_malformed_frame` pins this.
+- **Transport drop edge cases.** If the transport errors during a caller's `transport.send(...)`, the waiter was registered but the frame never went out. Mitigation: on send error, remove the just-inserted waiter from the map before returning the error (caller observes the error; no orphan waiter).
+- **Preauth hash ordering.** Session setup depends on precise preauth hash updates. Mitigation: hash updates happen on the caller thread during send and in the receiver task on non-PENDING response arrival — same ordering as today, just split across threads. Tested by the existing session setup integration tests (real Docker + mocked).
+- **Shutdown races.** Dropping `Connection` while the receiver task is mid-route: the task holds `Arc<WaitersMap>`, the drop of `ConnectionInner` decrements the Arc but the task holds it. When the task exits (after transport EOF or `JoinHandle::abort`), the Arc is released. No leak.
 
-**Unknown:**
-- Test migration effort. Estimated 2-4 hours of Haiku-parallel work. True cost will be known after the first 50 tests are migrated.
-
-## Non-goals for this refactor
-
-Explicitly deferred:
-- Concurrent-ops credit semaphore. Added when parallelism is actually used.
-- Pause/resume. Added when cmdr wires it up to the UI.
-- Automatic CANCEL on future drop for in-flight ops (beyond just oneshot closure). Added when we measure that drop-without-cancel leaves server handles for too long.
-- Streaming read (like `write_file_streamed` but for reads). The current `read_file_with_progress` pattern works after migration; streaming can come as a separate addition.
-- `Connection` pool / multichannel. Future work.
-
-Keeping these out of scope makes the refactor tractable.
+**Scope carve-outs (deferred to Phase 3 or later):**
+- Concurrent-ops credit semaphore. Added when parallelism is actually wired up in callers.
+- `Connection::clone()`.
+- `execute()` / `execute_compound()` public API.
+- Automatic SMB CANCEL on future drop (today: drop just closes the oneshot; frame gets discarded on arrival).
+- Pause/resume transfers.
 
 ## For future consumers
 
-If you're writing a library or tool that uses `smb2` directly (not via cmdr):
+(Applies after Phase 3 lands. Phase 2 preserves today's API, so no new consumer-facing guidance yet.)
 
-- `Connection` is `Clone`. Clone it, spawn tasks, each task runs `execute()` calls independently. The library handles serialization of sends and routing of responses.
-- Dropping a future mid-flight is safe: the response is discarded when it arrives, credits are still applied. No wire-state corruption.
-- For explicit cancellation (e.g., the user cancelled a long upload), use `conn.cancel(msg_id, async_id)` before dropping the future. This sends SMB CANCEL so the server stops work.
-- Check `conn.credits()` before launching many parallel ops if your server is credit-conservative (QNAP, some NAS firmwares). Default credit discipline in the library is "assume you asked reasonably".
-- Errors from `execute()` are always typed. `Err(Error::Disconnected)` means the actor is gone and this `Connection` handle is dead; clone or reconnect.
-- `Connection::disconnect().await` is the graceful shutdown. Dropping without calling it aborts in-flight ops with `Err(Disconnected)`.
+When Phase 3 arrives:
+- `Connection` becomes `Clone`. Clone freely across tasks.
+- Dropping a future mid-flight is safe — the response is discarded when it arrives.
+- For explicit protocol-level cancellation (e.g., a multi-second upload), use `conn.cancel(msg_id, async_id)` before dropping the future.
+- `Err(Error::Disconnected)` means the connection is dead; reconnect (not clone).
+
+## Phase 3 preview (NOT in this PR)
+
+For planning purposes — not implemented in Phase 2:
+
+- `Connection` gains `#[derive(Clone)]` (just wraps `Arc<Inner>`).
+- New public methods `execute(cmd, body, tree_id) -> Result<Frame>`, `execute_compound(ops) -> Result<Vec<Result<Frame>>>`, `execute_with_credits(..., credit_charge)`.
+- `tree.rs` methods flip `&mut Connection` → `&Connection`; callers of `Tree::*` similarly.
+- `Pipeline::execute()` migrates from serial iteration to `FuturesUnordered` of `execute()` futures.
+- Legacy `send_request` + `receive_response` may remain as thin wrappers for a deprecation period.
+- SmbVolume in cmdr drops its `tokio::sync::Mutex`; parallel `copy_between_volumes` becomes feasible.
+
+Phase 3 is a big enough scope to warrant its own design doc when we get there. Mentioned here only to clarify Phase 2 is not a dead end.
