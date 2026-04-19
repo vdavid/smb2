@@ -1838,3 +1838,155 @@ async fn streamed_write_performance_vs_pipelined() {
         streamed_mbps / pipelined_mbps
     );
 }
+
+// ── Phase 3 prep: "100 tiny files" benchmark ──────────────────────────
+//
+// Measures the scenario Phase 3 is supposed to unlock: many small-file
+// reads from a single share. Compares today's sequential-through-one-
+// connection path (what cmdr's `SmbVolume` mutex enforces) against an
+// upper-bound parallel-across-N-connections run. Phase 3 (`Connection:
+// Clone` + `execute()`) would enable concurrent ops on ONE connection —
+// the N-connection ceiling is an over-estimate (parallel TCP streams)
+// but gives us a useful order-of-magnitude before we commit to scope.
+//
+// Run with:
+//   cargo test --test integration --release bench_100_tiny_files -- --ignored --nocapture
+//
+// Files: 100 × 10 KB, located at `_test/bench_100tiny/` on the naspi
+// share. Uploaded once (outside the timing), kept across runs (idempotent).
+
+#[tokio::test]
+#[ignore]
+async fn bench_100_tiny_files_seq_vs_parallel() {
+    let _ = env_logger::try_init();
+
+    const FILE_COUNT: usize = 100;
+    const FILE_SIZE: usize = 10 * 1024; // 10 KB
+    const PARALLEL_CONNS: usize = 10;
+    const BENCH_DIR: &str = "_test/bench_100tiny";
+
+    // ── Setup: ensure 100 × 10 KB test files exist on the share ──────
+    {
+        let mut client = connect_client_to_nas().await;
+        let mut share = client
+            .connect_share("naspi")
+            .await
+            .expect("connect_share setup");
+        let _ = client.create_directory(&mut share, BENCH_DIR).await;
+
+        let data = vec![0x42u8; FILE_SIZE];
+        let setup_start = std::time::Instant::now();
+        let mut uploaded = 0usize;
+        for i in 0..FILE_COUNT {
+            let path = format!("{}/f_{:03}.bin", BENCH_DIR, i);
+            // Upload only if missing, so repeated bench runs don't pay the
+            // upload tax every time.
+            let already_there = match client.stat(&mut share, &path).await {
+                Ok(info) => info.size as usize == FILE_SIZE,
+                Err(_) => false,
+            };
+            if !already_there {
+                client
+                    .write_file(&mut share, &path, &data)
+                    .await
+                    .expect("upload");
+                uploaded += 1;
+            }
+        }
+        println!(
+            "Setup: {}/{} files uploaded ({} already present), took {:.2?}",
+            uploaded,
+            FILE_COUNT,
+            FILE_COUNT - uploaded,
+            setup_start.elapsed()
+        );
+        let _ = client.disconnect_share(&share).await;
+    }
+
+    // ── Baseline: sequential reads on ONE connection ─────────────────
+    let seq_elapsed = {
+        let mut client = connect_client_to_nas().await;
+        let mut share = client
+            .connect_share("naspi")
+            .await
+            .expect("connect_share seq");
+
+        let start = std::time::Instant::now();
+        let mut total_bytes = 0usize;
+        for i in 0..FILE_COUNT {
+            let path = format!("{}/f_{:03}.bin", BENCH_DIR, i);
+            let d = client.read_file(&mut share, &path).await.expect("seq read");
+            assert_eq!(d.len(), FILE_SIZE);
+            total_bytes += d.len();
+        }
+        let elapsed = start.elapsed();
+        let _ = client.disconnect_share(&share).await;
+        assert_eq!(total_bytes, FILE_COUNT * FILE_SIZE);
+        elapsed
+    };
+    let seq_fps = FILE_COUNT as f64 / seq_elapsed.as_secs_f64();
+
+    // ── Treatment: N parallel reads on N connections ─────────────────
+    //
+    // Connect N times up front (timed separately), then issue 100 reads
+    // across those N connections as 10 rounds of 10 concurrent reads.
+    // Each connection reads 10 files sequentially — the parallelism is
+    // between connections, not within.
+    let conn_setup_start = std::time::Instant::now();
+    let mut clients: Vec<(SmbClient, _)> = Vec::with_capacity(PARALLEL_CONNS);
+    for _ in 0..PARALLEL_CONNS {
+        let mut c = connect_client_to_nas().await;
+        let s = c.connect_share("naspi").await.expect("connect_share par");
+        clients.push((c, s));
+    }
+    let conn_setup = conn_setup_start.elapsed();
+
+    let par_start = std::time::Instant::now();
+    let mut tasks = Vec::with_capacity(PARALLEL_CONNS);
+    let per_conn = FILE_COUNT / PARALLEL_CONNS; // 10
+    for (idx, (mut client, mut share)) in clients.into_iter().enumerate() {
+        let task = tokio::spawn(async move {
+            let mut bytes = 0usize;
+            for j in 0..per_conn {
+                let file_idx = idx * per_conn + j;
+                let path = format!("{}/f_{:03}.bin", BENCH_DIR, file_idx);
+                let d = client.read_file(&mut share, &path).await.expect("par read");
+                bytes += d.len();
+            }
+            let _ = client.disconnect_share(&share).await;
+            bytes
+        });
+        tasks.push(task);
+    }
+    let mut par_bytes = 0usize;
+    for t in tasks {
+        par_bytes += t.await.expect("task join");
+    }
+    let par_elapsed = par_start.elapsed();
+    assert_eq!(par_bytes, FILE_COUNT * FILE_SIZE);
+    let par_fps = FILE_COUNT as f64 / par_elapsed.as_secs_f64();
+
+    // ── Report ───────────────────────────────────────────────────────
+    let speedup = seq_elapsed.as_secs_f64() / par_elapsed.as_secs_f64();
+    println!();
+    println!("─────────────────────────────────────────────────────────");
+    println!("100 × 10 KB file read benchmark against QNAP");
+    println!("─────────────────────────────────────────────────────────");
+    println!(
+        "Sequential (1 conn):   {:>8.2?}  =  {:>6.1} files/sec",
+        seq_elapsed, seq_fps
+    );
+    println!(
+        "Parallel ({} conns):   {:>8.2?}  =  {:>6.1} files/sec   (setup {:.2?} extra)",
+        PARALLEL_CONNS, par_elapsed, par_fps, conn_setup
+    );
+    println!(
+        "Speedup:               {:>8.1}x   (upper bound — Phase 3 will be lower since it ",
+        speedup
+    );
+    println!(
+        "                                     uses ONE connection, not {})",
+        PARALLEL_CONNS
+    );
+    println!("─────────────────────────────────────────────────────────");
+}
