@@ -124,9 +124,26 @@ Tree-level encryption: `connect_share()` checks the share's encrypt flag and act
 
 `SmbClient::reconnect()` creates a fresh TCP connection, re-negotiates, and re-authenticates using stored credentials. All previous `Tree` handles and `FileId` values are invalidated. The caller must `connect_share` again.
 
+## Connection internals: receiver task + `oneshot` routing
+
+Phase 2 moved response demultiplexing out of `receive_response()`'s synchronous loop and into a background receiver task spawned per `Connection`. Public API signatures are unchanged (`send_request` + `receive_response` + compound variants), but the semantics underneath are now:
+
+- `Connection` owns an `Arc<Inner>` holding `waiters: Mutex<HashMap<MessageId, oneshot::Sender<Result<Frame>>>>`, `credits: AtomicU32`, `next_message_id: AtomicU64`, and crypto state.
+- On `Connection::from_transport`, a receiver task is spawned that owns the transport's read half. It decrypts/decompresses/sign-verifies/splits-compound and routes each sub-frame to the `oneshot::Sender` registered for its `MessageId`.
+- `send_request` allocates a `MessageId` (`AtomicU64::fetch_add(credit_charge)`), registers a `oneshot::Sender` in `waiters` (atomically checking `disconnected` under the waiters lock to rule out a TOCTOU where the receiver task has already shut down), pushes the corresponding `Receiver` onto the `Connection`-local `pending_fifo: VecDeque<Receiver>`, and writes the framed bytes through `TransportSend`. `receive_response` pops the front `Receiver` and awaits it.
+- **Cancellation-by-drop is safe by construction.** If a caller's future is aborted (`tokio::spawn` + `JoinHandle::abort()` is the common path in consumers), the `Receiver` in `pending_fifo` drops; the receiver task's `Sender::send` then fails silently when the late frame arrives; the frame is discarded. Credits are still applied in the receiver task so dropped-caller frames don't starve throughput.
+- **Transport drop** fans `Err(Disconnected)` to every pending `oneshot::Sender` and sets `disconnected=true` under the waiters lock. Subsequent `send_request` sees `disconnected=true` and returns `Err(Disconnected)` without inserting (no leaked waiters).
+
+Full design in [docs/specs/connection-actor.md](../../docs/specs/connection-actor.md) including the two-phase staging (Phase 2 = routing only, Phase 3 = `Connection: Clone` + `execute()` API for concurrent ops per connection).
+
+### Test-mode orphan-filter toggle (`set_orphan_filter_enabled(false)`)
+
+~550 existing unit tests queue mock responses with hardcoded `MessageId(0)` and call `receive_response()` directly without a preceding `send_request`. To keep them working without per-test rewrites, `Connection` has a test-only mode where the receiver task routes unmatched frames to an `mpsc` fallback channel (one `Vec<Frame>` per transport frame, preserving compound grouping). `receive_response`/`receive_compound_expected` read from the fallback when `pending_fifo` is empty. Production always has the filter on. See `set_orphan_filter_enabled` in `connection.rs`.
+
 ## Key decisions
 
-- **`&mut Connection` instead of `Arc<Mutex<Connection>>`**: Forces sequential access at compile time. The pipeline module handles concurrency differently (split transport halves).
+- **`&mut Connection` instead of `Arc<Mutex<Connection>>`**: Forces sequential access at compile time. Phase 3 will flip this to `&Connection` + `Clone` to support concurrent ops per connection. Internals are already `Arc`-based so the flip is trivial.
+- **Sender work stays on the caller thread, only the receiver is a task**: The send path already uses an internal Mutex on the transport write half for ordering; adding a second task just to drive sends would add latency without correctness gain. The receiver bug (orphan/dropped-caller frames corrupting the wire) only existed on the receive side, so only the receive side needed a task.
 - **Compound reads as default**: One round-trip for small files. Saves 2 RTTs vs sequential CREATE/READ/CLOSE.
 - **512 KB pipeline chunks**: Balances between too many small requests (overhead) and too few large ones (credit starvation). Gives ~20 chunks per 10 MB file.
 - **Password stored in `SmbClient`**: Enables reconnect without re-prompting. Not encrypted in memory. Drop when done.
@@ -134,8 +151,10 @@ Tree-level encryption: `connect_share()` checks the share's encrypt flag and act
 ## Gotchas
 
 - **Preauth hash excludes the final success response**: Only STATUS_MORE_PROCESSING_REQUIRED responses are hashed. Including the success response produces wrong keys. (MS-SMB2 3.2.5.3.1)
-- **Oplock break notifications arrive with MessageId 0xFFFFFFFFFFFFFFFF**: `receive_response` / `receive_compound` must detect and skip these unsolicited messages.
-- **Orphan responses get dropped by MessageId demux**: `Connection` tracks the set of in-flight MessageIds in its `pending` field. `send_request` / `send_compound` insert; `receive_response` / `receive_compound_expected` skip any frame whose first MessageId isn't in the set (cancelled-op leftover, server oddity, etc.) so it doesn't pollute the next operation's response. Credits still get applied so throughput stays correct. See [docs/specs/connection-actor.md](../../docs/specs/connection-actor.md) for the full story and the Phase 2 roadmap (actor tasks + Clone connection + `execute()` API for parallel ops per connection). Tests that build mock responses via the `build_*_response` helpers run with the filter off (helpers hardcode `MessageId(0)` and can't track the caller's `next_message_id` advance); orphan-filter coverage lives in dedicated tests with explicit MessageIds.
+- **Oplock break notifications arrive with MessageId 0xFFFFFFFFFFFFFFFF**: The receiver task detects these and skips them without invoking a waiter lookup.
+- **Register-waiter must be atomic with `disconnected` check**: The waiters lock covers both reading `disconnected` and inserting the `oneshot::Sender`. If the check and insert were racy, a receiver-task failure mid-send could leave an orphan `Sender` in the map that never gets routed — caller would hang on `rx.await` forever. Same goes for `fan_error_to_waiters`: it sets `disconnected=true` UNDER the same waiters lock before draining, so new sends strictly either succeed-and-get-drained or fail at the insert check.
+- **Silent frame discard on decrypt/decompress/malformed header**: The receiver task currently `log+continue`s on these — if a legitimate response's frame was corrupted, the matching waiter hangs forever (the msg_id isn't recoverable for decrypt failures). This is a known hole; Phase 3 should decide between "tear down the connection" (safer) and "log and continue" (today). See code-review note in `docs/specs/connection-actor.md` § Risks and non-risks.
+- **STATUS_PENDING loop**: CHANGE_NOTIFY and other long-poll operations get STATUS_PENDING first. The receiver task keeps the waiter registered on PENDING and does NOT forward the interim response. Credits from PENDING are still applied so the caller's `conn.credits()` reflects them.
 - **STATUS_PENDING loop**: CHANGE_NOTIFY and other long-poll operations get STATUS_PENDING first. Must loop until a non-pending response arrives. The pending response still carries valid credit grants.
 - **Signing and encryption are mutually exclusive on the wire**: When encrypting, zero the signature field (AEAD provides integrity). On receive, skip signature verification if decryption succeeded.
 - **Compound encryption wraps the entire chain**: One TRANSFORM_HEADER for all sub-requests concatenated, not per sub-request.

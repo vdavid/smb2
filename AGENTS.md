@@ -157,8 +157,12 @@ implementations.
 - Large files get chunked at `MaxReadSize`/`MaxWriteSize` and reassembled
 - Credits flow back from responses, sliding the window forward
 
-**Key constraint:** Only ONE task reads from the transport. Multiple pipelines on the same connection share a single
-receive task that demultiplexes by `MessageId`.
+**Key constraint:** Only ONE task reads from the transport. Every `Connection` spawns a single receiver task on
+construction that owns the read half, demultiplexes each incoming frame to the matching request's
+`oneshot::Sender<Frame>` (keyed by `MessageId`), and handles decrypt/decompress/sign-verify/credits/PENDING-loop/
+oplock-break/session-expiry centrally. Dropping a caller's future drops its `oneshot::Receiver`; the receiver task
+discards the late-arriving response silently. See `docs/specs/connection-actor.md` for the full design and
+`src/client/CLAUDE.md` § "Connection internals: receiver task + `oneshot` routing" for the architectural sketch.
 
 ## Key design decisions
 
