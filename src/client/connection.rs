@@ -619,10 +619,7 @@ impl Connection {
     /// naked `&mut PreauthHasher` can no longer be handed out. Closure-based
     /// access keeps the lock scoped to the caller's update.
     #[doc(hidden)] // unused outside the crate; kept for crate-internal parity.
-    pub fn with_preauth_hasher_mut<R>(
-        &self,
-        f: impl FnOnce(&mut PreauthHasher) -> R,
-    ) -> R {
+    pub fn with_preauth_hasher_mut<R>(&self, f: impl FnOnce(&mut PreauthHasher) -> R) -> R {
         let mut h = self.inner.preauth_hasher.lock().unwrap();
         f(&mut h)
     }
@@ -4221,5 +4218,79 @@ mod tests {
             0,
             "second compound sub-request must have DFS_OPERATIONS"
         );
+    }
+
+    // ── Phase 3 A.1: Connection: Clone ───────────────────────────────
+
+    /// Confirms clones share the same connection-wide state via `Arc<Inner>`.
+    ///
+    /// Design note (Option A from `docs/specs/connection-actor.md` review):
+    /// a cloned `Connection` starts with an EMPTY caller-local `pending_fifo`.
+    /// `oneshot::Receiver` isn't `Clone`, and in-flight waiters belong to
+    /// the task that sent the request — a new clone is a fresh sender
+    /// handle to the same actor, not a snapshot. Credits, session id,
+    /// negotiated params, and crypto state are shared.
+    #[tokio::test]
+    async fn connection_is_cloneable_and_clones_share_state() {
+        let mock = Arc::new(MockTransport::new());
+        let mut original = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // Mutate shared state on the original.
+        original.set_credits(42);
+        original.set_session_id(SessionId(0x1234_5678_9ABC_DEF0));
+        original.set_next_message_id(100);
+
+        // Clone and verify the clone sees the same shared state.
+        let cloned = original.clone();
+        assert_eq!(cloned.credits(), 42);
+        assert_eq!(cloned.session_id(), SessionId(0x1234_5678_9ABC_DEF0));
+        assert_eq!(cloned.next_message_id(), 100);
+        assert_eq!(cloned.server_name(), "test-server");
+
+        // Mutate via the clone and verify the original observes it too.
+        cloned.inner.credits.store(7, Ordering::Release);
+        assert_eq!(original.credits(), 7);
+
+        // Caller-local state is per-clone: both FIFOs start empty.
+        assert!(original.pending_fifo.is_empty());
+        assert!(cloned.pending_fifo.is_empty());
+    }
+
+    /// A clone'd `Connection` survives the original being dropped: the
+    /// receiver task and transport sender are behind `Arc<Inner>`, so
+    /// dropping the last Arc (not the first) is what aborts the task.
+    #[tokio::test]
+    async fn connection_is_cloneable_clone_outlives_original() {
+        let mock = Arc::new(MockTransport::new());
+        let mut original = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        original.set_credits(9);
+
+        let cloned = original.clone();
+        drop(original);
+
+        // Shared state still accessible — the receiver task is still live
+        // because the clone holds an `Arc<Inner>`.
+        assert_eq!(cloned.credits(), 9);
+        assert_eq!(cloned.server_name(), "test-server");
+
+        // Send should still work: the transport's send half lives on Inner.
+        // We won't register a waiter (no response queued), just verify the
+        // send path doesn't panic on a dead-task-map.
+        // (Easier: send_cancel has no waiter registration.)
+        cloned
+            .inner
+            .sender
+            .send(b"\x00\x00\x00\x10ignore-me")
+            .await
+            .unwrap();
+        assert_eq!(mock.sent_count(), 1);
     }
 }
