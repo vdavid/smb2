@@ -71,6 +71,13 @@ impl MockTransport {
     /// `receive()` returns `Err(Error::Disconnected)`.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        // Use `notify_one` (stores a permit for the next `notified().await`)
+        // in addition to `notify_waiters` (wakes currently-parked waiters).
+        // `notify_waiters` alone loses the signal if `close()` fires
+        // between `receive()`'s `closed.load()` check and its
+        // `notified().await` — no waiter is parked yet, so nothing gets
+        // woken. The stored permit from `notify_one` covers that gap.
+        self.notify.notify_one();
         self.notify.notify_waiters();
     }
 

@@ -284,7 +284,7 @@ impl Connection {
         // Update preauth hash with request bytes.
         self.preauth_hasher.update(&req_bytes);
 
-        let rx = self.register_waiter(msg_id);
+        let rx = self.register_waiter(msg_id)?;
         self.pending_fifo.push_back(rx);
 
         let rtt_start = std::time::Instant::now();
@@ -449,8 +449,10 @@ impl Connection {
         let mut msg_bytes = pack_message(&header, body);
 
         // Register waiter BEFORE send (so the receiver task can match any
-        // response that arrives fast).
-        let rx = self.register_waiter(msg_id);
+        // response that arrives fast). Atomically fails if the receiver
+        // task has already shut down, so we don't hang on a map entry
+        // that'll never be routed.
+        let rx = self.register_waiter(msg_id)?;
         self.pending_fifo.push_back(rx);
 
         let wire_bytes = if should_encrypt {
@@ -687,11 +689,22 @@ impl Connection {
         }
 
         // Register every sub-request MessageId as in-flight BEFORE sending.
+        // If any registration fails (connection died mid-registration),
+        // roll back the ones we did register.
         let mut registered_ids = Vec::with_capacity(message_ids.len());
         for id in &message_ids {
-            let rx = self.register_waiter(*id);
-            self.pending_fifo.push_back(rx);
-            registered_ids.push(*id);
+            match self.register_waiter(*id) {
+                Ok(rx) => {
+                    self.pending_fifo.push_back(rx);
+                    registered_ids.push(*id);
+                }
+                Err(e) => {
+                    for done in registered_ids.iter().rev() {
+                        self.cancel_last_waiter(*done);
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         let total_len: usize = sub_requests.iter().map(|r| r.len()).sum();
@@ -912,10 +925,24 @@ impl Connection {
     }
 
     /// Register a waiter in the shared map and return the Receiver.
-    fn register_waiter(&self, msg_id: MessageId) -> oneshot::Receiver<Result<RoutedFrame>> {
+    ///
+    /// Atomically checks `disconnected` under the waiters lock. If the
+    /// connection died between `send_request`'s fast-path check and
+    /// this call, returns `Err(Disconnected)` without inserting —
+    /// prevents a TOCTOU where the receiver task has already drained
+    /// the waiters map but we'd insert a new entry that no one will
+    /// ever route to, leaving the caller hanging on `rx.await`.
+    ///
+    /// `fan_error_to_waiters` sets `disconnected = true` under the
+    /// same lock, making the two paths strictly ordered.
+    fn register_waiter(&self, msg_id: MessageId) -> Result<oneshot::Receiver<Result<RoutedFrame>>> {
+        let mut waiters = self.inner.waiters.lock().unwrap();
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
         let (tx, rx) = oneshot::channel();
-        self.inner.waiters.lock().unwrap().insert(msg_id, tx);
-        rx
+        waiters.insert(msg_id, tx);
+        Ok(rx)
     }
 
     /// Remove a waiter from the map (used on send error).
@@ -1005,7 +1032,9 @@ impl Connection {
     /// task), use [`Self::test_mark_pending_dropped`] instead.
     #[cfg(test)]
     pub(crate) fn test_mark_pending(&mut self, msg_id: MessageId) {
-        let rx = self.register_waiter(msg_id);
+        let rx = self
+            .register_waiter(msg_id)
+            .expect("test_mark_pending on a live connection should not see disconnected");
         self.pending_fifo.push_back(rx);
     }
 
@@ -1017,7 +1046,9 @@ impl Connection {
     /// apply.
     #[cfg(test)]
     pub(crate) fn test_mark_pending_dropped(&mut self, msg_id: MessageId) {
-        let _rx = self.register_waiter(msg_id);
+        let _rx = self
+            .register_waiter(msg_id)
+            .expect("test_mark_pending_dropped on a live connection should not see disconnected");
         // drop _rx immediately, leaving only the Sender in the map
     }
 
@@ -1279,21 +1310,24 @@ fn prepare_sub_frame(
 /// Fan the given error (as best we can clone it) to every pending waiter
 /// and clear the waiters map. Also close the orphan fallback. Marks the
 /// connection as disconnected so new sends fail-fast.
+///
+/// `disconnected` is set UNDER the waiters lock so `register_waiter` sees
+/// either "still alive → insert succeeds" or "dead → insert rejected",
+/// never "inserted but already drained" (which would leave the caller
+/// hanging on `rx.await`).
 fn fan_error_to_waiters(inner: &Inner, e: &Error) {
-    inner.disconnected.store(true, Ordering::Release);
     let drained: Vec<(MessageId, oneshot::Sender<Result<RoutedFrame>>)> = {
         let mut waiters = inner.waiters.lock().unwrap();
+        inner.disconnected.store(true, Ordering::Release);
         waiters.drain().collect()
     };
     for (_id, tx) in drained {
         let _ = tx.send(Err(clone_err_as_disconnected(e)));
     }
-    let fallback_tx = inner.orphan_fallback_tx.lock().unwrap().clone();
+    let fallback_tx = inner.orphan_fallback_tx.lock().unwrap().take();
     if let Some(tx) = fallback_tx {
         let _ = tx.send(Err(clone_err_as_disconnected(e)));
     }
-    // Close fallback channel too (dropping tx) — next .recv() returns None.
-    *inner.orphan_fallback_tx.lock().unwrap() = None;
 }
 
 /// Best-effort error clone: `Error` isn't `Clone` (Io holds std::io::Error).
