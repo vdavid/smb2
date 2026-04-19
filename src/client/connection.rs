@@ -72,7 +72,6 @@ pub(crate) struct RoutedFrame {
     pub raw: Vec<u8>,
 }
 
-
 /// Crypto state shared between the caller thread (sending) and receiver task
 /// (verifying signatures, decrypting).
 ///
@@ -123,6 +122,11 @@ struct Inner {
     /// Tests that don't go through `send_request` disable this so the
     /// receiver task routes unmatched frames to `orphan_fallback_tx` instead.
     orphan_filter_enabled: AtomicBool,
+    /// Set to true when the receiver task exits (transport error / EOF).
+    /// New `send_request` / `send_compound` calls short-circuit to
+    /// `Err(Disconnected)` once this flips so they don't register waiters
+    /// into a dead map.
+    disconnected: AtomicBool,
     /// Fallback channel for frames with no matching waiter when the orphan
     /// filter is disabled. Each send carries ONE transport frame's worth
     /// of sub-responses (preserves compound-frame grouping for tests).
@@ -138,6 +142,7 @@ impl Inner {
             next_message_id: AtomicU64::new(0),
             crypto: StdMutex::new(CryptoState::new()),
             orphan_filter_enabled: AtomicBool::new(true),
+            disconnected: AtomicBool::new(false),
             orphan_fallback_tx: StdMutex::new(None),
         }
     }
@@ -167,7 +172,7 @@ pub struct Connection {
     /// Only set when `set_orphan_filter_enabled(false)` has been called.
     orphan_fallback_rx: StdMutex<Option<mpsc::UnboundedReceiver<Result<Vec<RoutedFrame>>>>>,
     /// Buffered sub-frames from the fallback: when one transport-frame's
-    /// Vec<RoutedFrame> arrives but the caller only needs one sub-response,
+    /// `Vec<RoutedFrame>` arrives but the caller only needs one sub-response,
     /// we buffer the rest here for the next call.
     orphan_fallback_buffer: StdMutex<VecDeque<RoutedFrame>>,
 
@@ -415,6 +420,9 @@ impl Connection {
         tree_id: Option<TreeId>,
         credit_charge: u16,
     ) -> Result<(MessageId, Vec<u8>)> {
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
         let msg_id = self.allocate_msg_id(credit_charge.max(1) as u64);
 
         let mut header = Header::new_request(command);
@@ -495,7 +503,12 @@ impl Connection {
         }
         debug!(
             "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, len={}",
-            command, msg_id.0, credit_charge, tree_id, should_sign, msg_bytes.len()
+            command,
+            msg_id.0,
+            credit_charge,
+            tree_id,
+            should_sign,
+            msg_bytes.len()
         );
         Ok((msg_id, msg_bytes))
     }
@@ -608,6 +621,9 @@ impl Connection {
             return Err(Error::invalid_data(
                 "compound request must have at least one operation",
             ));
+        }
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
         }
 
         let (should_sign, should_encrypt) = {
@@ -742,7 +758,6 @@ impl Connection {
         }
         Ok(results)
     }
-
 
     /// Receive exactly `expected` compound sub-responses, gathering
     /// additional transport frames if needed.
@@ -889,7 +904,10 @@ impl Connection {
 
     /// Allocate `charge` consecutive MessageIds and return the first.
     fn allocate_msg_id(&self, charge: u64) -> MessageId {
-        let first = self.inner.next_message_id.fetch_add(charge, Ordering::SeqCst);
+        let first = self
+            .inner
+            .next_message_id
+            .fetch_add(charge, Ordering::SeqCst);
         MessageId(first)
     }
 
@@ -1024,9 +1042,7 @@ impl Connection {
 
     #[cfg(test)]
     pub(crate) fn set_credits(&mut self, credits: u16) {
-        self.inner
-            .credits
-            .store(credits as u32, Ordering::Release);
+        self.inner.credits.store(credits as u32, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1125,10 +1141,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                 match maybe_tx {
                     Some(tx) => {
                         if tx.send(result).is_err() {
-                            trace!(
-                                "recv: late arrival for dropped waiter, msg_id={}",
-                                msg_id.0
-                            );
+                            trace!("recv: late arrival for dropped waiter, msg_id={}", msg_id.0);
                         }
                     }
                     None => {
@@ -1264,8 +1277,10 @@ fn prepare_sub_frame(
 }
 
 /// Fan the given error (as best we can clone it) to every pending waiter
-/// and clear the waiters map. Also close the orphan fallback.
+/// and clear the waiters map. Also close the orphan fallback. Marks the
+/// connection as disconnected so new sends fail-fast.
 fn fan_error_to_waiters(inner: &Inner, e: &Error) {
+    inner.disconnected.store(true, Ordering::Release);
     let drained: Vec<(MessageId, oneshot::Sender<Result<RoutedFrame>>)> = {
         let mut waiters = inner.waiters.lock().unwrap();
         waiters.drain().collect()
@@ -1455,7 +1470,6 @@ impl<T: TransportReceive> TransportReceive for Arc<T> {
         (**self).receive().await
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3314,6 +3328,67 @@ mod tests {
         }
 
         mock.assert_fully_consumed();
+    }
+
+    // ── Phase 2 robustness tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn phase2_transport_close_errors_all_pending_waiters() {
+        // Register three waiters, then close the transport. All three
+        // awaits must resolve to an error rather than hanging forever.
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(10);
+        conn.set_next_message_id(10);
+        conn.test_mark_pending(MessageId(10));
+        conn.test_mark_pending(MessageId(11));
+        conn.test_mark_pending(MessageId(12));
+
+        // Close the transport to trigger the receiver-task error fan-out.
+        mock.close();
+
+        for _ in 0..3 {
+            let err = conn.receive_response().await.err();
+            assert!(
+                err.is_some(),
+                "after transport close, receive_response must return an error",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn phase2_oplock_break_does_not_consume_caller_waiter() {
+        // Receiver task must silently skip oplock-break notifications
+        // (MessageId=UNSOLICITED) and NOT deliver them to any waiter. A
+        // subsequent legitimate response for a registered waiter must
+        // still arrive.
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(10);
+        conn.set_next_message_id(4);
+        conn.test_mark_pending(MessageId(4));
+
+        // Oplock break first, then the real Create response.
+        mock.queue_response(build_oplock_break_notification());
+        mock.queue_response(build_create_response_with_msg_id(
+            FileId {
+                persistent: 0x33,
+                volatile: 0x44,
+            },
+            MessageId(4),
+        ));
+
+        let (header, _, _) = conn.receive_response().await.unwrap();
+        assert_eq!(header.message_id, MessageId(4));
+        assert_eq!(header.command, Command::Create);
     }
 
     // ── CANCEL tests (pitfall #7) ────────────────────────────────────

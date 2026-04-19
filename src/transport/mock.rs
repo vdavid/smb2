@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use tokio::sync::Notify;
 
