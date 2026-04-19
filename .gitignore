@@ -1,5 +1,6 @@
 .idea/
 .claude/projects/
+.claude/worktrees/
 related-repos/
 target/
 .DS_Store
