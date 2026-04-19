@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use log::{debug, info, trace, warn};
@@ -107,7 +107,14 @@ impl CryptoState {
 }
 
 /// Shared connection state held in an `Arc` by the caller-facing `Connection`
-/// and the spawned receiver task.
+/// (including all its clones) and the spawned receiver task.
+///
+/// Phase 3 Stage A.1 moved all connection-wide state here so `Connection`
+/// can be `Clone`: each clone shares the same `Arc<Inner>` and therefore
+/// sees the same credits, session id, negotiated params, and crypto state.
+/// Only caller-local bookkeeping (the per-caller `pending_fifo` of oneshot
+/// receivers, plus the test-mode orphan-fallback receiver/buffer) stays on
+/// the outer `Connection` and starts fresh per clone.
 struct Inner {
     /// Per-request routing: msg_id → oneshot sender waiting for its response.
     waiters: StdMutex<HashMap<MessageId, oneshot::Sender<Result<RoutedFrame>>>>,
@@ -132,10 +139,37 @@ struct Inner {
     /// of sub-responses (preserves compound-frame grouping for tests).
     /// Populated lazily by `set_orphan_filter_enabled(false)`.
     orphan_fallback_tx: StdMutex<Option<mpsc::UnboundedSender<Result<Vec<RoutedFrame>>>>>,
+
+    /// Shared transport send handle. `TransportSend::send` takes `&self` so
+    /// this can be called from any clone without a wrapping mutex — the
+    /// transport's implementation already serializes writes internally.
+    sender: Arc<dyn TransportSend>,
+    /// Handle for the background receiver task. Aborted when the last clone
+    /// of `Connection` drops (via `Inner`'s `Drop`). The transport's read
+    /// half's EOF also stops the task; the abort is a safety net.
+    receiver_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+
+    /// Server name (hostname or IP) used for UNC paths. Set at construction
+    /// and never mutated.
+    server_name: String,
+    /// Negotiated parameters, populated once by `negotiate`.
+    params: OnceLock<NegotiatedParams>,
+    /// Estimated round-trip time measured during negotiate.
+    estimated_rtt: StdMutex<Option<Duration>>,
+    /// Whether compression is active on this connection (negotiated).
+    compression_enabled: AtomicBool,
+    /// Whether the client wants compression (from config).
+    compression_requested: AtomicBool,
+    /// Preauth integrity hash (for SMB 3.1.1 key derivation). Mutated during
+    /// negotiate and session setup; both happen on one task before any clone
+    /// is expected to observe it.
+    preauth_hasher: StdMutex<PreauthHasher>,
+    /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
+    dfs_trees: StdMutex<HashSet<TreeId>>,
 }
 
 impl Inner {
-    fn new() -> Self {
+    fn new(sender: Arc<dyn TransportSend>, server_name: String) -> Self {
         Self {
             waiters: StdMutex::new(HashMap::new()),
             credits: AtomicU32::new(1),
@@ -144,6 +178,24 @@ impl Inner {
             orphan_filter_enabled: AtomicBool::new(true),
             disconnected: AtomicBool::new(false),
             orphan_fallback_tx: StdMutex::new(None),
+            sender,
+            receiver_task: StdMutex::new(None),
+            server_name,
+            params: OnceLock::new(),
+            estimated_rtt: StdMutex::new(None),
+            compression_enabled: AtomicBool::new(false),
+            compression_requested: AtomicBool::new(true),
+            preauth_hasher: StdMutex::new(PreauthHasher::new()),
+            dfs_trees: StdMutex::new(HashSet::new()),
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Last `Arc<Inner>` dropping: abort the receiver task if still alive.
+        if let Some(handle) = self.receiver_task.lock().unwrap().take() {
+            handle.abort();
         }
     }
 }
@@ -156,40 +208,55 @@ impl Inner {
 /// the `oneshot::Sender` registered for its `MessageId`. Callers push a
 /// `oneshot::Receiver` onto a local FIFO via `send_request` and pop/await
 /// via `receive_response`.
+///
+/// Phase 3 Stage A.1: `Connection` is `Clone`. All connection-wide state
+/// lives behind `Arc<Inner>`, so cloning is a single `Arc::clone`. The
+/// caller-local FIFO of pending response receivers stays on the outer
+/// `Connection` and starts empty on each clone — a clone is a fresh sender
+/// handle to the same actor, not a snapshot of in-flight requests on the
+/// original.
 pub struct Connection {
-    sender: Box<dyn TransportSend>,
-    /// Shared state with the receiver task.
+    /// Shared state (credits, waiters, crypto, transport sender, negotiated
+    /// params, receiver task) behind `Arc<Inner>`. `clone()` bumps this.
     inner: Arc<Inner>,
-    /// Handle for the receiver task. Dropped on `Connection` drop (we rely
-    /// on the transport's read-half EOF to stop the task; the abort-on-drop
-    /// is a safety net).
-    receiver_task: Option<tokio::task::JoinHandle<()>>,
     /// Caller-local FIFO of pending response receivers. `send_request` /
     /// `send_compound` push, `receive_response` / `receive_compound_expected`
-    /// pop.
+    /// pop. Fresh and empty on each `clone()` — in-flight requests belong to
+    /// the caller that started them, not to new sender handles.
     pending_fifo: VecDeque<oneshot::Receiver<Result<RoutedFrame>>>,
     /// Caller-local receiver for the orphan fallback channel (test mode).
     /// Only set when `set_orphan_filter_enabled(false)` has been called.
+    /// Fresh `None` on clone.
     orphan_fallback_rx: StdMutex<Option<mpsc::UnboundedReceiver<Result<Vec<RoutedFrame>>>>>,
     /// Buffered sub-frames from the fallback: when one transport-frame's
     /// `Vec<RoutedFrame>` arrives but the caller only needs one sub-response,
-    /// we buffer the rest here for the next call.
+    /// we buffer the rest here for the next call. Fresh empty on clone.
     orphan_fallback_buffer: StdMutex<VecDeque<RoutedFrame>>,
+}
 
-    /// Negotiated parameters (populated after negotiate).
-    params: Option<NegotiatedParams>,
-    /// The server name (hostname or IP) used for UNC paths.
-    server_name: String,
-    /// Estimated round-trip time, measured during negotiate.
-    estimated_rtt: Option<Duration>,
-    /// Whether to attempt compression on outgoing messages.
-    compression_enabled: bool,
-    /// Whether the client wants compression (from config).
-    compression_requested: bool,
-    /// Preauth integrity hash (for SMB 3.1.1 key derivation).
-    preauth_hasher: PreauthHasher,
-    /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
-    dfs_trees: HashSet<TreeId>,
+impl Clone for Connection {
+    /// Create a new sender handle to the same connection.
+    ///
+    /// Shared across clones (via `Arc<Inner>`): credits, waiters map,
+    /// negotiated params, session id, crypto state, transport sender,
+    /// receiver task.
+    ///
+    /// Per-clone (fresh each time): the caller-local `pending_fifo` of
+    /// `oneshot::Receiver`s that `receive_response` pops from, plus the
+    /// test-mode orphan-fallback receiver and buffer. `oneshot::Receiver`
+    /// isn't `Clone` and in-flight waiters are bookkeeping for the task
+    /// that started them — a new clone represents a new caller that hasn't
+    /// sent anything yet. The receiver task still routes all responses by
+    /// `MessageId` through the shared waiters map, so drops from either
+    /// clone are safe.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            pending_fifo: VecDeque::new(),
+            orphan_fallback_rx: StdMutex::new(None),
+            orphan_fallback_buffer: StdMutex::new(VecDeque::new()),
+        }
+    }
 }
 
 impl Connection {
@@ -199,25 +266,18 @@ impl Connection {
         receiver: Box<dyn TransportReceive>,
         server_name: impl Into<String>,
     ) -> Self {
-        let inner = Arc::new(Inner::new());
+        let sender: Arc<dyn TransportSend> = Arc::from(sender);
+        let inner = Arc::new(Inner::new(sender, server_name.into()));
         let inner_for_task = Arc::clone(&inner);
-        let receiver_task = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             receiver_loop(receiver, inner_for_task).await;
         });
+        *inner.receiver_task.lock().unwrap() = Some(handle);
         Self {
-            sender,
             inner,
-            receiver_task: Some(receiver_task),
             pending_fifo: VecDeque::new(),
             orphan_fallback_rx: StdMutex::new(None),
             orphan_fallback_buffer: StdMutex::new(VecDeque::new()),
-            params: None,
-            server_name: server_name.into(),
-            estimated_rtt: None,
-            compression_enabled: false,
-            compression_requested: true,
-            preauth_hasher: PreauthHasher::new(),
-            dfs_trees: HashSet::new(),
         }
     }
 
@@ -257,7 +317,7 @@ impl Connection {
             },
         ];
 
-        if self.compression_requested {
+        if self.inner.compression_requested.load(Ordering::Acquire) {
             negotiate_contexts.push(NegotiateContext::Compression {
                 flags: 0,
                 algorithms: vec![COMPRESSION_LZ4],
@@ -282,23 +342,23 @@ impl Connection {
         let req_bytes = pack_message(&header, &request);
 
         // Update preauth hash with request bytes.
-        self.preauth_hasher.update(&req_bytes);
+        self.inner.preauth_hasher.lock().unwrap().update(&req_bytes);
 
         let rx = self.register_waiter(msg_id)?;
         self.pending_fifo.push_back(rx);
 
         let rtt_start = std::time::Instant::now();
-        if let Err(e) = self.sender.send(&req_bytes).await {
+        if let Err(e) = self.inner.sender.send(&req_bytes).await {
             self.remove_waiter(msg_id);
             self.pending_fifo.pop_back();
             return Err(e);
         }
 
         let frame = self.await_next_response().await?;
-        self.estimated_rtt = Some(rtt_start.elapsed());
+        *self.inner.estimated_rtt.lock().unwrap() = Some(rtt_start.elapsed());
 
         // Preauth hash update with response bytes.
-        self.preauth_hasher.update(&frame.raw);
+        self.inner.preauth_hasher.lock().unwrap().update(&frame.raw);
 
         let resp_header = &frame.header;
         if !resp_header.is_response() {
@@ -373,9 +433,16 @@ impl Connection {
         }
 
         let signing_required = resp.security_mode.signing_required();
-        self.compression_enabled = self.compression_requested && compression_supported;
+        let compression_enabled =
+            self.inner.compression_requested.load(Ordering::Acquire) && compression_supported;
+        self.inner
+            .compression_enabled
+            .store(compression_enabled, Ordering::Release);
 
-        self.params = Some(NegotiatedParams {
+        // OnceLock: set is idempotent-first-writer-wins. Re-negotiation isn't
+        // a supported flow; if this ever fails it means negotiate was called
+        // twice on the same connection.
+        let _ = self.inner.params.set(NegotiatedParams {
             dialect: resp.dialect_revision,
             max_read_size: resp.max_read_size,
             max_write_size: resp.max_write_size,
@@ -395,7 +462,7 @@ impl Connection {
         debug!(
             "negotiate: max_read={}, max_write={}, max_transact={}, server_guid={:?}, cipher={:?}, gmac={}, compression={}",
             resp.max_read_size, resp.max_write_size, resp.max_transact_size,
-            resp.server_guid, cipher, gmac_negotiated, self.compression_enabled
+            resp.server_guid, cipher, gmac_negotiated, compression_enabled
         );
 
         Ok(())
@@ -457,7 +524,7 @@ impl Connection {
 
         let wire_bytes = if should_encrypt {
             let encrypted = self.encrypt_bytes(&msg_bytes)?;
-            match self.sender.send(&encrypted).await {
+            match self.inner.sender.send(&encrypted).await {
                 Ok(()) => {
                     debug!(
                         "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, encrypted, len={} (plaintext {})",
@@ -477,10 +544,10 @@ impl Connection {
                     signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)?;
                 }
             }
-            if self.compression_enabled && msg_bytes.len() > Header::SIZE {
+            if self.compression_enabled() && msg_bytes.len() > Header::SIZE {
                 if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
                     let framed = build_compressed_frame(&compressed);
-                    match self.sender.send(&framed).await {
+                    match self.inner.sender.send(&framed).await {
                         Ok(()) => {
                             debug!(
                                 "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
@@ -499,7 +566,7 @@ impl Connection {
             msg_bytes.clone()
         };
 
-        if let Err(e) = self.sender.send(&wire_bytes).await {
+        if let Err(e) = self.inner.sender.send(&wire_bytes).await {
             self.cancel_last_waiter(msg_id);
             return Err(e);
         }
@@ -517,7 +584,7 @@ impl Connection {
 
     /// Get the estimated round-trip time.
     pub fn estimated_rtt(&self) -> Option<Duration> {
-        self.estimated_rtt
+        *self.inner.estimated_rtt.lock().unwrap()
     }
 
     /// Receive a response, verify signature if needed, and update credits.
@@ -531,17 +598,33 @@ impl Connection {
 
     /// Get the negotiated parameters.
     pub fn params(&self) -> Option<&NegotiatedParams> {
-        self.params.as_ref()
+        self.inner.params.get()
     }
 
-    /// Get a mutable reference to the preauth hasher.
-    pub fn preauth_hasher_mut(&mut self) -> &mut PreauthHasher {
-        &mut self.preauth_hasher
+    /// Get a clone of the preauth hasher's current state.
+    ///
+    /// The hasher lives behind a lock (shared across `Connection` clones
+    /// now that the type is `Clone`). Callers that want to derive per-session
+    /// keys — see `session.rs` — take a snapshot via this method and feed
+    /// their own session-specific updates into it without disturbing the
+    /// shared connection-level hasher. Returning an owned clone is ~a few
+    /// hundred bytes of SHA-512 state; cheaper than the actual KDF it feeds.
+    pub fn preauth_hasher(&self) -> PreauthHasher {
+        self.inner.preauth_hasher.lock().unwrap().clone()
     }
 
-    /// Get the preauth hasher.
-    pub fn preauth_hasher(&self) -> &PreauthHasher {
-        &self.preauth_hasher
+    /// Run a closure with a mutable borrow of the preauth hasher.
+    ///
+    /// The hasher lives behind a lock now that `Connection` is `Clone`; a
+    /// naked `&mut PreauthHasher` can no longer be handed out. Closure-based
+    /// access keeps the lock scoped to the caller's update.
+    #[doc(hidden)] // unused outside the crate; kept for crate-internal parity.
+    pub fn with_preauth_hasher_mut<R>(
+        &self,
+        f: impl FnOnce(&mut PreauthHasher) -> R,
+    ) -> R {
+        let mut h = self.inner.preauth_hasher.lock().unwrap();
+        f(&mut h)
     }
 
     /// Set the session ID.
@@ -600,17 +683,19 @@ impl Connection {
 
     /// Get the server name.
     pub fn server_name(&self) -> &str {
-        &self.server_name
+        &self.inner.server_name
     }
 
     /// Set whether the client wants compression.
     pub fn set_compression_requested(&mut self, requested: bool) {
-        self.compression_requested = requested;
+        self.inner
+            .compression_requested
+            .store(requested, Ordering::Release);
     }
 
     /// Whether compression is active on this connection.
     pub fn compression_enabled(&self) -> bool {
-        self.compression_enabled
+        self.inner.compression_enabled.load(Ordering::Acquire)
     }
 
     /// Send a related compound request (multiple operations chained).
@@ -715,9 +800,9 @@ impl Connection {
 
         let send_result = if should_encrypt {
             let encrypted = self.encrypt_bytes(&compound_buf)?;
-            self.sender.send(&encrypted).await
+            self.inner.sender.send(&encrypted).await
         } else {
-            self.sender.send(&compound_buf).await
+            self.inner.sender.send(&compound_buf).await
         };
 
         if let Err(e) = send_result {
@@ -845,7 +930,7 @@ impl Connection {
 
         if should_encrypt {
             let encrypted = self.encrypt_bytes(&msg_bytes)?;
-            self.sender.send(&encrypted).await?;
+            self.inner.sender.send(&encrypted).await?;
             debug!(
                 "send_cancel: msg_id={}, async_id={:?}, encrypted",
                 original_msg_id.0, async_id
@@ -857,7 +942,7 @@ impl Connection {
                     signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
                 }
             }
-            self.sender.send(&msg_bytes).await?;
+            self.inner.sender.send(&msg_bytes).await?;
             debug!(
                 "send_cancel: msg_id={}, async_id={:?}, signed={}",
                 original_msg_id.0, async_id, should_sign
@@ -903,16 +988,16 @@ impl Connection {
 
     /// Register a tree as DFS-enabled.
     pub fn register_dfs_tree(&mut self, tree_id: TreeId) {
-        self.dfs_trees.insert(tree_id);
+        self.inner.dfs_trees.lock().unwrap().insert(tree_id);
     }
 
     /// Deregister a tree from DFS tracking.
     pub fn deregister_dfs_tree(&mut self, tree_id: TreeId) {
-        self.dfs_trees.remove(&tree_id);
+        self.inner.dfs_trees.lock().unwrap().remove(&tree_id);
     }
 
     fn should_set_dfs_flag(&self, tree_id: Option<TreeId>) -> bool {
-        tree_id.is_some_and(|id| self.dfs_trees.contains(&id))
+        tree_id.is_some_and(|id| self.inner.dfs_trees.lock().unwrap().contains(&id))
     }
 
     /// Allocate `charge` consecutive MessageIds and return the first.
@@ -1021,7 +1106,9 @@ impl Connection {
 
     #[cfg(test)]
     pub(crate) fn set_test_params(&mut self, params: NegotiatedParams) {
-        self.params = Some(params);
+        // OnceLock: first setter wins. Tests sometimes stage params on a
+        // fresh connection; ignore any collision.
+        let _ = self.inner.params.set(params);
     }
 
     /// Mark a MessageId as in-flight (test-only).
@@ -1083,20 +1170,16 @@ impl Connection {
 
     #[cfg(test)]
     pub(crate) fn set_compression_enabled(&mut self, enabled: bool) {
-        self.compression_enabled = enabled;
+        self.inner
+            .compression_enabled
+            .store(enabled, Ordering::Release);
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        // Abort the receiver task. Dropping the transport's read half will
-        // also cause the task to exit on its next receive call, but we
-        // also abort for immediate cleanup.
-        if let Some(handle) = self.receiver_task.take() {
-            handle.abort();
-        }
-    }
-}
+// `Connection`'s teardown lives on `Inner::drop`: the receiver task is
+// aborted only when the last clone drops (the last `Arc<Inner>` goes away).
+// Per-clone bookkeeping (pending_fifo, orphan_fallback_*) is plain-Rust-owned
+// and drops naturally with the outer struct.
 
 /// Receiver task loop: owns the transport receive half, routes each frame
 /// to its waiter.
