@@ -75,7 +75,7 @@ pub use client::tree::{DirectoryEntry, FileInfo, FsInfo, Tree};
 pub use client::pipeline::{Op, OpResult, Pipeline};
 
 // Connection-level types (useful for advanced users)
-pub use client::connection::NegotiatedParams;
+pub use client::connection::{Frame, NegotiatedParams};
 pub use client::session::Session;
 
 // File watching

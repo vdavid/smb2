@@ -65,10 +65,30 @@ pub struct NegotiatedParams {
 }
 
 /// A received SMB2 sub-response, post-decrypt / post-decompress / post-header-parse.
+///
+/// This is what `Connection::execute` / `execute_with_credits` return on
+/// success (and what each inner `Result` in `execute_compound`'s return
+/// vector wraps). The three fields cover every downstream parse need:
+///
+/// - `header`: the parsed SMB2 header. Includes `status`, `command`,
+///   `message_id`, `credits`, `tree_id`, etc.
+/// - `body`: the sub-frame bytes after the header (i.e.
+///   `raw[Header::SIZE..]`). Most callers unpack this via `ReadCursor` +
+///   `Unpack`.
+/// - `raw`: the full sub-frame bytes, header included. Kept for preauth
+///   hash updates and any caller that wants to re-verify signatures or
+///   inspect the original wire bytes.
+///
+/// Callers receive one `Frame` per matched `MessageId`. Frames are owned;
+/// the receiver task allocates fresh `Vec`s for `body` / `raw` as it splits
+/// compound frames, so you can store or mutate them freely.
 #[derive(Debug)]
-pub(crate) struct RoutedFrame {
+pub struct Frame {
+    /// Parsed SMB2 header of this sub-response.
     pub header: Header,
+    /// Sub-frame bytes after the header (body portion only).
     pub body: Vec<u8>,
+    /// Full sub-frame bytes including the header.
     pub raw: Vec<u8>,
 }
 
@@ -117,7 +137,7 @@ impl CryptoState {
 /// the outer `Connection` and starts fresh per clone.
 struct Inner {
     /// Per-request routing: msg_id → oneshot sender waiting for its response.
-    waiters: StdMutex<HashMap<MessageId, oneshot::Sender<Result<RoutedFrame>>>>,
+    waiters: StdMutex<HashMap<MessageId, oneshot::Sender<Result<Frame>>>>,
     /// Credits available to the caller. Updated by the receiver task on every
     /// frame (orphans included), read by the caller thread for pre-send checks.
     credits: AtomicU32,
@@ -138,7 +158,7 @@ struct Inner {
     /// filter is disabled. Each send carries ONE transport frame's worth
     /// of sub-responses (preserves compound-frame grouping for tests).
     /// Populated lazily by `set_orphan_filter_enabled(false)`.
-    orphan_fallback_tx: StdMutex<Option<mpsc::UnboundedSender<Result<Vec<RoutedFrame>>>>>,
+    orphan_fallback_tx: StdMutex<Option<mpsc::UnboundedSender<Result<Vec<Frame>>>>>,
 
     /// Shared transport send handle. `TransportSend::send` takes `&self` so
     /// this can be called from any clone without a wrapping mutex — the
@@ -223,15 +243,15 @@ pub struct Connection {
     /// `send_compound` push, `receive_response` / `receive_compound_expected`
     /// pop. Fresh and empty on each `clone()` — in-flight requests belong to
     /// the caller that started them, not to new sender handles.
-    pending_fifo: VecDeque<oneshot::Receiver<Result<RoutedFrame>>>,
+    pending_fifo: VecDeque<oneshot::Receiver<Result<Frame>>>,
     /// Caller-local receiver for the orphan fallback channel (test mode).
     /// Only set when `set_orphan_filter_enabled(false)` has been called.
     /// Fresh `None` on clone.
-    orphan_fallback_rx: StdMutex<Option<mpsc::UnboundedReceiver<Result<Vec<RoutedFrame>>>>>,
+    orphan_fallback_rx: StdMutex<Option<mpsc::UnboundedReceiver<Result<Vec<Frame>>>>>,
     /// Buffered sub-frames from the fallback: when one transport-frame's
-    /// `Vec<RoutedFrame>` arrives but the caller only needs one sub-response,
+    /// `Vec<Frame>` arrives but the caller only needs one sub-response,
     /// we buffer the rest here for the next call. Fresh empty on clone.
-    orphan_fallback_buffer: StdMutex<VecDeque<RoutedFrame>>,
+    orphan_fallback_buffer: StdMutex<VecDeque<Frame>>,
 }
 
 impl Clone for Connection {
@@ -1017,7 +1037,7 @@ impl Connection {
     ///
     /// `fan_error_to_waiters` sets `disconnected = true` under the
     /// same lock, making the two paths strictly ordered.
-    fn register_waiter(&self, msg_id: MessageId) -> Result<oneshot::Receiver<Result<RoutedFrame>>> {
+    fn register_waiter(&self, msg_id: MessageId) -> Result<oneshot::Receiver<Result<Frame>>> {
         let mut waiters = self.inner.waiters.lock().unwrap();
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -1050,7 +1070,7 @@ impl Connection {
     /// in tests hardcode `MessageId(0)` which doesn't match caller-allocated
     /// msg_ids, so per-waiter routing doesn't apply. We still drain the
     /// fifo on the side so drops are clean.
-    async fn await_next_response(&mut self) -> Result<RoutedFrame> {
+    async fn await_next_response(&mut self) -> Result<Frame> {
         let filter_on = self.inner.orphan_filter_enabled.load(Ordering::Acquire);
         if filter_on {
             if let Some(rx) = self.pending_fifo.pop_front() {
@@ -1228,10 +1248,10 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
         };
 
         // Produce a list of routable entries for this transport frame.
-        // Each entry is (msg_id, Result<RoutedFrame>, was_pending_or_oplock).
+        // Each entry is (msg_id, Result<Frame>, was_pending_or_oplock).
         // Frames that should NOT be forwarded to a waiter (oplock break,
         // STATUS_PENDING interim) are marked as such.
-        let mut routable: Vec<(MessageId, Result<RoutedFrame>)> = Vec::new();
+        let mut routable: Vec<(MessageId, Result<Frame>)> = Vec::new();
         for sub in sub_frames {
             match prepare_sub_frame(&sub, was_encrypted, &inner) {
                 Ok(Some((msg_id, routed))) => routable.push((msg_id, Ok(routed))),
@@ -1270,7 +1290,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             // cleanly — so we do route if a waiter matches, but we also
             // push the frame to fallback (so receive_response from any
             // caller can retrieve it).
-            let mut fallback_batch: Vec<RoutedFrame> = Vec::new();
+            let mut fallback_batch: Vec<Frame> = Vec::new();
             let mut fallback_err: Option<Error> = None;
             for (msg_id, result) in routable {
                 // Clean up any matching waiter (fire-and-forget).
@@ -1304,7 +1324,7 @@ fn prepare_sub_frame(
     sub: &[u8],
     was_encrypted: bool,
     inner: &Inner,
-) -> std::result::Result<Option<(MessageId, RoutedFrame)>, (MessageId, Error)> {
+) -> std::result::Result<Option<(MessageId, Frame)>, (MessageId, Error)> {
     // Parse the header.
     let mut cursor = ReadCursor::new(sub);
     let header = match Header::unpack(&mut cursor) {
@@ -1384,7 +1404,7 @@ fn prepare_sub_frame(
     };
     let raw = sub.to_vec();
     let msg_id = header.message_id;
-    Ok(Some((msg_id, RoutedFrame { header, body, raw })))
+    Ok(Some((msg_id, Frame { header, body, raw })))
 }
 
 /// Fan the given error (as best we can clone it) to every pending waiter
@@ -1396,7 +1416,7 @@ fn prepare_sub_frame(
 /// never "inserted but already drained" (which would leave the caller
 /// hanging on `rx.await`).
 fn fan_error_to_waiters(inner: &Inner, e: &Error) {
-    let drained: Vec<(MessageId, oneshot::Sender<Result<RoutedFrame>>)> = {
+    let drained: Vec<(MessageId, oneshot::Sender<Result<Frame>>)> = {
         let mut waiters = inner.waiters.lock().unwrap();
         inner.disconnected.store(true, Ordering::Release);
         waiters.drain().collect()
