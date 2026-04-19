@@ -43,7 +43,7 @@ thiserror = "2"
 num_enum = "0.7"
 
 # Async runtime -- transport layer needs net, io-util, time, sync
-tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"] }
 
 # Crypto -- signing, encryption, key derivation
 hmac = "0.13"

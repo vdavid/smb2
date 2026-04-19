@@ -1,19 +1,28 @@
-//! Connection state and sequential message exchange.
+//! Connection state and message exchange with actor-based routing.
 //!
-//! The [`Connection`] type manages a single TCP connection to an SMB server,
-//! handling negotiate, credit tracking, message ID sequencing, preauth hash
-//! maintenance, and message signing.
+//! The [`Connection`] type manages a single TCP connection to an SMB server.
+//! A background receiver task owns the transport's read half, demultiplexes
+//! incoming frames by `MessageId`, and routes each response to the matching
+//! per-request `oneshot::Sender`. The caller-thread path holds the write
+//! half (guarded by its own Mutex via the transport trait) and pushes a
+//! per-request `oneshot::Receiver` onto a FIFO that `receive_response`
+//! pops from.
+//!
+//! See `docs/specs/connection-actor.md` for the full design (Phase 2).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use log::{debug, info, trace, warn};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
 use crate::crypto::signing::{self, SigningAlgorithm};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::msg::header::Header;
 use crate::msg::negotiate::{
     NegotiateContext, NegotiateRequest, NegotiateResponse, CIPHER_AES_128_CCM, CIPHER_AES_128_GCM,
@@ -29,7 +38,6 @@ use crate::transport::{TcpTransport, TransportReceive, TransportSend};
 use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, Dialect, MessageId, SessionId, TreeId};
-use crate::Error;
 
 /// Parameters established during negotiate.
 #[derive(Debug, Clone)]
@@ -56,30 +64,115 @@ pub struct NegotiatedParams {
     pub compression_supported: bool,
 }
 
-/// Low-level connection that handles sequential message exchange.
+/// A received SMB2 sub-response, post-decrypt / post-decompress / post-header-parse.
+#[derive(Debug)]
+pub(crate) struct RoutedFrame {
+    pub header: Header,
+    pub body: Vec<u8>,
+    pub raw: Vec<u8>,
+}
+
+
+/// Crypto state shared between the caller thread (sending) and receiver task
+/// (verifying signatures, decrypting).
+///
+/// Uses `std::sync::Mutex` because the critical sections are short and never
+/// hold the lock across an `.await`. Mutation is rare (once at session setup),
+/// reads happen once per frame on either side.
+struct CryptoState {
+    signing_key: Option<Vec<u8>>,
+    signing_algorithm: Option<SigningAlgorithm>,
+    should_sign: bool,
+    encryption_key: Option<Vec<u8>>,
+    decryption_key: Option<Vec<u8>>,
+    encryption_cipher: Option<Cipher>,
+    should_encrypt: bool,
+    nonce_gen: Option<NonceGenerator>,
+    session_id: SessionId,
+}
+
+impl CryptoState {
+    fn new() -> Self {
+        Self {
+            signing_key: None,
+            signing_algorithm: None,
+            should_sign: false,
+            encryption_key: None,
+            decryption_key: None,
+            encryption_cipher: None,
+            should_encrypt: false,
+            nonce_gen: None,
+            session_id: SessionId::NONE,
+        }
+    }
+}
+
+/// Shared connection state held in an `Arc` by the caller-facing `Connection`
+/// and the spawned receiver task.
+struct Inner {
+    /// Per-request routing: msg_id → oneshot sender waiting for its response.
+    waiters: StdMutex<HashMap<MessageId, oneshot::Sender<Result<RoutedFrame>>>>,
+    /// Credits available to the caller. Updated by the receiver task on every
+    /// frame (orphans included), read by the caller thread for pre-send checks.
+    credits: AtomicU32,
+    /// Next message id to allocate. Incremented by caller on send.
+    next_message_id: AtomicU64,
+    /// Crypto state for signing / encryption.
+    crypto: StdMutex<CryptoState>,
+    /// Whether orphan responses (msg_id not in waiters) should be dropped.
+    /// Tests that don't go through `send_request` disable this so the
+    /// receiver task routes unmatched frames to `orphan_fallback_tx` instead.
+    orphan_filter_enabled: AtomicBool,
+    /// Fallback channel for frames with no matching waiter when the orphan
+    /// filter is disabled. Each send carries ONE transport frame's worth
+    /// of sub-responses (preserves compound-frame grouping for tests).
+    /// Populated lazily by `set_orphan_filter_enabled(false)`.
+    orphan_fallback_tx: StdMutex<Option<mpsc::UnboundedSender<Result<Vec<RoutedFrame>>>>>,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self {
+            waiters: StdMutex::new(HashMap::new()),
+            credits: AtomicU32::new(1),
+            next_message_id: AtomicU64::new(0),
+            crypto: StdMutex::new(CryptoState::new()),
+            orphan_filter_enabled: AtomicBool::new(true),
+            orphan_fallback_tx: StdMutex::new(None),
+        }
+    }
+}
+
+/// Low-level connection with actor-based response routing.
 ///
 /// Manages credit tracking, message ID sequencing, preauth integrity hash,
-/// and message signing. This is the non-pipelined variant: one request at
-/// a time, wait for the response before sending the next.
+/// message signing, and encryption. Phase 2 of the refactor: a background
+/// receiver task owns the transport's read half and routes each frame to
+/// the `oneshot::Sender` registered for its `MessageId`. Callers push a
+/// `oneshot::Receiver` onto a local FIFO via `send_request` and pop/await
+/// via `receive_response`.
 pub struct Connection {
     sender: Box<dyn TransportSend>,
-    receiver: Box<dyn TransportReceive>,
+    /// Shared state with the receiver task.
+    inner: Arc<Inner>,
+    /// Handle for the receiver task. Dropped on `Connection` drop (we rely
+    /// on the transport's read-half EOF to stop the task; the abort-on-drop
+    /// is a safety net).
+    receiver_task: Option<tokio::task::JoinHandle<()>>,
+    /// Caller-local FIFO of pending response receivers. `send_request` /
+    /// `send_compound` push, `receive_response` / `receive_compound_expected`
+    /// pop.
+    pending_fifo: VecDeque<oneshot::Receiver<Result<RoutedFrame>>>,
+    /// Caller-local receiver for the orphan fallback channel (test mode).
+    /// Only set when `set_orphan_filter_enabled(false)` has been called.
+    orphan_fallback_rx: StdMutex<Option<mpsc::UnboundedReceiver<Result<Vec<RoutedFrame>>>>>,
+    /// Buffered sub-frames from the fallback: when one transport-frame's
+    /// Vec<RoutedFrame> arrives but the caller only needs one sub-response,
+    /// we buffer the rest here for the next call.
+    orphan_fallback_buffer: StdMutex<VecDeque<RoutedFrame>>,
+
     /// Negotiated parameters (populated after negotiate).
     params: Option<NegotiatedParams>,
-    /// Next message ID (simple counter for sequential mode).
-    next_message_id: u64,
-    /// Available credits.
-    credits: u16,
-    /// Preauth integrity hash (for SMB 3.1.1 key derivation).
-    preauth_hasher: PreauthHasher,
-    /// Signing key, set after session setup.
-    signing_key: Option<Vec<u8>>,
-    /// Signing algorithm, set after session setup.
-    signing_algorithm: Option<SigningAlgorithm>,
-    /// Whether to sign outgoing messages.
-    should_sign: bool,
-    /// Active session ID.
-    session_id: SessionId,
     /// The server name (hostname or IP) used for UNC paths.
     server_name: String,
     /// Estimated round-trip time, measured during negotiate.
@@ -88,41 +181,10 @@ pub struct Connection {
     compression_enabled: bool,
     /// Whether the client wants compression (from config).
     compression_requested: bool,
-    /// Encryption key for outgoing messages (SMB 3.x).
-    encryption_key: Option<Vec<u8>>,
-    /// Decryption key for incoming messages (SMB 3.x).
-    decryption_key: Option<Vec<u8>>,
-    /// Negotiated encryption cipher.
-    encryption_cipher: Option<Cipher>,
-    /// Nonce generator for encryption.
-    nonce_gen: Option<NonceGenerator>,
-    /// Whether to encrypt outgoing messages.
-    should_encrypt: bool,
+    /// Preauth integrity hash (for SMB 3.1.1 key derivation).
+    preauth_hasher: PreauthHasher,
     /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
     dfs_trees: HashSet<TreeId>,
-    /// MessageIds of in-flight requests awaiting a response.
-    ///
-    /// Populated by `send_request` / `send_compound` after a successful send,
-    /// consulted by `receive_response` / `receive_compound` to reject orphaned
-    /// frames whose MessageId matches no in-flight request (left over by a
-    /// cancelled op, mid-flight error, or server oddity). Without this set,
-    /// an orphan would be handed to whichever caller next called receive,
-    /// corrupting their operation and every subsequent op on the connection.
-    ///
-    /// See `docs/specs/connection-actor.md` for the full story. In the
-    /// follow-up actor refactor this moves into the receiver task's state.
-    pending: HashSet<MessageId>,
-    /// Whether to drop responses whose MessageId isn't in `pending`.
-    ///
-    /// Always `true` in production — that's the whole point of this
-    /// refactor. Crate-private tests that build mock responses with
-    /// default `MessageId(0)` headers (via the `build_*_response`
-    /// helpers) turn it off via `setup_connection`, because mock msg_ids
-    /// don't track the caller's `next_message_id` advance. The direct
-    /// receive-path tests that exercise the filter (with explicit msg_ids
-    /// via `build_*_with_msg_id`) keep the default, so the filter is
-    /// still under test.
-    orphan_filter_enabled: bool,
 }
 
 impl Connection {
@@ -132,73 +194,42 @@ impl Connection {
         receiver: Box<dyn TransportReceive>,
         server_name: impl Into<String>,
     ) -> Self {
+        let inner = Arc::new(Inner::new());
+        let inner_for_task = Arc::clone(&inner);
+        let receiver_task = tokio::spawn(async move {
+            receiver_loop(receiver, inner_for_task).await;
+        });
         Self {
             sender,
-            receiver,
+            inner,
+            receiver_task: Some(receiver_task),
+            pending_fifo: VecDeque::new(),
+            orphan_fallback_rx: StdMutex::new(None),
+            orphan_fallback_buffer: StdMutex::new(VecDeque::new()),
             params: None,
-            next_message_id: 0,
-            credits: 1,
-            preauth_hasher: PreauthHasher::new(),
-            signing_key: None,
-            signing_algorithm: None,
-            should_sign: false,
-            session_id: SessionId::NONE,
             server_name: server_name.into(),
             estimated_rtt: None,
             compression_enabled: false,
             compression_requested: true,
-            encryption_key: None,
-            decryption_key: None,
-            encryption_cipher: None,
-            nonce_gen: None,
-            should_encrypt: false,
+            preauth_hasher: PreauthHasher::new(),
             dfs_trees: HashSet::new(),
-            pending: HashSet::new(),
-            orphan_filter_enabled: true,
         }
     }
 
     /// Connect to an SMB server over TCP.
     pub async fn connect(addr: &str, timeout: Duration) -> Result<Self> {
-        // Extract the server name (host part) from addr.
         let server_name = addr.split(':').next().unwrap_or(addr).to_string();
-
         let transport = TcpTransport::connect(addr, timeout).await?;
         info!("connection: connected to {}", addr);
-        // Clone into two Arc-wrapped halves is not needed because TcpTransport
-        // implements both traits. We wrap it in Arc for the split.
-        let transport = std::sync::Arc::new(transport);
-        Ok(Self {
-            sender: Box::new(transport.clone()),
-            receiver: Box::new(transport),
-            params: None,
-            next_message_id: 0,
-            credits: 1,
-            preauth_hasher: PreauthHasher::new(),
-            signing_key: None,
-            signing_algorithm: None,
-            should_sign: false,
-            session_id: SessionId::NONE,
+        let transport = Arc::new(transport);
+        Ok(Self::from_transport(
+            Box::new(Arc::clone(&transport)),
+            Box::new(transport),
             server_name,
-            estimated_rtt: None,
-            compression_enabled: false,
-            compression_requested: true,
-            encryption_key: None,
-            decryption_key: None,
-            encryption_cipher: None,
-            nonce_gen: None,
-            should_encrypt: false,
-            dfs_trees: HashSet::new(),
-            pending: HashSet::new(),
-            orphan_filter_enabled: true,
-        })
+        ))
     }
 
     /// Perform the SMB2 NEGOTIATE exchange.
-    ///
-    /// Sends a NegotiateRequest with all five dialects and required negotiate
-    /// contexts, processes the response, validates it, and stores the
-    /// negotiated parameters.
     pub async fn negotiate(&mut self) -> Result<()> {
         debug!("negotiate: sending request, dialects={:?}", Dialect::ALL);
         let client_guid = generate_guid();
@@ -223,7 +254,7 @@ impl Connection {
 
         if self.compression_requested {
             negotiate_contexts.push(NegotiateContext::Compression {
-                flags: 0, // unchained
+                flags: 0,
                 algorithms: vec![COMPRESSION_LZ4],
             });
         }
@@ -238,45 +269,36 @@ impl Connection {
             negotiate_contexts,
         };
 
-        // Pack header + body to get the raw wire bytes.
+        // Register a waiter for msg_id=0 (negotiate is always first).
         let mut header = Header::new_request(Command::Negotiate);
-        header.message_id = MessageId(self.next_message_id);
+        let msg_id = self.allocate_msg_id(1);
+        header.message_id = msg_id;
         header.credits = 1;
-
         let req_bytes = pack_message(&header, &request);
-        self.next_message_id += 1;
 
         // Update preauth hash with request bytes.
         self.preauth_hasher.update(&req_bytes);
-        trace!(
-            "negotiate: preauth hash updated with request ({} bytes)",
-            req_bytes.len()
-        );
 
-        // Send and measure RTT.
+        let rx = self.register_waiter(msg_id);
+        self.pending_fifo.push_back(rx);
+
         let rtt_start = std::time::Instant::now();
-        self.sender.send(&req_bytes).await?;
+        if let Err(e) = self.sender.send(&req_bytes).await {
+            self.remove_waiter(msg_id);
+            self.pending_fifo.pop_back();
+            return Err(e);
+        }
 
-        // Receive.
-        let resp_bytes = self.receiver.receive().await?;
+        let frame = self.await_next_response().await?;
         self.estimated_rtt = Some(rtt_start.elapsed());
-        trace!(
-            "negotiate: received response ({} bytes), rtt={:?}",
-            resp_bytes.len(),
-            self.estimated_rtt.unwrap()
-        );
 
-        // Update preauth hash with response bytes.
-        self.preauth_hasher.update(&resp_bytes);
+        // Preauth hash update with response bytes.
+        self.preauth_hasher.update(&frame.raw);
 
-        // Parse response header.
-        let mut cursor = ReadCursor::new(&resp_bytes);
-        let resp_header = Header::unpack(&mut cursor)?;
-
+        let resp_header = &frame.header;
         if !resp_header.is_response() {
             return Err(Error::invalid_data("expected a response but got a request"));
         }
-
         if resp_header.command != Command::Negotiate {
             return Err(Error::invalid_data(format!(
                 "expected Negotiate response, got {:?}",
@@ -284,10 +306,6 @@ impl Connection {
             )));
         }
 
-        // Update credits from response.
-        self.credits = resp_header.credits;
-
-        // Check for error status (but allow success).
         if resp_header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
                 status: resp_header.status,
@@ -295,18 +313,16 @@ impl Connection {
             });
         }
 
-        // Parse response body.
+        // Parse the body.
+        let mut cursor = ReadCursor::new(&frame.body);
         let resp = NegotiateResponse::unpack(&mut cursor)?;
 
-        // Validate the dialect is one we offered.
         if !Dialect::ALL.contains(&resp.dialect_revision) {
             return Err(Error::invalid_data(format!(
                 "server selected dialect 0x{:04X} which we did not offer",
                 u16::from(resp.dialect_revision)
             )));
         }
-
-        // Validate MaxReadSize/MaxWriteSize >= 65536.
         if resp.max_read_size < 65536 {
             return Err(Error::invalid_data(format!(
                 "MaxReadSize {} is below minimum 65536",
@@ -320,7 +336,6 @@ impl Connection {
             )));
         }
 
-        // Determine signing, encryption, and compression from negotiate contexts.
         let mut gmac_negotiated = false;
         let mut cipher = None;
         let mut compression_supported = false;
@@ -333,7 +348,6 @@ impl Connection {
                     gmac_negotiated = true;
                 }
                 NegotiateContext::Encryption { ciphers } => {
-                    // Server picks one cipher in the response.
                     if let Some(&c) = ciphers.first() {
                         cipher = match c {
                             CIPHER_AES_128_CCM => Some(Cipher::Aes128Ccm),
@@ -354,8 +368,6 @@ impl Connection {
         }
 
         let signing_required = resp.security_mode.signing_required();
-
-        // Enable compression if both client and server support it.
         self.compression_enabled = self.compression_requested && compression_supported;
 
         self.params = Some(NegotiatedParams {
@@ -385,9 +397,6 @@ impl Connection {
     }
 
     /// Send a request and return the raw bytes that were sent (for preauth hash).
-    ///
-    /// Packs the header + body, optionally signs, sends, and returns the bytes.
-    /// Equivalent to `send_request_with_credits(command, body, tree_id, 1)`.
     pub async fn send_request(
         &mut self,
         command: Command,
@@ -398,11 +407,7 @@ impl Connection {
             .await
     }
 
-    /// Send a request with a custom CreditCharge (for multi-credit operations).
-    ///
-    /// The CreditCharge determines how many credits this request consumes
-    /// and how many consecutive MessageIds it uses. For READ/WRITE with
-    /// payloads larger than 64KB, CreditCharge = ceil(payload / 65536).
+    /// Send a request with a custom CreditCharge.
     pub async fn send_request_with_credits(
         &mut self,
         command: Command,
@@ -410,238 +415,103 @@ impl Connection {
         tree_id: Option<TreeId>,
         credit_charge: u16,
     ) -> Result<(MessageId, Vec<u8>)> {
+        let msg_id = self.allocate_msg_id(credit_charge.max(1) as u64);
+
         let mut header = Header::new_request(command);
-        header.message_id = MessageId(self.next_message_id);
-        header.credits = 256; // Request more credits.
+        header.message_id = msg_id;
+        header.credits = 256;
         header.credit_charge = CreditCharge(credit_charge);
-        header.session_id = self.session_id;
+        header.session_id = self.session_id();
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
         }
 
-        // Signing and encryption are mutually exclusive (pitfall #4).
-        // When encrypting, we zero the Signature field; AEAD provides auth.
-        if self.should_sign && !self.should_encrypt {
+        let (should_sign, should_encrypt) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (c.should_sign, c.should_encrypt)
+        };
+
+        if should_sign && !should_encrypt {
             header.flags.set_signed();
         }
-
-        // Auto-set DFS flag for trees with DFS capability.
         if self.should_set_dfs_flag(tree_id) {
             header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
         }
 
         let mut msg_bytes = pack_message(&header, body);
-        let msg_id = MessageId(self.next_message_id);
-        // Multi-credit requests consume consecutive MessageIds.
-        self.next_message_id += credit_charge as u64;
 
-        if self.should_encrypt {
-            // Encrypt: no signing, AEAD provides authentication.
+        // Register waiter BEFORE send (so the receiver task can match any
+        // response that arrives fast).
+        let rx = self.register_waiter(msg_id);
+        self.pending_fifo.push_back(rx);
+
+        let wire_bytes = if should_encrypt {
             let encrypted = self.encrypt_bytes(&msg_bytes)?;
-            self.sender.send(&encrypted).await?;
-            self.pending.insert(msg_id);
-            debug!(
-                "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, encrypted, len={} (plaintext {})",
-                command, msg_id.0, credit_charge, tree_id, encrypted.len(), msg_bytes.len()
-            );
-            return Ok((msg_id, msg_bytes));
-        }
-
-        if self.should_sign {
-            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
-                signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)?;
+            match self.sender.send(&encrypted).await {
+                Ok(()) => {
+                    debug!(
+                        "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, encrypted, len={} (plaintext {})",
+                        command, msg_id.0, credit_charge, tree_id, encrypted.len(), msg_bytes.len()
+                    );
+                    return Ok((msg_id, msg_bytes));
+                }
+                Err(e) => {
+                    self.cancel_last_waiter(msg_id);
+                    return Err(e);
+                }
             }
-        }
-
-        // Try to compress after signing (per spec: sign then compress).
-        if self.compression_enabled && msg_bytes.len() > Header::SIZE {
-            if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
-                let framed = build_compressed_frame(&compressed);
-                self.sender.send(&framed).await?;
-                self.pending.insert(msg_id);
-                debug!(
-                    "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
-                    command, msg_id.0, credit_charge, tree_id, self.should_sign,
-                    msg_bytes.len(), framed.len()
-                );
-                return Ok((msg_id, msg_bytes));
+        } else {
+            if should_sign {
+                let c = self.inner.crypto.lock().unwrap();
+                if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
+                    signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)?;
+                }
             }
-        }
+            if self.compression_enabled && msg_bytes.len() > Header::SIZE {
+                if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
+                    let framed = build_compressed_frame(&compressed);
+                    match self.sender.send(&framed).await {
+                        Ok(()) => {
+                            debug!(
+                                "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
+                                command, msg_id.0, credit_charge, tree_id, should_sign,
+                                msg_bytes.len(), framed.len()
+                            );
+                            return Ok((msg_id, msg_bytes));
+                        }
+                        Err(e) => {
+                            self.cancel_last_waiter(msg_id);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            msg_bytes.clone()
+        };
 
-        self.sender.send(&msg_bytes).await?;
-        self.pending.insert(msg_id);
+        if let Err(e) = self.sender.send(&wire_bytes).await {
+            self.cancel_last_waiter(msg_id);
+            return Err(e);
+        }
         debug!(
             "send: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, len={}",
-            command,
-            msg_id.0,
-            credit_charge,
-            tree_id,
-            self.should_sign,
-            msg_bytes.len()
+            command, msg_id.0, credit_charge, tree_id, should_sign, msg_bytes.len()
         );
         Ok((msg_id, msg_bytes))
     }
 
-    /// Get the estimated round-trip time (measured during negotiate).
+    /// Get the estimated round-trip time.
     pub fn estimated_rtt(&self) -> Option<Duration> {
         self.estimated_rtt
     }
 
     /// Receive a response, verify signature if needed, and update credits.
     ///
-    /// Automatically loops past `STATUS_PENDING` interim responses
-    /// (MS-SMB2 3.3.4.3): collects their credits and keeps waiting
-    /// for the final response.
-    ///
-    /// Returns the parsed header, the raw body bytes, and the full raw
-    /// response bytes (needed for preauth hash updates).
+    /// Automatically skips `STATUS_PENDING` interim responses; the receiver
+    /// task keeps the waiter registered and only forwards the final response.
     pub async fn receive_response(&mut self) -> Result<(Header, Vec<u8>, Vec<u8>)> {
-        loop {
-            let resp_bytes = self.receiver.receive().await?;
-            trace!("recv: raw response {} bytes", resp_bytes.len());
-
-            // Check for encryption transform header and decrypt if needed.
-            // Per spec: decrypt first, then decompress, then verify signature.
-            // When encrypted, skip signature verification (AEAD provides auth).
-            let (resp_bytes, was_encrypted) =
-                if resp_bytes.len() >= 4 && resp_bytes[0..4] == TRANSFORM_PROTOCOL_ID {
-                    trace!("recv: detected encryption transform header, decrypting");
-                    let decrypted = self.decrypt_bytes(&resp_bytes)?;
-                    (decrypted, true)
-                } else {
-                    (resp_bytes, false)
-                };
-
-            // Check for compression transform header and decompress if needed.
-            // Per spec: decompress first, then verify signature.
-            let resp_bytes = if resp_bytes.len() >= 4 && resp_bytes[0..4] == COMPRESSION_PROTOCOL_ID
-            {
-                trace!("recv: detected compression transform header, decompressing");
-                decompress_response(&resp_bytes)?
-            } else {
-                resp_bytes
-            };
-
-            // Verify signature if signing is active AND the response has the
-            // SIGNED flag set (spec section 3.2.5.1.3). Skip for STATUS_PENDING
-            // interim responses and unsolicited oplock break notifications.
-            // Skip if the message was encrypted (AEAD already authenticated).
-            // A valid SMB2 header is always 64 bytes. Guard on that so the
-            // field accesses below (up to byte 32) are guaranteed in-bounds.
-            if self.should_sign && !was_encrypted && resp_bytes.len() >= Header::SIZE {
-                let flags = u32::from_le_bytes(resp_bytes[16..20].try_into().unwrap());
-                let is_signed = (flags & HeaderFlags::SIGNED) != 0;
-
-                // Also check for STATUS_PENDING (skip verification) and
-                // unsolicited messages (MessageId 0xFFFFFFFFFFFFFFFF).
-                let status = u32::from_le_bytes(resp_bytes[8..12].try_into().unwrap());
-                let msg_id_bytes: [u8; 8] = resp_bytes[24..32].try_into().unwrap();
-                let msg_id = u64::from_le_bytes(msg_id_bytes);
-                let is_pending = status == NtStatus::PENDING.0;
-                let is_unsolicited = msg_id == 0xFFFF_FFFF_FFFF_FFFF;
-
-                if is_signed && !is_pending && !is_unsolicited {
-                    if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
-                        signing::verify_signature(&resp_bytes, key, *algo, msg_id, false)?;
-                    }
-                }
-            }
-
-            // Parse header.
-            let mut cursor = ReadCursor::new(&resp_bytes);
-            let header = Header::unpack(&mut cursor)?;
-
-            // Update credits (interim responses carry credits too).
-            let prev_credits = self.credits;
-            if header.credits > 0 {
-                self.credits = self.credits.saturating_add(header.credits);
-            }
-
-            // Unsolicited oplock/lease break notification: arrives with
-            // MessageId = 0xFFFFFFFFFFFFFFFF (MS-SMB2 3.2.5.19).
-            // We don't cache, so we skip the notification without sending
-            // an acknowledgment. The server will time out and forcibly
-            // break the oplock after ~35 seconds, which is safe.
-            if header.message_id == MessageId::UNSOLICITED {
-                debug!(
-                    "recv: skipping unsolicited oplock break notification, cmd={:?}",
-                    header.command,
-                );
-                continue;
-            }
-
-            // STATUS_PENDING is an interim response: collect credits and
-            // keep waiting for the final response (MS-SMB2 3.3.4.3).
-            if header.status.is_pending() {
-                debug!(
-                    "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}, credits={} (was {}, granted {})",
-                    header.command,
-                    header.message_id.0,
-                    self.credits,
-                    prev_credits,
-                    header.credits
-                );
-                continue;
-            }
-
-            // Consume one credit for the request that generated this response.
-            self.credits = self.credits.saturating_sub(1);
-
-            debug!(
-                "recv: cmd={:?}, status={:?}, msg_id={}, credits={} (was {}, granted {})",
-                header.command,
-                header.status,
-                header.message_id.0,
-                self.credits,
-                prev_credits,
-                header.credits
-            );
-            if self.credits == 0 {
-                warn!("recv: zero credits remaining -- credit starvation");
-            }
-
-            // Orphan check: if this MessageId isn't one we're waiting on, drop
-            // the frame. Can happen after a cancelled/aborted op leaves its
-            // response in the pipe, or if the server sends something we
-            // didn't ask for. Credits have been applied (grant + consume),
-            // so throughput stays correct. Without this, the orphan would be
-            // handed to the caller and corrupt their operation — and every
-            // subsequent op on the connection. See docs/specs/connection-actor.md.
-            //
-            // `pending.remove()` returns true iff the id was present, so
-            // `!remove()` = "not expected" = orphan. In the normal path
-            // it removes the entry and continues to the return below.
-            //
-            // Gated on `orphan_filter_enabled` so the mass of existing
-            // unit tests that use the `build_*_response` helpers (which
-            // hardcode `MessageId(0)`) keep working without per-test
-            // msg_id threading. `setup_connection` in `test_helpers.rs`
-            // flips it off; production leaves it on.
-            if self.orphan_filter_enabled && !self.pending.remove(&header.message_id) {
-                debug!(
-                    "recv: orphan response dropped, msg_id={}, cmd={:?}, status={:?}",
-                    header.message_id.0, header.command, header.status
-                );
-                continue;
-            }
-
-            // STATUS_NETWORK_SESSION_EXPIRED: the session timed out on the
-            // server side. The caller should reconnect (SmbClient::reconnect).
-            // Reference: MS-SMB2 section 3.2.5.1.6.
-            if header.status == NtStatus::NETWORK_SESSION_EXPIRED {
-                warn!(
-                    "recv: session expired (STATUS_NETWORK_SESSION_EXPIRED), \
-                     cmd={:?}, msg_id={} -- caller should reconnect",
-                    header.command, header.message_id.0
-                );
-                return Err(Error::SessionExpired);
-            }
-
-            // Return the body bytes (everything after the header).
-            let body_bytes = resp_bytes[Header::SIZE..].to_vec();
-
-            return Ok((header, body_bytes, resp_bytes));
-        }
+        let frame = self.await_next_response().await?;
+        Ok((frame.header, frame.body, frame.raw))
     }
 
     /// Get the negotiated parameters.
@@ -661,12 +531,12 @@ impl Connection {
 
     /// Set the session ID.
     pub fn set_session_id(&mut self, id: SessionId) {
-        self.session_id = id;
+        self.inner.crypto.lock().unwrap().session_id = id;
     }
 
     /// Get the current session ID.
     pub fn session_id(&self) -> SessionId {
-        self.session_id
+        self.inner.crypto.lock().unwrap().session_id
     }
 
     /// Activate signing with the given key and algorithm.
@@ -676,18 +546,13 @@ impl Connection {
             algorithm,
             key.len()
         );
-        self.signing_key = Some(key);
-        self.signing_algorithm = Some(algorithm);
-        self.should_sign = true;
+        let mut c = self.inner.crypto.lock().unwrap();
+        c.signing_key = Some(key);
+        c.signing_algorithm = Some(algorithm);
+        c.should_sign = true;
     }
 
     /// Activate encryption with the given keys and cipher.
-    ///
-    /// After activation, all outgoing messages are encrypted with a
-    /// TRANSFORM_HEADER and all incoming encrypted messages are decrypted.
-    /// Signing is mutually exclusive with encryption (pitfall #4):
-    /// when encrypting, the Signature field is zeroed and AEAD provides
-    /// authentication.
     pub fn activate_encryption(&mut self, enc_key: Vec<u8>, dec_key: Vec<u8>, cipher: Cipher) {
         debug!(
             "encryption: activated, cipher={:?}, enc_key_len={}, dec_key_len={}",
@@ -695,26 +560,27 @@ impl Connection {
             enc_key.len(),
             dec_key.len()
         );
-        self.encryption_key = Some(enc_key);
-        self.decryption_key = Some(dec_key);
-        self.encryption_cipher = Some(cipher);
-        self.nonce_gen = Some(NonceGenerator::new());
-        self.should_encrypt = true;
+        let mut c = self.inner.crypto.lock().unwrap();
+        c.encryption_key = Some(enc_key);
+        c.decryption_key = Some(dec_key);
+        c.encryption_cipher = Some(cipher);
+        c.nonce_gen = Some(NonceGenerator::new());
+        c.should_encrypt = true;
     }
 
     /// Whether encryption is active on this connection.
     pub fn should_encrypt(&self) -> bool {
-        self.should_encrypt
+        self.inner.crypto.lock().unwrap().should_encrypt
     }
 
     /// Get the current number of available credits.
     pub fn credits(&self) -> u16 {
-        self.credits
+        self.inner.credits.load(Ordering::Acquire) as u16
     }
 
     /// Get the next message ID (without incrementing).
     pub fn next_message_id(&self) -> u64 {
-        self.next_message_id
+        self.inner.next_message_id.load(Ordering::Acquire)
     }
 
     /// Get the server name.
@@ -723,8 +589,6 @@ impl Connection {
     }
 
     /// Set whether the client wants compression.
-    ///
-    /// Must be called before [`negotiate`](Self::negotiate) to have effect.
     pub fn set_compression_requested(&mut self, requested: bool) {
         self.compression_requested = requested;
     }
@@ -734,20 +598,7 @@ impl Connection {
         self.compression_enabled
     }
 
-    /// Set negotiated params directly (for testing).
     /// Send a related compound request (multiple operations chained).
-    ///
-    /// Related compounds share SessionId and TreeId. The first operation
-    /// provides the real FileId; subsequent operations use the sentinel
-    /// FileId `{0xFFFF..., 0xFFFF...}` meaning "use the FileId from the
-    /// previous response."
-    ///
-    /// Each sub-request is packed with its own header. The `NextCommand`
-    /// field links them. All sub-requests except the last are padded
-    /// to 8-byte alignment. The `SMB2_FLAGS_RELATED_OPERATIONS` flag is
-    /// set on all sub-requests except the first.
-    ///
-    /// Returns the MessageIds assigned to each sub-request.
     pub async fn send_compound(
         &mut self,
         tree_id: TreeId,
@@ -759,184 +610,142 @@ impl Connection {
             ));
         }
 
+        let (should_sign, should_encrypt) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (c.should_sign, c.should_encrypt)
+        };
+
+        let session_id = self.session_id();
         let mut message_ids = Vec::with_capacity(operations.len());
         let mut sub_requests: Vec<Vec<u8>> = Vec::with_capacity(operations.len());
 
-        // Step 1: Pack each sub-request with its header.
         for (i, (command, body, credit_charge)) in operations.iter().enumerate() {
+            let charge = credit_charge.0.max(1) as u64;
+            let msg_id = self.allocate_msg_id(charge);
+
             let mut header = Header::new_request(*command);
-            header.message_id = MessageId(self.next_message_id);
-            header.credits = 256; // Request more credits.
+            header.message_id = msg_id;
+            header.credits = 256;
             header.credit_charge = *credit_charge;
-            header.session_id = self.session_id;
+            header.session_id = session_id;
             header.tree_id = Some(tree_id);
 
-            // Set RELATED_OPERATIONS on all except the first.
             if i > 0 {
                 header.flags.set_related();
             }
-
-            // Sign flag (actual signing happens after padding).
-            // Signing and encryption are mutually exclusive (pitfall #4).
-            if self.should_sign && !self.should_encrypt {
+            if should_sign && !should_encrypt {
                 header.flags.set_signed();
             }
-
-            // Auto-set DFS flag for trees with DFS capability.
             if self.should_set_dfs_flag(Some(tree_id)) {
                 header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
             }
 
-            let msg_id = MessageId(self.next_message_id);
             message_ids.push(msg_id);
-            self.next_message_id += credit_charge.0 as u64;
-
             let msg_bytes = pack_message(&header, *body);
             sub_requests.push(msg_bytes);
         }
 
-        // Step 2: Pad all sub-requests except the last to 8-byte alignment.
+        // Pad all sub-requests except the last to 8-byte alignment.
         let last_idx = sub_requests.len() - 1;
         for sub_req in sub_requests.iter_mut().take(last_idx) {
-            let current_len = sub_req.len();
-            let remainder = current_len % 8;
-            if remainder != 0 {
-                let pad = 8 - remainder;
-                sub_req.resize(current_len + pad, 0);
+            let rem = sub_req.len() % 8;
+            if rem != 0 {
+                let pad = 8 - rem;
+                let new_len = sub_req.len() + pad;
+                sub_req.resize(new_len, 0);
             }
         }
 
-        // Step 3: Set NextCommand offsets by backpatching each header.
-        // NextCommand is at header bytes 20..24.
         for sub_req in sub_requests.iter_mut().take(last_idx) {
             let next_cmd = sub_req.len() as u32;
             sub_req[20..24].copy_from_slice(&next_cmd.to_le_bytes());
         }
-        // Last sub-request: NextCommand = 0 (already the default).
 
-        // Step 4: Sign each sub-request individually (including padding).
-        // Signing and encryption are mutually exclusive (pitfall #4).
-        if self.should_sign && !self.should_encrypt {
-            if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+        if should_sign && !should_encrypt {
+            let c = self.inner.crypto.lock().unwrap();
+            if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
                 for (i, sub_req) in sub_requests.iter_mut().enumerate() {
                     signing::sign_message(sub_req, key, *algo, message_ids[i].0, false)?;
                 }
             }
         }
 
-        // Step 5: Concatenate all sub-requests into one buffer.
+        // Register every sub-request MessageId as in-flight BEFORE sending.
+        let mut registered_ids = Vec::with_capacity(message_ids.len());
+        for id in &message_ids {
+            let rx = self.register_waiter(*id);
+            self.pending_fifo.push_back(rx);
+            registered_ids.push(*id);
+        }
+
         let total_len: usize = sub_requests.iter().map(|r| r.len()).sum();
         let mut compound_buf = Vec::with_capacity(total_len);
         for sub_req in &sub_requests {
             compound_buf.extend_from_slice(sub_req);
         }
 
-        // Step 6: Encrypt the entire compound chain if encryption is active.
-        // Per pitfall #9: one TRANSFORM_HEADER wraps the whole compound,
-        // NOT per sub-request.
-        if self.should_encrypt {
+        let send_result = if should_encrypt {
             let encrypted = self.encrypt_bytes(&compound_buf)?;
-            self.sender.send(&encrypted).await?;
-            debug!(
-                "send_compound: {} operations, encrypted, total_len={} (plaintext {}), msg_ids={:?}, tree_id={}",
-                operations.len(),
-                encrypted.len(),
-                compound_buf.len(),
-                message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
-                tree_id,
-            );
+            self.sender.send(&encrypted).await
         } else {
-            self.sender.send(&compound_buf).await?;
-            debug!(
-                "send_compound: {} operations, total_len={}, msg_ids={:?}, tree_id={}, signed={}",
-                operations.len(),
-                compound_buf.len(),
-                message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
-                tree_id,
-                self.should_sign,
-            );
+            self.sender.send(&compound_buf).await
+        };
+
+        if let Err(e) = send_result {
+            // Undo registration.
+            for id in registered_ids.iter().rev() {
+                self.cancel_last_waiter(*id);
+            }
+            return Err(e);
         }
 
-        // Register every sub-request MessageId as in-flight. A compound with
-        // N ops has N MessageIds; each gets its own response (possibly split
-        // across frames by the server — see receive_compound_expected).
-        for id in &message_ids {
-            self.pending.insert(*id);
-        }
+        debug!(
+            "send_compound: {} operations, total_len={}, msg_ids={:?}, tree_id={}, signed={}, encrypted={}",
+            operations.len(),
+            compound_buf.len(),
+            message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
+            tree_id,
+            should_sign,
+            should_encrypt,
+        );
 
         Ok(message_ids)
     }
 
-    /// Receive a compound response (multiple responses in one frame).
+    /// Receive a compound response (possibly multiple sub-responses from
+    /// the next transport frame).
     ///
-    /// Splits the response by `NextCommand` offsets and returns each
-    /// sub-response as `(Header, body_bytes)`.
-    ///
-    /// **Note:** per MS-SMB2 section 3.3.4.1.3, the server only SHOULD
-    /// compound responses -- it MAY send them as separate frames even when
-    /// the client compounded the request. This method returns whatever
-    /// arrives in the next frame. Callers that sent N related sub-requests
-    /// and need to collect all N responses should use
-    /// [`Self::receive_compound_expected`] instead, which transparently
-    /// gathers additional frames when the server splits.
+    /// Returns whatever sub-responses arrive from the next routed frame,
+    /// matched by the order of `pending_fifo`. Returns at least one
+    /// sub-response on success.
     pub async fn receive_compound(&mut self) -> Result<Vec<(Header, Vec<u8>)>> {
+        // Pop one response (blocking); compounds register multiple msg_ids
+        // but each sub-frame is routed independently by the receiver task.
+        let first = self.await_next_response().await?;
+        let mut results = vec![(first.header, first.body)];
+
+        // Drain additional sub-frames that have ALREADY been delivered to
+        // the buffer (non-blocking) — they belong to the same transport
+        // frame. Only drain the buffer; the fifo/fallback channel may hold
+        // items from LATER transport frames that belong to subsequent
+        // receive_* calls, so we don't touch those here.
         loop {
-            let (resp_bytes, was_encrypted) = self.receive_and_preprocess_frame().await?;
-            let results = self.parse_compound_frame(&resp_bytes, was_encrypted)?;
-
-            // Orphan check: if the first sub-response's MessageId isn't one
-            // we're waiting on, the whole frame is leftover from a cancelled
-            // or aborted operation. Drop it. Credits were already applied
-            // inside parse_compound_frame, so throughput stays correct.
-            //
-            // Compound responses always correspond 1:1 with the sub-requests
-            // that produced them, with consecutive MessageIds matching what
-            // the caller sent. So checking the first is sufficient; the
-            // rest either match or represent a misbehaving server (in which
-            // case we still drop the frame cleanly rather than hand stale
-            // data to the next caller).
-            //
-            // Gated on `orphan_filter_enabled` — same reason as in
-            // receive_response (test ergonomics for the mass of
-            // build_*_response-based tests).
-            if self.orphan_filter_enabled {
-                if let Some((first_header, _)) = results.first() {
-                    if !self.pending.contains(&first_header.message_id) {
-                        debug!(
-                            "recv_compound: orphan frame dropped, first msg_id={}, cmd={:?}",
-                            first_header.message_id.0, first_header.command
-                        );
-                        continue;
-                    }
-                }
-                // Remove all returned sub-response MessageIds from the set.
-                for (header, _) in &results {
-                    self.pending.remove(&header.message_id);
-                }
+            let next = self.orphan_fallback_buffer.lock().unwrap().pop_front();
+            match next {
+                Some(frame) => results.push((frame.header, frame.body)),
+                None => break,
             }
-
-            if self.credits == 0 {
-                warn!("recv_compound: zero credits remaining -- credit starvation");
-            }
-            return Ok(results);
         }
+
+        if self.credits() == 0 {
+            warn!("recv_compound: zero credits remaining -- credit starvation");
+        }
+        Ok(results)
     }
 
-    /// Receive exactly `expected` compound sub-responses, transparently
-    /// gathering additional transport frames if the server split the
-    /// compound chain across multiple sends.
-    ///
-    /// Per MS-SMB2 section 3.3.4.1.3, the server MAY choose to not compound
-    /// responses even when the client compounded the request (Samba is
-    /// known to do this in some scenarios). In that case each response
-    /// arrives in its own frame. This method reads additional frames until
-    /// `expected` sub-responses have been collected, logging at DEBUG the
-    /// first time it notices a split.
-    ///
-    /// Returns `Err(Error::invalid_data)` if a frame contains more
-    /// sub-responses than remain expected -- that would indicate a
-    /// protocol error (the server sent responses for requests we didn't
-    /// make, or our bookkeeping is wrong).
+
+    /// Receive exactly `expected` compound sub-responses, gathering
+    /// additional transport frames if needed.
     pub async fn receive_compound_expected(
         &mut self,
         expected: usize,
@@ -944,233 +753,37 @@ impl Connection {
         if expected == 0 {
             return Ok(Vec::new());
         }
-
-        let mut results = self.receive_compound().await?;
-
-        if results.len() > expected {
-            return Err(Error::invalid_data(format!(
-                "split compound response overflow: expected {} sub-responses total, \
-                 but first frame has {}",
+        let mut results = Vec::with_capacity(expected);
+        for i in 0..expected {
+            let frame = self.await_next_response().await?;
+            trace!(
+                "recv_compound_expected: got sub-response {}/{} msg_id={}, cmd={:?}",
+                i + 1,
                 expected,
-                results.len(),
+                frame.header.message_id.0,
+                frame.header.command
+            );
+            results.push((frame.header, frame.body));
+        }
+        // Overflow check: if more sub-frames from the same transport-frame
+        // batch are buffered in the orphan fallback buffer, that's a
+        // protocol error — the server sent more responses than we asked
+        // for. Defensive: matches the old behavior.
+        let extra = self.orphan_fallback_buffer.lock().unwrap().len();
+        if extra > 0 {
+            self.orphan_fallback_buffer.lock().unwrap().clear();
+            return Err(Error::invalid_data(format!(
+                "split compound response overflow: expected {} sub-responses total, got {} more",
+                expected, extra,
             )));
         }
-
-        if results.len() < expected {
-            debug!(
-                "recv_compound: server split compound response; got {} of {}, reading remaining frames",
-                results.len(),
-                expected,
-            );
-        }
-
-        while results.len() < expected {
-            let (resp_bytes, was_encrypted) = self.receive_and_preprocess_frame().await?;
-            let more = self.parse_compound_frame(&resp_bytes, was_encrypted)?;
-
-            // Orphan filter: any frame arriving during a split response whose
-            // first sub-response isn't one we're still waiting on is leftover
-            // from a previous cancelled op. Drop it and keep reading. Same
-            // flag-gated semantics as receive_compound / receive_response.
-            if self.orphan_filter_enabled {
-                if let Some((first_header, _)) = more.first() {
-                    if !self.pending.contains(&first_header.message_id) {
-                        debug!(
-                            "recv_compound: orphan frame dropped during gather, first msg_id={}, cmd={:?}",
-                            first_header.message_id.0, first_header.command
-                        );
-                        continue;
-                    }
-                }
-                for (header, _) in &more {
-                    self.pending.remove(&header.message_id);
-                }
-            }
-
-            if results.len() + more.len() > expected {
-                return Err(Error::invalid_data(format!(
-                    "split compound response overflow: expected {} sub-responses total, \
-                     already collected {}, but next frame has {} more",
-                    expected,
-                    results.len(),
-                    more.len(),
-                )));
-            }
-            results.extend(more);
-        }
-
-        if self.credits == 0 {
+        if self.credits() == 0 {
             warn!("recv_compound: zero credits remaining -- credit starvation");
         }
-
-        Ok(results)
-    }
-
-    /// Receive one frame from the transport, transparently decrypting,
-    /// decompressing, and skipping unsolicited oplock/lease break
-    /// notifications. Returns the preprocessed frame bytes and whether
-    /// the frame was encrypted on the wire.
-    async fn receive_and_preprocess_frame(&mut self) -> Result<(Vec<u8>, bool)> {
-        loop {
-            let raw = self.receiver.receive().await?;
-            trace!("recv_compound: raw response {} bytes", raw.len());
-
-            // Check for encryption transform header and decrypt if needed.
-            let (raw, was_encrypted) = if raw.len() >= 4 && raw[0..4] == TRANSFORM_PROTOCOL_ID {
-                trace!("recv_compound: detected encryption transform header, decrypting");
-                let decrypted = self.decrypt_bytes(&raw)?;
-                (decrypted, true)
-            } else {
-                (raw, false)
-            };
-
-            // Check for compression transform header and decompress if needed.
-            let decompressed = if raw.len() >= 4 && raw[0..4] == COMPRESSION_PROTOCOL_ID {
-                trace!("recv_compound: detected compression transform header, decompressing");
-                decompress_response(&raw)?
-            } else {
-                raw
-            };
-
-            // Check if this is an unsolicited oplock break (MessageId = 0xFFFF...).
-            // Parse the MessageId from the raw header bytes (offset 24..32).
-            if decompressed.len() >= Header::SIZE {
-                let msg_id = u64::from_le_bytes(decompressed[24..32].try_into().unwrap());
-                if msg_id == MessageId::UNSOLICITED.0 {
-                    debug!("recv_compound: skipping unsolicited oplock break notification");
-                    continue;
-                }
-            }
-
-            return Ok((decompressed, was_encrypted));
-        }
-    }
-
-    /// Parse a single preprocessed frame into one or more sub-responses,
-    /// splitting on `NextCommand` offsets, verifying signatures, and
-    /// updating credits.
-    fn parse_compound_frame(
-        &mut self,
-        resp_bytes: &[u8],
-        was_encrypted: bool,
-    ) -> Result<Vec<(Header, Vec<u8>)>> {
-        let mut results = Vec::new();
-        let mut offset = 0usize;
-
-        loop {
-            if offset + Header::SIZE > resp_bytes.len() {
-                return Err(Error::invalid_data(format!(
-                    "compound response truncated at offset {}: need {} bytes for header, but only {} remain",
-                    offset,
-                    Header::SIZE,
-                    resp_bytes.len() - offset,
-                )));
-            }
-
-            // All responses except the first must start at 8-byte aligned offsets.
-            if !results.is_empty() && offset % 8 != 0 {
-                return Err(Error::invalid_data(format!(
-                    "compound response at offset {} is not 8-byte aligned -- must disconnect",
-                    offset,
-                )));
-            }
-
-            // Verify signature on this sub-response if signing is active.
-            let sub_start = offset;
-
-            // Parse the header to get NextCommand.
-            let mut cursor = ReadCursor::new(&resp_bytes[offset..]);
-            let header = Header::unpack(&mut cursor)?;
-            let next_command = header.next_command;
-
-            // Determine the end of this sub-response.
-            let sub_end = if next_command > 0 {
-                offset + next_command as usize
-            } else {
-                resp_bytes.len()
-            };
-
-            if sub_end > resp_bytes.len() {
-                return Err(Error::invalid_data(format!(
-                    "compound NextCommand offset {} at position {} exceeds response length {}",
-                    next_command,
-                    offset,
-                    resp_bytes.len(),
-                )));
-            }
-
-            // Verify signature on the sub-response slice if needed.
-            // Skip if the message was encrypted (AEAD already authenticated).
-            if self.should_sign && !was_encrypted {
-                let sub_slice = &resp_bytes[sub_start..sub_end];
-                if sub_slice.len() >= 20 {
-                    // Length already checked (>= 20), so these slices are always 4 bytes.
-                    let flags = u32::from_le_bytes(sub_slice[16..20].try_into().unwrap());
-                    let is_signed = (flags & HeaderFlags::SIGNED) != 0;
-                    let status = u32::from_le_bytes(sub_slice[8..12].try_into().unwrap());
-                    let is_pending = status == NtStatus::PENDING.0;
-
-                    if is_signed && !is_pending {
-                        if let (Some(key), Some(algo)) =
-                            (&self.signing_key, &self.signing_algorithm)
-                        {
-                            signing::verify_signature(
-                                sub_slice,
-                                key,
-                                *algo,
-                                header.message_id.0,
-                                false,
-                            )?;
-                        }
-                    }
-                }
-            }
-
-            // Update credits from this sub-response.
-            if header.credits > 0 {
-                self.credits = self.credits.saturating_add(header.credits);
-            }
-            // Consume credits for the request that generated this response.
-            self.credits = self.credits.saturating_sub(header.credit_charge.0);
-
-            debug!(
-                "recv_compound: cmd={:?}, status={:?}, msg_id={}, credits={}",
-                header.command, header.status, header.message_id.0, self.credits,
-            );
-
-            // Extract the body bytes (everything after the header in this sub-response).
-            let body_start = offset + Header::SIZE;
-            let body_bytes = if body_start < sub_end {
-                resp_bytes[body_start..sub_end].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            results.push((header, body_bytes));
-
-            if next_command == 0 {
-                break;
-            }
-            offset += next_command as usize;
-        }
-
         Ok(results)
     }
 
     /// Send a CANCEL request for an outstanding operation.
-    ///
-    /// CANCEL is best-effort -- the server may or may not honor it.
-    /// It does NOT consume a credit or allocate a new MessageId.
-    ///
-    /// If `async_id` is `Some`, the request has received STATUS_PENDING
-    /// and CANCEL uses the async header format (with `SMB2_FLAGS_ASYNC_COMMAND`
-    /// and the AsyncId). Otherwise it uses the original MessageId in a
-    /// sync header.
-    ///
-    /// CANCEL does not expect a response -- the canceled operation's response
-    /// (which may already be in flight) serves as the implicit response.
-    ///
-    /// Reference: MS-SMB2 section 3.2.4.24.
     pub async fn send_cancel(
         &mut self,
         original_msg_id: MessageId,
@@ -1178,27 +791,31 @@ impl Connection {
     ) -> Result<()> {
         use crate::msg::cancel::CancelRequest;
 
+        let (should_sign, should_encrypt) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (c.should_sign, c.should_encrypt)
+        };
+        let session_id = self.session_id();
+
         let mut header = Header::new_request(Command::Cancel);
         header.message_id = original_msg_id;
         header.credit_charge = CreditCharge(0);
-        header.credits = 0; // Don't request credits on CANCEL.
-        header.session_id = self.session_id;
+        header.credits = 0;
+        header.session_id = session_id;
 
         if let Some(aid) = async_id {
             header.flags.set_async();
             header.async_id = Some(aid);
             header.tree_id = None;
         }
-
-        // Signing and encryption are mutually exclusive (pitfall #4).
-        if self.should_sign && !self.should_encrypt {
+        if should_sign && !should_encrypt {
             header.flags.set_signed();
         }
 
         let body = CancelRequest;
         let mut msg_bytes = pack_message(&header, &body);
 
-        if self.should_encrypt {
+        if should_encrypt {
             let encrypted = self.encrypt_bytes(&msg_bytes)?;
             self.sender.send(&encrypted).await?;
             debug!(
@@ -1206,41 +823,42 @@ impl Connection {
                 original_msg_id.0, async_id
             );
         } else {
-            // Sign after packing, if signing is active.
-            if self.should_sign {
-                if let (Some(key), Some(algo)) = (&self.signing_key, &self.signing_algorithm) {
+            if should_sign {
+                let c = self.inner.crypto.lock().unwrap();
+                if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
                     signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
                 }
             }
-
             self.sender.send(&msg_bytes).await?;
             debug!(
                 "send_cancel: msg_id={}, async_id={:?}, signed={}",
-                original_msg_id.0, async_id, self.should_sign
+                original_msg_id.0, async_id, should_sign
             );
         }
-
-        // CANCEL does NOT consume a credit and does NOT advance next_message_id.
         Ok(())
     }
 
     /// Encrypt plaintext into a TRANSFORM_HEADER + ciphertext frame.
-    fn encrypt_bytes(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let enc_key = self
+    fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut c = self.inner.crypto.lock().unwrap();
+        let enc_key = c
             .encryption_key
             .as_ref()
-            .ok_or_else(|| Error::invalid_data("encryption active but no encryption key"))?;
-        let cipher = self
+            .ok_or_else(|| Error::invalid_data("encryption active but no encryption key"))?
+            .clone();
+        let cipher = c
             .encryption_cipher
             .ok_or_else(|| Error::invalid_data("encryption active but no cipher"))?;
-        let nonce = self
+        let session_id = c.session_id.0;
+        let nonce = c
             .nonce_gen
             .as_mut()
             .ok_or_else(|| Error::invalid_data("encryption active but no nonce generator"))?
             .next(cipher);
+        drop(c);
 
         let (transform_header, ciphertext) =
-            encryption::encrypt_message(plaintext, enc_key, cipher, &nonce, self.session_id.0)?;
+            encryption::encrypt_message(plaintext, &enc_key, cipher, &nonce, session_id)?;
 
         let mut encrypted = transform_header;
         encrypted.extend_from_slice(&ciphertext);
@@ -1255,49 +873,105 @@ impl Connection {
         Ok(encrypted)
     }
 
-    /// Decrypt a TRANSFORM_HEADER + ciphertext frame into plaintext.
-    fn decrypt_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let dec_key = self.decryption_key.as_ref().ok_or_else(|| {
-            Error::invalid_data("received encrypted message but no decryption key")
-        })?;
-        let cipher = self
-            .encryption_cipher
-            .ok_or_else(|| Error::invalid_data("received encrypted message but no cipher"))?;
-
-        if data.len() < TransformHeader::SIZE {
-            return Err(Error::invalid_data(
-                "encrypted message too short for TransformHeader",
-            ));
-        }
-
-        let transform_header = &data[..TransformHeader::SIZE];
-        let ciphertext = &data[TransformHeader::SIZE..];
-
-        let plaintext = encryption::decrypt_message(transform_header, ciphertext, dec_key, cipher)?;
-
-        trace!(
-            "decrypt: ciphertext={} bytes, plaintext={} bytes",
-            ciphertext.len(),
-            plaintext.len()
-        );
-
-        Ok(plaintext)
-    }
-
-    /// Register a tree as DFS-enabled. Called by `Tree::connect` when the
-    /// share has the DFS capability flag.
+    /// Register a tree as DFS-enabled.
     pub fn register_dfs_tree(&mut self, tree_id: TreeId) {
         self.dfs_trees.insert(tree_id);
     }
 
-    /// Deregister a tree from DFS tracking. Called by `Tree::disconnect`.
+    /// Deregister a tree from DFS tracking.
     pub fn deregister_dfs_tree(&mut self, tree_id: TreeId) {
         self.dfs_trees.remove(&tree_id);
     }
 
-    /// Check whether the DFS flag should be set for a given tree ID.
     fn should_set_dfs_flag(&self, tree_id: Option<TreeId>) -> bool {
         tree_id.is_some_and(|id| self.dfs_trees.contains(&id))
+    }
+
+    /// Allocate `charge` consecutive MessageIds and return the first.
+    fn allocate_msg_id(&self, charge: u64) -> MessageId {
+        let first = self.inner.next_message_id.fetch_add(charge, Ordering::SeqCst);
+        MessageId(first)
+    }
+
+    /// Register a waiter in the shared map and return the Receiver.
+    fn register_waiter(&self, msg_id: MessageId) -> oneshot::Receiver<Result<RoutedFrame>> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.waiters.lock().unwrap().insert(msg_id, tx);
+        rx
+    }
+
+    /// Remove a waiter from the map (used on send error).
+    fn remove_waiter(&self, msg_id: MessageId) {
+        self.inner.waiters.lock().unwrap().remove(&msg_id);
+    }
+
+    /// Remove the last-pushed fifo entry matching `msg_id` and remove its
+    /// map entry — used when a send fails after registration.
+    fn cancel_last_waiter(&mut self, msg_id: MessageId) {
+        self.pending_fifo.pop_back();
+        self.remove_waiter(msg_id);
+    }
+
+    /// Get the next response for the caller.
+    ///
+    /// Production (orphan filter ON): pops the next `oneshot::Receiver`
+    /// from `pending_fifo` and awaits it — the receiver task routes by
+    /// msg_id to the matching sender.
+    ///
+    /// Test mode (orphan filter OFF): ignores the fifo for data delivery
+    /// and reads from the fallback batch channel instead. Mock responses
+    /// in tests hardcode `MessageId(0)` which doesn't match caller-allocated
+    /// msg_ids, so per-waiter routing doesn't apply. We still drain the
+    /// fifo on the side so drops are clean.
+    async fn await_next_response(&mut self) -> Result<RoutedFrame> {
+        let filter_on = self.inner.orphan_filter_enabled.load(Ordering::Acquire);
+        if filter_on {
+            if let Some(rx) = self.pending_fifo.pop_front() {
+                return match rx.await {
+                    Ok(Ok(frame)) => Ok(frame),
+                    Ok(Err(e)) => Err(e),
+                    Err(_canceled) => Err(Error::Disconnected),
+                };
+            }
+            return Err(Error::invalid_data(
+                "receive_response called without a pending request (orphan filter enabled)",
+            ));
+        }
+        // Filter off (test mode): buffer → fallback channel.
+        // Drop any fifo entry at the front (its response is going through fallback).
+        self.pending_fifo.pop_front();
+        if let Some(frame) = self.orphan_fallback_buffer.lock().unwrap().pop_front() {
+            return Ok(frame);
+        }
+        // Take the rx temporarily (std::sync::Mutex can't be held across await).
+        let rx_opt = self.orphan_fallback_rx.lock().unwrap().take();
+        let mut rx = match rx_opt {
+            Some(r) => r,
+            None => {
+                return Err(Error::invalid_data(
+                    "receive_response called with orphan filter off but no fallback configured",
+                ));
+            }
+        };
+        let result = rx.recv().await;
+        *self.orphan_fallback_rx.lock().unwrap() = Some(rx);
+        match result {
+            Some(Ok(mut batch)) => {
+                if batch.is_empty() {
+                    return Err(Error::Disconnected);
+                }
+                let first = batch.remove(0);
+                if !batch.is_empty() {
+                    let mut buf = self.orphan_fallback_buffer.lock().unwrap();
+                    for f in batch {
+                        buf.push_back(f);
+                    }
+                }
+                Ok(first)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(Error::Disconnected),
+        }
     }
 
     #[cfg(test)]
@@ -1307,33 +981,387 @@ impl Connection {
 
     /// Mark a MessageId as in-flight (test-only).
     ///
-    /// Normally `send_request` / `send_compound` populate the `pending` set
-    /// automatically. Tests that feed canned responses to `receive_response`
-    /// directly — without going through the send path — use this to simulate
-    /// "we sent a request with this MessageId and are awaiting its response".
-    ///
-    /// Without this, the orphan filter in `receive_response` would drop the
-    /// test's response as unexpected.
+    /// Registers a waiter in the shared map AND pushes the receiver onto
+    /// the caller's FIFO, simulating "caller just sent this request". For
+    /// the specific scenario of simulating a dropped-caller future (aborted
+    /// task), use [`Self::test_mark_pending_dropped`] instead.
     #[cfg(test)]
     pub(crate) fn test_mark_pending(&mut self, msg_id: MessageId) {
-        self.pending.insert(msg_id);
+        let rx = self.register_waiter(msg_id);
+        self.pending_fifo.push_back(rx);
+    }
+
+    /// Register a waiter in the map but immediately drop its receiver,
+    /// simulating "caller sent this request then was cancelled" (test-only).
+    ///
+    /// When the response arrives, the receiver task routes it to the Sender
+    /// and `send()` fails silently — the frame is discarded, credits still
+    /// apply.
+    #[cfg(test)]
+    pub(crate) fn test_mark_pending_dropped(&mut self, msg_id: MessageId) {
+        let _rx = self.register_waiter(msg_id);
+        // drop _rx immediately, leaving only the Sender in the map
     }
 
     /// Enable or disable the orphan-response filter (test-only).
-    ///
-    /// Production: always on (set at construction). Tests that rely on the
-    /// `build_*_response` helpers — which hardcode `MessageId(0)` and don't
-    /// track the caller's `next_message_id` advance — call this with `false`
-    /// in their setup helpers so responses aren't dropped as orphans.
-    /// Orphan-filter coverage lives in dedicated tests that assign explicit
-    /// MessageIds (see the orphan-response tests in this file).
     #[cfg(test)]
     pub(crate) fn set_orphan_filter_enabled(&mut self, enabled: bool) {
-        self.orphan_filter_enabled = enabled;
+        self.inner
+            .orphan_filter_enabled
+            .store(enabled, Ordering::Release);
+        if !enabled {
+            // Install a fallback channel: the receiver task pushes
+            // unmatched frames here, and receive_response falls back to
+            // reading from it when the fifo is empty.
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.inner.orphan_fallback_tx.lock().unwrap() = Some(tx);
+            *self.orphan_fallback_rx.lock().unwrap() = Some(rx);
+        } else {
+            *self.inner.orphan_fallback_tx.lock().unwrap() = None;
+            *self.orphan_fallback_rx.lock().unwrap() = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_credits(&mut self, credits: u16) {
+        self.inner
+            .credits
+            .store(credits as u32, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_message_id(&mut self, id: u64) {
+        self.inner.next_message_id.store(id, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_compression_enabled(&mut self, enabled: bool) {
+        self.compression_enabled = enabled;
     }
 }
 
-/// Pack a header + body into raw SMB2 message bytes (no transport framing).
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Abort the receiver task. Dropping the transport's read half will
+        // also cause the task to exit on its next receive call, but we
+        // also abort for immediate cleanup.
+        if let Some(handle) = self.receiver_task.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Receiver task loop: owns the transport receive half, routes each frame
+/// to its waiter.
+async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inner>) {
+    loop {
+        let raw = match transport_recv.receive().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                debug!("receiver_loop: transport error: {}, shutting down", e);
+                fan_error_to_waiters(&inner, &e);
+                return;
+            }
+        };
+        trace!("receiver_loop: received {} bytes", raw.len());
+
+        // Decrypt if TRANSFORM_HEADER.
+        let (decoded, was_encrypted) = if raw.len() >= 4 && raw[0..4] == TRANSFORM_PROTOCOL_ID {
+            match decrypt_frame(&raw, &inner) {
+                Ok(plain) => (plain, true),
+                Err(e) => {
+                    warn!("receiver_loop: decrypt failed: {}, skipping frame", e);
+                    continue;
+                }
+            }
+        } else {
+            (raw, false)
+        };
+
+        // Decompress if COMPRESSION_HEADER.
+        let decoded = if decoded.len() >= 4 && decoded[0..4] == COMPRESSION_PROTOCOL_ID {
+            match decompress_response(&decoded) {
+                Ok(plain) => plain,
+                Err(e) => {
+                    warn!("receiver_loop: decompress failed: {}, skipping frame", e);
+                    continue;
+                }
+            }
+        } else {
+            decoded
+        };
+
+        // Split by NextCommand.
+        let sub_frames = match split_compound(&decoded) {
+            Ok(subs) => subs,
+            Err(e) => {
+                warn!("receiver_loop: malformed frame: {}, skipping", e);
+                continue;
+            }
+        };
+
+        // Produce a list of routable entries for this transport frame.
+        // Each entry is (msg_id, Result<RoutedFrame>, was_pending_or_oplock).
+        // Frames that should NOT be forwarded to a waiter (oplock break,
+        // STATUS_PENDING interim) are marked as such.
+        let mut routable: Vec<(MessageId, Result<RoutedFrame>)> = Vec::new();
+        for sub in sub_frames {
+            match prepare_sub_frame(&sub, was_encrypted, &inner) {
+                Ok(Some((msg_id, routed))) => routable.push((msg_id, Ok(routed))),
+                Ok(None) => { /* skip (oplock break, STATUS_PENDING, etc.) */ }
+                Err((msg_id, e)) => routable.push((msg_id, Err(e))),
+            }
+        }
+
+        if routable.is_empty() {
+            continue;
+        }
+
+        // Decide routing per filter mode.
+        let filter_on = inner.orphan_filter_enabled.load(Ordering::Acquire);
+        if filter_on {
+            for (msg_id, result) in routable {
+                let maybe_tx = inner.waiters.lock().unwrap().remove(&msg_id);
+                match maybe_tx {
+                    Some(tx) => {
+                        if tx.send(result).is_err() {
+                            trace!(
+                                "recv: late arrival for dropped waiter, msg_id={}",
+                                msg_id.0
+                            );
+                        }
+                    }
+                    None => {
+                        debug!("recv: orphan dropped, msg_id={}", msg_id.0);
+                    }
+                }
+            }
+        } else {
+            // Filter disabled (test mode): push ALL sub-frames as ONE batch
+            // to the fallback channel, ignoring waiter routing. Tests that
+            // disable the filter use mock responses with hardcoded msg_ids
+            // (typically 0) that don't match the caller's registered
+            // msg_ids. However, an explicit "dropped caller" waiter still
+            // needs to consume its response so the Sender is dropped
+            // cleanly — so we do route if a waiter matches, but we also
+            // push the frame to fallback (so receive_response from any
+            // caller can retrieve it).
+            let mut fallback_batch: Vec<RoutedFrame> = Vec::new();
+            let mut fallback_err: Option<Error> = None;
+            for (msg_id, result) in routable {
+                // Clean up any matching waiter (fire-and-forget).
+                let _ = inner.waiters.lock().unwrap().remove(&msg_id);
+                match result {
+                    Ok(frame) => fallback_batch.push(frame),
+                    Err(e) => {
+                        fallback_err = Some(e);
+                    }
+                }
+            }
+            if !fallback_batch.is_empty() || fallback_err.is_some() {
+                let fallback = inner.orphan_fallback_tx.lock().unwrap().clone();
+                if let Some(tx) = fallback {
+                    let payload = match fallback_err {
+                        Some(e) => Err(e),
+                        None => Ok(fallback_batch),
+                    };
+                    let _ = tx.send(payload);
+                }
+            }
+        }
+    }
+}
+
+/// Prepare a routable sub-frame from raw bytes. Returns Ok(Some(...)) if
+/// the frame should be forwarded, Ok(None) if it should be skipped
+/// (oplock break, STATUS_PENDING), Err((msg_id, e)) if signature
+/// verification failed and the error should be delivered to the waiter.
+fn prepare_sub_frame(
+    sub: &[u8],
+    was_encrypted: bool,
+    inner: &Inner,
+) -> std::result::Result<Option<(MessageId, RoutedFrame)>, (MessageId, Error)> {
+    // Parse the header.
+    let mut cursor = ReadCursor::new(sub);
+    let header = match Header::unpack(&mut cursor) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("recv: header parse error: {}, skipping sub-frame", e);
+            return Ok(None);
+        }
+    };
+
+    // Always update credits.
+    if header.credits > 0 {
+        let prev = inner.credits.load(Ordering::Relaxed) as u16;
+        let next = prev.saturating_add(header.credits);
+        inner.credits.store(next as u32, Ordering::Release);
+    }
+
+    // Oplock break notification: MessageId=UNSOLICITED. Skip silently.
+    if header.message_id == MessageId::UNSOLICITED {
+        debug!(
+            "recv: skipping unsolicited oplock break notification, cmd={:?}",
+            header.command
+        );
+        return Ok(None);
+    }
+
+    // STATUS_PENDING is an interim response — don't forward, keep waiter.
+    if header.status.is_pending() {
+        debug!(
+            "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}",
+            header.command, header.message_id.0
+        );
+        return Ok(None);
+    }
+
+    // Consume credit_charge (or 1 if zero).
+    let consume = header.credit_charge.0.max(1);
+    let prev = inner.credits.load(Ordering::Relaxed) as u16;
+    inner
+        .credits
+        .store(prev.saturating_sub(consume) as u32, Ordering::Release);
+
+    // Verify signature if signing is active and not encrypted.
+    let (should_sign, signing_key, signing_algorithm) = {
+        let c = inner.crypto.lock().unwrap();
+        (c.should_sign, c.signing_key.clone(), c.signing_algorithm)
+    };
+    if should_sign && !was_encrypted && sub.len() >= Header::SIZE {
+        let flags = u32::from_le_bytes(sub[16..20].try_into().unwrap());
+        let is_signed = (flags & HeaderFlags::SIGNED) != 0;
+        let status = u32::from_le_bytes(sub[8..12].try_into().unwrap());
+        let is_pending = status == NtStatus::PENDING.0;
+        if is_signed && !is_pending {
+            if let (Some(key), Some(algo)) = (signing_key, signing_algorithm) {
+                if let Err(e) =
+                    signing::verify_signature(sub, &key, algo, header.message_id.0, false)
+                {
+                    return Err((header.message_id, e));
+                }
+            }
+        }
+    }
+
+    // Special status handling: session expired → error.
+    if header.status == NtStatus::NETWORK_SESSION_EXPIRED {
+        warn!(
+            "recv: session expired (STATUS_NETWORK_SESSION_EXPIRED), cmd={:?}, msg_id={}",
+            header.command, header.message_id.0
+        );
+        return Err((header.message_id, Error::SessionExpired));
+    }
+
+    let body = if sub.len() > Header::SIZE {
+        sub[Header::SIZE..].to_vec()
+    } else {
+        Vec::new()
+    };
+    let raw = sub.to_vec();
+    let msg_id = header.message_id;
+    Ok(Some((msg_id, RoutedFrame { header, body, raw })))
+}
+
+/// Fan the given error (as best we can clone it) to every pending waiter
+/// and clear the waiters map. Also close the orphan fallback.
+fn fan_error_to_waiters(inner: &Inner, e: &Error) {
+    let drained: Vec<(MessageId, oneshot::Sender<Result<RoutedFrame>>)> = {
+        let mut waiters = inner.waiters.lock().unwrap();
+        waiters.drain().collect()
+    };
+    for (_id, tx) in drained {
+        let _ = tx.send(Err(clone_err_as_disconnected(e)));
+    }
+    let fallback_tx = inner.orphan_fallback_tx.lock().unwrap().clone();
+    if let Some(tx) = fallback_tx {
+        let _ = tx.send(Err(clone_err_as_disconnected(e)));
+    }
+    // Close fallback channel too (dropping tx) — next .recv() returns None.
+    *inner.orphan_fallback_tx.lock().unwrap() = None;
+}
+
+/// Best-effort error clone: `Error` isn't `Clone` (Io holds std::io::Error).
+/// Everything maps to `Error::Disconnected` for waiter-fan-out purposes —
+/// waiters only need to know "the connection died".
+fn clone_err_as_disconnected(_e: &Error) -> Error {
+    Error::Disconnected
+}
+
+fn decrypt_frame(data: &[u8], inner: &Inner) -> Result<Vec<u8>> {
+    let c = inner.crypto.lock().unwrap();
+    let dec_key = c
+        .decryption_key
+        .as_ref()
+        .ok_or_else(|| Error::invalid_data("received encrypted message but no decryption key"))?
+        .clone();
+    let cipher = c
+        .encryption_cipher
+        .ok_or_else(|| Error::invalid_data("received encrypted message but no cipher"))?;
+    drop(c);
+
+    if data.len() < TransformHeader::SIZE {
+        return Err(Error::invalid_data(
+            "encrypted message too short for TransformHeader",
+        ));
+    }
+
+    let transform_header = &data[..TransformHeader::SIZE];
+    let ciphertext = &data[TransformHeader::SIZE..];
+    let plaintext = encryption::decrypt_message(transform_header, ciphertext, &dec_key, cipher)?;
+    Ok(plaintext)
+}
+
+/// Split a preprocessed frame into sub-frames by `NextCommand` offsets.
+/// Returns the raw byte slices (as owned Vec<u8>) for each sub-frame.
+fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut results = Vec::new();
+    let mut offset = 0usize;
+
+    loop {
+        if offset + Header::SIZE > data.len() {
+            return Err(Error::invalid_data(format!(
+                "compound response truncated at offset {}: need {} bytes for header, but only {} remain",
+                offset,
+                Header::SIZE,
+                data.len() - offset,
+            )));
+        }
+
+        if !results.is_empty() && offset % 8 != 0 {
+            return Err(Error::invalid_data(format!(
+                "compound response at offset {} is not 8-byte aligned -- must disconnect",
+                offset,
+            )));
+        }
+
+        // Parse NextCommand directly from header bytes 20..24.
+        let next_cmd = u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap());
+        let sub_end = if next_cmd > 0 {
+            offset + next_cmd as usize
+        } else {
+            data.len()
+        };
+
+        if sub_end > data.len() {
+            return Err(Error::invalid_data(format!(
+                "compound NextCommand offset {} at position {} exceeds response length {}",
+                next_cmd,
+                offset,
+                data.len(),
+            )));
+        }
+
+        results.push(data[offset..sub_end].to_vec());
+        if next_cmd == 0 {
+            break;
+        }
+        offset += next_cmd as usize;
+    }
+    Ok(results)
+}
+
+/// Pack a header + body into raw SMB2 message bytes.
 pub(crate) fn pack_message(header: &Header, body: &dyn Pack) -> Vec<u8> {
     let mut cursor = WriteCursor::new();
     header.pack(&mut cursor);
@@ -1341,7 +1369,6 @@ pub(crate) fn pack_message(header: &Header, body: &dyn Pack) -> Vec<u8> {
     cursor.into_inner()
 }
 
-/// Generate a random GUID.
 fn generate_guid() -> Guid {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("failed to generate random GUID");
@@ -1355,17 +1382,12 @@ fn generate_guid() -> Guid {
     }
 }
 
-/// Generate a 32-byte random salt for preauth integrity.
 fn generate_salt() -> Vec<u8> {
     let mut salt = vec![0u8; 32];
     getrandom::fill(&mut salt).expect("failed to generate random salt");
     salt
 }
 
-/// Build a compressed frame: CompressionTransformHeader + uncompressed prefix + compressed data.
-///
-/// The header is 16 bytes (unchained mode). The offset field tells the receiver
-/// how many uncompressed bytes precede the compressed data.
 fn build_compressed_frame(compressed: &CompressedMessage) -> Vec<u8> {
     let header = CompressionTransformHeader {
         original_compressed_segment_size: compressed.original_size,
@@ -1373,7 +1395,6 @@ fn build_compressed_frame(compressed: &CompressedMessage) -> Vec<u8> {
         flags: SMB2_COMPRESSION_FLAG_NONE,
         offset_or_length: compressed.offset,
     };
-
     let mut cursor = WriteCursor::new();
     header.pack(&mut cursor);
     let mut frame = cursor.into_inner();
@@ -1382,37 +1403,28 @@ fn build_compressed_frame(compressed: &CompressedMessage) -> Vec<u8> {
     frame
 }
 
-/// Decompress a response that starts with a CompressionTransformHeader.
-///
-/// Parses the 16-byte unchained header, extracts the uncompressed prefix and
-/// compressed data, decompresses, and returns the reconstructed full message.
 fn decompress_response(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < CompressionTransformHeader::SIZE {
         return Err(Error::invalid_data(
             "compressed response too short for CompressionTransformHeader",
         ));
     }
-
     let mut cursor = ReadCursor::new(data);
     let header = CompressionTransformHeader::unpack(&mut cursor)?;
-
     if header.compression_algorithm != COMPRESSION_ALGORITHM_LZ4 {
         return Err(Error::invalid_data(format!(
             "unsupported compression algorithm 0x{:04X}, only LZ4 (0x{:04X}) is supported",
             header.compression_algorithm, COMPRESSION_ALGORITHM_LZ4
         )));
     }
-
     if header.flags != SMB2_COMPRESSION_FLAG_NONE {
         return Err(Error::invalid_data(format!(
             "unsupported compression flags 0x{:04X}, only unchained (0x0000) is supported",
             header.flags
         )));
     }
-
     let offset = header.offset_or_length as usize;
     let remaining = &data[CompressionTransformHeader::SIZE..];
-
     if offset > remaining.len() {
         return Err(Error::invalid_data(format!(
             "compression offset {} exceeds remaining data length {}",
@@ -1420,10 +1432,8 @@ fn decompress_response(data: &[u8]) -> Result<Vec<u8>> {
             remaining.len()
         )));
     }
-
     let uncompressed_prefix = &remaining[..offset];
     let compressed_data = &remaining[offset..];
-
     decompress_message(
         uncompressed_prefix,
         compressed_data,
@@ -1431,9 +1441,7 @@ fn decompress_response(data: &[u8]) -> Result<Vec<u8>> {
     )
 }
 
-// We need Arc-based TransportSend/TransportReceive for TcpTransport sharing.
-use std::sync::Arc;
-
+// Arc-based TransportSend/TransportReceive for TcpTransport sharing.
 #[async_trait::async_trait]
 impl<T: TransportSend> TransportSend for Arc<T> {
     async fn send(&self, data: &[u8]) -> Result<()> {
@@ -1447,6 +1455,7 @@ impl<T: TransportReceive> TransportReceive for Arc<T> {
         (**self).receive().await
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1602,7 +1611,7 @@ mod tests {
         conn.set_orphan_filter_enabled(false);
 
         // Manually set past negotiate.
-        conn.next_message_id = 5;
+        conn.set_next_message_id(5);
 
         use crate::msg::tree_disconnect::TreeDisconnectRequest;
         let body = TreeDisconnectRequest;
@@ -1627,7 +1636,7 @@ mod tests {
         // Activate signing.
         let key = vec![0xAA; 16];
         conn.activate_signing(key, SigningAlgorithm::HmacSha256);
-        conn.session_id = SessionId(0x1234);
+        conn.set_session_id(SessionId(0x1234));
 
         use crate::msg::tree_disconnect::TreeDisconnectRequest;
         let body = TreeDisconnectRequest;
@@ -1798,7 +1807,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
+        conn.set_credits(256);
 
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -1888,7 +1897,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
+        conn.set_credits(256);
 
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -1972,7 +1981,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let responses = conn.receive_compound().await.unwrap();
 
@@ -2011,7 +2020,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let responses = conn.receive_compound_expected(3).await.unwrap();
 
@@ -2052,7 +2061,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let responses = conn.receive_compound_expected(3).await.unwrap();
 
@@ -2098,7 +2107,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let responses = conn.receive_compound_expected(3).await.unwrap();
 
@@ -2135,7 +2144,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         // We ask for 2 but the frame contains 3 -- should error.
         let err = conn.receive_compound_expected(2).await.unwrap_err();
@@ -2155,7 +2164,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
+        conn.set_credits(256);
 
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2222,7 +2231,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 3;
+        conn.set_credits(3);
 
         let _responses = conn.receive_compound().await.unwrap();
 
@@ -2400,8 +2409,8 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
-        conn.compression_enabled = true;
+        conn.set_credits(256);
+        conn.set_compression_enabled(true);
 
         // Build a request with highly compressible payload.
         // We need a body that produces bytes larger than Header::SIZE.
@@ -2459,8 +2468,8 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
-        conn.compression_enabled = false; // Compression disabled.
+        conn.set_credits(256);
+        conn.set_compression_enabled(false); // Compression disabled.
 
         // Build a request with compressible payload.
         use crate::msg::write::WriteRequest;
@@ -2533,7 +2542,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let (header, body, raw) = conn.receive_response().await.unwrap();
         assert_eq!(header.command, Command::Read);
@@ -2566,7 +2575,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let (header, _body, raw) = conn.receive_response().await.unwrap();
         assert_eq!(header.command, Command::Echo);
@@ -2686,7 +2695,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let (header, _body, _raw) = conn.receive_response().await.unwrap();
 
@@ -2714,7 +2723,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let (header, _body, _raw) = conn.receive_response().await.unwrap();
 
@@ -2747,7 +2756,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let responses = conn.receive_compound().await.unwrap();
 
@@ -2853,8 +2862,8 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        conn.credits = 10;
-        conn.next_message_id = 5;
+        conn.set_credits(10);
+        conn.set_next_message_id(5);
 
         // Simulate having just sent a Create with msg_id=4: mark it as the
         // MessageId we're waiting on. receive_response must return this
@@ -2963,8 +2972,8 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        conn.credits = 10;
-        conn.next_message_id = 12;
+        conn.set_credits(10);
+        conn.set_next_message_id(12);
 
         // Caller sent 3 ops: Create (msg_id=9), QueryInfo (10), Close (11).
         conn.test_mark_pending(MessageId(9));
@@ -3027,13 +3036,17 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        conn.credits = 10;
+        conn.set_credits(10);
 
         // Simulate Task A: sent Create msg_id=4, then was aborted.
-        // `test_mark_pending` adds msg_id=4 to the in-flight set (Phase 1)
-        // or registers a dead waiter in the map (Phase 2 evolution).
-        conn.next_message_id = 4;
-        conn.test_mark_pending(MessageId(4));
+        // `test_mark_pending_dropped` registers the Sender in the map but
+        // immediately drops the Receiver — exactly the "caller's future
+        // was cancelled" state this test is exercising. When msg_id=4's
+        // response arrives, the receiver task routes it to the Sender
+        // and the send fails silently (no Receiver); the frame is
+        // discarded.
+        conn.set_next_message_id(4);
+        conn.test_mark_pending_dropped(MessageId(4));
 
         // Task A's response arrives late on the wire.
         mock.queue_response(build_create_response_with_msg_id(
@@ -3045,9 +3058,8 @@ mod tests {
         ));
 
         // Task B: allocate msg_id=5 (simulating the send that would happen).
-        // In Phase 1, the next send_request would set next_message_id=5 → 6.
-        // We manipulate directly to keep the test surgical.
-        conn.next_message_id = 6;
+        // Live waiter — B will actually await this one.
+        conn.set_next_message_id(6);
         conn.test_mark_pending(MessageId(5));
 
         // B's response (its own Create).
@@ -3108,8 +3120,8 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        conn.credits = 10;
-        conn.next_message_id = 4;
+        conn.set_credits(10);
+        conn.set_next_message_id(4);
 
         // Caller sent two Creates (msg_id=4 and msg_id=5).
         conn.test_mark_pending(MessageId(4));
@@ -3176,11 +3188,11 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        conn.credits = 10;
-        conn.next_message_id = 4;
+        conn.set_credits(10);
+        conn.set_next_message_id(4);
 
-        // Task A: sent, aborted. msg_id=4 left in pending.
-        conn.test_mark_pending(MessageId(4));
+        // Task A: sent, aborted. msg_id=4 has a dead waiter.
+        conn.test_mark_pending_dropped(MessageId(4));
 
         // A's late response — carries +100 credits in the header.
         let a_frame = {
@@ -3210,7 +3222,7 @@ mod tests {
         mock.queue_response(a_frame);
 
         // B sends msg_id=5.
-        conn.next_message_id = 6;
+        conn.set_next_message_id(6);
         conn.test_mark_pending(MessageId(5));
         mock.queue_response(build_create_response_with_msg_id(
             FileId {
@@ -3261,8 +3273,8 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        conn.credits = 10;
-        conn.next_message_id = 4;
+        conn.set_credits(10);
+        conn.set_next_message_id(4);
         conn.test_mark_pending(MessageId(4));
 
         // Queue a malformed frame (too short to be a valid SMB2 header),
@@ -3315,8 +3327,8 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.next_message_id = 10;
-        conn.credits = 5;
+        conn.set_next_message_id(10);
+        conn.set_credits(5);
 
         conn.send_cancel(MessageId(7), None).await.unwrap();
 
@@ -3335,7 +3347,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.session_id = SessionId(0xAAAA);
+        conn.set_session_id(SessionId(0xAAAA));
 
         conn.send_cancel(MessageId(42), None).await.unwrap();
 
@@ -3365,7 +3377,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.session_id = SessionId(0xBBBB);
+        conn.set_session_id(SessionId(0xBBBB));
 
         let async_id = 0x1234_5678_9ABC_DEF0u64;
         conn.send_cancel(MessageId(99), Some(async_id))
@@ -3397,7 +3409,7 @@ mod tests {
 
         let key = vec![0xCC; 16];
         conn.activate_signing(key, SigningAlgorithm::HmacSha256);
-        conn.session_id = SessionId(0xDDDD);
+        conn.set_session_id(SessionId(0xDDDD));
 
         conn.send_cancel(MessageId(50), None).await.unwrap();
 
@@ -3444,7 +3456,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 10;
+        conn.set_credits(10);
 
         let result = conn.receive_response().await;
         assert!(result.is_err());
@@ -3470,7 +3482,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 3;
+        conn.set_credits(3);
 
         let _ = conn.receive_response().await;
 
@@ -3501,7 +3513,7 @@ mod tests {
             compression_supported: false,
         });
         conn.set_session_id(SessionId(0xDEAD));
-        conn.credits = 10;
+        conn.set_credits(10);
 
         // 16-byte key for AES-128.
         let enc_key = vec![0x42; 16];
@@ -3724,7 +3736,7 @@ mod tests {
             compression_supported: false,
         });
         conn.set_session_id(SessionId(1));
-        conn.credits = 5;
+        conn.set_credits(5);
 
         let (_msg_id, _plaintext) = conn
             .send_request(Command::Echo, &EchoRequest, None)
@@ -3819,7 +3831,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
+        conn.set_credits(256);
 
         let tree_id = TreeId(7);
         conn.register_dfs_tree(tree_id);
@@ -3849,7 +3861,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
+        conn.set_credits(256);
 
         use crate::msg::echo::EchoRequest;
         let body = EchoRequest;
@@ -3875,7 +3887,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
+        conn.set_credits(256);
 
         let tree_id = TreeId(7);
         conn.register_dfs_tree(tree_id);
@@ -3905,7 +3917,7 @@ mod tests {
             "test-server",
         );
         conn.set_orphan_filter_enabled(false);
-        conn.credits = 256;
+        conn.set_credits(256);
 
         let tree_id = TreeId(42);
         conn.register_dfs_tree(tree_id);

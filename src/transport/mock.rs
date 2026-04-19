@@ -7,6 +7,9 @@
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
 use crate::transport::{TransportReceive, TransportSend};
@@ -14,19 +17,23 @@ use crate::transport::{TransportReceive, TransportSend};
 /// A mock transport that queues responses and records sent messages.
 ///
 /// Use this in tests to simulate server conversations without a real
-/// network connection. Responses are returned in FIFO order. When no
-/// responses remain, `receive()` returns [`Error::Disconnected`].
+/// network connection. Responses are returned in FIFO order.
 ///
-/// Uses `std::sync::Mutex` (not `tokio::sync::Mutex`) because the
-/// critical sections are trivially short (push/pop/clone) and never
-/// hold the lock across an `.await` point.
+/// `receive()` awaits on an internal `Notify` when the queue is empty,
+/// so the background receiver task doesn't exit prematurely between
+/// `queue_response` calls. Explicit disconnect is triggered by calling
+/// [`Self::close`].
 pub struct MockTransport {
     /// Responses to return on `receive()`, in order.
     responses: Mutex<VecDeque<Vec<u8>>>,
     /// Messages that were sent, for assertions.
     sent: Mutex<Vec<Vec<u8>>>,
-    /// How many times `receive()` was called (including those returning Disconnected).
+    /// How many times `receive()` was called successfully (returning Ok).
     receive_count: Mutex<usize>,
+    /// Wakes receivers when a response is queued or `close()` is called.
+    notify: Notify,
+    /// Set by `close()` to signal end-of-stream.
+    closed: AtomicBool,
 }
 
 impl MockTransport {
@@ -36,20 +43,35 @@ impl MockTransport {
             responses: Mutex::new(VecDeque::new()),
             sent: Mutex::new(Vec::new()),
             receive_count: Mutex::new(0),
+            notify: Notify::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Queue a response to be returned by the next `receive()` call.
     pub fn queue_response(&self, data: Vec<u8>) {
         self.responses.lock().unwrap().push_back(data);
+        self.notify.notify_one();
     }
 
     /// Queue multiple responses to be returned in order.
     pub fn queue_responses(&self, responses: Vec<Vec<u8>>) {
         let mut guard = self.responses.lock().unwrap();
+        let count = responses.len();
         for r in responses {
             guard.push_back(r);
         }
+        drop(guard);
+        for _ in 0..count {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Signal end-of-stream: after all queued responses are drained,
+    /// `receive()` returns `Err(Error::Disconnected)`.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     /// Get all messages that were sent.
@@ -122,16 +144,18 @@ impl TransportSend for MockTransport {
 #[async_trait]
 impl TransportReceive for MockTransport {
     async fn receive(&self) -> Result<Vec<u8>> {
-        let result = self
-            .responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or(Error::Disconnected);
-        if result.is_ok() {
-            *self.receive_count.lock().unwrap() += 1;
+        loop {
+            // Check queued data first.
+            if let Some(data) = self.responses.lock().unwrap().pop_front() {
+                *self.receive_count.lock().unwrap() += 1;
+                return Ok(data);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Disconnected);
+            }
+            // Wait for either a new response or a close signal.
+            self.notify.notified().await;
         }
-        result
     }
 }
 
@@ -160,8 +184,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_queued_responses_returns_disconnected() {
+    async fn close_causes_receive_to_return_disconnected() {
         let mock = MockTransport::new();
+        mock.close();
 
         let result = mock.receive().await;
         assert!(result.is_err());
@@ -239,7 +264,8 @@ mod tests {
         mock.send(&[0x03]).await.unwrap();
         assert_eq!(mock.receive().await.unwrap(), vec![0xF3]);
 
-        // No more responses.
+        // No more responses. Close to cause Disconnected.
+        mock.close();
         assert!(mock.receive().await.is_err());
 
         // All three sends recorded.
