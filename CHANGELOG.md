@@ -7,6 +7,21 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `Connection` now uses a background receiver task with per-request `oneshot::Sender` routing (Phase 2 of
+  the actor refactor). All public API signatures are preserved; the change is internal. See
+  `docs/specs/connection-actor.md`. A caller's dropped future (for example, `tokio::task::JoinHandle::abort()`
+  in a downstream consumer) now correctly discards the corresponding late-arriving response instead of
+  letting it pollute the next operation's receive. Credits still tick on dropped-caller frames so
+  throughput stays correct under cancellation churn.
+- `tokio` is formalized as a hard runtime requirement; added `"rt"` to the tokio feature set. The library
+  spawns a receiver task per `Connection`.
+- `MockTransport::receive()` now awaits via `tokio::sync::Notify` when the queue is empty instead of
+  returning `Err(Disconnected)` immediately. Added `MockTransport::close()` to signal end-of-stream. This
+  lets the background receiver task stay alive across a test's interleaved `queue_response` calls. External
+  consumers writing tests with `MockTransport` directly need to call `close()` to get the old behavior.
+
 ### Added
 
 - `FileWriter::abort()` -- fast-cancel companion to `finish()`. Discards any unsent data, drains in-flight
@@ -21,6 +36,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Caller futures that get dropped mid-flight (for example, a cancelled listing task in a consuming
+  application) no longer leave in-flight SMB requests on the wire that corrupt subsequent operations.
+  The receiver task discards late-arriving frames whose waiter's `oneshot::Receiver` has been dropped.
+  Reproduces and fixes the cmdr `listing_task.abort()` regression.
 - Compound requests no longer error with `invalid_data: expected N compound responses, got M` when the
   server sends responses as separate frames instead of one compounded frame. Per MS-SMB2 3.3.4.1.3 the
   server SHOULD compound but MAY split, and Samba (including QNAP NAS firmware built on Samba) splits
