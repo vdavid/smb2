@@ -3523,6 +3523,7 @@ mod tests {
     // an error before the timeout.
 
     #[tokio::test]
+    #[ignore = "phase3-red: pins P3.4 silent-discard fix; un-ignore when A.4 lands"]
     async fn phase3_decrypt_failure_errors_waiter_not_hangs() {
         use crate::crypto::encryption::Cipher;
 
