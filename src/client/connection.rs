@@ -3425,6 +3425,85 @@ mod tests {
         assert_eq!(header.command, Command::Create);
     }
 
+    // ── Phase 3 (silent-discard fix) red test ───────────────────────
+    //
+    // Pins the invariant that an unrecoverable frame-level error
+    // (decrypt failure, decompress failure, malformed header after
+    // decryption) MUST NOT silently discard the frame and leave the
+    // matching waiter hanging forever. The Phase 2 receiver task
+    // currently `log-at-WARN + continue`s on decrypt failure — the
+    // msg_id isn't recoverable from an unparseable frame, so there's
+    // no waiter to notify targeted; the only correct behavior is to
+    // tear down the connection and fan `Err(Disconnected)` to all
+    // pending waiters.
+    //
+    // This test uses `tokio::time::timeout` to detect the hang: if
+    // the waiter doesn't resolve within 2 seconds, it's hung (bug
+    // present, test fails). Post-P3.4 fix, the waiter resolves with
+    // an error before the timeout.
+
+    #[tokio::test]
+    async fn phase3_decrypt_failure_errors_waiter_not_hangs() {
+        use crate::crypto::encryption::Cipher;
+
+        let mock = Arc::new(MockTransport::new());
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(10);
+
+        // Activate encryption with a key that WON'T match what the
+        // malformed frame was "encrypted" with — decrypt will fail auth.
+        let enc_key = vec![0x42; 16];
+        let dec_key = vec![0x99; 16]; // deliberately wrong decryption key
+        conn.activate_encryption(enc_key, dec_key, Cipher::Aes128Gcm);
+
+        // Simulate: the caller sent msg_id=4 and is awaiting its response.
+        conn.test_mark_pending(MessageId(4));
+
+        // Build a frame that starts with TRANSFORM_PROTOCOL_ID so the
+        // receiver task takes the decrypt path, but whose ciphertext
+        // is garbage that will fail the GCM auth tag check. We craft a
+        // "valid-shape" transform header (52 bytes) plus ~64 bytes of
+        // garbage ciphertext. The receiver task's decrypt_frame call
+        // returns Err; currently it's log+continue (the bug).
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&TRANSFORM_PROTOCOL_ID); // 0xFD 'S' 'M' 'B'
+        frame.extend_from_slice(&[0u8; 16]); // signature
+        frame.extend_from_slice(&[0u8; 16]); // nonce
+        frame.extend_from_slice(&64u32.to_le_bytes()); // original_message_size
+        frame.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        frame.extend_from_slice(&1u16.to_le_bytes()); // flags (Encrypted)
+        frame.extend_from_slice(&0xDEADu64.to_le_bytes()); // session_id
+                                                           // Garbage ciphertext — will fail GCM auth on decrypt.
+        frame.extend_from_slice(&[0xAAu8; 64]);
+        mock.queue_response(frame);
+
+        // Await the waiter with a short timeout. If Phase 3's fix is in
+        // place, the receiver task tears down on decrypt failure and the
+        // waiter resolves with Err(Disconnected) quickly. Without the
+        // fix, the receiver task `log+continue`s, the waiter hangs, and
+        // the timeout fires (test fails).
+        let result = tokio::time::timeout(Duration::from_secs(2), conn.receive_response()).await;
+
+        assert!(
+            result.is_ok(),
+            "receive_response hung forever on a decrypt-failed frame — Phase 3's silent-discard \
+             fix must tear down the connection on unrecoverable frame errors and propagate \
+             Err(Disconnected) to pending waiters. Instead the receiver task silently discards \
+             the frame and the waiter never resolves. (P3.4 fixes this.)"
+        );
+        let waiter_result = result.unwrap();
+        assert!(
+            waiter_result.is_err(),
+            "receive_response should return an error on decrypt failure, not Ok. Got: {:?}",
+            waiter_result.as_ref().map(|_| "Ok(_)")
+        );
+    }
+
     // ── CANCEL tests (pitfall #7) ────────────────────────────────────
 
     #[tokio::test]

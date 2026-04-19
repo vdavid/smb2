@@ -6,13 +6,13 @@ This doc is the single source of truth during the refactor. Decisions are pinned
 
 ## Staging
 
-Three phases on `main`, each landed as a separate PR:
-
 1. **Phase 1 — `HashSet<MessageId>` demux (done, commit `750e07a`).** `Connection` tracks in-flight `MessageId`s in a `pending: HashSet<MessageId>`. `send_request` / `send_compound` insert; `receive_response` / `receive_compound_expected` skip frames whose MessageId isn't in the set (crediting them so throughput stays correct, logging at DEBUG). Zero public API change, zero caller change, ~260 LOC. Fixes the observed field bug for strictly-sequential callers.
 
-2. **Phase 2 — Actor task + `oneshot`-per-request routing (this PR).** Spawn a receiver task on `Connection::connect` that owns the read half of the transport and routes each frame to the `oneshot::Sender` registered for its `MessageId`. `send_request` / `send_compound` now register an `oneshot::Receiver` in a caller-local FIFO before returning; `receive_response` / `receive_compound_expected` pop from that FIFO and await the next response. Public API signatures unchanged. No `Connection: Clone`, no `execute()` API — those are Phase 3. **The key semantic improvement: dropping a caller's future (`tokio::spawn`'d task aborted, `select!` arm cancelled, etc.) no longer corrupts the wire — the `oneshot::Receiver` closes, the frame is discarded on arrival.**
+2. **Phase 2 — Actor task + `oneshot`-per-request routing (done, commits `b5f7249` + `1099f33` + `9b1d366`).** Background receiver task per `Connection` owns the transport read half and routes each frame to the `oneshot::Sender` registered for its `MessageId`. `send_request` / `send_compound` now register an `oneshot::Receiver` in a caller-local FIFO before returning; `receive_response` / `receive_compound_expected` pop from that FIFO and await. Public API signatures unchanged. **The key semantic improvement: dropping a caller's future (`tokio::spawn`'d task aborted, `select!` arm cancelled, etc.) no longer corrupts the wire.**
 
-3. **Phase 3 — Public `execute()` API + `Connection: Clone` + caller migration (future PR).** Expose `execute()` / `execute_compound()` for callers that want concurrent ops per connection. `Connection` becomes `Clone` (wraps the existing `Arc<Inner>`). Callers in `tree.rs` migrate from `send_request` + `receive_response` to `execute()`. Pipelined loops in `tree.rs` become `FuturesUnordered` over `execute_with_credits()` calls. Unlocks "100 tiny files in parallel" and similar. Strictly additive — Phase 2's public API stays valid during and after Phase 3.
+3. **Phase 3 — Public `execute()` API + `Connection: Clone` + caller migration (this PR).** Exposes `execute()` / `execute_with_credits()` / `execute_compound()` for concurrent ops per connection. `Connection` becomes `Clone` (wraps the existing `Arc<Inner>`). `tree.rs` callers migrate; legacy `send_request` / `receive_response` / compound variants are removed big-bang in the same PR. Closes the silent-frame-discard hole from Phase 2's code review. See § "Phase 3 design (current)" below.
+
+4. **Phase 4 — cmdr `SmbVolume` multi-connection pool (future, cmdr repo).** Wraps multiple `SmbClient`s inside `SmbVolume`, distributes ops across them for batch-copy workloads. Captures the remaining ~2.5x gap between Phase 3's single-session ceiling and the 7.5x multi-session ceiling. Pure cmdr PR, no smb2 changes. See § "Why Phase 4 lives in cmdr, not smb2" at the end.
 
 Each phase is a strict subset of the next. Work from Phase 1 carries into Phase 2 (the `HashSet` becomes a `HashMap<MessageId, oneshot::Sender>`); Phase 2's actor is what Phase 3 exposes.
 
@@ -457,15 +457,173 @@ When Phase 3 arrives:
 - For explicit protocol-level cancellation (e.g., a multi-second upload), use `conn.cancel(msg_id, async_id)` before dropping the future.
 - `Err(Error::Disconnected)` means the connection is dead; reconnect (not clone).
 
-## Phase 3 preview (NOT in this PR)
+## Phase 3 design (current)
 
-For planning purposes — not implemented in Phase 2:
+Phase 3 takes the actor infrastructure Phase 2 built and exposes it to callers as a clean, concurrent-op-friendly API. Done in four stages on `main`, each its own commit and green-light gate.
 
-- `Connection` gains `#[derive(Clone)]` (just wraps `Arc<Inner>`).
-- New public methods `execute(cmd, body, tree_id) -> Result<Frame>`, `execute_compound(ops) -> Result<Vec<Result<Frame>>>`, `execute_with_credits(..., credit_charge)`.
-- `tree.rs` methods flip `&mut Connection` → `&Connection`; callers of `Tree::*` similarly.
-- `Pipeline::execute()` migrates from serial iteration to `FuturesUnordered` of `execute()` futures.
-- Legacy `send_request` + `receive_response` may remain as thin wrappers for a deprecation period.
-- SmbVolume in cmdr drops its `tokio::sync::Mutex`; parallel `copy_between_volumes` becomes feasible.
+### Why Phase 3 is worth doing (the bench data)
 
-Phase 3 is a big enough scope to warrant its own design doc when we get there. Mentioned here only to clarify Phase 2 is not a dead end.
+From yesterday's `bench_100_tiny_files_seq_vs_parallel` against QNAP (Wi-Fi 6E, close to router):
+
+| Scenario              | Time    | Files/sec | Notes |
+|-----------------------|---------|-----------|-------|
+| Sequential, 1 conn    | 593 ms  | 169       | today's cmdr path |
+| Parallel, 10 conns    | 79 ms   | 1264      | ceiling, via 10 TCP sessions |
+| **Speedup**           |         |           | **7.5x** |
+
+The 7.5x ceiling requires multiple SMB sessions (Phase 4 — cmdr-side `SmbVolume` connection pool). Phase 3 (one Connection, many concurrent `execute()` calls) captures a smaller share — best estimate **~3x** on this NAS, since QNAP appears to serialize execution within a single session. Phase 3 still delivers meaningful gain from pipelining-within-credit-window and client-side overlap, and is a prerequisite for Phase 4.
+
+### What Phase 3 is — and isn't
+
+**Is:**
+- `Connection: Clone` (wraps the existing `Arc<Inner>` — trivial).
+- Three new public methods: `execute`, `execute_with_credits`, `execute_compound`.
+- Migration of ~30 call sites in `tree.rs` from `send_request` + `receive_response` to `execute()`.
+- Removal of the legacy `send_request` / `send_request_with_credits` / `receive_response` / `receive_compound` / `receive_compound_expected` / `send_compound` public methods. Big-bang, no deprecation period.
+- Silent-discard-hole fix from code review finding #3 (the receiver task tears down the connection on unrecoverable frame errors instead of hanging the waiter).
+- Public `Frame` type (promoted from `pub(crate) RoutedFrame`).
+
+**Isn't:**
+- Connection pool. cmdr's `SmbVolume` owns that in Phase 4 — protocol library stays as a per-session engine. See [§ "Why Phase 4 lives in cmdr, not smb2"](#why-phase-4-lives-in-cmdr-not-smb2).
+- SMB3 Multichannel (single session across multiple TCP connections). Deferred indefinitely; diminishing returns for home/prosumer users.
+- Explicit SMB `CANCEL` on dropped future. Drop still works correctly (the oneshot closes, the receiver task discards the frame). Sending `CANCEL` proactively saves server-side work on long ops but isn't needed for correctness — deferred until someone has a workload where it matters.
+- Automatic reconnect on disconnected Connection. Clone of a dead Connection returns `Err(Disconnected)` on execute; caller reconnects explicitly.
+
+### Stages
+
+| Stage | Scope | Green-light |
+|-------|-------|-------------|
+| **P3.0** — Design doc + red test | This section. Plus `phase3_decrypt_failure_errors_waiter_not_hangs` red test (uses `tokio::time::timeout` to prove the receiver task currently hangs waiters on decrypt failure). | Design committed; red test fails against current code. |
+| **P3.1** — `Connection: Clone` | `#[derive(Clone)]`. Flip pure readers to `&self`. **No new API**, no migration. | All 834+ unit tests unchanged. `let c2 = conn.clone();` compiles. |
+| **P3.2** — Additive `execute()` API | `execute`, `execute_with_credits`, `execute_compound`. Internally wrap the actor. Old API still present. Concurrency tests go green. | Old tests pass. New tests: 100 concurrent `execute` on one connection, dropped-future doesn't affect others, compound partial-failure routes correctly. |
+| **P3.3** — Migrate `tree.rs` callers + remove old API | ~30 call sites flip to `execute()`. `Tree::*` methods become `&Connection`. `send_request` etc. removed. Pipelined loops → `FuturesUnordered`. | All existing tests + Docker + consumer + QNAP green. |
+| **P3.4** — Silent-discard fix | Receiver task tears down on decrypt/decompress/malformed-header error. Red test from P3.0 goes green. | `phase3_decrypt_failure_errors_waiter_not_hangs` green. All integration green. |
+
+### Decisions
+
+| # | Decision | Choice | Why |
+|---|----------|--------|-----|
+| E1 | Credit discipline in concurrent mode | **Best-effort, no semaphore.** Callers check `conn.credits()` before launching many concurrent ops. Server returns `STATUS_INSUFFICIENT_RESOURCES` if exceeded; we bubble it up. | Adding a semaphore is strictly more code + a new failure mode (starvation). SMB servers grant credits generously (256 per request ask); in practice the caller's natural pacing stays within the window. If this ever bites, a semaphore can be added later without public API change. |
+| E2 | `execute` return type | `Result<Frame>` where `Frame = { header: Header, body: Vec<u8>, raw: Vec<u8> }`. `Frame` is public (promoted from `pub(crate) RoutedFrame`). | Matches what callers actually consume. Old `receive_response` returned `(Header, Vec<u8>, Vec<u8>)` — same data, less ergonomic. |
+| E3 | `execute_compound` return shape | `Result<Vec<Result<Frame>>>`. Outer `Result` for "did the compound even make it onto the wire". Inner `Result` per sub-op because compound partial failure is common (CREATE ok, READ fails — caller wants the FileId to issue standalone CLOSE). | Matches current semantics of `receive_compound_expected` + per-sub-op status checks, just typed more strictly. Partial failure is protocol-normal. |
+| E4 | `CompoundOp` shape | `CompoundOp<'a> { command: Command, body: &'a dyn Pack, tree_id: Option<TreeId>, credit_charge: CreditCharge }`. Passed as `&[CompoundOp<'_>]`. | Mirrors today's `send_compound` tuple args but typed. Caller pre-allocates a small Vec or uses `&[CompoundOp::new(...); N]`. |
+| E5 | Handshake mutators' `self` | Stay `&mut self` (`activate_signing`, `activate_encryption`, `set_session_id`, `set_compression_requested`, `register_dfs_tree`, `deregister_dfs_tree`). | They're called once during session setup on one task. No value in flipping to `&self` (which would force clones or require the caller to manage it). If a future need for callable-from-any-clone mutator emerges, flip that one. |
+| E6 | Silent-discard policy | **Tear down on unrecoverable frame errors** (decrypt failure, decompress failure, malformed header). Receiver task fans `Err(Disconnected)` to all pending waiters, exits. | Log-and-continue hangs the matching waiter forever with no way to recover (msg_id isn't recoverable from an unparsable frame). Connection corruption is nearly always fatal anyway — the protocol state is out of sync after one bad frame. Caller sees `Err(Disconnected)`, reconnects. |
+| E7 | Old API removal strategy | **Big-bang in P3.3.** No deprecation period. | The library has one known consumer (cmdr), and we control both sides. Keeping a deprecated API for one release adds maintenance burden and confuses any new reader. Clean removal. CHANGELOG documents the breaking change. |
+| E8 | `Connection::Drop` semantics | Last clone dropping: cancel the receiver task, close the transport, pending waiters get `Err(Disconnected)`. | Clones hold `Arc<Inner>`; `Arc` drop runs when the last clone goes. `Inner`'s `Drop` aborts the receiver `JoinHandle` and flips `disconnected=true` — subsequent ops on a stale clone (rare) get `Err(Disconnected)`. |
+| E9 | Explicit SMB `CANCEL` on future drop | **Not in Phase 3.** Drop still correct (oneshot closes, late frame discarded). `CANCEL` sent proactively would save server work on long ops but add complexity. Callers who need it use `Connection::send_cancel` explicitly. | Correctness vs. optimization. Correctness is done; optimization is opt-in. |
+| E10 | Pipelined-read/write location | Stays in `tree.rs`. Each chunk becomes one `execute_with_credits` call; the loop collects futures into `FuturesUnordered` to interleave. | Tree-level code knows the "many chunks of one file" shape. Actor just routes. Credit pacing stays on the caller side. |
+| E11 | `Pipeline` module (`client/pipeline.rs`) | Migrate sequential-loop to `FuturesUnordered<execute>` during P3.3. Public API of `Pipeline::execute(Vec<Op>)` stays identical; internal shape changes. | One call site, minimal ripple. Lets the pipeline batch execute ops actually-concurrently instead of today's sequential-per-op loop. |
+| E12 | `Watcher` (`client/watcher.rs`) | Becomes `conn.execute(CHANGE_NOTIFY, ...)` in a loop. No special lifecycle plumbing. | One less thing to maintain. |
+
+### Public API (post-Phase-3)
+
+```rust
+impl Connection {
+    pub async fn connect(addr: impl ToSocketAddrs, timeout: Duration) -> Result<Self>;
+
+    // Core execute API.
+    pub async fn execute(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+    ) -> Result<Frame>;
+
+    pub async fn execute_with_credits(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+    ) -> Result<Frame>;
+
+    pub async fn execute_compound(&self, ops: &[CompoundOp<'_>]) -> Result<Vec<Result<Frame>>>;
+
+    pub async fn send_cancel(&self, target_msg_id: MessageId, async_id: Option<u64>) -> Result<()>;
+
+    // Handshake mutators (used by session.rs during setup). &mut self.
+    pub async fn negotiate(&mut self) -> Result<NegotiatedParams>;
+    pub fn activate_signing(&mut self, key: Vec<u8>, algorithm: SigningAlgorithm);
+    pub fn activate_encryption(&mut self, enc_key: Vec<u8>, dec_key: Vec<u8>, cipher: Cipher);
+    pub fn set_session_id(&mut self, id: SessionId);
+    pub fn set_compression_requested(&mut self, requested: bool);
+    pub fn register_dfs_tree(&mut self, tree_id: TreeId);
+    pub fn deregister_dfs_tree(&mut self, tree_id: TreeId);
+
+    // Fast accessors. &self.
+    pub fn credits(&self) -> u16;
+    pub fn params(&self) -> Option<NegotiatedParams>;
+    pub fn should_encrypt(&self) -> bool;
+    pub fn should_sign(&self) -> bool;
+    pub fn session_id(&self) -> SessionId;
+    pub fn server_name(&self) -> &str;
+    pub fn compression_enabled(&self) -> bool;
+
+    // Graceful teardown. Drops still work; this just makes ordering explicit.
+    pub async fn disconnect(&self) -> Result<()>;
+}
+
+#[derive(Clone)]  // cheap — just Arc<Inner>
+pub struct Connection { /* ... */ }
+
+pub struct Frame {
+    pub header: Header,
+    pub body: Vec<u8>,
+    pub raw: Vec<u8>,
+}
+
+pub struct CompoundOp<'a> {
+    pub command: Command,
+    pub body: &'a dyn Pack,
+    pub tree_id: Option<TreeId>,
+    pub credit_charge: CreditCharge,
+}
+```
+
+### Removed (breaking) in Phase 3
+
+- `Connection::send_request`, `send_request_with_credits`, `send_compound`
+- `Connection::receive_response`, `receive_compound`, `receive_compound_expected`
+- `Connection::test_mark_pending`, `test_mark_pending_dropped`, `set_orphan_filter_enabled` — test helpers become obsolete when the API no longer needs a FIFO
+
+### Test plan
+
+**Red test written at P3.0** (compile-able against current code, fails at runtime):
+
+- `phase3_decrypt_failure_errors_waiter_not_hangs` — register a waiter for msg_id=4, then inject a frame with `TRANSFORM_PROTOCOL_ID` + garbage payload (fails decrypt). Wrap the `rx.await` in `tokio::time::timeout(Duration::from_secs(2))`. Currently: timeout fires (waiter hung, bug present). Post-P3.4: waiter resolves with `Err(Disconnected)` or similar before timeout.
+
+**Green-on-completion tests** (written during their respective stages):
+
+- **P3.1** — `connection_is_cloneable_and_clones_share_state`: clone a connection, confirm both see the same `credits()`, `session_id()`, `server_name()`.
+- **P3.2** — `concurrent_execute_on_one_connection_all_succeed`: spawn 50 tasks, each calling `clone.execute()`, assert all 50 get their own response with correct MessageId.
+- **P3.2** — `dropped_execute_future_does_not_affect_others`: spawn 5 tasks, abort 2 mid-flight, assert the 3 survivors complete cleanly and credits tick correctly.
+- **P3.2** — `execute_compound_partial_failure`: 3-op compound where op 2 returns `STATUS_OBJECT_NAME_NOT_FOUND`. Outer `Ok`, inner has `[Ok, Err, Ok]` — caller can use op 1's `FileId` to issue a standalone CLOSE.
+- **P3.3** — existing 834+ tests continue to pass after migration. No new tests needed — the migration is behaviorally equivalent.
+- **P3.4** — red test from P3.0 goes green.
+- **Stress** (optional, added with P3.2): `stress_concurrent_ops_with_random_drops` — 1000 iterations of random ops + random drops, no hangs, no cross-talk.
+
+**Integration tests (Docker + consumer + QNAP)**: unchanged. Black-box against `SmbClient`; Phase 3 is invisible to them.
+
+**Benchmark rerun (P3.8)**: extend `bench_100_tiny_files_seq_vs_parallel` with a third variant: single-connection concurrent `execute()` via 10 cloned handles. Confirms real Phase 3 gain number.
+
+### Risks and mitigations
+
+| Risk | Mitigation |
+|------|------------|
+| Credit window exhaustion under 100 concurrent `execute()` calls (server returns `STATUS_INSUFFICIENT_RESOURCES`). | Best-effort credit check in caller (E1). Log at DEBUG. If this ever bites in production, add a semaphore in a follow-up. |
+| Existing tests break because mocks no longer work without FIFO API. | `set_orphan_filter_enabled` fallback survives through P3.2; removed in P3.3 alongside the legacy API. Mock tests that used it migrate to the new shape during P3.3. |
+| `Arc<Inner>` pessimizes hot-path reads of credits/next_msg_id. | These are already `AtomicU32`/`AtomicU64`; reads are lock-free. `Arc` is one pointer hop. Measured as zero-impact in practice. |
+| Big-bang API removal breaks cmdr mid-stream. | cmdr is bumped in P3.7 in the same session. If a cmdr-side call site breaks the build, we fix it there or adjust the smb2 API in flight. Release cycle: smb2 first, cmdr second. Only cmdr depends on smb2 today, so the window is a few minutes. |
+| Silent-discard fix tears down connection for transient errors (e.g., single flipped bit). | Unrecoverable frame errors (bad decrypt, bad header) are very rare outside of "wire is broken" scenarios. Connection teardown forces reconnect, which recovers from wire breakage. The alternative (hang forever) is strictly worse. |
+
+### Why Phase 4 lives in cmdr, not smb2
+
+`smb2` is a protocol library — one `Connection` is one SMB session. Pooled multi-connection belongs at the application layer because:
+
+- **File handles are per-session.** A transparent pool can only handle self-contained open-read-close operations; anything stateful breaks.
+- **Ordering guarantees disappear.** A pool with work-stealing doesn't give you "op 2 happens after op 1 on the server."
+- **Pool policy depends on workload.** "How many connections, pre-opened or lazy, how to retry" is application-specific. A library default is always wrong for someone.
+- **Resource footprint.** Each session costs server memory + auth state. Opening 10 eagerly is impolite from a low-level library.
+
+cmdr's `SmbVolume` is the right layer: it already knows the workload (file-manager batch ops, mostly self-contained). Phase 4 is "wrap `SmbClient` in a pool inside `SmbVolume`" — a cmdr PR, not an smb2 change.
