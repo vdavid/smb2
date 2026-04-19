@@ -92,6 +92,55 @@ pub struct Frame {
     pub raw: Vec<u8>,
 }
 
+/// One sub-operation in a compound request, as passed to
+/// [`Connection::execute_compound`].
+///
+/// Each `CompoundOp` describes a single SMB2 operation (CREATE, READ,
+/// CLOSE, etc.) that the receiver side pairs with a [`Frame`] response
+/// by `MessageId`. The server MAY split compound responses into multiple
+/// transport frames — the receiver task handles that transparently; each
+/// sub-op still gets routed to its own waiter by msg_id.
+///
+/// Field-by-field:
+///
+/// - `command`: the SMB2 command code (`Create`, `Read`, `Write`, etc.).
+/// - `body`: the packed request body as a `&dyn Pack`. Typical callers
+///   pass `&MyRequest { ... }` — the trait object lets one compound
+///   chain hold heterogeneous request types.
+/// - `tree_id`: the `TreeId` to stamp into the header, or `None` when
+///   the op predates tree connect (for example, SESSION_SETUP in a
+///   compound). For ordinary file ops, pass `Some(tree.tree_id)`.
+/// - `credit_charge`: the number of credits (and consecutive MessageIds)
+///   this op consumes. Most ops use `CreditCharge(1)`. Large READ / WRITE
+///   ops consume `ceil(payload_size / 65536)` — see the docs on
+///   [`execute_with_credits`](Connection::execute_with_credits) for details.
+pub struct CompoundOp<'a> {
+    /// The SMB2 command code.
+    pub command: Command,
+    /// The packed request body, as a `&dyn Pack`.
+    pub body: &'a dyn Pack,
+    /// `Some(tree_id)` for tree-scoped ops, `None` for connection-level ones.
+    pub tree_id: Option<TreeId>,
+    /// Credit charge (and consecutive-MessageId count) for this sub-op.
+    pub credit_charge: CreditCharge,
+}
+
+impl<'a> CompoundOp<'a> {
+    /// Build a `CompoundOp` with the default single-credit charge.
+    ///
+    /// Equivalent to setting `credit_charge: CreditCharge(1)`. For reads
+    /// or writes larger than 64 KB, construct the struct directly with
+    /// the right charge.
+    pub fn new(command: Command, body: &'a dyn Pack, tree_id: Option<TreeId>) -> Self {
+        Self {
+            command,
+            body,
+            tree_id,
+            credit_charge: CreditCharge(1),
+        }
+    }
+}
+
 /// Crypto state shared between the caller thread (sending) and receiver task
 /// (verifying signatures, decrypting).
 ///

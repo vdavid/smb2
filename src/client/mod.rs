@@ -17,7 +17,7 @@ pub mod tree;
 pub mod watcher;
 
 pub use crate::crypto::encryption::Cipher;
-pub use connection::{Connection, Frame, NegotiatedParams};
+pub use connection::{CompoundOp, Connection, Frame, NegotiatedParams};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
