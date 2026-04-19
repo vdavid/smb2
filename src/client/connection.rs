@@ -962,6 +962,307 @@ impl Connection {
         Ok(results)
     }
 
+    /// Send a single SMB2 request and wait for its response.
+    ///
+    /// Takes `&self` so multiple clones of a `Connection` can call `execute`
+    /// concurrently from different tasks — the receiver task routes each
+    /// response to its own `oneshot::Sender` by `MessageId`. Cancellation
+    /// by drop is safe by construction: if the caller's future is dropped
+    /// before the response arrives, the `oneshot::Receiver` drops, and
+    /// the receiver task discards the late frame silently on arrival
+    /// (credits still apply).
+    ///
+    /// Equivalent to `execute_with_credits(command, body, tree_id, CreditCharge(1))`.
+    /// For large READ / WRITE ops (> 64 KB payload), use `execute_with_credits`
+    /// with a charge of `ceil(payload_size / 65536)` — each credit consumed
+    /// also consumes one consecutive `MessageId`, and gaps in the id
+    /// sequence cause the server to drop the connection.
+    pub async fn execute(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+    ) -> Result<Frame> {
+        self.execute_with_credits(command, body, tree_id, CreditCharge(1))
+            .await
+    }
+
+    /// Send a single SMB2 request with a caller-specified credit charge.
+    ///
+    /// Same semantics as [`execute`](Self::execute) — see that method's doc
+    /// for the concurrency / cancellation invariants — but lets the caller
+    /// set `credit_charge` directly. Use `CreditCharge(ceil(payload_size /
+    /// 65536))` for READ / WRITE ops larger than 64 KB.
+    ///
+    /// On the wire this is the same as `send_request_with_credits` +
+    /// `receive_response` — the difference is that this method owns its
+    /// `oneshot::Receiver` locally (not in a caller-shared FIFO), so
+    /// it's safe to call from multiple tasks on clones of the same
+    /// `Connection`.
+    pub async fn execute_with_credits(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+    ) -> Result<Frame> {
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        let charge = credit_charge.0.max(1);
+        let msg_id = self.allocate_msg_id(charge as u64);
+
+        let mut header = Header::new_request(command);
+        header.message_id = msg_id;
+        header.credits = 256;
+        header.credit_charge = CreditCharge(charge);
+        header.session_id = self.session_id();
+        if let Some(tid) = tree_id {
+            header.tree_id = Some(tid);
+        }
+
+        let (should_sign, should_encrypt) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (c.should_sign, c.should_encrypt)
+        };
+
+        if should_sign && !should_encrypt {
+            header.flags.set_signed();
+        }
+        if self.should_set_dfs_flag(tree_id) {
+            header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
+        }
+
+        let mut msg_bytes = pack_message(&header, body);
+
+        // Register waiter BEFORE send so the receiver task can match any
+        // fast-arriving response. `register_waiter` atomically rechecks
+        // `disconnected` under the waiters lock, so a receiver-task
+        // teardown between the early fast-path check above and this
+        // insertion returns `Err(Disconnected)` instead of leaving a
+        // ghost Sender that never gets routed.
+        let rx = self.register_waiter(msg_id)?;
+
+        // Build the wire bytes with encryption / signing / compression.
+        let wire_bytes = if should_encrypt {
+            match self.encrypt_bytes(&msg_bytes) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    self.remove_waiter(msg_id);
+                    return Err(e);
+                }
+            }
+        } else {
+            if should_sign {
+                let c = self.inner.crypto.lock().unwrap();
+                if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
+                    if let Err(e) =
+                        signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)
+                    {
+                        drop(c);
+                        self.remove_waiter(msg_id);
+                        return Err(e);
+                    }
+                }
+            }
+            if self.compression_enabled() && msg_bytes.len() > Header::SIZE {
+                if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
+                    let framed = build_compressed_frame(&compressed);
+                    match self.inner.sender.send(&framed).await {
+                        Ok(()) => {
+                            debug!(
+                                "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
+                                command, msg_id.0, charge, tree_id, should_sign,
+                                msg_bytes.len(), framed.len()
+                            );
+                            return await_frame(rx).await;
+                        }
+                        Err(e) => {
+                            self.remove_waiter(msg_id);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            msg_bytes
+        };
+
+        if let Err(e) = self.inner.sender.send(&wire_bytes).await {
+            self.remove_waiter(msg_id);
+            return Err(e);
+        }
+        debug!(
+            "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
+            command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
+        );
+        await_frame(rx).await
+    }
+
+    /// Send a compound SMB2 request (multiple operations in one transport
+    /// frame) and return the per-sub-op responses.
+    ///
+    /// Takes `&self`. Each [`CompoundOp`] is assigned its own `MessageId`
+    /// and its own `oneshot::Sender` registered in the waiters map. The
+    /// server MAY split the compound response into multiple transport
+    /// frames (MS-SMB2 § 3.3.4.1.3) — the receiver task's per-`MessageId`
+    /// routing handles that transparently; each sub-op's waiter resolves
+    /// independently.
+    ///
+    /// Return shape (per decision E3 in `docs/specs/connection-actor.md`):
+    ///
+    /// - Outer `Result`: `Err` if the compound didn't make it onto the wire
+    ///   (encryption failed, signing failed, transport send failed, or the
+    ///   connection was already disconnected). On this path no waiter
+    ///   observes a response — we clean them up before returning.
+    /// - Inner `Vec<Result<Frame>>`: one entry per sub-op, in the same
+    ///   order as `ops`. `Ok(frame)` with the server's response, including
+    ///   non-success statuses encoded in `frame.header.status`. `Err` when
+    ///   a sub-op hit a waiter-level error (session expired, signature
+    ///   verify failure, connection dropped mid-await). Compound partial
+    ///   failure is protocol-normal — for example, CREATE may succeed but
+    ///   a later READ fail — so callers typically match on each inner
+    ///   result individually.
+    pub async fn execute_compound(
+        &self,
+        ops: &[CompoundOp<'_>],
+    ) -> Result<Vec<Result<Frame>>> {
+        if ops.is_empty() {
+            return Err(Error::invalid_data(
+                "compound request must have at least one operation",
+            ));
+        }
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+
+        let (should_sign, should_encrypt) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (c.should_sign, c.should_encrypt)
+        };
+
+        let session_id = self.session_id();
+        let mut message_ids: Vec<MessageId> = Vec::with_capacity(ops.len());
+        let mut sub_requests: Vec<Vec<u8>> = Vec::with_capacity(ops.len());
+
+        for (i, op) in ops.iter().enumerate() {
+            let charge = op.credit_charge.0.max(1);
+            let msg_id = self.allocate_msg_id(charge as u64);
+
+            let mut header = Header::new_request(op.command);
+            header.message_id = msg_id;
+            header.credits = 256;
+            header.credit_charge = CreditCharge(charge);
+            header.session_id = session_id;
+            header.tree_id = op.tree_id;
+
+            if i > 0 {
+                header.flags.set_related();
+            }
+            if should_sign && !should_encrypt {
+                header.flags.set_signed();
+            }
+            if self.should_set_dfs_flag(op.tree_id) {
+                header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
+            }
+
+            message_ids.push(msg_id);
+            sub_requests.push(pack_message(&header, op.body));
+        }
+
+        // 8-byte align all but the last sub-request, then wire up
+        // `NextCommand` offsets.
+        let last_idx = sub_requests.len() - 1;
+        for sub_req in sub_requests.iter_mut().take(last_idx) {
+            let rem = sub_req.len() % 8;
+            if rem != 0 {
+                let pad = 8 - rem;
+                let new_len = sub_req.len() + pad;
+                sub_req.resize(new_len, 0);
+            }
+        }
+        for sub_req in sub_requests.iter_mut().take(last_idx) {
+            let next_cmd = sub_req.len() as u32;
+            sub_req[20..24].copy_from_slice(&next_cmd.to_le_bytes());
+        }
+
+        if should_sign && !should_encrypt {
+            let c = self.inner.crypto.lock().unwrap();
+            if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
+                for (i, sub_req) in sub_requests.iter_mut().enumerate() {
+                    signing::sign_message(sub_req, key, *algo, message_ids[i].0, false)?;
+                }
+            }
+        }
+
+        // Register one oneshot::Receiver per sub-op BEFORE the send,
+        // collected in the same order as `ops` / `message_ids`. On any
+        // registration error, unregister the ones we already inserted.
+        let mut receivers: Vec<oneshot::Receiver<Result<Frame>>> =
+            Vec::with_capacity(message_ids.len());
+        let mut registered: Vec<MessageId> = Vec::with_capacity(message_ids.len());
+        for id in &message_ids {
+            match self.register_waiter(*id) {
+                Ok(rx) => {
+                    receivers.push(rx);
+                    registered.push(*id);
+                }
+                Err(e) => {
+                    for done in &registered {
+                        self.remove_waiter(*done);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        let total_len: usize = sub_requests.iter().map(|r| r.len()).sum();
+        let mut compound_buf = Vec::with_capacity(total_len);
+        for sub_req in &sub_requests {
+            compound_buf.extend_from_slice(sub_req);
+        }
+
+        let send_result = if should_encrypt {
+            match self.encrypt_bytes(&compound_buf) {
+                Ok(enc) => self.inner.sender.send(&enc).await,
+                Err(e) => {
+                    for id in &registered {
+                        self.remove_waiter(*id);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            self.inner.sender.send(&compound_buf).await
+        };
+
+        if let Err(e) = send_result {
+            for id in &registered {
+                self.remove_waiter(*id);
+            }
+            return Err(e);
+        }
+
+        debug!(
+            "execute_compound: {} operations, total_len={}, msg_ids={:?}, signed={}, encrypted={}",
+            ops.len(),
+            compound_buf.len(),
+            message_ids.iter().map(|m| m.0).collect::<Vec<_>>(),
+            should_sign,
+            should_encrypt,
+        );
+
+        // Collect per-sub-op results in submission order. Each `rx.await`
+        // resolves independently — the receiver task splits the response
+        // frame by `NextCommand` and routes each sub-response to its own
+        // waiter, so we can await them sequentially without blocking any
+        // of them (they may already all be resolved by the time we loop).
+        let mut results: Vec<Result<Frame>> = Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            results.push(await_frame(rx).await);
+        }
+        Ok(results)
+    }
+
     /// Send a CANCEL request for an outstanding operation.
     pub async fn send_cancel(
         &mut self,
@@ -1557,6 +1858,26 @@ fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
         offset += next_cmd as usize;
     }
     Ok(results)
+}
+
+/// Await a per-request `oneshot::Receiver` and translate the three
+/// outcomes into a `Result<Frame>`:
+///
+/// - `Ok(Ok(frame))` — the receiver task routed a successful response.
+/// - `Ok(Err(e))` — the receiver task delivered a targeted error for
+///   this `MessageId` (signature-verify failure, session expired, etc.).
+/// - `Err(_)` on the outer await means the `oneshot::Sender` was dropped
+///   without sending, which happens on connection teardown (see
+///   `fan_error_to_waiters` — it calls `send(Err(Disconnected))` for
+///   every pending waiter, so we only see a raw canceled channel if
+///   the whole map was dropped without that call, i.e. Arc teardown).
+///   Map it to `Error::Disconnected`.
+async fn await_frame(rx: oneshot::Receiver<Result<Frame>>) -> Result<Frame> {
+    match rx.await {
+        Ok(Ok(frame)) => Ok(frame),
+        Ok(Err(e)) => Err(e),
+        Err(_canceled) => Err(Error::Disconnected),
+    }
 }
 
 /// Pack a header + body into raw SMB2 message bytes.
