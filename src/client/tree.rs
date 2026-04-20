@@ -29,6 +29,8 @@ use crate::pack::{FileTime, ReadCursor, Unpack};
 use crate::types::flags::FileAccessMask;
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
+#[cfg(test)]
+use crate::types::MessageId;
 use crate::Error;
 
 /// Maximum number of requests to keep in flight during pipelining.

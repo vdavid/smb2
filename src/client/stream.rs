@@ -164,37 +164,36 @@ impl<'a> FileDownload<'a> {
         };
 
         let credit_charge = (this_chunk as u64).div_ceil(65536).max(1) as u16;
-        let send_result = self
+        let exec_result = self
             .conn
-            .send_request_with_credits(Command::Read, &req, Some(self.tree.tree_id), credit_charge)
+            .execute_with_credits(
+                Command::Read,
+                &req,
+                Some(self.tree.tree_id),
+                crate::types::CreditCharge(credit_charge),
+            )
             .await;
 
-        if let Err(e) = send_result {
-            self.done = true;
-            return Some(Err(e));
-        }
-
-        let recv_result = self.conn.receive_response().await;
-        match recv_result {
+        match exec_result {
             Err(e) => {
                 self.done = true;
                 Some(Err(e))
             }
-            Ok((resp_header, resp_body, _)) => {
-                if resp_header.status == NtStatus::END_OF_FILE {
+            Ok(frame) => {
+                if frame.header.status == NtStatus::END_OF_FILE {
                     let _ = self.close().await;
                     return None;
                 }
 
-                if resp_header.status != NtStatus::SUCCESS {
+                if frame.header.status != NtStatus::SUCCESS {
                     self.done = true;
                     return Some(Err(Error::Protocol {
-                        status: resp_header.status,
+                        status: frame.header.status,
                         command: Command::Read,
                     }));
                 }
 
-                let mut cursor = ReadCursor::new(&resp_body);
+                let mut cursor = ReadCursor::new(&frame.body);
                 match ReadResponse::unpack(&mut cursor) {
                     Err(e) => {
                         self.done = true;
@@ -423,39 +422,33 @@ impl<'a> FileUpload<'a> {
         };
 
         let credit_charge = (this_chunk as u64).div_ceil(65536).max(1) as u16;
-        let send_result = self
+        let exec_result = self
             .conn
-            .send_request_with_credits(
+            .execute_with_credits(
                 Command::Write,
                 &write_req,
                 Some(self.tree.tree_id),
-                credit_charge,
+                crate::types::CreditCharge(credit_charge),
             )
             .await;
 
-        if let Err(e) = send_result {
-            self.done = true;
-            return Err(e);
-        }
-
-        let recv_result = self.conn.receive_response().await;
-        match recv_result {
+        match exec_result {
             Err(e) => {
                 self.done = true;
                 Err(e)
             }
-            Ok((resp_header, resp_body, _)) => {
-                if resp_header.status != NtStatus::SUCCESS {
+            Ok(frame) => {
+                if frame.header.status != NtStatus::SUCCESS {
                     self.done = true;
                     // Best-effort close without flush.
                     let _ = self.tree.close_handle(self.conn, self.file_id).await;
                     return Err(Error::Protocol {
-                        status: resp_header.status,
+                        status: frame.header.status,
                         command: Command::Write,
                     });
                 }
 
-                let mut cursor = ReadCursor::new(&resp_body);
+                let mut cursor = ReadCursor::new(&frame.body);
                 let resp = WriteResponse::unpack(&mut cursor)?;
                 self.bytes_written += resp.count as u64;
 
@@ -520,6 +513,13 @@ impl Drop for FileUpload<'_> {
 /// # Ok(())
 /// # }
 /// ```
+/// Pinned-boxed `execute_with_credits` future, kept owned by `FileWriter`
+/// in a `FuturesUnordered` so multiple WRITEs can be in flight on one
+/// connection concurrently.
+type BoxedWriteFut = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<crate::client::connection::Frame>> + Send>,
+>;
+
 pub struct FileWriter<'a> {
     tree: &'a Tree,
     conn: &'a mut Connection,
@@ -527,8 +527,10 @@ pub struct FileWriter<'a> {
     max_write_size: u32,
     /// Next write offset in the file.
     offset: u64,
-    /// Number of pipelined WRITE requests awaiting responses.
-    in_flight: usize,
+    /// In-flight WRITE futures. `FuturesUnordered::len()` gives the same
+    /// "how many responses are pending" count the old `in_flight: usize`
+    /// field tracked pre-Phase-3.
+    in_flight: futures_util::stream::FuturesUnordered<BoxedWriteFut>,
     /// Confirmed bytes (from WRITE responses).
     total_written: u64,
     /// Buffer for leftover data when a push chunk is larger than `max_write_size`.
@@ -555,7 +557,7 @@ impl<'a> FileWriter<'a> {
             file_id,
             max_write_size,
             offset: 0,
-            in_flight: 0,
+            in_flight: futures_util::stream::FuturesUnordered::new(),
             total_written: 0,
             pending_data: Vec::new(),
             pending_offset: 0,
@@ -699,6 +701,8 @@ impl<'a> FileWriter<'a> {
     /// # }
     /// ```
     pub async fn abort(mut self) -> Result<u64> {
+        use futures_util::stream::StreamExt;
+
         // 1. Discard anything we have not yet put on the wire. Unsent data
         //    means nothing to the server and carries no credits.
         self.pending_data.clear();
@@ -709,20 +713,19 @@ impl<'a> FileWriter<'a> {
         //    kernel/network buffer, and dropping them unread would desync
         //    credits and message IDs. Errors are swallowed: on abort we
         //    don't care if a WRITE failed or succeeded.
-        while self.in_flight > 0 {
-            match self.conn.receive_response().await {
-                Ok((resp_header, resp_body, _)) => {
-                    self.in_flight -= 1;
-                    if resp_header.status == NtStatus::SUCCESS {
+        while let Some(result) = self.in_flight.next().await {
+            match result {
+                Ok(frame) => {
+                    if frame.header.status == NtStatus::SUCCESS {
                         // Keep total_written accurate for callers that log it.
-                        let mut cursor = ReadCursor::new(&resp_body);
+                        let mut cursor = ReadCursor::new(&frame.body);
                         if let Ok(resp) = WriteResponse::unpack(&mut cursor) {
                             self.total_written += resp.count as u64;
                         }
                     } else {
                         debug!(
                             "stream: FileWriter::abort() ignoring WRITE error status {:?}",
-                            resp_header.status
+                            frame.header.status
                         );
                     }
                 }
@@ -731,11 +734,10 @@ impl<'a> FileWriter<'a> {
                     // sensible to do — the connection may already be gone.
                     // Mark everything drained and move on.
                     debug!(
-                        "stream: FileWriter::abort() giving up on remaining {} in-flight \
+                        "stream: FileWriter::abort() giving up on remaining in-flight \
                          response(s) after transport error: {}",
-                        self.in_flight, e
+                        e
                     );
-                    self.in_flight = 0;
                     break;
                 }
             }
@@ -793,8 +795,8 @@ impl<'a> FileWriter<'a> {
         Some(slice)
     }
 
-    /// Send one wire-level WRITE request.
-    async fn send_wire_chunk(&mut self, data: Vec<u8>) -> Result<()> {
+    /// Launch one wire-level WRITE request into the `in_flight` queue.
+    fn launch_wire_chunk(&mut self, data: Vec<u8>) {
         let data_len = data.len() as u64;
         let credit_charge = data_len.div_ceil(65536).max(1) as u16;
 
@@ -810,40 +812,43 @@ impl<'a> FileWriter<'a> {
             data,
         };
 
-        self.conn
-            .send_request_with_credits(Command::Write, &req, Some(self.tree.tree_id), credit_charge)
-            .await?;
+        let c = self.conn.clone();
+        let tree_id = self.tree.tree_id;
+        self.in_flight.push(Box::pin(async move {
+            c.execute_with_credits(
+                Command::Write,
+                &req,
+                Some(tree_id),
+                crate::types::CreditCharge(credit_charge),
+            )
+            .await
+        }));
 
         self.offset += data_len;
-        self.in_flight += 1;
-        Ok(())
     }
 
     /// Receive one in-flight WRITE response.
     async fn drain_one(&mut self) -> Result<()> {
-        if self.in_flight == 0 {
+        use futures_util::stream::StreamExt;
+
+        let Some(result) = self.in_flight.next().await else {
             return Ok(());
-        }
+        };
+        let frame = result?;
 
-        let (resp_header, resp_body, _) = self.conn.receive_response().await?;
-        self.in_flight -= 1;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             // Drain remaining in-flight (best-effort), then close handle.
-            for _ in 0..self.in_flight {
-                let _ = self.conn.receive_response().await;
-            }
-            self.in_flight = 0;
+            while self.in_flight.next().await.is_some() {}
             // Best-effort close.
             let _ = self.tree.close_handle(self.conn, self.file_id).await;
             self.done = true;
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Write,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(&frame.body);
         let resp = WriteResponse::unpack(&mut cursor)?;
         self.total_written += resp.count as u64;
 
@@ -852,7 +857,7 @@ impl<'a> FileWriter<'a> {
 
     /// Drain all in-flight WRITE responses.
     async fn drain_all(&mut self) -> Result<()> {
-        while self.in_flight > 0 {
+        while !self.in_flight.is_empty() {
             self.drain_one().await?;
         }
         Ok(())
@@ -862,7 +867,7 @@ impl<'a> FileWriter<'a> {
     fn can_send(&self, data: &[u8]) -> bool {
         let credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
         let credits_available = self.conn.credits() as usize / credit_charge.max(1) as usize;
-        credits_available > 0 && self.in_flight < MAX_PIPELINE_WINDOW
+        credits_available > 0 && self.in_flight.len() < MAX_PIPELINE_WINDOW
     }
 
     /// Try to send a wire chunk. If the window is full or credits are exhausted,
@@ -870,20 +875,20 @@ impl<'a> FileWriter<'a> {
     /// `Ok(false)` (caller decides whether to wait or return).
     async fn send_or_stash(&mut self, data: Vec<u8>) -> Result<bool> {
         // Make room if the window is full.
-        if self.in_flight >= MAX_PIPELINE_WINDOW {
+        if self.in_flight.len() >= MAX_PIPELINE_WINDOW {
             self.drain_one().await?;
         }
 
         if self.can_send(&data) {
-            self.send_wire_chunk(data).await?;
+            self.launch_wire_chunk(data);
             return Ok(true);
         }
 
         // No credits — drain one response to reclaim credits and retry.
-        if self.in_flight > 0 {
+        if !self.in_flight.is_empty() {
             self.drain_one().await?;
             if self.can_send(&data) {
-                self.send_wire_chunk(data).await?;
+                self.launch_wire_chunk(data);
                 return Ok(true);
             }
         }
@@ -897,11 +902,11 @@ impl<'a> FileWriter<'a> {
     async fn flush_stash(&mut self) -> Result<()> {
         if let Some(stashed) = self.stashed_chunk.take() {
             // Make room if needed.
-            if self.in_flight > 0 && !self.can_send(&stashed) {
+            if !self.in_flight.is_empty() && !self.can_send(&stashed) {
                 self.drain_one().await?;
             }
             if self.can_send(&stashed) {
-                self.send_wire_chunk(stashed).await?;
+                self.launch_wire_chunk(stashed);
             } else {
                 // Re-stash — caller must drain more or give up.
                 self.stashed_chunk = Some(stashed);

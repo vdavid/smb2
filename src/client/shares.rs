@@ -62,27 +62,27 @@ async fn tree_connect_ipc(conn: &mut Connection) -> Result<TreeId> {
         path: unc_path,
     };
 
-    let (_, _) = conn.send_request(Command::TreeConnect, &req, None).await?;
-    let (resp_header, resp_body, _) = conn.receive_response().await?;
+    let frame = conn.execute(Command::TreeConnect, &req, None).await?;
 
-    if resp_header.command != Command::TreeConnect {
+    if frame.header.command != Command::TreeConnect {
         return Err(Error::invalid_data(format!(
             "expected TreeConnect response, got {:?}",
-            resp_header.command
+            frame.header.command
         )));
     }
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::TreeConnect,
         });
     }
 
-    let mut cursor = ReadCursor::new(&resp_body);
+    let mut cursor = ReadCursor::new(&frame.body);
     let _resp = TreeConnectResponse::unpack(&mut cursor)?;
 
-    let tree_id = resp_header
+    let tree_id = frame
+        .header
         .tree_id
         .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
 
@@ -153,19 +153,18 @@ async fn open_srvsvc_pipe(conn: &mut Connection, tree_id: TreeId) -> Result<File
         create_contexts: vec![],
     };
 
-    let (_, _) = conn
-        .send_request(Command::Create, &req, Some(tree_id))
+    let frame = conn
+        .execute(Command::Create, &req, Some(tree_id))
         .await?;
-    let (resp_header, resp_body, _) = conn.receive_response().await?;
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::Create,
         });
     }
 
-    let mut cursor = ReadCursor::new(&resp_body);
+    let mut cursor = ReadCursor::new(&frame.body);
     let resp = CreateResponse::unpack(&mut cursor)?;
     debug!("shares: opened srvsvc pipe, file_id={:?}", resp.file_id);
     Ok(resp.file_id)
@@ -191,19 +190,18 @@ async fn write_pipe(
         data: data.to_vec(),
     };
 
-    let (_, _) = conn
-        .send_request(Command::Write, &req, Some(tree_id))
+    let frame = conn
+        .execute(Command::Write, &req, Some(tree_id))
         .await?;
-    let (resp_header, resp_body, _) = conn.receive_response().await?;
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::Write,
         });
     }
 
-    let mut cursor = ReadCursor::new(&resp_body);
+    let mut cursor = ReadCursor::new(&frame.body);
     let resp = WriteResponse::unpack(&mut cursor)?;
     debug!("shares: wrote {} bytes to pipe", resp.count);
     Ok(())
@@ -223,19 +221,18 @@ async fn read_pipe(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> R
         read_channel_info: vec![],
     };
 
-    let (_, _) = conn
-        .send_request(Command::Read, &req, Some(tree_id))
+    let frame = conn
+        .execute(Command::Read, &req, Some(tree_id))
         .await?;
-    let (resp_header, resp_body, _) = conn.receive_response().await?;
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::Read,
         });
     }
 
-    let mut cursor = ReadCursor::new(&resp_body);
+    let mut cursor = ReadCursor::new(&frame.body);
     let resp = ReadResponse::unpack(&mut cursor)?;
     debug!("shares: read {} bytes from pipe", resp.data.len());
     Ok(resp.data)
@@ -245,14 +242,13 @@ async fn read_pipe(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> R
 async fn close_handle(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> Result<()> {
     let req = CloseRequest { flags: 0, file_id };
 
-    let (_, _) = conn
-        .send_request(Command::Close, &req, Some(tree_id))
+    let frame = conn
+        .execute(Command::Close, &req, Some(tree_id))
         .await?;
-    let (resp_header, _, _) = conn.receive_response().await?;
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::Close,
         });
     }
@@ -263,14 +259,13 @@ async fn close_handle(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -
 /// Disconnect from a tree.
 async fn tree_disconnect(conn: &mut Connection, tree_id: TreeId) -> Result<()> {
     let body = TreeDisconnectRequest;
-    let (_, _) = conn
-        .send_request(Command::TreeDisconnect, &body, Some(tree_id))
+    let frame = conn
+        .execute(Command::TreeDisconnect, &body, Some(tree_id))
         .await?;
-    let (resp_header, _, _) = conn.receive_response().await?;
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::TreeDisconnect,
         });
     }
@@ -567,6 +562,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn list_shares_uses_correct_server_name() {
         let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
         let mut conn =
             Connection::from_transport(Box::new(mock.clone()), Box::new(mock.clone()), "my-nas");
         conn.set_test_params(NegotiatedParams {
@@ -582,7 +578,6 @@ pub(crate) mod tests {
             compression_supported: false,
         });
         conn.set_session_id(SessionId(0x1234));
-        conn.set_orphan_filter_enabled(false);
 
         queue_share_listing_responses(&mock, &[("share1", STYPE_DISKTREE, "")]);
 

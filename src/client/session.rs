@@ -611,6 +611,7 @@ mod tests {
     #[tokio::test]
     async fn session_setup_stores_session_id() {
         let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
         let session_id = SessionId(0xDEAD_BEEF);
 
         // Queue the two session setup responses.
@@ -647,6 +648,7 @@ mod tests {
     #[tokio::test]
     async fn session_setup_derives_signing_key() {
         let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
         let session_id = SessionId(0x1234);
 
         let challenge = build_ntlm_challenge();
@@ -677,6 +679,7 @@ mod tests {
     #[tokio::test]
     async fn session_setup_activates_signing() {
         let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
         let session_id = SessionId(0x5678);
 
         let challenge = build_ntlm_challenge();
@@ -708,6 +711,7 @@ mod tests {
     #[tokio::test]
     async fn session_setup_error_on_auth_failure() {
         let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
         let session_id = SessionId(0x9999);
 
         let challenge = build_ntlm_challenge();
@@ -761,8 +765,5 @@ mod tests {
             cipher: None,
             compression_supported: false,
         });
-        // Mock responses use default MessageId(0) and don't track caller's
-        // next_message_id advance, so the orphan filter would drop them.
-        conn.set_orphan_filter_enabled(false);
     }
 }

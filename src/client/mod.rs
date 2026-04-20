@@ -925,21 +925,19 @@ impl SmbClient {
             create_contexts: vec![],
         };
 
-        let (_, _) = self
+        let frame = self
             .conn
-            .send_request(crate::types::Command::Create, &req, Some(tree.tree_id))
+            .execute(crate::types::Command::Create, &req, Some(tree.tree_id))
             .await?;
 
-        let (resp_header, resp_body, _) = self.conn.receive_response().await?;
-
-        if resp_header.status != crate::types::status::NtStatus::SUCCESS {
+        if frame.header.status != crate::types::status::NtStatus::SUCCESS {
             return Err(crate::Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: crate::types::Command::Create,
             });
         }
 
-        let mut cursor = crate::pack::ReadCursor::new(&resp_body);
+        let mut cursor = crate::pack::ReadCursor::new(&frame.body);
         let create_resp = crate::msg::create::CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
@@ -971,28 +969,26 @@ impl SmbClient {
             };
 
             let credit_charge = (chunk_size as u64).div_ceil(65536).max(1) as u16;
-            let (_, _) = self
+            let frame = self
                 .conn
-                .send_request_with_credits(
+                .execute_with_credits(
                     crate::types::Command::Write,
                     &write_req,
                     Some(tree.tree_id),
-                    credit_charge,
+                    crate::types::CreditCharge(credit_charge),
                 )
                 .await?;
 
-            let (resp_header, resp_body, _) = self.conn.receive_response().await?;
-
-            if resp_header.status != crate::types::status::NtStatus::SUCCESS {
+            if frame.header.status != crate::types::status::NtStatus::SUCCESS {
                 // Close handle before returning error.
                 let _ = tree.close_handle(&mut self.conn, file_id).await;
                 return Err(crate::Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: crate::types::Command::Write,
                 });
             }
 
-            let mut cursor = crate::pack::ReadCursor::new(&resp_body);
+            let mut cursor = crate::pack::ReadCursor::new(&frame.body);
             let resp = crate::msg::write::WriteResponse::unpack(&mut cursor)?;
 
             total_written += resp.count as u64;
@@ -1230,6 +1226,7 @@ mod tests {
 
     /// Create a mock-backed SmbClient without going through TCP.
     async fn make_mock_client(mock: &Arc<MockTransport>, session_id: SessionId) -> SmbClient {
+        mock.enable_auto_rewrite_msg_id();
         queue_negotiate_and_session(mock, session_id);
 
         let mut conn = Connection::from_transport(
@@ -1237,9 +1234,6 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        // Mock responses use default MessageId(0); orphan filter would drop
-        // them after the first. See setup_connection in test_helpers.rs.
-        conn.set_orphan_filter_enabled(false);
 
         conn.negotiate().await.unwrap();
 
@@ -1310,15 +1304,15 @@ mod tests {
 
         // Create a new mock for the "reconnected" transport.
         let mock2 = Arc::new(MockTransport::new());
+        mock2.enable_auto_rewrite_msg_id();
         let new_session_id = SessionId(0x2222);
         queue_negotiate_and_session(mock2.as_ref(), new_session_id);
 
-        let mut new_conn = Connection::from_transport(
+        let new_conn = Connection::from_transport(
             Box::new(mock2.clone()),
             Box::new(mock2.clone()),
             "test-server",
         );
-        new_conn.set_orphan_filter_enabled(false);
 
         client.reconnect_with(new_conn).await.unwrap();
 
@@ -1336,14 +1330,14 @@ mod tests {
 
         // Create a new mock for the "reconnected" transport.
         let mock2 = Arc::new(MockTransport::new());
+        mock2.enable_auto_rewrite_msg_id();
         queue_negotiate_and_session(mock2.as_ref(), SessionId(0x2222));
 
-        let mut new_conn = Connection::from_transport(
+        let new_conn = Connection::from_transport(
             Box::new(mock2.clone()),
             Box::new(mock2.clone()),
             "test-server",
         );
-        new_conn.set_orphan_filter_enabled(false);
 
         client.reconnect_with(new_conn).await.unwrap();
 
@@ -1356,6 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn smb_client_auto_reconnect_flag_stored() {
         let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
         queue_negotiate_and_session(mock.as_ref(), SessionId(1));
 
         let mut conn = Connection::from_transport(
@@ -1363,7 +1358,6 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        conn.set_orphan_filter_enabled(false);
         conn.negotiate().await.unwrap();
         let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
 

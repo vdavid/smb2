@@ -64,27 +64,27 @@ async fn tree_connect_ipc(conn: &mut Connection) -> Result<TreeId> {
         path: unc_path,
     };
 
-    let (_, _) = conn.send_request(Command::TreeConnect, &req, None).await?;
-    let (resp_header, resp_body, _) = conn.receive_response().await?;
+    let frame = conn.execute(Command::TreeConnect, &req, None).await?;
 
-    if resp_header.command != Command::TreeConnect {
+    if frame.header.command != Command::TreeConnect {
         return Err(Error::invalid_data(format!(
             "expected TreeConnect response, got {:?}",
-            resp_header.command
+            frame.header.command
         )));
     }
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::TreeConnect,
         });
     }
 
-    let mut cursor = ReadCursor::new(&resp_body);
+    let mut cursor = ReadCursor::new(&frame.body);
     let _resp = TreeConnectResponse::unpack(&mut cursor)?;
 
-    let tree_id = resp_header
+    let tree_id = frame
+        .header
         .tree_id
         .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
 
@@ -123,20 +123,19 @@ async fn send_dfs_ioctl(
         input_data,
     };
 
-    let (_, _) = conn
-        .send_request(Command::Ioctl, &ioctl_req, Some(tree_id))
+    let frame = conn
+        .execute(Command::Ioctl, &ioctl_req, Some(tree_id))
         .await?;
-    let (resp_header, resp_body, _) = conn.receive_response().await?;
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::Ioctl,
         });
     }
 
     // Parse the IOCTL response envelope
-    let mut cursor = ReadCursor::new(&resp_body);
+    let mut cursor = ReadCursor::new(&frame.body);
     let ioctl_resp = IoctlResponse::unpack(&mut cursor)?;
 
     debug!(
@@ -160,14 +159,13 @@ async fn send_dfs_ioctl(
 /// Disconnect from a tree.
 async fn tree_disconnect(conn: &mut Connection, tree_id: TreeId) -> Result<()> {
     let body = TreeDisconnectRequest;
-    let (_, _) = conn
-        .send_request(Command::TreeDisconnect, &body, Some(tree_id))
+    let frame = conn
+        .execute(Command::TreeDisconnect, &body, Some(tree_id))
         .await?;
-    let (resp_header, _, _) = conn.receive_response().await?;
 
-    if resp_header.status != NtStatus::SUCCESS {
+    if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
-            status: resp_header.status,
+            status: frame.header.status,
             command: Command::TreeDisconnect,
         });
     }

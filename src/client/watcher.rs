@@ -153,42 +153,34 @@ impl<'a> Watcher<'a> {
             completion_filter: DEFAULT_COMPLETION_FILTER,
         };
 
-        let (_, _) = self
+        // `execute` handles STATUS_PENDING transparently: the receiver task
+        // keeps the waiter registered through interim responses and only
+        // resolves the oneshot when the real (non-pending) response arrives.
+        let frame = self
             .conn
-            .send_request(Command::ChangeNotify, &req, Some(self.tree.tree_id))
+            .execute(Command::ChangeNotify, &req, Some(self.tree.tree_id))
             .await?;
 
-        // The server will likely send STATUS_PENDING first, then the real
-        // response later. Loop until we get a non-pending response.
-        loop {
-            let (resp_header, resp_body, _) = self.conn.receive_response().await?;
-
-            if resp_header.status == NtStatus::PENDING {
-                debug!("watcher: received STATUS_PENDING, waiting for changes...");
-                continue;
-            }
-
-            if resp_header.status == NtStatus::NOTIFY_ENUM_DIR {
-                return Err(Error::Protocol {
-                    status: resp_header.status,
-                    command: Command::ChangeNotify,
-                });
-            }
-
-            if resp_header.status != NtStatus::SUCCESS {
-                return Err(Error::Protocol {
-                    status: resp_header.status,
-                    command: Command::ChangeNotify,
-                });
-            }
-
-            let mut cursor = ReadCursor::new(&resp_body);
-            let resp = ChangeNotifyResponse::unpack(&mut cursor)?;
-
-            let events = parse_notify_information(&resp.output_data)?;
-            debug!("watcher: received {} change event(s)", events.len());
-            return Ok(events);
+        if frame.header.status == NtStatus::NOTIFY_ENUM_DIR {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::ChangeNotify,
+            });
         }
+
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::ChangeNotify,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&frame.body);
+        let resp = ChangeNotifyResponse::unpack(&mut cursor)?;
+
+        let events = parse_notify_information(&resp.output_data)?;
+        debug!("watcher: received {} change event(s)", events.len());
+        Ok(events)
     }
 
     /// Close the directory handle.
