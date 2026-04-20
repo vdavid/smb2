@@ -4651,6 +4651,321 @@ mod tests {
         assert!(cloned.pending_fifo.is_empty());
     }
 
+    // ── Phase 3 A.2: `execute` / `execute_with_credits` / `execute_compound` ──
+    //
+    // These tests exercise the additive concurrent-op API. All callers take
+    // `&self`, so the orphan filter stays ENABLED (production behavior). Mock
+    // responses hardcode the MessageIds that `execute` allocates, starting at 0
+    // by default (or a specific `set_next_message_id` for multi-op tests).
+
+    /// Build an ECHO response with a specific MessageId.
+    fn build_echo_response_with_msg_id(msg_id: MessageId) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Echo);
+        h.flags.set_response();
+        h.credits = 10;
+        h.message_id = msg_id;
+        pack_message(&h, &crate::msg::echo::EchoResponse)
+    }
+
+    /// Queue a response AFTER the spawned task has sent its request (and
+    /// thus registered its waiter). Using `multi_thread` so the receiver
+    /// task can race the test task — catching any regression where the
+    /// orphan filter silently drops the response.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_returns_correct_frame_for_sent_request() {
+        let mock = Arc::new(MockTransport::new());
+
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // Spawn the execute first. `execute` allocates msg_id=0.
+        let c = conn.clone();
+        let handle = tokio::spawn(async move {
+            c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                .await
+        });
+
+        // Wait for the send to land, then queue the response.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < 1 {
+            if std::time::Instant::now() > deadline {
+                panic!("execute task did not send its request in 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        mock.queue_response(build_echo_response_with_msg_id(MessageId(0)));
+
+        let frame = handle.await.unwrap().unwrap();
+
+        assert_eq!(frame.header.command, Command::Echo);
+        assert_eq!(frame.header.message_id, MessageId(0));
+        assert!(frame.header.is_response());
+        // Body should unpack as EchoResponse.
+        let mut cursor = ReadCursor::new(&frame.body);
+        crate::msg::echo::EchoResponse::unpack(&mut cursor).unwrap();
+
+        mock.assert_fully_consumed();
+    }
+
+    /// N concurrent `execute` calls on clones of the same `Connection` all
+    /// succeed — the receiver task's per-MessageId routing delivers each
+    /// response to its own waiter. Needs a multi-threaded runtime so the
+    /// receiver task can make progress while the task-under-test runs.
+    ///
+    /// Gotcha/Why: we MUST spawn the tasks first and wait for all N sends
+    /// to register waiters before queuing responses. The receiver task
+    /// starts reading `mock` immediately after `from_transport`. If we
+    /// pre-queue all N responses, the receiver races the spawned tasks —
+    /// any response whose msg_id hasn't had its waiter registered yet is
+    /// dropped by the orphan filter (enabled by default in production
+    /// mode), and the task hangs forever waiting for a response that's
+    /// already been discarded. This ordering reflects the production
+    /// reality: responses always arrive AFTER the client sent them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_execute_on_one_connection_all_succeed() {
+        const N: u64 = 20;
+
+        let mock = Arc::new(MockTransport::new());
+
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // Spawn N tasks FIRST — they register waiters and send requests.
+        let mut handles = Vec::with_capacity(N as usize);
+        for _ in 0..N {
+            let c = conn.clone();
+            handles.push(tokio::spawn(async move {
+                c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                    .await
+            }));
+        }
+
+        // Wait until all N requests have been sent AND all waiters are
+        // registered. Poll `sent_count` rather than hardcode a sleep.
+        // `execute` registers the waiter BEFORE calling `sender.send`,
+        // so `sent_count >= N` implies all N waiters are live.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < N as usize {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "tasks did not send all {} requests in 5s (got {})",
+                    N,
+                    mock.sent_count()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Now queue responses for msg_ids 0..N. Each one routes to a
+        // registered waiter.
+        for i in 0..N {
+            mock.queue_response(build_echo_response_with_msg_id(MessageId(i)));
+        }
+
+        let mut got_ids: Vec<u64> = Vec::with_capacity(N as usize);
+        for h in handles {
+            let frame = h.await.unwrap().unwrap();
+            assert_eq!(frame.header.command, Command::Echo);
+            got_ids.push(frame.header.message_id.0);
+        }
+        got_ids.sort_unstable();
+        assert_eq!(got_ids, (0..N).collect::<Vec<_>>());
+
+        mock.assert_fully_consumed();
+    }
+
+    /// Dropping 2 of 5 execute futures before their responses arrive does
+    /// NOT corrupt the other 3: the receiver task silently discards the
+    /// frames routed to dropped oneshots, and the 3 surviving tasks see
+    /// their own responses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_execute_future_does_not_affect_others() {
+        let mock = Arc::new(MockTransport::new());
+
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // Spawn 5 tasks. Each allocates its own MessageId in submission
+        // order: 0, 1, 2, 3, 4. To make allocation deterministic on the
+        // multi_thread runtime, wait for each task's send to land before
+        // spawning the next. `yield_now` alone isn't enough — on a
+        // multi-worker runtime, the next spawn can race the previous
+        // task's send and reorder msg_id allocation.
+        let mut handles = Vec::new();
+        for idx in 0..5 {
+            let c = conn.clone();
+            let h = tokio::spawn(async move {
+                c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                    .await
+            });
+            handles.push(h);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while mock.sent_count() < idx + 1 {
+                if std::time::Instant::now() > deadline {
+                    panic!(
+                        "task {} did not send its request in 5s (sent_count={})",
+                        idx,
+                        mock.sent_count()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // All 5 tasks have sent; waiters registered; msg_ids = 0..5.
+        assert_eq!(mock.sent_count(), 5);
+
+        // Abort tasks at indices 1 and 3 (msg_ids 1 and 3).
+        handles[1].abort();
+        handles[3].abort();
+
+        // Now queue responses for all 5 msg_ids. The 2 aborted-task
+        // responses route to closed oneshots and get silently discarded;
+        // the 3 live tasks get their responses.
+        for i in 0..5u64 {
+            mock.queue_response(build_echo_response_with_msg_id(MessageId(i)));
+        }
+
+        // Collect results: tasks 0, 2, 4 should complete OK; tasks 1, 3
+        // return JoinError (they were aborted).
+        for (idx, h) in handles.into_iter().enumerate() {
+            let res = h.await;
+            if idx == 1 || idx == 3 {
+                assert!(res.is_err(), "task {} should have been aborted", idx);
+            } else {
+                let frame = res.unwrap().unwrap();
+                assert_eq!(frame.header.command, Command::Echo);
+                assert_eq!(frame.header.message_id, MessageId(idx as u64));
+            }
+        }
+
+        // All 5 responses were consumed by the receiver task (even the 2
+        // whose waiters were dropped — the task reads every frame off the
+        // mock regardless of waiter state).
+        mock.assert_fully_consumed();
+    }
+
+    /// Compound partial failure: op 1 succeeds, op 2 returns an error
+    /// status, op 3 succeeds. Outer result is `Ok(vec)`; inner is
+    /// `[Ok, Ok(with-error-status), Ok]` — the per-sub-op error is
+    /// encoded in `frame.header.status`, not in the inner `Result`,
+    /// because the server returned a well-formed frame for every op.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_compound_partial_failure_routes_correctly() {
+        let mock = Arc::new(MockTransport::new());
+
+        // 3-op compound. `execute_compound` allocates msg_ids 0, 1, 2.
+        let echo_ok_0 = build_echo_response_with_msg_id(MessageId(0));
+        let mut err_hdr = Header::new_request(Command::Echo);
+        err_hdr.flags.set_response();
+        err_hdr.credits = 10;
+        err_hdr.message_id = MessageId(1);
+        err_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let err_body = pack_message(
+            &err_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+        let echo_ok_2 = build_echo_response_with_msg_id(MessageId(2));
+
+        let compound_response = build_compound_response_frame(&[echo_ok_0, err_body, echo_ok_2]);
+
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        let c = conn.clone();
+        let handle = tokio::spawn(async move {
+            let ops = [
+                CompoundOp::new(Command::Echo, &crate::msg::echo::EchoRequest, None),
+                CompoundOp::new(Command::Echo, &crate::msg::echo::EchoRequest, None),
+                CompoundOp::new(Command::Echo, &crate::msg::echo::EchoRequest, None),
+            ];
+            c.execute_compound(&ops).await
+        });
+
+        // Wait for the compound request to land on the wire — one send
+        // for all 3 sub-ops — then queue the response. All 3 waiters
+        // are registered before the send, so the single compound-reply
+        // frame routes to all of them.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < 1 {
+            if std::time::Instant::now() > deadline {
+                panic!("execute_compound did not send in 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        mock.queue_response(compound_response);
+
+        let results = handle.await.unwrap().unwrap();
+
+        assert_eq!(results.len(), 3);
+        let f0 = results[0].as_ref().expect("op 0 should be Ok");
+        assert_eq!(f0.header.status, NtStatus::SUCCESS);
+        assert_eq!(f0.header.message_id, MessageId(0));
+
+        let f1 = results[1].as_ref().expect("op 1 still carries a Frame — error status in header");
+        assert_eq!(f1.header.status, NtStatus::OBJECT_NAME_NOT_FOUND);
+        assert_eq!(f1.header.message_id, MessageId(1));
+
+        let f2 = results[2].as_ref().expect("op 2 should be Ok");
+        assert_eq!(f2.header.status, NtStatus::SUCCESS);
+        assert_eq!(f2.header.message_id, MessageId(2));
+
+        mock.assert_fully_consumed();
+    }
+
+    /// Using a clone after the original is dropped: the `Arc<Inner>` keeps
+    /// the receiver task alive. Specifically for `execute` (the A.1 test
+    /// only exercised direct `sender.send`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_on_clone_works_after_original_dropped() {
+        let mock = Arc::new(MockTransport::new());
+
+        let original = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let cloned = original.clone();
+        drop(original);
+
+        let c = cloned.clone();
+        let handle = tokio::spawn(async move {
+            c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                .await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < 1 {
+            if std::time::Instant::now() > deadline {
+                panic!("execute on clone did not send in 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        mock.queue_response(build_echo_response_with_msg_id(MessageId(0)));
+
+        let frame = handle.await.unwrap().unwrap();
+        assert_eq!(frame.header.command, Command::Echo);
+        assert_eq!(frame.header.message_id, MessageId(0));
+
+        mock.assert_fully_consumed();
+    }
+
     /// A clone'd `Connection` survives the original being dropped: the
     /// receiver task and transport sender are behind `Arc<Inner>`, so
     /// dropping the last Arc (not the first) is what aborts the task.
