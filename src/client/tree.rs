@@ -8,7 +8,7 @@ use std::ops::ControlFlow;
 
 use log::{debug, info, trace, warn};
 
-use crate::client::connection::Connection;
+use crate::client::connection::{CompoundOp, Connection};
 use crate::client::stream::Progress;
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
@@ -28,7 +28,7 @@ use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{FileTime, ReadCursor, Unpack};
 use crate::types::flags::FileAccessMask;
 use crate::types::status::NtStatus;
-use crate::types::{Command, CreditCharge, FileId, MessageId, OplockLevel, TreeId};
+use crate::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
 use crate::Error;
 
 /// Maximum number of requests to keep in flight during pipelining.
@@ -37,6 +37,25 @@ use crate::Error;
 /// increases memory usage (buffering responses). 32 x 64 KB = 2 MB
 /// in flight is plenty for Gigabit LAN.
 const MAX_PIPELINE_WINDOW: usize = 32;
+
+/// Unwrap an `execute_compound` result, propagating the first inner
+/// waiter-level error (session expired, signature verify failure,
+/// connection disconnected mid-await) as the outer `Err`. Returns a
+/// `Vec<Frame>` so callers can index per sub-op.
+///
+/// Matches the pre-Phase-3 `receive_compound_expected`'s short-circuit
+/// semantics: any routing-level failure aborts the whole operation
+/// rather than silently handing back a partial response list the
+/// caller would have to inspect one-by-one. Sub-op status codes
+/// (`STATUS_OBJECT_NAME_NOT_FOUND` and friends) are NOT errors here;
+/// they ride in `Frame::header.status` and the caller checks them.
+fn all_or_first_err(frames: Vec<Result<crate::client::connection::Frame>>) -> Result<Vec<crate::client::connection::Frame>> {
+    let mut out = Vec::with_capacity(frames.len());
+    for r in frames {
+        out.push(r?);
+    }
+    Ok(out)
+}
 
 /// File attribute constant: the entry is a directory.
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
@@ -139,28 +158,27 @@ impl Tree {
             path: unc_path,
         };
 
-        let (_, _req_raw) = conn.send_request(Command::TreeConnect, &req, None).await?;
+        let frame = conn.execute(Command::TreeConnect, &req, None).await?;
 
-        let (resp_header, resp_body, _resp_raw) = conn.receive_response().await?;
-
-        if resp_header.command != Command::TreeConnect {
+        if frame.header.command != Command::TreeConnect {
             return Err(Error::invalid_data(format!(
                 "expected TreeConnect response, got {:?}",
-                resp_header.command
+                frame.header.command
             )));
         }
 
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::TreeConnect,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(&frame.body);
         let resp = TreeConnectResponse::unpack(&mut cursor)?;
 
-        let tree_id = resp_header
+        let tree_id = frame
+            .header
             .tree_id
             .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
 
@@ -296,21 +314,34 @@ impl Tree {
         };
 
         // Send as compound.
-        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-            (Command::Create, &create_req, CreditCharge(1)),
-            (Command::Read, &read_req, CreditCharge(read_credit_charge)),
-            (Command::Close, &close_req, CreditCharge(1)),
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Read,
+                body: &read_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(read_credit_charge),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
         ];
 
-        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
 
-        // Receive compound response. If the server split the compound
-        // chain across frames, `receive_compound_expected` gathers them.
-        let responses = conn.receive_compound_expected(3).await?;
-
-        let (create_header, create_body) = &responses[0];
-        let (read_header, read_body) = &responses[1];
-        let (close_header, _close_body) = &responses[2];
+        let create_header = &responses[0].header;
+        let create_body = &responses[0].body;
+        let read_header = &responses[1].header;
+        let read_body = &responses[1].body;
+        let close_header = &responses[2].header;
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
@@ -384,15 +415,13 @@ impl Tree {
             self.share_name, self.tree_id
         );
         let body = TreeDisconnectRequest;
-        let (_, _) = conn
-            .send_request(Command::TreeDisconnect, &body, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::TreeDisconnect, &body, Some(self.tree_id))
             .await?;
 
-        let (resp_header, _, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::TreeDisconnect,
             });
         }
@@ -462,10 +491,16 @@ impl Tree {
 
         debug!("tree: delete_files batch, count={}", paths.len());
 
-        // Phase 1: Send all compound requests.
-        let mut sent_count = 0;
-        let mut send_error: Option<Error> = None;
-
+        // Issue one `execute_compound` per path sequentially. Each compound
+        // is still CREATE+CLOSE in a single wire frame, so per-file round
+        // trips stay at 1. Pre-Phase-3 this loop did "phase 1: send all,
+        // phase 2: receive all" to overlap server work — the new API
+        // doesn't expose raw send/receive separately; if that throughput
+        // matters, `execute_compound` can run on cloned connections via
+        // `tokio::spawn` to interleave responses through the receiver
+        // task's per-`MessageId` routing.
+        let mut results: Vec<Result<()>> = Vec::with_capacity(paths.len());
+        let mut cleanup_handles: Vec<FileId> = Vec::new();
         for path in paths {
             let normalized = self.format_path(path);
             let create_req = CreateRequest {
@@ -485,72 +520,57 @@ impl Tree {
                 name: normalized,
                 create_contexts: vec![],
             };
-
             let close_req = CloseRequest {
                 flags: 0,
                 file_id: FileId::SENTINEL,
             };
-
-            let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-                (Command::Create, &create_req, CreditCharge(1)),
-                (Command::Close, &close_req, CreditCharge(1)),
+            let ops = [
+                CompoundOp {
+                    command: Command::Create,
+                    body: &create_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
+                CompoundOp {
+                    command: Command::Close,
+                    body: &close_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
             ];
-
-            match conn.send_compound(self.tree_id, &operations).await {
-                Ok(_) => sent_count += 1,
-                Err(e) => {
-                    send_error = Some(e);
-                    break;
-                }
-            }
-        }
-
-        // Phase 2: Receive all compound responses.
-        let mut results: Vec<Result<()>> = Vec::with_capacity(paths.len());
-        let mut cleanup_handles: Vec<FileId> = Vec::new();
-
-        for (i, path) in paths.iter().enumerate().take(sent_count) {
-            match conn.receive_compound_expected(2).await {
-                Ok(responses) => {
-                    let (create_header, create_body) = &responses[0];
-                    let (close_header, _) = &responses[1];
-
-                    if create_header.status != NtStatus::SUCCESS {
-                        results.push(Err(Error::Protocol {
-                            status: create_header.status,
-                            command: Command::Create,
-                        }));
-                    } else if close_header.status != NtStatus::SUCCESS {
-                        // CREATE succeeded, CLOSE failed. Need cleanup.
-                        if let Ok(create_resp) =
-                            CreateResponse::unpack(&mut ReadCursor::new(create_body))
-                        {
-                            cleanup_handles.push(create_resp.file_id);
-                        }
-                        results.push(Err(Error::Protocol {
-                            status: close_header.status,
-                            command: Command::Close,
-                        }));
-                    } else {
-                        info!("tree: batch deleted file={}", path);
-                        results.push(Ok(()));
-                    }
-                }
+            let frames = match conn.execute_compound(&ops).await {
+                Ok(v) => v,
                 Err(e) => {
                     results.push(Err(e));
-                    for _ in (i + 1)..sent_count {
-                        results.push(Err(Error::Disconnected));
-                    }
-                    break;
+                    continue;
                 }
-            }
-        }
-
-        // Fill unsent paths with the send error.
-        if let Some(err) = send_error {
-            results.push(Err(err));
-            for _ in (sent_count + 1)..paths.len() {
-                results.push(Err(Error::Disconnected));
+            };
+            let responses = match all_or_first_err(frames) {
+                Ok(v) => v,
+                Err(e) => {
+                    results.push(Err(e));
+                    continue;
+                }
+            };
+            let create_header = &responses[0].header;
+            let create_body = &responses[0].body;
+            let close_header = &responses[1].header;
+            if create_header.status != NtStatus::SUCCESS {
+                results.push(Err(Error::Protocol {
+                    status: create_header.status,
+                    command: Command::Create,
+                }));
+            } else if close_header.status != NtStatus::SUCCESS {
+                if let Ok(create_resp) = CreateResponse::unpack(&mut ReadCursor::new(create_body)) {
+                    cleanup_handles.push(create_resp.file_id);
+                }
+                results.push(Err(Error::Protocol {
+                    status: close_header.status,
+                    command: Command::Close,
+                }));
+            } else {
+                info!("tree: batch deleted file={}", path);
+                results.push(Ok(()));
             }
         }
 
@@ -626,20 +646,42 @@ impl Tree {
             file_id: FileId::SENTINEL,
         };
 
-        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-            (Command::Create, &create_req, CreditCharge(1)),
-            (Command::QueryInfo, &basic_req, CreditCharge(1)),
-            (Command::QueryInfo, &std_req, CreditCharge(1)),
-            (Command::Close, &close_req, CreditCharge(1)),
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &basic_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &std_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
         ];
 
-        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
-        let responses = conn.receive_compound_expected(4).await?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
 
-        let (create_header, create_body) = &responses[0];
-        let (basic_header, basic_body) = &responses[1];
-        let (std_header, std_body) = &responses[2];
-        let (close_header, _close_body) = &responses[3];
+        let create_header = &responses[0].header;
+        let create_body = &responses[0].body;
+        let basic_header = &responses[1].header;
+        let basic_body = &responses[1].body;
+        let std_header = &responses[2].header;
+        let std_body = &responses[2].body;
+        let close_header = &responses[3].header;
 
         // If CREATE failed, all ops cascade. No handle to clean up.
         if create_header.status != NtStatus::SUCCESS {
@@ -757,13 +799,14 @@ impl Tree {
 
         debug!("tree: stat_files batch, count={}", paths.len());
 
-        // Phase 1: Send all compound requests.
-        let mut sent_count = 0;
-        let mut send_error: Option<Error> = None;
+        // Issue one `execute_compound` per path sequentially. See
+        // `delete_files` for the same shape and the note on wire-level
+        // pipelining tradeoffs.
+        let mut results: Vec<Result<FileInfo>> = Vec::with_capacity(paths.len());
+        let mut cleanup_handles: Vec<FileId> = Vec::new();
 
         for path in paths {
             let normalized = self.format_path(path);
-
             let create_req = CreateRequest {
                 requested_oplock_level: OplockLevel::None,
                 impersonation_level: ImpersonationLevel::Impersonation,
@@ -781,7 +824,6 @@ impl Tree {
                 name: normalized,
                 create_contexts: vec![],
             };
-
             let basic_req = QueryInfoRequest {
                 info_type: InfoType::File,
                 file_info_class: FILE_BASIC_INFORMATION,
@@ -791,7 +833,6 @@ impl Tree {
                 file_id: FileId::SENTINEL,
                 input_buffer: vec![],
             };
-
             let std_req = QueryInfoRequest {
                 info_type: InfoType::File,
                 file_info_class: FILE_STANDARD_INFORMATION,
@@ -801,56 +842,55 @@ impl Tree {
                 file_id: FileId::SENTINEL,
                 input_buffer: vec![],
             };
-
             let close_req = CloseRequest {
                 flags: 0,
                 file_id: FileId::SENTINEL,
             };
-
-            let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-                (Command::Create, &create_req, CreditCharge(1)),
-                (Command::QueryInfo, &basic_req, CreditCharge(1)),
-                (Command::QueryInfo, &std_req, CreditCharge(1)),
-                (Command::Close, &close_req, CreditCharge(1)),
+            let ops = [
+                CompoundOp {
+                    command: Command::Create,
+                    body: &create_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
+                CompoundOp {
+                    command: Command::QueryInfo,
+                    body: &basic_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
+                CompoundOp {
+                    command: Command::QueryInfo,
+                    body: &std_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
+                CompoundOp {
+                    command: Command::Close,
+                    body: &close_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
             ];
-
-            match conn.send_compound(self.tree_id, &operations).await {
-                Ok(_) => sent_count += 1,
-                Err(e) => {
-                    send_error = Some(e);
-                    break;
-                }
-            }
-        }
-
-        // Phase 2: Receive all compound responses.
-        let mut results: Vec<Result<FileInfo>> = Vec::with_capacity(paths.len());
-        let mut cleanup_handles: Vec<FileId> = Vec::new();
-
-        for i in 0..sent_count {
-            match conn.receive_compound_expected(4).await {
-                Ok(responses) => {
-                    results.push(self.parse_stat_batch_response(&responses, &mut cleanup_handles));
-                    if results[i].is_ok() {
-                        debug!("tree: batch stat done for file={}", paths[i]);
-                    }
-                }
+            let frames = match conn.execute_compound(&ops).await {
+                Ok(v) => v,
                 Err(e) => {
                     results.push(Err(e));
-                    for _ in (i + 1)..sent_count {
-                        results.push(Err(Error::Disconnected));
-                    }
-                    break;
+                    continue;
                 }
+            };
+            let responses = match all_or_first_err(frames) {
+                Ok(v) => v,
+                Err(e) => {
+                    results.push(Err(e));
+                    continue;
+                }
+            };
+            let parsed = self.parse_stat_batch_response(&responses, &mut cleanup_handles);
+            if parsed.is_ok() {
+                debug!("tree: batch stat done for file={}", path);
             }
-        }
-
-        // Fill unsent paths with the send error.
-        if let Some(err) = send_error {
-            results.push(Err(err));
-            for _ in (sent_count + 1)..paths.len() {
-                results.push(Err(Error::Disconnected));
-            }
+            results.push(parsed);
         }
 
         // Phase 3: Cleanup -- standalone CLOSEs for leaked handles.
@@ -872,12 +912,11 @@ impl Tree {
 
     /// Parse a single stat compound response for the batch stat method.
     ///
-    /// Expects exactly four sub-responses (CREATE, QUERY_INFO basic,
-    /// QUERY_INFO standard, CLOSE). The caller must guarantee this by
-    /// gathering responses via `receive_compound_expected(4)`.
+    /// Expects exactly four sub-frames (CREATE, QUERY_INFO basic,
+    /// QUERY_INFO standard, CLOSE).
     fn parse_stat_batch_response(
         &self,
-        responses: &[(crate::msg::header::Header, Vec<u8>)],
+        responses: &[crate::client::connection::Frame],
         cleanup_handles: &mut Vec<FileId>,
     ) -> Result<FileInfo> {
         debug_assert_eq!(
@@ -886,9 +925,12 @@ impl Tree {
             "stat compound must have 4 sub-responses"
         );
 
-        let (create_header, create_body) = &responses[0];
-        let (basic_header, basic_body) = &responses[1];
-        let (std_header, std_body) = &responses[2];
+        let create_header = &responses[0].header;
+        let create_body = &responses[0].body;
+        let basic_header = &responses[1].header;
+        let basic_body = &responses[1].body;
+        let std_header = &responses[2].header;
+        let std_body = &responses[2].body;
 
         if create_header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
@@ -1015,21 +1057,33 @@ impl Tree {
         };
 
         // Send as compound.
-        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-            (Command::Create, &create_req, CreditCharge(1)),
-            (Command::QueryInfo, &query_req, CreditCharge(1)),
-            (Command::Close, &close_req, CreditCharge(1)),
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &query_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
         ];
 
-        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
 
-        // Receive compound response. If the server split the compound
-        // chain across frames, `receive_compound_expected` gathers them.
-        let responses = conn.receive_compound_expected(3).await?;
-
-        let (create_header, _create_body) = &responses[0];
-        let (query_header, query_body) = &responses[1];
-        let (close_header, _close_body) = &responses[2];
+        let create_header = &responses[0].header;
+        let query_header = &responses[1].header;
+        let query_body = &responses[1].body;
+        let close_header = &responses[2].header;
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
@@ -1042,7 +1096,7 @@ impl Tree {
         // Check QUERY_INFO response.
         if !query_header.status.is_success_or_partial() {
             // QUERY_INFO failed. Issue standalone CLOSE to clean up.
-            let mut cursor = ReadCursor::new(&responses[0].1);
+            let mut cursor = ReadCursor::new(&responses[0].body);
             let create_resp = CreateResponse::unpack(&mut cursor)?;
             debug!(
                 "tree: compound QUERY_INFO failed ({:?}), issuing standalone CLOSE",
@@ -1148,18 +1202,33 @@ impl Tree {
             file_id: FileId::SENTINEL,
         };
 
-        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-            (Command::Create, &create_req, CreditCharge(1)),
-            (Command::SetInfo, &setinfo_req, CreditCharge(1)),
-            (Command::Close, &close_req, CreditCharge(1)),
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::SetInfo,
+                body: &setinfo_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
         ];
 
-        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
-        let responses = conn.receive_compound_expected(3).await?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
 
-        let (create_header, create_body) = &responses[0];
-        let (setinfo_header, _setinfo_body) = &responses[1];
-        let (close_header, _close_body) = &responses[2];
+        let create_header = &responses[0].header;
+        let create_body = &responses[0].body;
+        let setinfo_header = &responses[1].header;
+        let close_header = &responses[2].header;
 
         // If CREATE failed, all ops cascade. No handle to clean up.
         if create_header.status != NtStatus::SUCCESS {
@@ -1215,14 +1284,14 @@ impl Tree {
 
         debug!("tree: rename_files batch, count={}", renames.len());
 
-        // Phase 1: Send all compound requests.
-        let mut sent_count = 0;
-        let mut send_error: Option<Error> = None;
+        // Sequential `execute_compound` per rename. See `delete_files` for
+        // the pipelining note.
+        let mut results: Vec<Result<()>> = Vec::with_capacity(renames.len());
+        let mut cleanup_handles: Vec<FileId> = Vec::new();
 
         for (from, to) in renames {
             let from_normalized = self.format_path(from);
             let to_normalized = normalize_path(to);
-
             let create_req = CreateRequest {
                 requested_oplock_level: OplockLevel::None,
                 impersonation_level: ImpersonationLevel::Impersonation,
@@ -1240,7 +1309,6 @@ impl Tree {
                 name: from_normalized,
                 create_contexts: vec![],
             };
-
             let setinfo_req = SetInfoRequest {
                 info_type: InfoType::File,
                 file_info_class: FILE_RENAME_INFORMATION,
@@ -1248,81 +1316,71 @@ impl Tree {
                 file_id: FileId::SENTINEL,
                 buffer: build_rename_info_buffer(&to_normalized),
             };
-
             let close_req = CloseRequest {
                 flags: 0,
                 file_id: FileId::SENTINEL,
             };
-
-            let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-                (Command::Create, &create_req, CreditCharge(1)),
-                (Command::SetInfo, &setinfo_req, CreditCharge(1)),
-                (Command::Close, &close_req, CreditCharge(1)),
+            let ops = [
+                CompoundOp {
+                    command: Command::Create,
+                    body: &create_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
+                CompoundOp {
+                    command: Command::SetInfo,
+                    body: &setinfo_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
+                CompoundOp {
+                    command: Command::Close,
+                    body: &close_req,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                },
             ];
-
-            match conn.send_compound(self.tree_id, &operations).await {
-                Ok(_) => sent_count += 1,
-                Err(e) => {
-                    send_error = Some(e);
-                    break;
-                }
-            }
-        }
-
-        // Phase 2: Receive all compound responses.
-        let mut results: Vec<Result<()>> = Vec::with_capacity(renames.len());
-        let mut cleanup_handles: Vec<FileId> = Vec::new();
-
-        for (i, (from, to)) in renames.iter().enumerate().take(sent_count) {
-            match conn.receive_compound_expected(3).await {
-                Ok(responses) => {
-                    let (create_header, create_body) = &responses[0];
-                    let (setinfo_header, _) = &responses[1];
-                    let (close_header, _) = &responses[2];
-
-                    if create_header.status != NtStatus::SUCCESS {
-                        results.push(Err(Error::Protocol {
-                            status: create_header.status,
-                            command: Command::Create,
-                        }));
-                    } else if setinfo_header.status != NtStatus::SUCCESS {
-                        // CREATE succeeded, SET_INFO failed. Need cleanup.
-                        if let Ok(create_resp) =
-                            CreateResponse::unpack(&mut ReadCursor::new(create_body))
-                        {
-                            cleanup_handles.push(create_resp.file_id);
-                        }
-                        results.push(Err(Error::Protocol {
-                            status: setinfo_header.status,
-                            command: Command::SetInfo,
-                        }));
-                    } else {
-                        // Check CLOSE (non-fatal if rename succeeded).
-                        if close_header.status != NtStatus::SUCCESS {
-                            debug!(
-                                "tree: batch rename CLOSE returned {:?} (non-fatal)",
-                                close_header.status,
-                            );
-                        }
-                        info!("tree: batch renamed from={} to={}", from, to);
-                        results.push(Ok(()));
-                    }
-                }
+            let frames = match conn.execute_compound(&ops).await {
+                Ok(v) => v,
                 Err(e) => {
                     results.push(Err(e));
-                    for _ in (i + 1)..sent_count {
-                        results.push(Err(Error::Disconnected));
-                    }
-                    break;
+                    continue;
                 }
-            }
-        }
+            };
+            let responses = match all_or_first_err(frames) {
+                Ok(v) => v,
+                Err(e) => {
+                    results.push(Err(e));
+                    continue;
+                }
+            };
+            let create_header = &responses[0].header;
+            let create_body = &responses[0].body;
+            let setinfo_header = &responses[1].header;
+            let close_header = &responses[2].header;
 
-        // Fill unsent paths with the send error.
-        if let Some(err) = send_error {
-            results.push(Err(err));
-            for _ in (sent_count + 1)..renames.len() {
-                results.push(Err(Error::Disconnected));
+            if create_header.status != NtStatus::SUCCESS {
+                results.push(Err(Error::Protocol {
+                    status: create_header.status,
+                    command: Command::Create,
+                }));
+            } else if setinfo_header.status != NtStatus::SUCCESS {
+                if let Ok(create_resp) = CreateResponse::unpack(&mut ReadCursor::new(create_body)) {
+                    cleanup_handles.push(create_resp.file_id);
+                }
+                results.push(Err(Error::Protocol {
+                    status: setinfo_header.status,
+                    command: Command::SetInfo,
+                }));
+            } else {
+                if close_header.status != NtStatus::SUCCESS {
+                    debug!(
+                        "tree: batch rename CLOSE returned {:?} (non-fatal)",
+                        close_header.status,
+                    );
+                }
+                info!("tree: batch renamed from={} to={}", from, to);
+                results.push(Ok(()));
             }
         }
 
@@ -1405,27 +1463,41 @@ impl Tree {
         };
 
         // Send as 4-way compound.
-        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-            (Command::Create, &create_req, CreditCharge(1)),
-            (
-                Command::Write,
-                &write_req,
-                CreditCharge(write_credit_charge),
-            ),
-            (Command::Flush, &flush_req, CreditCharge(1)),
-            (Command::Close, &close_req, CreditCharge(1)),
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Write,
+                body: &write_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(write_credit_charge),
+            },
+            CompoundOp {
+                command: Command::Flush,
+                body: &flush_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
         ];
 
-        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
 
-        // Receive compound response. If the server split the compound
-        // chain across frames, `receive_compound_expected` gathers them.
-        let responses = conn.receive_compound_expected(4).await?;
-
-        let (create_header, create_body) = &responses[0];
-        let (write_header, write_body) = &responses[1];
-        let (flush_header, _flush_body) = &responses[2];
-        let (close_header, _close_body) = &responses[3];
+        let create_header = &responses[0].header;
+        let create_body = &responses[0].body;
+        let write_header = &responses[1].header;
+        let write_body = &responses[1].body;
+        let flush_header = &responses[2].header;
+        let close_header = &responses[3].header;
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
@@ -1698,20 +1770,18 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::Create, &req, Some(self.tree_id))
             .await?;
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(&frame.body);
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
@@ -1909,20 +1979,18 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::Create, &req, Some(self.tree_id))
             .await?;
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(&frame.body);
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
@@ -1980,16 +2048,26 @@ impl Tree {
             file_id: FileId::SENTINEL,
         };
 
-        let operations: Vec<(Command, &dyn crate::pack::Pack, CreditCharge)> = vec![
-            (Command::Create, &create_req, CreditCharge(1)),
-            (Command::Close, &close_req, CreditCharge(1)),
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
         ];
 
-        let _msg_ids = conn.send_compound(self.tree_id, &operations).await?;
-        let responses = conn.receive_compound_expected(2).await?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
 
-        let (create_header, create_body) = &responses[0];
-        let (close_header, _close_body) = &responses[1];
+        let create_header = &responses[0].header;
+        let create_body = &responses[0].body;
+        let close_header = &responses[1].header;
 
         // If CREATE failed, all ops in the compound fail (cascaded). No handle to clean up.
         if create_header.status != NtStatus::SUCCESS {
@@ -2041,20 +2119,18 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::Create, &req, Some(self.tree_id))
             .await?;
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
         Ok(resp.file_id)
     }
@@ -2085,20 +2161,18 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::Create, &req, Some(self.tree_id))
             .await?;
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
         Ok((resp.file_id, resp.end_of_file))
     }
@@ -2128,20 +2202,18 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        let (_, _) = conn
-            .send_request(Command::Create, &req, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::Create, &req, Some(self.tree_id))
             .await?;
 
-        let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Create,
             });
         }
 
-        let mut cursor = ReadCursor::new(&resp_body);
+        let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
         Ok(resp.file_id)
     }
@@ -2179,24 +2251,22 @@ impl Tree {
             };
             first = false;
 
-            let (_, _) = conn
-                .send_request(Command::QueryDirectory, &req, Some(self.tree_id))
+            let frame = conn
+                .execute(Command::QueryDirectory, &req, Some(self.tree_id))
                 .await?;
 
-            let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-            if resp_header.status == NtStatus::NO_MORE_FILES {
+            if frame.header.status == NtStatus::NO_MORE_FILES {
                 break;
             }
 
-            if resp_header.status != NtStatus::SUCCESS {
+            if frame.header.status != NtStatus::SUCCESS {
                 return Err(Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: Command::QueryDirectory,
                 });
             }
 
-            let mut cursor = ReadCursor::new(&resp_body);
+            let mut cursor = ReadCursor::new(&frame.body);
             let resp = QueryDirectoryResponse::unpack(&mut cursor)?;
 
             // Parse FileBothDirectoryInformation entries from the output buffer.
@@ -2248,25 +2318,23 @@ impl Tree {
                 read_channel_info: vec![],
             };
 
-            let (_, _) = conn
-                .send_request(Command::Read, &req, Some(self.tree_id))
+            let frame = conn
+                .execute(Command::Read, &req, Some(self.tree_id))
                 .await?;
 
-            let (resp_header, resp_body, _) = conn.receive_response().await?;
-
             // STATUS_END_OF_FILE means we read past the end.
-            if resp_header.status == NtStatus::END_OF_FILE {
+            if frame.header.status == NtStatus::END_OF_FILE {
                 break;
             }
 
-            if resp_header.status != NtStatus::SUCCESS {
+            if frame.header.status != NtStatus::SUCCESS {
                 return Err(Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: Command::Read,
                 });
             }
 
-            let mut cursor = ReadCursor::new(&resp_body);
+            let mut cursor = ReadCursor::new(&frame.body);
             let resp = ReadResponse::unpack(&mut cursor)?;
 
             if resp.data.is_empty() {
@@ -2294,12 +2362,12 @@ impl Tree {
         credit_charge: u16,
         total_chunks: usize,
     ) -> Result<Vec<u8>> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
         let mut data = vec![0u8; file_size as usize];
         let mut chunks_sent = 0usize;
         let mut chunks_received = 0usize;
-        let mut in_flight: Vec<(MessageId, usize)> = Vec::new();
 
-        // Initial fill: send up to window_size reads.
         let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
         let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
 
@@ -2316,15 +2384,19 @@ impl Tree {
             conn.credits()
         );
 
-        for _ in 0..initial_window {
-            let offset = chunks_sent as u64 * chunk_size as u64;
-            let this_chunk = if chunks_sent == total_chunks - 1 {
+        // Spawn each chunk read as an independent `execute_with_credits`
+        // future. `FuturesUnordered` polls them concurrently — the actor-
+        // based receiver task routes responses by `MessageId`, so all
+        // chunks compete fairly even when they arrive out of order.
+        let mut in_flight = FuturesUnordered::new();
+        let build_req = |chunk_index: usize| -> ReadRequest {
+            let offset = chunk_index as u64 * chunk_size as u64;
+            let this_chunk = if chunk_index == total_chunks - 1 {
                 (file_size - offset) as u32
             } else {
                 chunk_size
             };
-
-            let req = ReadRequest {
+            ReadRequest {
                 padding: 0x50,
                 flags: 0,
                 length: this_chunk,
@@ -2334,91 +2406,66 @@ impl Tree {
                 channel: SMB2_CHANNEL_NONE,
                 remaining_bytes: 0,
                 read_channel_info: vec![],
-            };
+            }
+        };
+        let launch_chunk = |conn: &Connection,
+                            chunk_index: usize,
+                            tree_id: TreeId|
+         -> _ {
+            let c = conn.clone();
+            let req = build_req(chunk_index);
+            async move {
+                let frame = c
+                    .execute_with_credits(
+                        Command::Read,
+                        &req,
+                        Some(tree_id),
+                        CreditCharge(credit_charge),
+                    )
+                    .await;
+                (chunk_index, frame)
+            }
+        };
 
-            let (msg_id, _) = conn
-                .send_request_with_credits(Command::Read, &req, Some(self.tree_id), credit_charge)
-                .await?;
-
-            in_flight.push((msg_id, chunks_sent));
+        for _ in 0..initial_window {
+            in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
             chunks_sent += 1;
         }
 
-        // Sliding loop: receive one, send one, until all chunks received.
         while chunks_received < total_chunks {
-            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            let Some((chunk_index, frame_result)) = in_flight.next().await else {
+                break;
+            };
             chunks_received += 1;
+            let frame = frame_result?;
 
-            if resp_header.status == NtStatus::END_OF_FILE {
-                // File is shorter than expected. Continue collecting remaining
-                // in-flight responses but don't send more.
+            if frame.header.status == NtStatus::END_OF_FILE {
+                // File is shorter than expected. Keep draining but don't
+                // launch more.
                 continue;
             }
 
-            if resp_header.status != NtStatus::SUCCESS {
+            if frame.header.status != NtStatus::SUCCESS {
                 return Err(Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: Command::Read,
                 });
             }
 
-            // Find which chunk this response belongs to by matching MessageId.
-            let msg_id = resp_header.message_id;
-            let chunk_index = in_flight
-                .iter()
-                .find(|(mid, _)| *mid == msg_id)
-                .map(|(_, idx)| *idx)
-                .ok_or_else(|| {
-                    Error::invalid_data(format!(
-                        "received response with unexpected MessageId {}",
-                        msg_id
-                    ))
-                })?;
-
-            let mut cursor = ReadCursor::new(&resp_body);
+            let mut cursor = ReadCursor::new(&frame.body);
             let resp = ReadResponse::unpack(&mut cursor)?;
 
             if !resp.data.is_empty() {
-                // Place data at the correct offset.
                 let dest_offset = chunk_index as u64 * chunk_size as u64;
                 let dest_end = (dest_offset as usize + resp.data.len()).min(data.len());
                 let src_len = dest_end - dest_offset as usize;
                 data[dest_offset as usize..dest_end].copy_from_slice(&resp.data[..src_len]);
             }
 
-            // Immediately send the next chunk if available and credits allow.
             if chunks_sent < total_chunks {
                 let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
                 if credits_available > 0 {
-                    let offset = chunks_sent as u64 * chunk_size as u64;
-                    let this_chunk = if chunks_sent == total_chunks - 1 {
-                        (file_size - offset) as u32
-                    } else {
-                        chunk_size
-                    };
-
-                    let req = ReadRequest {
-                        padding: 0x50,
-                        flags: 0,
-                        length: this_chunk,
-                        offset,
-                        file_id,
-                        minimum_count: 0,
-                        channel: SMB2_CHANNEL_NONE,
-                        remaining_bytes: 0,
-                        read_channel_info: vec![],
-                    };
-
-                    let (msg_id, _) = conn
-                        .send_request_with_credits(
-                            Command::Read,
-                            &req,
-                            Some(self.tree_id),
-                            credit_charge,
-                        )
-                        .await?;
-
-                    in_flight.push((msg_id, chunks_sent));
+                    in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
                     chunks_sent += 1;
                 }
             }
@@ -2444,11 +2491,12 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
         let mut data = vec![0u8; file_size as usize];
         let mut chunks_sent = 0usize;
         let mut chunks_received = 0usize;
         let mut bytes_received = 0u64;
-        let mut in_flight: Vec<(MessageId, usize)> = Vec::new();
 
         let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
         let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
@@ -2459,16 +2507,15 @@ impl Tree {
             ));
         }
 
-        // Initial fill: send up to window_size reads.
-        for _ in 0..initial_window {
-            let offset = chunks_sent as u64 * chunk_size as u64;
-            let this_chunk = if chunks_sent == total_chunks - 1 {
+        let mut in_flight = FuturesUnordered::new();
+        let build_req = |chunk_index: usize| -> ReadRequest {
+            let offset = chunk_index as u64 * chunk_size as u64;
+            let this_chunk = if chunk_index == total_chunks - 1 {
                 (file_size - offset) as u32
             } else {
                 chunk_size
             };
-
-            let req = ReadRequest {
+            ReadRequest {
                 padding: 0x50,
                 flags: 0,
                 length: this_chunk,
@@ -2478,45 +2525,48 @@ impl Tree {
                 channel: SMB2_CHANNEL_NONE,
                 remaining_bytes: 0,
                 read_channel_info: vec![],
-            };
+            }
+        };
+        let launch_chunk = |conn: &Connection, chunk_index: usize, tree_id: TreeId| {
+            let c = conn.clone();
+            let req = build_req(chunk_index);
+            async move {
+                let frame = c
+                    .execute_with_credits(
+                        Command::Read,
+                        &req,
+                        Some(tree_id),
+                        CreditCharge(credit_charge),
+                    )
+                    .await;
+                (chunk_index, frame)
+            }
+        };
 
-            let (msg_id, _) = conn
-                .send_request_with_credits(Command::Read, &req, Some(self.tree_id), credit_charge)
-                .await?;
-
-            in_flight.push((msg_id, chunks_sent));
+        for _ in 0..initial_window {
+            in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
             chunks_sent += 1;
         }
 
-        // Sliding loop: receive one, report progress, send one.
         while chunks_received < total_chunks {
-            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            let Some((chunk_index, frame_result)) = in_flight.next().await else {
+                break;
+            };
             chunks_received += 1;
+            let frame = frame_result?;
 
-            if resp_header.status == NtStatus::END_OF_FILE {
+            if frame.header.status == NtStatus::END_OF_FILE {
                 continue;
             }
 
-            if resp_header.status != NtStatus::SUCCESS {
+            if frame.header.status != NtStatus::SUCCESS {
                 return Err(Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: Command::Read,
                 });
             }
 
-            let msg_id = resp_header.message_id;
-            let chunk_index = in_flight
-                .iter()
-                .find(|(mid, _)| *mid == msg_id)
-                .map(|(_, idx)| *idx)
-                .ok_or_else(|| {
-                    Error::invalid_data(format!(
-                        "received response with unexpected MessageId {}",
-                        msg_id
-                    ))
-                })?;
-
-            let mut cursor = ReadCursor::new(&resp_body);
+            let mut cursor = ReadCursor::new(&frame.body);
             let resp = ReadResponse::unpack(&mut cursor)?;
 
             if !resp.data.is_empty() {
@@ -2527,7 +2577,6 @@ impl Tree {
                 bytes_received += src_len as u64;
             }
 
-            // Report progress and check for cancellation.
             let progress = Progress {
                 bytes_transferred: bytes_received,
                 total_bytes: Some(file_size),
@@ -2536,39 +2585,10 @@ impl Tree {
                 return Err(Error::Cancelled);
             }
 
-            // Send next chunk if available.
             if chunks_sent < total_chunks {
                 let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
                 if credits_available > 0 {
-                    let offset = chunks_sent as u64 * chunk_size as u64;
-                    let this_chunk = if chunks_sent == total_chunks - 1 {
-                        (file_size - offset) as u32
-                    } else {
-                        chunk_size
-                    };
-
-                    let req = ReadRequest {
-                        padding: 0x50,
-                        flags: 0,
-                        length: this_chunk,
-                        offset,
-                        file_id,
-                        minimum_count: 0,
-                        channel: SMB2_CHANNEL_NONE,
-                        remaining_bytes: 0,
-                        read_channel_info: vec![],
-                    };
-
-                    let (msg_id, _) = conn
-                        .send_request_with_credits(
-                            Command::Read,
-                            &req,
-                            Some(self.tree_id),
-                            credit_charge,
-                        )
-                        .await?;
-
-                    in_flight.push((msg_id, chunks_sent));
+                    in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
                     chunks_sent += 1;
                 }
             }
@@ -2590,11 +2610,12 @@ impl Tree {
         credit_charge: u16,
         total_chunks: usize,
     ) -> Result<u64> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
         let mut chunks_sent = 0usize;
         let mut chunks_received = 0usize;
         let mut total_written = 0u64;
 
-        // Initial fill: send up to window_size writes.
         let max_from_credits = conn.credits() as usize / credit_charge.max(1) as usize;
         let initial_window = total_chunks.min(max_from_credits).min(MAX_PIPELINE_WINDOW);
 
@@ -2611,13 +2632,13 @@ impl Tree {
             conn.credits()
         );
 
-        for _ in 0..initial_window {
-            let offset = chunks_sent * chunk_size as usize;
+        let mut in_flight = FuturesUnordered::new();
+        let build_req = |chunk_index: usize| -> WriteRequest {
+            let offset = chunk_index * chunk_size as usize;
             let end = (offset + chunk_size as usize).min(data.len());
             let chunk = &data[offset..end];
-
-            let req = WriteRequest {
-                data_offset: 0x70, // header (64) + fixed write body (48) = 112 = 0x70
+            WriteRequest {
+                data_offset: 0x70,
                 offset: offset as u64,
                 file_id,
                 channel: 0,
@@ -2626,60 +2647,51 @@ impl Tree {
                 write_channel_info_length: 0,
                 flags: 0,
                 data: chunk.to_vec(),
-            };
+            }
+        };
+        let launch_chunk = |conn: &Connection, chunk_index: usize, tree_id: TreeId| {
+            let c = conn.clone();
+            let req = build_req(chunk_index);
+            async move {
+                let frame = c
+                    .execute_with_credits(
+                        Command::Write,
+                        &req,
+                        Some(tree_id),
+                        CreditCharge(credit_charge),
+                    )
+                    .await;
+                (chunk_index, frame)
+            }
+        };
 
-            let (_, _) = conn
-                .send_request_with_credits(Command::Write, &req, Some(self.tree_id), credit_charge)
-                .await?;
-
+        for _ in 0..initial_window {
+            in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
             chunks_sent += 1;
         }
 
-        // Sliding loop: receive one, send one, until all chunks received.
         while chunks_received < total_chunks {
-            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            let Some((_chunk_index, frame_result)) = in_flight.next().await else {
+                break;
+            };
             chunks_received += 1;
+            let frame = frame_result?;
 
-            if resp_header.status != NtStatus::SUCCESS {
+            if frame.header.status != NtStatus::SUCCESS {
                 return Err(Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: Command::Write,
                 });
             }
 
-            let mut cursor = ReadCursor::new(&resp_body);
+            let mut cursor = ReadCursor::new(&frame.body);
             let resp = WriteResponse::unpack(&mut cursor)?;
             total_written += resp.count as u64;
 
-            // Immediately send the next chunk if available and credits allow.
             if chunks_sent < total_chunks {
                 let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
                 if credits_available > 0 {
-                    let offset = chunks_sent * chunk_size as usize;
-                    let end = (offset + chunk_size as usize).min(data.len());
-                    let chunk = &data[offset..end];
-
-                    let req = WriteRequest {
-                        data_offset: 0x70,
-                        offset: offset as u64,
-                        file_id,
-                        channel: 0,
-                        remaining_bytes: 0,
-                        write_channel_info_offset: 0,
-                        write_channel_info_length: 0,
-                        flags: 0,
-                        data: chunk.to_vec(),
-                    };
-
-                    let (_, _) = conn
-                        .send_request_with_credits(
-                            Command::Write,
-                            &req,
-                            Some(self.tree_id),
-                            credit_charge,
-                        )
-                        .await?;
-
+                    in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
                     chunks_sent += 1;
                 }
             }
@@ -2703,11 +2715,21 @@ impl Tree {
     where
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        type BoxedExecute = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::client::connection::Frame>>
+                    + Send,
+            >,
+        >;
+
         let mut offset = 0u64;
         let mut in_flight = 0usize;
         let mut total_written = 0u64;
         let mut done = false; // callback exhausted or errored
         let mut callback_err: Option<std::io::Error> = None;
+        let mut in_flight_futs: FuturesUnordered<BoxedExecute> = FuturesUnordered::new();
 
         // Buffer for leftover data when a callback chunk is larger than max_write.
         let mut pending_data: Vec<u8> = Vec::new();
@@ -2791,9 +2813,11 @@ impl Tree {
 
             match chunk {
                 None => break,
-                Some(data) => {
-                    let data_len = data.len() as u64;
-                    let credit_charge = data_len.div_ceil(65536).max(1) as u16;
+                Some(chunk_data) => {
+                    let data_len = chunk_data.len() as u64;
+                    let cc = data_len.div_ceil(65536).max(1) as u16;
+                    let c = conn.clone();
+                    let tree_id = self.tree_id;
                     let req = WriteRequest {
                         data_offset: 0x70,
                         offset,
@@ -2803,18 +2827,17 @@ impl Tree {
                         write_channel_info_offset: 0,
                         write_channel_info_length: 0,
                         flags: 0,
-                        data,
+                        data: chunk_data,
                     };
-
-                    let (_, _) = conn
-                        .send_request_with_credits(
+                    in_flight_futs.push(Box::pin(async move {
+                        c.execute_with_credits(
                             Command::Write,
                             &req,
-                            Some(self.tree_id),
-                            credit_charge,
+                            Some(tree_id),
+                            CreditCharge(cc),
                         )
-                        .await?;
-
+                        .await
+                    }));
                     offset += data_len;
                     in_flight += 1;
                 }
@@ -2823,25 +2846,26 @@ impl Tree {
 
         // Sliding loop: receive one response, send next chunk (if any).
         while in_flight > 0 {
-            let (resp_header, resp_body, _) = conn.receive_response().await?;
+            let frame_result = match in_flight_futs.next().await {
+                Some(r) => r,
+                None => break,
+            };
             in_flight -= 1;
+            let frame = frame_result?;
 
-            if resp_header.status != NtStatus::SUCCESS {
+            if frame.header.status != NtStatus::SUCCESS {
                 // Drain remaining in-flight responses (best-effort).
-                for _ in 0..in_flight {
-                    let _ = conn.receive_response().await;
-                }
+                while in_flight_futs.next().await.is_some() {}
                 return Err(Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: Command::Write,
                 });
             }
 
-            let mut cursor = ReadCursor::new(&resp_body);
+            let mut cursor = ReadCursor::new(&frame.body);
             let resp = WriteResponse::unpack(&mut cursor)?;
             total_written += resp.count as u64;
 
-            // Send the next chunk if available and we don't have a pending error.
             if callback_err.is_none() && stashed_chunk.is_none() {
                 let chunk = next_wire_chunk(
                     &mut pending_data,
@@ -2851,12 +2875,14 @@ impl Tree {
                     next_chunk,
                 );
 
-                if let Some(data) = chunk {
-                    let data_len = data.len() as u64;
-                    let credit_charge = data_len.div_ceil(65536).max(1) as u16;
-                    let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
+                if let Some(chunk_data) = chunk {
+                    let data_len = chunk_data.len() as u64;
+                    let cc = data_len.div_ceil(65536).max(1) as u16;
+                    let credits_available = conn.credits() as usize / cc.max(1) as usize;
 
                     if credits_available > 0 {
+                        let c = conn.clone();
+                        let tree_id = self.tree_id;
                         let req = WriteRequest {
                             data_offset: 0x70,
                             offset,
@@ -2866,33 +2892,31 @@ impl Tree {
                             write_channel_info_offset: 0,
                             write_channel_info_length: 0,
                             flags: 0,
-                            data,
+                            data: chunk_data,
                         };
-
-                        let (_, _) = conn
-                            .send_request_with_credits(
+                        in_flight_futs.push(Box::pin(async move {
+                            c.execute_with_credits(
                                 Command::Write,
                                 &req,
-                                Some(self.tree_id),
-                                credit_charge,
+                                Some(tree_id),
+                                CreditCharge(cc),
                             )
-                            .await?;
-
+                            .await
+                        }));
                         offset += data_len;
                         in_flight += 1;
                     } else {
-                        // Can't send yet -- stash the chunk for the next iteration.
-                        stashed_chunk = Some(data);
+                        stashed_chunk = Some(chunk_data);
                     }
                 }
-            } else if let Some(data) = stashed_chunk.take() {
-                // Retry a previously stashed chunk now that we received a response
-                // (which should have returned credits).
-                let data_len = data.len() as u64;
-                let credit_charge = data_len.div_ceil(65536).max(1) as u16;
-                let credits_available = conn.credits() as usize / credit_charge.max(1) as usize;
+            } else if let Some(chunk_data) = stashed_chunk.take() {
+                let data_len = chunk_data.len() as u64;
+                let cc = data_len.div_ceil(65536).max(1) as u16;
+                let credits_available = conn.credits() as usize / cc.max(1) as usize;
 
                 if credits_available > 0 {
+                    let c = conn.clone();
+                    let tree_id = self.tree_id;
                     let req = WriteRequest {
                         data_offset: 0x70,
                         offset,
@@ -2902,23 +2926,21 @@ impl Tree {
                         write_channel_info_offset: 0,
                         write_channel_info_length: 0,
                         flags: 0,
-                        data,
+                        data: chunk_data,
                     };
-
-                    let (_, _) = conn
-                        .send_request_with_credits(
+                    in_flight_futs.push(Box::pin(async move {
+                        c.execute_with_credits(
                             Command::Write,
                             &req,
-                            Some(self.tree_id),
-                            credit_charge,
+                            Some(tree_id),
+                            CreditCharge(cc),
                         )
-                        .await?;
-
+                        .await
+                    }));
                     offset += data_len;
                     in_flight += 1;
                 } else {
-                    // Still no credits -- re-stash and wait for the next response.
-                    stashed_chunk = Some(data);
+                    stashed_chunk = Some(chunk_data);
                 }
             }
         }
@@ -2940,15 +2962,13 @@ impl Tree {
         debug!("tree: flushing file handle");
         let req = FlushRequest { file_id };
 
-        let (_, _) = conn
-            .send_request(Command::Flush, &req, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::Flush, &req, Some(self.tree_id))
             .await?;
 
-        let (resp_header, _, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Flush,
             });
         }
@@ -2960,15 +2980,13 @@ impl Tree {
     pub(crate) async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
         let req = CloseRequest { flags: 0, file_id };
 
-        let (_, _) = conn
-            .send_request(Command::Close, &req, Some(self.tree_id))
+        let frame = conn
+            .execute(Command::Close, &req, Some(self.tree_id))
             .await?;
 
-        let (resp_header, _, _) = conn.receive_response().await?;
-
-        if resp_header.status != NtStatus::SUCCESS {
+        if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: resp_header.status,
+                status: frame.header.status,
                 command: Command::Close,
             });
         }
@@ -3005,20 +3023,18 @@ impl Tree {
                 data: chunk.to_vec(),
             };
 
-            let (_, _) = conn
-                .send_request(Command::Write, &req, Some(self.tree_id))
+            let frame = conn
+                .execute(Command::Write, &req, Some(self.tree_id))
                 .await?;
 
-            let (resp_header, resp_body, _) = conn.receive_response().await?;
-
-            if resp_header.status != NtStatus::SUCCESS {
+            if frame.header.status != NtStatus::SUCCESS {
                 return Err(Error::Protocol {
-                    status: resp_header.status,
+                    status: frame.header.status,
                     command: Command::Write,
                 });
             }
 
-            let mut cursor = ReadCursor::new(&resp_body);
+            let mut cursor = ReadCursor::new(&frame.body);
             let resp = WriteResponse::unpack(&mut cursor)?;
 
             total_written += resp.count as u64;

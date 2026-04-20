@@ -84,17 +84,18 @@ impl Session {
             security_buffer: type1_bytes,
         };
 
-        let (_, req1_raw) = conn
-            .send_request(Command::SessionSetup, &req1, None)
+        let (frame1, req1_raw) = conn
+            .execute_capturing_request(Command::SessionSetup, &req1, None)
             .await?;
 
         // Update session preauth hash with request.
         session_hasher.update(&req1_raw);
 
-        let (resp1_header, resp1_body, resp1_raw) = conn.receive_response().await?;
+        let resp1_header = frame1.header;
+        let resp1_body = frame1.body;
 
         // Update session preauth hash with response.
-        session_hasher.update(&resp1_raw);
+        session_hasher.update(&frame1.raw);
 
         if resp1_header.command != Command::SessionSetup {
             return Err(Error::invalid_data(format!(
@@ -140,8 +141,8 @@ impl Session {
             security_buffer: type3_bytes,
         };
 
-        let (_, req2_raw) = conn
-            .send_request(Command::SessionSetup, &req2, None)
+        let (frame2, req2_raw) = conn
+            .execute_capturing_request(Command::SessionSetup, &req2, None)
             .await?;
 
         // Update session preauth hash with the request ONLY.
@@ -150,7 +151,8 @@ impl Session {
         // Only STATUS_MORE_PROCESSING_REQUIRED responses are hashed.
         session_hasher.update(&req2_raw);
 
-        let (resp2_header, resp2_body, _resp2_raw) = conn.receive_response().await?;
+        let resp2_header = frame2.header;
+        let resp2_body = frame2.body;
 
         // Do NOT hash the success response -- the preauth hash used for
         // key derivation contains only messages up to (and including)
@@ -359,12 +361,16 @@ impl Session {
             security_buffer: token,
         };
 
-        let (_, req_raw) = conn.send_request(Command::SessionSetup, &req, None).await?;
+        let (frame, req_raw) = conn
+            .execute_capturing_request(Command::SessionSetup, &req, None)
+            .await?;
 
         // Hash the request (same as NTLM round 1).
         session_hasher.update(&req_raw);
 
-        let (resp_header, resp_body, resp_raw) = conn.receive_response().await?;
+        let resp_header = frame.header;
+        let resp_body = frame.body;
+        let resp_raw = frame.raw;
 
         if resp_header.command != Command::SessionSetup {
             return Err(Error::invalid_data(format!(

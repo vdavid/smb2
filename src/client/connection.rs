@@ -987,6 +987,101 @@ impl Connection {
             .await
     }
 
+    /// Crate-internal variant of [`execute`] that also returns the plaintext
+    /// request bytes that were packed on the wire (before any encryption).
+    ///
+    /// Only `session.rs` needs this: its SESSION_SETUP rounds feed the
+    /// *request* bytes into the session-local preauth hasher for key
+    /// derivation, and the signed/encrypted wire form would break the
+    /// hash because preauth covers the plaintext. Rather than forcing
+    /// session.rs to re-pack messages with a predicted msg_id, we let
+    /// `execute_with_credits_capturing_request` hand them back.
+    pub(crate) async fn execute_capturing_request(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+    ) -> Result<(Frame, Vec<u8>)> {
+        self.execute_with_credits_capturing_request(command, body, tree_id, CreditCharge(1))
+            .await
+    }
+
+    /// See [`Self::execute_capturing_request`].
+    pub(crate) async fn execute_with_credits_capturing_request(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+    ) -> Result<(Frame, Vec<u8>)> {
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        let charge = credit_charge.0.max(1);
+        let msg_id = self.allocate_msg_id(charge as u64);
+
+        let mut header = Header::new_request(command);
+        header.message_id = msg_id;
+        header.credits = 256;
+        header.credit_charge = CreditCharge(charge);
+        header.session_id = self.session_id();
+        if let Some(tid) = tree_id {
+            header.tree_id = Some(tid);
+        }
+
+        let (should_sign, should_encrypt) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (c.should_sign, c.should_encrypt)
+        };
+
+        if should_sign && !should_encrypt {
+            header.flags.set_signed();
+        }
+        if self.should_set_dfs_flag(tree_id) {
+            header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
+        }
+
+        let mut msg_bytes = pack_message(&header, body);
+        let captured = msg_bytes.clone();
+
+        let rx = self.register_waiter(msg_id)?;
+
+        let wire_bytes = if should_encrypt {
+            match self.encrypt_bytes(&msg_bytes) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    self.remove_waiter(msg_id);
+                    return Err(e);
+                }
+            }
+        } else {
+            if should_sign {
+                let c = self.inner.crypto.lock().unwrap();
+                if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
+                    if let Err(e) =
+                        signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)
+                    {
+                        drop(c);
+                        self.remove_waiter(msg_id);
+                        return Err(e);
+                    }
+                }
+            }
+            msg_bytes
+        };
+
+        if let Err(e) = self.inner.sender.send(&wire_bytes).await {
+            self.remove_waiter(msg_id);
+            return Err(e);
+        }
+        debug!(
+            "execute_cap: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}",
+            command, msg_id.0, charge, tree_id, should_sign, should_encrypt
+        );
+        let frame = await_frame(rx).await?;
+        Ok((frame, captured))
+    }
+
     /// Send a single SMB2 request with a caller-specified credit charge.
     ///
     /// Same semantics as [`execute`](Self::execute) — see that method's doc

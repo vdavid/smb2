@@ -36,6 +36,9 @@ log = "0.4"
 # Async runtime agnostic
 async-trait = "0.1"
 
+# `FuturesUnordered` for pipelined concurrent `execute` calls.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
 # Error handling
 thiserror = "2"
 
