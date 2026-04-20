@@ -153,9 +153,7 @@ async fn open_srvsvc_pipe(conn: &mut Connection, tree_id: TreeId) -> Result<File
         create_contexts: vec![],
     };
 
-    let frame = conn
-        .execute(Command::Create, &req, Some(tree_id))
-        .await?;
+    let frame = conn.execute(Command::Create, &req, Some(tree_id)).await?;
 
     if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
@@ -190,9 +188,7 @@ async fn write_pipe(
         data: data.to_vec(),
     };
 
-    let frame = conn
-        .execute(Command::Write, &req, Some(tree_id))
-        .await?;
+    let frame = conn.execute(Command::Write, &req, Some(tree_id)).await?;
 
     if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
@@ -221,9 +217,7 @@ async fn read_pipe(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> R
         read_channel_info: vec![],
     };
 
-    let frame = conn
-        .execute(Command::Read, &req, Some(tree_id))
-        .await?;
+    let frame = conn.execute(Command::Read, &req, Some(tree_id)).await?;
 
     if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {
@@ -242,9 +236,7 @@ async fn read_pipe(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> R
 async fn close_handle(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> Result<()> {
     let req = CloseRequest { flags: 0, file_id };
 
-    let frame = conn
-        .execute(Command::Close, &req, Some(tree_id))
-        .await?;
+    let frame = conn.execute(Command::Close, &req, Some(tree_id)).await?;
 
     if frame.header.status != NtStatus::SUCCESS {
         return Err(Error::Protocol {

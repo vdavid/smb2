@@ -222,15 +222,17 @@ impl TransportReceive for MockTransport {
                         None => continue,
                     }
                 };
-                while needed > 0 {
-                    let have = self.pending_sent_msg_ids.lock().unwrap().len();
-                    if have >= needed {
-                        break;
+                if needed > 0 {
+                    loop {
+                        let have = self.pending_sent_msg_ids.lock().unwrap().len();
+                        if have >= needed {
+                            break;
+                        }
+                        if self.closed.load(Ordering::Acquire) {
+                            return Err(Error::Disconnected);
+                        }
+                        self.send_notify.notified().await;
                     }
-                    if self.closed.load(Ordering::Acquire) {
-                        return Err(Error::Disconnected);
-                    }
-                    self.send_notify.notified().await;
                 }
                 // Consume one response and `needed` sent msg_ids,
                 // rewriting each sub-frame's zero msg_id to match the

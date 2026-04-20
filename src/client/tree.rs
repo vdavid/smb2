@@ -28,9 +28,9 @@ use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{FileTime, ReadCursor, Unpack};
 use crate::types::flags::FileAccessMask;
 use crate::types::status::NtStatus;
-use crate::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
 #[cfg(test)]
 use crate::types::MessageId;
+use crate::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
 use crate::Error;
 
 /// Maximum number of requests to keep in flight during pipelining.
@@ -51,7 +51,9 @@ const MAX_PIPELINE_WINDOW: usize = 32;
 /// caller would have to inspect one-by-one. Sub-op status codes
 /// (`STATUS_OBJECT_NAME_NOT_FOUND` and friends) are NOT errors here;
 /// they ride in `Frame::header.status` and the caller checks them.
-fn all_or_first_err(frames: Vec<Result<crate::client::connection::Frame>>) -> Result<Vec<crate::client::connection::Frame>> {
+fn all_or_first_err(
+    frames: Vec<Result<crate::client::connection::Frame>>,
+) -> Result<Vec<crate::client::connection::Frame>> {
     let mut out = Vec::with_capacity(frames.len());
     for r in frames {
         out.push(r?);
@@ -2410,10 +2412,7 @@ impl Tree {
                 read_channel_info: vec![],
             }
         };
-        let launch_chunk = |conn: &Connection,
-                            chunk_index: usize,
-                            tree_id: TreeId|
-         -> _ {
+        let launch_chunk = |conn: &Connection, chunk_index: usize, tree_id: TreeId| -> _ {
             let c = conn.clone();
             let req = build_req(chunk_index);
             async move {
@@ -2720,10 +2719,7 @@ impl Tree {
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         type BoxedExecute = std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<crate::client::connection::Frame>>
-                    + Send,
-            >,
+            Box<dyn std::future::Future<Output = Result<crate::client::connection::Frame>> + Send>,
         >;
 
         let mut offset = 0u64;

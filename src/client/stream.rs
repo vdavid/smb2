@@ -520,6 +520,7 @@ type BoxedWriteFut = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<crate::client::connection::Frame>> + Send>,
 >;
 
+/// Push-based streaming writer: see module-level docs for the example.
 pub struct FileWriter<'a> {
     tree: &'a Tree,
     conn: &'a mut Connection,
