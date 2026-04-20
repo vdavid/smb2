@@ -84,6 +84,15 @@ the canonical pattern. `MAX_PIPELINE_WINDOW` and `conn.credits()`-based pacing s
 
 ### Fixed
 
+- Unrecoverable frame errors (decrypt auth-tag mismatch, decompression failure, malformed sub-frame
+  header after compound splitting) no longer hang pending waiters indefinitely. Previously the
+  receiver task log-at-WARN'd and `continue`d, which left any waiter matching the discarded frame's
+  `MessageId` stuck on `rx.await` forever — the `msg_id` isn't recoverable from an unparseable frame,
+  so no targeted error could be delivered. Per decision E6 in the Phase 3 design, the receiver task
+  now tears the connection down on these conditions: fans `Err(Disconnected)` to every pending
+  waiter and exits. Callers see the error promptly and can reconnect. Sub-frame signature-verification
+  failures and `STATUS_NETWORK_SESSION_EXPIRED` stay targeted (delivered only to the matching waiter)
+  because the `msg_id` is known.
 - Caller futures that get dropped mid-flight (for example, a cancelled listing task in a consuming
   application) no longer leave in-flight SMB requests on the wire that corrupt subsequent operations.
   The receiver task discards late-arriving frames whose waiter's `oneshot::Receiver` has been dropped.

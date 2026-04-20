@@ -1154,13 +1154,24 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
         };
         trace!("receiver_loop: received {} bytes", raw.len());
 
-        // Decrypt if TRANSFORM_HEADER.
+        // Decrypt if TRANSFORM_HEADER. Per P3.4 / decision E6: on an
+        // unrecoverable frame error (decrypt auth tag mismatch, decompress
+        // failure, malformed sub-frame structure) we tear the connection
+        // down instead of log-and-continue. The msg_id isn't recoverable
+        // from an unparseable frame, so there's no targeted waiter to
+        // notify; log-and-continue would leave the matching waiter
+        // hanging forever. Teardown fans Err(Disconnected) to every
+        // pending waiter; the caller reconnects.
         let (decoded, was_encrypted) = if raw.len() >= 4 && raw[0..4] == TRANSFORM_PROTOCOL_ID {
             match decrypt_frame(&raw, &inner) {
                 Ok(plain) => (plain, true),
                 Err(e) => {
-                    warn!("receiver_loop: decrypt failed: {}, skipping frame", e);
-                    continue;
+                    warn!(
+                        "receiver_loop: decrypt failed: {}; tearing down connection",
+                        e
+                    );
+                    fan_error_to_waiters(&inner, &e);
+                    return;
                 }
             }
         } else {
@@ -1172,8 +1183,12 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             match decompress_response(&decoded) {
                 Ok(plain) => plain,
                 Err(e) => {
-                    warn!("receiver_loop: decompress failed: {}, skipping frame", e);
-                    continue;
+                    warn!(
+                        "receiver_loop: decompress failed: {}; tearing down connection",
+                        e
+                    );
+                    fan_error_to_waiters(&inner, &e);
+                    return;
                 }
             }
         } else {
@@ -1184,21 +1199,35 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
         let sub_frames = match split_compound(&decoded) {
             Ok(subs) => subs,
             Err(e) => {
-                warn!("receiver_loop: malformed frame: {}, skipping", e);
-                continue;
+                warn!(
+                    "receiver_loop: malformed frame: {}; tearing down connection",
+                    e
+                );
+                fan_error_to_waiters(&inner, &e);
+                return;
             }
         };
 
         // Produce a list of routable entries for this transport frame.
-        // Each entry is (msg_id, Result<Frame>, was_pending_or_oplock).
-        // Frames that should NOT be forwarded to a waiter (oplock break,
-        // STATUS_PENDING interim) are marked as such.
+        // SubFrameAction::Skip frames (oplock break, STATUS_PENDING) are
+        // dropped silently. A parse error from prepare_sub_frame is fatal:
+        // the compound split succeeded (framing looked valid) but a header
+        // inside is corrupt — the connection is out of sync and we can't
+        // recover. Tear down so pending waiters see Err(Disconnected)
+        // rather than hanging forever.
         let mut routable: Vec<(MessageId, Result<Frame>)> = Vec::new();
         for sub in sub_frames {
             match prepare_sub_frame(&sub, was_encrypted, &inner) {
-                Ok(Some((msg_id, routed))) => routable.push((msg_id, Ok(routed))),
-                Ok(None) => { /* skip (oplock break, STATUS_PENDING, etc.) */ }
-                Err((msg_id, e)) => routable.push((msg_id, Err(e))),
+                Ok(SubFrameAction::Route(msg_id, result)) => routable.push((msg_id, result)),
+                Ok(SubFrameAction::Skip) => { /* oplock break / STATUS_PENDING */ }
+                Err(e) => {
+                    warn!(
+                        "receiver_loop: sub-frame parse failed: {}; tearing down connection",
+                        e
+                    );
+                    fan_error_to_waiters(&inner, &e);
+                    return;
+                }
             }
         }
 
@@ -1222,22 +1251,41 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
     }
 }
 
-/// Prepare a routable sub-frame from raw bytes. Returns Ok(Some(...)) if
-/// the frame should be forwarded, Ok(None) if it should be skipped
-/// (oplock break, STATUS_PENDING), Err((msg_id, e)) if signature
-/// verification failed and the error should be delivered to the waiter.
-fn prepare_sub_frame(
-    sub: &[u8],
-    was_encrypted: bool,
-    inner: &Inner,
-) -> std::result::Result<Option<(MessageId, Frame)>, (MessageId, Error)> {
-    // Parse the header.
+/// Outcome of preparing a single sub-frame.
+pub(crate) enum SubFrameAction {
+    /// Route this response to the waiter for `msg_id`.
+    ///
+    /// The inner `Result` lets us deliver a per-sub-op error (signature
+    /// verification failure, session expired) targeted at its matching
+    /// waiter without disturbing others.
+    Route(MessageId, std::result::Result<Frame, Error>),
+    /// Skip silently — not forwarded to any waiter.
+    /// Used for oplock-break notifications (MessageId=UNSOLICITED) and
+    /// STATUS_PENDING interim responses (keep the waiter alive).
+    Skip,
+}
+
+/// Prepare a routable sub-frame from raw bytes.
+///
+/// Returns `Ok(SubFrameAction::Route(...))` for a normal response (possibly
+/// carrying a sub-op error), `Ok(SubFrameAction::Skip)` for oplock/PENDING
+/// frames that the caller should drop silently, and `Err(e)` for
+/// unrecoverable errors where the connection is now out of sync
+/// (header parse failure on a sub-frame the compound-splitter claimed was
+/// valid — the receiver loop fans the error to all waiters and exits).
+fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<SubFrameAction> {
+    // Parse the header. A failure here means split_compound produced a
+    // chunk that doesn't start with a valid SMB2 header — the framing is
+    // corrupt and we can't know where the next sub-frame begins. Fatal
+    // to the connection.
     let mut cursor = ReadCursor::new(sub);
     let header = match Header::unpack(&mut cursor) {
         Ok(h) => h,
         Err(e) => {
-            warn!("recv: header parse error: {}, skipping sub-frame", e);
-            return Ok(None);
+            return Err(Error::invalid_data(format!(
+                "sub-frame header parse failed: {}",
+                e
+            )));
         }
     };
 
@@ -1254,7 +1302,7 @@ fn prepare_sub_frame(
             "recv: skipping unsolicited oplock break notification, cmd={:?}",
             header.command
         );
-        return Ok(None);
+        return Ok(SubFrameAction::Skip);
     }
 
     // STATUS_PENDING is an interim response — don't forward, keep waiter.
@@ -1263,7 +1311,7 @@ fn prepare_sub_frame(
             "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}",
             header.command, header.message_id.0
         );
-        return Ok(None);
+        return Ok(SubFrameAction::Skip);
     }
 
     // Consume credit_charge (or 1 if zero).
@@ -1288,7 +1336,7 @@ fn prepare_sub_frame(
                 if let Err(e) =
                     signing::verify_signature(sub, &key, algo, header.message_id.0, false)
                 {
-                    return Err((header.message_id, e));
+                    return Ok(SubFrameAction::Route(header.message_id, Err(e)));
                 }
             }
         }
@@ -1300,7 +1348,10 @@ fn prepare_sub_frame(
             "recv: session expired (STATUS_NETWORK_SESSION_EXPIRED), cmd={:?}, msg_id={}",
             header.command, header.message_id.0
         );
-        return Err((header.message_id, Error::SessionExpired));
+        return Ok(SubFrameAction::Route(
+            header.message_id,
+            Err(Error::SessionExpired),
+        ));
     }
 
     let body = if sub.len() > Header::SIZE {
@@ -1310,7 +1361,10 @@ fn prepare_sub_frame(
     };
     let raw = sub.to_vec();
     let msg_id = header.message_id;
-    Ok(Some((msg_id, Frame { header, body, raw })))
+    Ok(SubFrameAction::Route(
+        msg_id,
+        Ok(Frame { header, body, raw }),
+    ))
 }
 
 /// Fan the given error (as best we can clone it) to every pending waiter
@@ -2062,7 +2116,6 @@ mod tests {
     // an error before the timeout.
 
     #[tokio::test]
-    #[ignore = "phase3-red: pins P3.4 silent-discard fix; un-ignore when A.4 lands"]
     async fn phase3_decrypt_failure_errors_waiter_not_hangs() {
         use crate::crypto::encryption::Cipher;
 
