@@ -9,18 +9,66 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **Breaking: `Connection`'s send/receive API collapsed into `execute` / `execute_compound`** (Phase 3 of the
+  actor refactor). The legacy `send_request`, `send_request_with_credits`, `send_compound`,
+  `receive_response`, `receive_compound`, and `receive_compound_expected` are gone; callers use a single
+  awaitable call per op. `Connection::execute(command, body, tree_id)` returns `Result<Frame>` where
+  `Frame = { header, body, raw }`. `Connection::execute_compound(&[CompoundOp])` returns
+  `Result<Vec<Result<Frame>>>` — the outer `Result` is "did the compound hit the wire", the inner one is
+  per-sub-op so partial-failure handling (for example, `CREATE` ok, `READ` fails, issue standalone `CLOSE`
+  with the returned `FileId`) is straightforward. `Connection: Clone`; clones share the receiver task so
+  concurrent `execute` calls from different tasks/clones multiplex over the same SMB session. Cancelling
+  (dropping) a future mid-flight is safe by construction — the matching late-arriving frame is discarded.
 - `Connection` now uses a background receiver task with per-request `oneshot::Sender` routing (Phase 2 of
-  the actor refactor). All public API signatures are preserved; the change is internal. See
-  `docs/specs/connection-actor.md`. A caller's dropped future (for example, `tokio::task::JoinHandle::abort()`
-  in a downstream consumer) now correctly discards the corresponding late-arriving response instead of
-  letting it pollute the next operation's receive. Credits still tick on dropped-caller frames so
-  throughput stays correct under cancellation churn.
+  the actor refactor). See `docs/specs/connection-actor.md`. A caller's dropped future (for example,
+  `tokio::task::JoinHandle::abort()` in a downstream consumer) now correctly discards the corresponding
+  late-arriving response instead of letting it pollute the next operation's receive. Credits still tick on
+  dropped-caller frames so throughput stays correct under cancellation churn.
 - `tokio` is formalized as a hard runtime requirement; added `"rt"` to the tokio feature set. The library
   spawns a receiver task per `Connection`.
 - `MockTransport::receive()` now awaits via `tokio::sync::Notify` when the queue is empty instead of
   returning `Err(Disconnected)` immediately. Added `MockTransport::close()` to signal end-of-stream. This
   lets the background receiver task stay alive across a test's interleaved `queue_response` calls. External
   consumers writing tests with `MockTransport` directly need to call `close()` to get the old behavior.
+- `MockTransport::enable_auto_rewrite_msg_id()` — opt-in test-mode shim that rewrites each zero-msg_id
+  sub-frame of a queued response to match the next pending sent msg_id in FIFO order, so canned
+  `build_*_response` helpers that hardcode `MessageId(0)` route through the Phase 3 receiver task without
+  needing to predict the caller's allocated msg_ids. Replaces the pre-Phase-3
+  `Connection::set_orphan_filter_enabled(false)` escape hatch.
+
+### Migration guide (pre-Phase-3 → Phase 3)
+
+Single request:
+```rust
+// Before
+conn.send_request(Command::Create, &req, Some(tree_id)).await?;
+let (header, body, _raw) = conn.receive_response().await?;
+// After
+let frame = conn.execute(Command::Create, &req, Some(tree_id)).await?;
+// frame.header, frame.body, frame.raw
+```
+
+Compound request:
+```rust
+// Before
+let ops = vec![(Command::Create, &create_req, CreditCharge(1)), /*...*/];
+conn.send_compound(tree_id, &ops).await?;
+let responses = conn.receive_compound_expected(3).await?;
+// responses: Vec<(Header, Vec<u8>)>
+// After
+let ops = [
+    CompoundOp { command: Command::Create, body: &create_req, tree_id: Some(tree_id), credit_charge: CreditCharge(1) },
+    // ...
+];
+let frames = conn.execute_compound(&ops).await?;
+// frames: Vec<Result<Frame>> — each entry may independently be Err (session expired, signature
+// verify failure, etc.). Sub-op status codes (OBJECT_NAME_NOT_FOUND and friends) ride in
+// frames[i].as_ref()?.header.status, NOT in the inner Result.
+```
+
+Pipelined sliding-window reads/writes: use `futures_util::stream::FuturesUnordered` of boxed
+`execute_with_credits` futures across `conn.clone()`s — see `src/client/tree.rs::read_pipelined_loop` for
+the canonical pattern. `MAX_PIPELINE_WINDOW` and `conn.credits()`-based pacing stay on the caller side.
 
 ### Added
 

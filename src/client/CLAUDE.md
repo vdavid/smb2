@@ -7,7 +7,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | File | Purpose |
 |---|---|
 | `mod.rs` | `SmbClient`, `ClientConfig`, `connect()` shorthand |
-| `connection.rs` | `Connection` -- credit tracking, message sequencing, signing, encryption, compound send/receive |
+| `connection.rs` | `Connection` -- credit tracking, message sequencing, signing, encryption, `execute` / `execute_compound` |
 | `session.rs` | `Session::setup()` -- NTLM auth, key derivation, signing/encryption activation |
 | `tree.rs` | `Tree` -- share connection, file CRUD, compound and pipelined I/O |
 | `stream.rs` | `FileDownload` / `FileUpload` / `FileWriter` -- streaming I/O with progress |
@@ -38,7 +38,7 @@ All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenienc
 
 ## Compound requests
 
-`send_compound` packs multiple operations into a single transport frame. Each sub-request is 8-byte aligned, linked via `NextCommand`. Subsequent related operations use `FileId::SENTINEL` (the server substitutes the real handle from the first CREATE).
+`Connection::execute_compound(&[CompoundOp])` packs multiple operations into a single transport frame. Each sub-request is 8-byte aligned, linked via `NextCommand`. Subsequent related operations use `FileId::SENTINEL` (the server substitutes the real handle from the first CREATE).
 
 - **Read compound**: CREATE + READ + CLOSE (3 ops, 1 round-trip). Default for `read_file`.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
@@ -50,24 +50,15 @@ All `Tree` methods take `&mut Connection` as a parameter. `SmbClient` convenienc
 
 ### Receiving compound responses
 
-Two methods on `Connection`:
+`execute_compound` returns `Result<Vec<Result<Frame>>>`. The outer `Result` is "did the compound hit the wire"; the inner one is per-sub-op (waiter-level: session expired, signature verify, connection dropped mid-await). Sub-op protocol status codes (`STATUS_OBJECT_NAME_NOT_FOUND` etc.) ride in the inner frame's `header.status`, not the inner `Result`. Per MS-SMB2 3.3.4.1.3 the server MAY split the compound response across multiple transport frames (Samba, QNAP, Windows Server in some cases); the receiver task routes each sub-response by `MessageId` so the per-waiter `oneshot::Receiver`s resolve independently and `execute_compound` reassembles the result vector in submission order.
 
-- `receive_compound()` -- returns whatever sub-responses arrive in the next frame. Use when you don't know (or care) how many to expect.
-- `receive_compound_expected(n)` -- collects exactly `n` sub-responses, reading additional transport frames if the server split the chain. Use this in every compound-using method that knows its shape.
-
-Per MS-SMB2 section 3.3.4.1.3, the server MAY compound responses -- it is not required to. Samba (including QNAP NAS firmware, which uses Samba) has been observed splitting compound chains in some cases; Windows Server does too under certain conditions. `receive_compound_expected` handles this transparently: a hot path that stays one round-trip when the server cooperates, and a fallback that gathers the remaining frames when it doesn't.
+Most callers use a small `all_or_first_err` helper (see `tree.rs`) that propagates the first inner `Err` as the outer `Err` (matching the pre-Phase-3 shortcircuit behavior) and hands back a `Vec<Frame>` indexable per sub-op. Tolerating partial failure (for example, CREATE ok, READ fails → issue standalone CLOSE with the create's returned `FileId`) keeps the individual inner `Result`s.
 
 ## Batch operations
 
-`delete_files`, `rename_files`, and `stat_files` send all compound requests before waiting for any responses, minimizing total round-trips for multi-file operations. The pattern:
+`delete_files`, `rename_files`, and `stat_files` issue one `execute_compound` per file. Partial failures are independent — if 3 of 50 files fail, the other 47 still succeed. Each method returns `Vec<Result<T>>` in the same order as the input.
 
-1. **Send all**: build and send N independent compound chains (one per file)
-2. **Receive all**: collect N compound responses, parse each independently
-3. **Cleanup**: issue standalone CLOSEs for any compound where CREATE succeeded but a later op failed
-
-Partial failures are independent -- if 3 of 50 files fail, the other 47 still succeed. Each method returns `Vec<Result<T>>` in the same order as the input.
-
-No credit windowing yet -- the server's initial 256-credit grant supports ~128 deletes, ~85 renames, or ~64 stats in a single batch. Enough for typical file manager use.
+Decision/Why — sequential execute vs parallel: pre-Phase-3 these methods did "phase 1 send all compounds, phase 2 receive all" for wire-level pipelining. With the new API a caller can re-create that shape by spawning `tokio::spawn` tasks over `conn.clone()`s, each calling `execute_compound`. For cmdr's "delete 50 files" flows the sequential-compound cost is small (one round-trip per file) so we chose simplicity. If a workload needs the extra parallelism later, the refactor is local to each batch method.
 
 ## DFS (Distributed File System) resolution
 
@@ -90,7 +81,9 @@ Reactive DFS resolution with multi-target failover. When a convenience method ge
 
 ## Pipelined I/O
 
-For large files, `read_file_pipelined` / `write_file_pipelined` send multiple READ/WRITE requests without waiting for responses, bounded by available credits. Chunk size is `min(512 KB, max_read_size)` with up to 32 in-flight requests. This is the core performance feature -- without it, throughput is ~10x worse.
+For large files, `read_file_pipelined` / `write_file_pipelined` issue multiple `execute_with_credits` calls concurrently on cloned connections via `futures_util::stream::FuturesUnordered`. The sliding window stays at 32 in-flight requests, credits are checked per launch via `conn.credits()`. Chunk size is `min(512 KB, max_read_size)`. This is the core performance feature -- without it, throughput is ~10x worse.
+
+`FileWriter` keeps an owned `FuturesUnordered<BoxedWriteFut>` field — `launch_wire_chunk` pushes a boxed `execute_with_credits` future, `drain_one` awaits `in_flight.next()`, and the public `write_chunk` / `finish` / `abort` drive that state machine.
 
 FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, with the sliding window handling backpressure. Complement to FileDownload (read streaming).
 
@@ -126,23 +119,21 @@ Tree-level encryption: `connect_share()` checks the share's encrypt flag and act
 
 ## Connection internals: receiver task + `oneshot` routing
 
-Phase 2 moved response demultiplexing out of `receive_response()`'s synchronous loop and into a background receiver task spawned per `Connection`. Public API signatures are unchanged (`send_request` + `receive_response` + compound variants), but the semantics underneath are now:
+`Connection::execute` / `execute_compound` is the primary API. A background receiver task (spawned per `Connection` at `from_transport`) owns the transport's read half and routes each sub-frame to a per-request `oneshot::Sender` by `MessageId`.
 
-- `Connection` owns an `Arc<Inner>` holding `waiters: Mutex<HashMap<MessageId, oneshot::Sender<Result<Frame>>>>`, `credits: AtomicU32`, `next_message_id: AtomicU64`, and crypto state.
-- On `Connection::from_transport`, a receiver task is spawned that owns the transport's read half. It decrypts/decompresses/sign-verifies/splits-compound and routes each sub-frame to the `oneshot::Sender` registered for its `MessageId`.
-- `send_request` allocates a `MessageId` (`AtomicU64::fetch_add(credit_charge)`), registers a `oneshot::Sender` in `waiters` (atomically checking `disconnected` under the waiters lock to rule out a TOCTOU where the receiver task has already shut down), pushes the corresponding `Receiver` onto the `Connection`-local `pending_fifo: VecDeque<Receiver>`, and writes the framed bytes through `TransportSend`. `receive_response` pops the front `Receiver` and awaits it.
-- **Cancellation-by-drop is safe by construction.** If a caller's future is aborted (`tokio::spawn` + `JoinHandle::abort()` is the common path in consumers), the `Receiver` in `pending_fifo` drops; the receiver task's `Sender::send` then fails silently when the late frame arrives; the frame is discarded. Credits are still applied in the receiver task so dropped-caller frames don't starve throughput.
-- **Transport drop** fans `Err(Disconnected)` to every pending `oneshot::Sender` and sets `disconnected=true` under the waiters lock. Subsequent `send_request` sees `disconnected=true` and returns `Err(Disconnected)` without inserting (no leaked waiters).
+- `Connection` is `Clone` and holds just `Arc<Inner>`. `Inner` owns `waiters: Mutex<HashMap<MessageId, oneshot::Sender<Result<Frame>>>>`, `credits: AtomicU32`, `next_message_id: AtomicU64`, the transport send half (via `Arc<dyn TransportSend>`), the receiver task's `JoinHandle`, and crypto state. All state is behind atomics or short-critical-section `std::sync::Mutex`.
+- `execute(command, body, tree_id)` allocates a `MessageId` (`AtomicU64::fetch_add(credit_charge)`), registers a `oneshot::Sender` in `waiters` atomically under the waiters lock (re-checks `disconnected` there to rule out a TOCTOU where the receiver task has already shut down and drained the map), packs the frame, signs/encrypts/compresses as needed, and writes through `TransportSend::send`. Then it awaits the local `oneshot::Receiver`. Returns `Result<Frame { header, body, raw }>`.
+- `execute_compound(&[CompoundOp])` does the same per sub-op, building one compound transport frame with `NextCommand` offsets, then awaits each per-sub-op receiver sequentially. Each receiver resolves independently (the receiver task splits the server's response by `NextCommand` and routes each sub-response by its `MessageId`). The outer `Result` is "did the compound hit the wire"; the inner `Vec<Result<Frame>>` has one entry per sub-op.
+- **Cancellation-by-drop is safe by construction.** If a caller's future is aborted (`tokio::spawn` + `JoinHandle::abort()` is the common path in consumers), the locally-owned `oneshot::Receiver` drops; the receiver task's `Sender::send` then fails silently when the late frame arrives; the frame is discarded. Credits are still applied in the receiver task so dropped-caller frames don't starve throughput.
+- **Transport drop** fans `Err(Disconnected)` to every pending `oneshot::Sender` and sets `disconnected=true` under the waiters lock. Subsequent `execute` / `execute_compound` sees `disconnected=true` and returns `Err(Disconnected)` without inserting (no leaked waiters).
 
-Full design in [docs/specs/connection-actor.md](../../docs/specs/connection-actor.md) including the two-phase staging (Phase 2 = routing only, Phase 3 = `Connection: Clone` + `execute()` API for concurrent ops per connection).
+Gotcha/Why — pre-Phase-3 `send_request` / `receive_response` split API was removed in Phase 3 Stage A.3. The test-mode `set_orphan_filter_enabled(false)` escape hatch is gone too; tests that build mocks without going through `setup_connection` call `mock.enable_auto_rewrite_msg_id()` instead, which rewrites each queued response's zero-msg_id to match the next pending sent msg_id in FIFO order.
 
-### Test-mode orphan-filter toggle (`set_orphan_filter_enabled(false)`)
-
-~550 existing unit tests queue mock responses with hardcoded `MessageId(0)` and call `receive_response()` directly without a preceding `send_request`. To keep them working without per-test rewrites, `Connection` has a test-only mode where the receiver task routes unmatched frames to an `mpsc` fallback channel (one `Vec<Frame>` per transport frame, preserving compound grouping). `receive_response`/`receive_compound_expected` read from the fallback when `pending_fifo` is empty. Production always has the filter on. See `set_orphan_filter_enabled` in `connection.rs`.
+Full design in [docs/specs/connection-actor.md](../../docs/specs/connection-actor.md).
 
 ## Key decisions
 
-- **`&mut Connection` instead of `Arc<Mutex<Connection>>`**: Forces sequential access at compile time. Phase 3 will flip this to `&Connection` + `Clone` to support concurrent ops per connection. Internals are already `Arc`-based so the flip is trivial.
+- **`execute` / `execute_compound` take `&self`**: `Connection: Clone` supports concurrent ops per connection — clone freely across tasks, the receiver task multiplexes responses by `MessageId`. `Tree::*` methods still take `&mut Connection` because session-setup mutators (`activate_signing`, `set_session_id`) keep `&mut self`; Tree code calls both, so `&mut` at that layer is the least-churn choice.
 - **Sender work stays on the caller thread, only the receiver is a task**: The send path already uses an internal Mutex on the transport write half for ordering; adding a second task just to drive sends would add latency without correctness gain. The receiver bug (orphan/dropped-caller frames corrupting the wire) only existed on the receive side, so only the receive side needed a task.
 - **Compound reads as default**: One round-trip for small files. Saves 2 RTTs vs sequential CREATE/READ/CLOSE.
 - **512 KB pipeline chunks**: Balances between too many small requests (overhead) and too few large ones (credit starvation). Gives ~20 chunks per 10 MB file.
