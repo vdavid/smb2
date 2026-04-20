@@ -1122,10 +1122,7 @@ impl Connection {
     ///   failure is protocol-normal — for example, CREATE may succeed but
     ///   a later READ fail — so callers typically match on each inner
     ///   result individually.
-    pub async fn execute_compound(
-        &self,
-        ops: &[CompoundOp<'_>],
-    ) -> Result<Vec<Result<Frame>>> {
+    pub async fn execute_compound(&self, ops: &[CompoundOp<'_>]) -> Result<Vec<Result<Frame>>> {
         if ops.is_empty() {
             return Err(Error::invalid_data(
                 "compound request must have at least one operation",
@@ -4918,7 +4915,9 @@ mod tests {
         assert_eq!(f0.header.status, NtStatus::SUCCESS);
         assert_eq!(f0.header.message_id, MessageId(0));
 
-        let f1 = results[1].as_ref().expect("op 1 still carries a Frame — error status in header");
+        let f1 = results[1]
+            .as_ref()
+            .expect("op 1 still carries a Frame — error status in header");
         assert_eq!(f1.header.status, NtStatus::OBJECT_NAME_NOT_FOUND);
         assert_eq!(f1.header.message_id, MessageId(1));
 
