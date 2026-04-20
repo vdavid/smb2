@@ -34,6 +34,18 @@ pub struct MockTransport {
     notify: Notify,
     /// Set by `close()` to signal end-of-stream.
     closed: AtomicBool,
+    /// When `true`, `receive()` rewrites each response sub-frame's
+    /// `MessageId` to match the `MessageId` of the next pending sent request
+    /// (and consumes it). See [`Self::enable_auto_rewrite_msg_id`].
+    auto_rewrite: AtomicBool,
+    /// FIFO of `MessageId`s observed in `send()` that haven't yet been
+    /// consumed by a `receive()` rewrite. Only used when `auto_rewrite`
+    /// is on.
+    pending_sent_msg_ids: Mutex<VecDeque<u64>>,
+    /// Signaled whenever a new send is recorded or a close happens — used
+    /// by `receive()` in auto-rewrite mode to wait for a sent msg_id to
+    /// pair with a queued response.
+    send_notify: Notify,
 }
 
 impl MockTransport {
@@ -45,7 +57,28 @@ impl MockTransport {
             receive_count: Mutex::new(0),
             notify: Notify::new(),
             closed: AtomicBool::new(false),
+            auto_rewrite: AtomicBool::new(false),
+            pending_sent_msg_ids: Mutex::new(VecDeque::new()),
+            send_notify: Notify::new(),
         }
+    }
+
+    /// Enable msg_id rewriting: when `true`, `receive()` rewrites each
+    /// response sub-frame's `MessageId` in-place to match the `MessageId`
+    /// of the next request recorded by `send()` (FIFO pairing).
+    ///
+    /// Without this, canned response builders hardcode `MessageId(0)` and
+    /// won't match the caller's allocated msg_ids — the receiver task
+    /// drops them as orphans and every caller hangs. This mode is the
+    /// test-fixture replacement for the pre-Phase-3 orphan-filter-off
+    /// path. Compound responses (multiple sub-frames chained via
+    /// `NextCommand`) each consume one sent msg_id in order.
+    ///
+    /// The receive side blocks until both a queued response and a sent
+    /// msg_id are available, so tests can queue responses before or
+    /// after the caller sends.
+    pub fn enable_auto_rewrite_msg_id(&self) {
+        self.auto_rewrite.store(true, Ordering::Release);
     }
 
     /// Queue a response to be returned by the next `receive()` call.
@@ -79,6 +112,11 @@ impl MockTransport {
         // woken. The stored permit from `notify_one` covers that gap.
         self.notify.notify_one();
         self.notify.notify_waiters();
+        // Same treatment for the send-notification used by auto-rewrite:
+        // close should wake a receive that's blocked waiting for a paired
+        // sent msg_id so it observes `closed` and bails out.
+        self.send_notify.notify_one();
+        self.send_notify.notify_waiters();
     }
 
     /// Get all messages that were sent.
@@ -143,6 +181,14 @@ impl Default for MockTransport {
 #[async_trait]
 impl TransportSend for MockTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
+        // In auto-rewrite mode, capture the MessageId of each sub-frame
+        // so `receive()` can rewrite a queued response to match.
+        if self.auto_rewrite.load(Ordering::Acquire) {
+            for msg_id in extract_msg_ids(data) {
+                self.pending_sent_msg_ids.lock().unwrap().push_back(msg_id);
+                self.send_notify.notify_one();
+            }
+        }
         self.sent.lock().unwrap().push(data.to_vec());
         Ok(())
     }
@@ -152,17 +198,153 @@ impl TransportSend for MockTransport {
 impl TransportReceive for MockTransport {
     async fn receive(&self) -> Result<Vec<u8>> {
         loop {
-            // Check queued data first.
-            if let Some(data) = self.responses.lock().unwrap().pop_front() {
+            let auto = self.auto_rewrite.load(Ordering::Acquire);
+            // Wait for a queued response first (auto mode and plain mode
+            // both need one to exist).
+            let has_response = !self.responses.lock().unwrap().is_empty();
+            if !has_response {
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Disconnected);
+                }
+                self.notify.notified().await;
+                continue;
+            }
+
+            if auto {
+                // We have a response; peek its sub-frame count and wait
+                // for at least that many sent msg_ids to be queued
+                // (one consumed per sub-frame, even ones that already
+                // have non-zero msg_ids, so pairing stays 1:1).
+                let needed = {
+                    let guard = self.responses.lock().unwrap();
+                    match guard.front() {
+                        Some(frame) => count_sub_frames(frame),
+                        None => continue,
+                    }
+                };
+                while needed > 0 {
+                    let have = self.pending_sent_msg_ids.lock().unwrap().len();
+                    if have >= needed {
+                        break;
+                    }
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(Error::Disconnected);
+                    }
+                    self.send_notify.notified().await;
+                }
+                // Consume one response and `needed` sent msg_ids,
+                // rewriting each sub-frame's zero msg_id to match the
+                // corresponding sent msg_id.
+                let mut data = match self.responses.lock().unwrap().pop_front() {
+                    Some(d) => d,
+                    None => continue,
+                };
+                let mut ids = self.pending_sent_msg_ids.lock().unwrap();
+                rewrite_msg_ids(&mut data, &mut ids);
+                drop(ids);
                 *self.receive_count.lock().unwrap() += 1;
                 return Ok(data);
             }
-            if self.closed.load(Ordering::Acquire) {
-                return Err(Error::Disconnected);
-            }
-            // Wait for either a new response or a close signal.
-            self.notify.notified().await;
+
+            // Plain mode: just pop and return.
+            let data = match self.responses.lock().unwrap().pop_front() {
+                Some(d) => d,
+                None => continue,
+            };
+            *self.receive_count.lock().unwrap() += 1;
+            return Ok(data);
         }
+    }
+}
+
+/// Extract `MessageId`s from a packed SMB2 request frame (possibly compound).
+/// Returns one msg_id per sub-frame, following `NextCommand` offsets.
+/// Returns an empty Vec if the data isn't a recognizable SMB2 frame —
+/// e.g. when `send()` is used with arbitrary bytes in transport-level tests.
+fn extract_msg_ids(data: &[u8]) -> Vec<u64> {
+    const HEADER_MIN: usize = 64;
+    if data.len() < HEADER_MIN {
+        return Vec::new();
+    }
+    // Not an SMB2 header — skip (non-SMB2 tests call send with arbitrary bytes).
+    if &data[0..4] != b"\xFESMB" {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        if offset + HEADER_MIN > data.len() {
+            break;
+        }
+        let msg_id =
+            u64::from_le_bytes(data[offset + 24..offset + 32].try_into().unwrap_or([0; 8]));
+        ids.push(msg_id);
+        let next = u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap_or([0; 4]));
+        if next == 0 {
+            break;
+        }
+        offset += next as usize;
+    }
+    ids
+}
+
+/// Count sub-frames in a packed SMB2 response frame by walking
+/// `NextCommand` offsets. Returns 0 for non-SMB2 frames, otherwise the
+/// total sub-frame count. `rewrite_msg_ids` consumes one sent msg_id
+/// per sub-frame (even those with already-set msg_ids) to keep
+/// send→receive pairing strictly 1:1 and avoid queue drift in tests
+/// that hardcode some but not all msg_ids.
+fn count_sub_frames(data: &[u8]) -> usize {
+    const HEADER_MIN: usize = 64;
+    if data.len() < HEADER_MIN || &data[0..4] != b"\xFESMB" {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    loop {
+        if offset + HEADER_MIN > data.len() {
+            break;
+        }
+        count += 1;
+        let next = u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap_or([0; 4]));
+        if next == 0 {
+            break;
+        }
+        offset += next as usize;
+    }
+    count
+}
+
+/// Rewrite each sub-frame's `MessageId` in-place, consuming one id from
+/// `ids` per sub-frame in FIFO order. Sub-frames whose msg_id is
+/// already non-zero keep their hardcoded id (so tests exercising out-of-
+/// order routing still work) but STILL consume one id from the queue
+/// to keep send→receive pairing 1:1.
+fn rewrite_msg_ids(data: &mut [u8], ids: &mut VecDeque<u64>) {
+    const HEADER_MIN: usize = 64;
+    if data.len() < HEADER_MIN || &data[0..4] != b"\xFESMB" {
+        return;
+    }
+    let mut offset = 0usize;
+    loop {
+        if offset + HEADER_MIN > data.len() {
+            break;
+        }
+        let existing =
+            u64::from_le_bytes(data[offset + 24..offset + 32].try_into().unwrap_or([0; 8]));
+        let consumed = ids.pop_front();
+        if existing == 0 {
+            if let Some(id) = consumed {
+                data[offset + 24..offset + 32].copy_from_slice(&id.to_le_bytes());
+            } else {
+                break;
+            }
+        }
+        let next = u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap_or([0; 4]));
+        if next == 0 {
+            break;
+        }
+        offset += next as usize;
     }
 }
 

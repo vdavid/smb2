@@ -16,12 +16,14 @@ use crate::types::{Command, Dialect, FileId, OplockLevel, SessionId, TreeId};
 
 /// Create a mock-backed connection with standard negotiated params.
 ///
-/// Disables the orphan-response filter because the `build_*_response` helpers
-/// hardcode `MessageId(0)` and don't track the caller's `next_message_id`
-/// advance — with the filter on, every response after the first would be
-/// dropped as an orphan. The filter is still exercised by the dedicated
-/// orphan-response tests in `connection.rs` that assign explicit MessageIds.
+/// Enables the mock's auto-msg_id-rewrite so canned `build_*_response`
+/// helpers (which hardcode `MessageId(0)` and don't know the caller's
+/// allocated msg_ids) still route through the Phase 3 receiver task: on
+/// each `receive()` the mock patches sub-frame msg_ids to match the next
+/// pending sent msg_id in FIFO order. Replaces the pre-Phase-3
+/// `set_orphan_filter_enabled(false)` path.
 pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
+    mock.enable_auto_rewrite_msg_id();
     let mut conn = Connection::from_transport(
         Box::new(mock.clone()),
         Box::new(mock.clone()),
@@ -40,7 +42,6 @@ pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
         compression_supported: false,
     });
     conn.set_session_id(SessionId(0x1234));
-    conn.set_orphan_filter_enabled(false);
     conn
 }
 
