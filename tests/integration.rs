@@ -1966,8 +1966,58 @@ async fn bench_100_tiny_files_seq_vs_parallel() {
     assert_eq!(par_bytes, FILE_COUNT * FILE_SIZE);
     let par_fps = FILE_COUNT as f64 / par_elapsed.as_secs_f64();
 
+    // ── Phase 3 variant: N concurrent reads on ONE connection ───────
+    //
+    // Uses `Connection: Clone` + `execute*` to run 10 tasks over a single
+    // SMB session. This is what Phase 3 actually unlocks for cmdr —
+    // concurrent ops per connection without a pool. Closer to the real
+    // per-session ceiling than the N-connections run above.
+    let p3_conn_setup_start = std::time::Instant::now();
+    let mut p3_conn = Connection::connect("192.168.1.111:445", Duration::from_secs(5))
+        .await
+        .expect("p3 Connection::connect");
+    p3_conn.negotiate().await.expect("p3 negotiate");
+    let _p3_session = Session::setup(&mut p3_conn, "david", &nas_password(), "")
+        .await
+        .expect("p3 session setup");
+    let p3_tree = std::sync::Arc::new(
+        Tree::connect(&mut p3_conn, "naspi")
+            .await
+            .expect("p3 tree connect"),
+    );
+    let p3_conn_setup = p3_conn_setup_start.elapsed();
+
+    let p3_start = std::time::Instant::now();
+    let mut p3_tasks = Vec::with_capacity(PARALLEL_CONNS);
+    for task_idx in 0..PARALLEL_CONNS {
+        let mut conn_clone = p3_conn.clone();
+        let tree = std::sync::Arc::clone(&p3_tree);
+        let task = tokio::spawn(async move {
+            let mut bytes = 0usize;
+            for j in 0..per_conn {
+                let file_idx = task_idx * per_conn + j;
+                let path = format!("{}/f_{:03}.bin", BENCH_DIR, file_idx);
+                let d = tree
+                    .read_file_compound(&mut conn_clone, &path)
+                    .await
+                    .expect("p3 read");
+                bytes += d.len();
+            }
+            bytes
+        });
+        p3_tasks.push(task);
+    }
+    let mut p3_bytes = 0usize;
+    for t in p3_tasks {
+        p3_bytes += t.await.expect("p3 task join");
+    }
+    let p3_elapsed = p3_start.elapsed();
+    assert_eq!(p3_bytes, FILE_COUNT * FILE_SIZE);
+    let p3_fps = FILE_COUNT as f64 / p3_elapsed.as_secs_f64();
+
     // ── Report ───────────────────────────────────────────────────────
     let speedup = seq_elapsed.as_secs_f64() / par_elapsed.as_secs_f64();
+    let p3_speedup = seq_elapsed.as_secs_f64() / p3_elapsed.as_secs_f64();
     println!();
     println!("─────────────────────────────────────────────────────────");
     println!("100 × 10 KB file read benchmark against QNAP");
@@ -1977,16 +2027,20 @@ async fn bench_100_tiny_files_seq_vs_parallel() {
         seq_elapsed, seq_fps
     );
     println!(
+        "Phase 3 (1 conn, {} clones): {:>8.2?}  =  {:>6.1} files/sec   (setup {:.2?} extra)",
+        PARALLEL_CONNS, p3_elapsed, p3_fps, p3_conn_setup
+    );
+    println!(
         "Parallel ({} conns):   {:>8.2?}  =  {:>6.1} files/sec   (setup {:.2?} extra)",
         PARALLEL_CONNS, par_elapsed, par_fps, conn_setup
     );
     println!(
-        "Speedup:               {:>8.1}x   (upper bound — Phase 3 will be lower since it ",
-        speedup
+        "Phase 3 speedup:       {:>8.1}x   (single-session concurrent execute)",
+        p3_speedup
     );
     println!(
-        "                                     uses ONE connection, not {})",
-        PARALLEL_CONNS
+        "Parallel speedup:      {:>8.1}x   (upper bound — multi-session, Phase 4 cmdr-side)",
+        speedup
     );
     println!("─────────────────────────────────────────────────────────");
 }
