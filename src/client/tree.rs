@@ -9,7 +9,7 @@ use std::ops::ControlFlow;
 use log::{debug, info, trace, warn};
 
 use crate::client::connection::{CompoundOp, Connection};
-use crate::client::stream::Progress;
+use crate::client::stream::{FileDownload, Progress};
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
 use crate::msg::create::{
@@ -1732,6 +1732,44 @@ impl Tree {
         Ok(data)
     }
 
+    /// Start a streaming file download on this tree.
+    ///
+    /// Issues CREATE and returns a [`FileDownload`] that pulls the body in
+    /// chunks via [`next_chunk`](FileDownload::next_chunk). Mirrors
+    /// [`SmbClient::download`](crate::SmbClient::download) but accepts a
+    /// borrowed [`Connection`] directly, so callers who hold a cloned
+    /// `Connection` (see [`Connection::clone`]) can drive concurrent
+    /// downloads on one SMB session.
+    ///
+    /// For files that fit in one READ (≤ `max_read_size`), prefer
+    /// [`read_file_compound`](Self::read_file_compound) — 1 RTT vs. 3 RTTs.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # async fn example(conn: &mut smb2::Connection, tree: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// let mut download = tree.download(conn, "big.bin").await?;
+    /// while let Some(chunk) = download.next_chunk().await {
+    ///     let bytes = chunk?;
+    ///     // process bytes
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn download<'a>(
+        &'a self,
+        conn: &'a mut Connection,
+        path: &str,
+    ) -> Result<FileDownload<'a>> {
+        let normalized = path.replace('/', "\\");
+        let normalized = normalized.trim_start_matches('\\');
+        let (file_id, file_size) = self.open_file(conn, normalized).await?;
+        let chunk_size = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        Ok(FileDownload::new(
+            self, conn, file_id, file_size, chunk_size,
+        ))
+    }
+
     /// Write a file using pipelined I/O with a sliding window.
     ///
     /// Opens/creates the file, then uses a sliding window to keep the pipe
@@ -2139,12 +2177,26 @@ impl Tree {
         Ok(resp.file_id)
     }
 
-    /// Open a file handle and return the file ID and size.
-    pub(crate) async fn open_file(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<(FileId, u64)> {
+    /// Open a file handle for reading and return the file ID and size.
+    ///
+    /// Sends a single CREATE with read access, `FileOpen` disposition (fail
+    /// if absent), and the standard share mask. Returns the server's
+    /// [`FileId`] plus the file's size in bytes (end-of-file offset) so
+    /// callers can size their read loop.
+    ///
+    /// Most callers want [`read_file_compound`](Self::read_file_compound),
+    /// [`read_file_pipelined`](Self::read_file_pipelined), or
+    /// [`download`](Self::download), which all open the file, read it, and
+    /// close it in one call. Use `open_file` directly when you want to build
+    /// a custom read loop — for example, constructing a [`FileDownload`]
+    /// with a non-default `chunk_size` via
+    /// [`FileDownload::new`](crate::client::stream::FileDownload::new).
+    ///
+    /// The caller is responsible for closing the handle when done (either
+    /// by handing it to a [`FileDownload`], which closes on completion or
+    /// drop, or by calling the internal close path). Leaking the handle
+    /// wastes server resources.
+    pub async fn open_file(&self, conn: &mut Connection, path: &str) -> Result<(FileId, u64)> {
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -6248,5 +6300,261 @@ mod tests {
         frame.extend_from_slice(&close_bytes);
 
         frame
+    }
+
+    // ── Tree::download (streaming via &mut Connection) ─────────────────────
+
+    /// Happy path: `Tree::download` returns a `FileDownload` that yields
+    /// all chunks of a small file in order and closes the handle cleanly.
+    #[tokio::test]
+    async fn tree_download_streams_small_file() {
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId {
+            persistent: 0xA1,
+            volatile: 0xB2,
+        };
+        let payload = b"streaming hello from Tree::download".to_vec();
+
+        // CREATE (open_file) — server returns handle + size.
+        mock.queue_response(build_create_response(file_id, payload.len() as u64));
+        // Single READ covering the whole file (payload fits in one
+        // max_read_size=65536 chunk).
+        mock.queue_response(build_read_response(NtStatus::SUCCESS, payload.clone()));
+        // CLOSE after the last chunk.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(11),
+            share_name: "share".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut download = tree
+            .download(&mut conn, "hello.txt")
+            .await
+            .expect("download");
+        assert_eq!(download.size(), payload.len() as u64);
+
+        let mut received = Vec::new();
+        while let Some(chunk) = download.next_chunk().await {
+            let bytes = chunk.expect("chunk");
+            received.extend_from_slice(&bytes);
+        }
+        assert_eq!(received, payload);
+
+        // CREATE + READ + CLOSE = 3 messages on the wire.
+        assert_eq!(mock.sent_count(), 3);
+        mock.assert_fully_consumed();
+    }
+
+    /// Error path: if CREATE fails, `Tree::download` surfaces the NTSTATUS
+    /// as `Error::Protocol` without ever constructing a `FileDownload`.
+    #[tokio::test]
+    async fn tree_download_create_failure_returns_protocol_error() {
+        let mock = Arc::new(MockTransport::new());
+
+        let mut create_hdr = Header::new_request(Command::Create);
+        create_hdr.flags.set_response();
+        create_hdr.credits = 32;
+        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let create_err = pack_message(
+            &create_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+        mock.queue_response(create_err);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(12),
+            share_name: "share".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.download(&mut conn, "missing.txt").await;
+        let err = result.err().expect("expected error");
+        assert_eq!(err.status(), Some(NtStatus::OBJECT_NAME_NOT_FOUND));
+    }
+
+    /// Dropping a `FileDownload` mid-stream (before draining all chunks)
+    /// must not panic. The `Drop` impl logs a warning; the handle may leak
+    /// on the server, but the client stays healthy.
+    #[tokio::test]
+    async fn tree_download_drop_mid_stream_does_not_panic() {
+        let mock = Arc::new(MockTransport::new());
+
+        let file_id = FileId {
+            persistent: 0xC3,
+            volatile: 0xD4,
+        };
+        // 3x max_read_size payload so at least one READ remains unsent
+        // after the caller drops early.
+        let total = 3 * 65536usize;
+        mock.queue_response(build_create_response(file_id, total as u64));
+        // Queue one READ response; we'll consume only that one and drop.
+        mock.queue_response(build_read_response(NtStatus::SUCCESS, vec![0xAB; 65536]));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(13),
+            share_name: "share".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut download = tree.download(&mut conn, "big.bin").await.expect("download");
+
+        let first = download
+            .next_chunk()
+            .await
+            .expect("first chunk exists")
+            .expect("first chunk ok");
+        assert_eq!(first.len(), 65536);
+
+        // Drop mid-stream -- must not panic.
+        drop(download);
+    }
+
+    /// Two `Tree::download` futures on cloned `Connection`s must both
+    /// complete with correct data, proving the headline reason for adding
+    /// `Tree::download`: concurrent downloads on one SMB session.
+    ///
+    /// The mock transport routes responses via the Phase 3 receiver task
+    /// (shared across all `Connection::clone()`s), so msg-id demux is what
+    /// wires each CREATE/READ/CLOSE to the right waiter. We queue the
+    /// responses AFTER the sends land (just like
+    /// `concurrent_execute_on_one_connection_all_succeed` in
+    /// `connection.rs`) so `enable_auto_rewrite_msg_id` can stamp them in
+    /// FIFO send order. Both downloads use the same payload, so it doesn't
+    /// matter which task's READ lands in which slot — whoever gets routed
+    /// their msg_id wins the correct bytes.
+    ///
+    /// Gotcha/Why: if the two tasks fetched DIFFERENT payloads, the FIFO
+    /// auto-rewrite in `MockTransport` would mis-pair sends and responses
+    /// unless we hand-serialized each phase across tasks, which would
+    /// defeat the concurrency the test is meant to prove. Keeping the
+    /// payloads identical lets both downloads race freely while we still
+    /// assert correctness of the whole pipeline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tree_download_concurrent_on_cloned_connections() {
+        use std::time::{Duration, Instant};
+
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+
+        let params = crate::client::connection::NegotiatedParams {
+            dialect: crate::types::Dialect::Smb2_0_2,
+            max_read_size: 65536,
+            max_write_size: 65536,
+            max_transact_size: 65536,
+            server_guid: crate::pack::Guid::ZERO,
+            signing_required: false,
+            capabilities: crate::types::flags::Capabilities::default(),
+            gmac_negotiated: false,
+            cipher: None,
+            compression_supported: false,
+        };
+        let mut conn_primary = crate::client::connection::Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn_primary.set_test_params(params);
+        conn_primary.set_session_id(crate::types::SessionId(0x1234));
+        let mut conn_secondary = conn_primary.clone();
+
+        let tree = Arc::new(Tree {
+            tree_id: TreeId(14),
+            share_name: "share".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        });
+
+        let payload = b"shared-body-for-both-readers".to_vec();
+
+        let file_id_1 = FileId {
+            persistent: 0x0A,
+            volatile: 0x1A,
+        };
+        let file_id_2 = FileId {
+            persistent: 0x0B,
+            volatile: 0x1B,
+        };
+
+        let tree_a = Arc::clone(&tree);
+        let payload_a = payload.clone();
+        let handle_a = tokio::spawn(async move {
+            let mut dl = tree_a
+                .download(&mut conn_primary, "same.txt")
+                .await
+                .expect("download a");
+            let mut buf = Vec::new();
+            while let Some(c) = dl.next_chunk().await {
+                buf.extend_from_slice(&c.expect("chunk a"));
+            }
+            assert_eq!(buf, payload_a);
+        });
+
+        let tree_b = Arc::clone(&tree);
+        let payload_b = payload.clone();
+        let handle_b = tokio::spawn(async move {
+            let mut dl = tree_b
+                .download(&mut conn_secondary, "same.txt")
+                .await
+                .expect("download b");
+            let mut buf = Vec::new();
+            while let Some(c) = dl.next_chunk().await {
+                buf.extend_from_slice(&c.expect("chunk b"));
+            }
+            assert_eq!(buf, payload_b);
+        });
+
+        // Wait for both CREATE sends before queuing responses.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < 2 {
+            if Instant::now() > deadline {
+                panic!("CREATE sends did not land: {}", mock.sent_count());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        mock.queue_response(build_create_response(file_id_1, payload.len() as u64));
+        mock.queue_response(build_create_response(file_id_2, payload.len() as u64));
+
+        // Wait for both READs, then answer with identical payloads.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < 4 {
+            if Instant::now() > deadline {
+                panic!("READ sends did not land: {}", mock.sent_count());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        mock.queue_response(build_read_response(NtStatus::SUCCESS, payload.clone()));
+        mock.queue_response(build_read_response(NtStatus::SUCCESS, payload.clone()));
+
+        // Both downloads issue a CLOSE after the final chunk.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < 6 {
+            if Instant::now() > deadline {
+                panic!("CLOSE sends did not land: {}", mock.sent_count());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_close_response());
+
+        handle_a.await.expect("task a panicked");
+        handle_b.await.expect("task b panicked");
+
+        assert_eq!(mock.sent_count(), 6); // 2 CREATE + 2 READ + 2 CLOSE
     }
 }

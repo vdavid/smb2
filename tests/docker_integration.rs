@@ -519,6 +519,73 @@ async fn guest_streaming_download() {
         .expect("disconnect failed");
 }
 
+/// `Tree::download` (borrowed `&mut Connection`) mirrors
+/// `SmbClient::download` against a real Samba container. Same payload, same
+/// RTT shape — the only difference is the caller holds the `Connection`
+/// directly, which is what unlocks concurrent downloads on cloned
+/// connections.
+#[tokio::test]
+#[ignore]
+async fn guest_tree_download_streams_via_connection() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+
+    let test_path = "docker_test_tree_download.tmp";
+    let test_data: Vec<u8> = (0..524_288).map(|i| (i % 251) as u8).collect();
+
+    // Seed the file through the high-level client, then download it back
+    // via the low-level Tree::download API.
+    {
+        let mut client = guest_client().await;
+        let mut write_tree = client
+            .connect_share("public")
+            .await
+            .expect("connect_share failed");
+        client
+            .write_file(&mut write_tree, test_path, &test_data)
+            .await
+            .expect("write_file failed");
+        client
+            .disconnect_share(&write_tree)
+            .await
+            .expect("disconnect failed");
+    }
+
+    let mut download = tree
+        .download(&mut conn, test_path)
+        .await
+        .expect("Tree::download failed");
+    assert_eq!(download.size(), test_data.len() as u64);
+
+    let mut received = Vec::new();
+    while let Some(chunk) = download.next_chunk().await {
+        let bytes = chunk.expect("next_chunk failed");
+        assert!(!bytes.is_empty());
+        received.extend_from_slice(&bytes);
+    }
+    assert_eq!(received, test_data);
+
+    drop(download);
+
+    // Clean up via a fresh client (we already consumed `conn` for the
+    // download; reuse it for the delete to exercise the same connection
+    // end-to-end).
+    let mut client = guest_client().await;
+    let mut cleanup_tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    client
+        .delete_file(&mut cleanup_tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&cleanup_tree)
+        .await
+        .expect("disconnect failed");
+}
+
 #[tokio::test]
 #[ignore]
 async fn guest_streaming_upload() {

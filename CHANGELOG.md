@@ -7,6 +7,19 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-04-21
+
+### Added
+
+- `Tree::download` for streaming reads driven by a borrowed `Connection`, mirroring the existing `SmbClient::download`
+  but unlocking concurrent downloads on a single SMB session (via `Connection::clone`).
+
+### Changed
+
+- `Tree::open_file` and `FileDownload::new` are now `pub` (were `pub(crate)`), so callers can build custom chunk loops
+  or reuse a handle across multiple readers.
+- `SmbClient::download` now delegates to `Tree::download` — zero behavior change.
+
 ## [0.7.0] - 2026-04-21
 
 First public release on crates.io. Bundles the FileWriter streaming write API with the Phase 3 Connection actor

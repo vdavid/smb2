@@ -87,6 +87,19 @@ For large files, `read_file_pipelined` / `write_file_pipelined` issue multiple `
 
 FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, with the sliding window handling backpressure. Complement to FileDownload (read streaming).
 
+## Streaming download entry points
+
+Two symmetric ways to start a `FileDownload`:
+
+- `SmbClient::download(&mut self, &Tree, path)` — convenience wrapper that borrows the client's internal `Connection`.
+- `Tree::download(&self, &mut Connection, path)` — takes the `Connection` directly. Use this when you hold a
+  `conn.clone()` and want to drive concurrent downloads on the same SMB session (each clone pairs with one outstanding
+  download; the receiver task multiplexes responses by `MessageId`). `SmbClient::download` delegates here.
+
+For full control, `Tree::open_file` (returns `(FileId, u64)`) plus `FileDownload::new` let callers build custom chunk
+loops with non-default `chunk_size`. Most users shouldn't need this — `read_file_compound` (1 RTT) handles small files
+and `Tree::download` / `SmbClient::download` handle the streaming case.
+
 FileWriter has two terminal operations:
 - `finish()` — send all buffered data, drain in-flight WRITEs, FLUSH (fsync on the server), CLOSE. Use on normal completion.
 - `abort()` — discard unsent data, drain in-flight WRITEs to keep credits/message-ids in sync, skip FLUSH, best-effort CLOSE. Use on cancellation or error paths where the partial remote file is going to be deleted anyway — `abort()` saves the fsync round-trip. The caller is responsible for deleting the partial remote file.

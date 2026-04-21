@@ -89,8 +89,19 @@ pub struct FileDownload<'a> {
 }
 
 impl<'a> FileDownload<'a> {
-    /// Create a new streaming download.
-    pub(crate) fn new(
+    /// Create a new streaming download from an already-opened file handle.
+    ///
+    /// Most callers want [`SmbClient::download`](crate::SmbClient::download) or
+    /// [`Tree::download`](crate::Tree::download), which issue the CREATE
+    /// themselves and wrap the resulting handle. Use this constructor when
+    /// you've already opened the file via [`Tree::open_file`] (for example,
+    /// to reuse a handle across multiple readers, or to build a custom
+    /// chunk loop with non-default `chunk_size`).
+    ///
+    /// The caller is responsible for making sure `file_id` belongs to `tree`
+    /// and was opened with read access. The `FileDownload` will CLOSE the
+    /// handle when the last chunk is consumed or when it is dropped.
+    pub fn new(
         tree: &'a Tree,
         conn: &'a mut Connection,
         file_id: FileId,

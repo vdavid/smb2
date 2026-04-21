@@ -757,19 +757,7 @@ impl SmbClient {
         tree: &'a Tree,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let normalized = path.replace('/', "\\");
-        let normalized = normalized.trim_start_matches('\\');
-
-        let (file_id, file_size) = tree.open_file(&mut self.conn, normalized).await?;
-        let chunk_size = self.conn.params().map(|p| p.max_read_size).unwrap_or(65536);
-
-        Ok(FileDownload::new(
-            tree,
-            &mut self.conn,
-            file_id,
-            file_size,
-            chunk_size,
-        ))
+        tree.download(&mut self.conn, path).await
     }
 
     /// Start a streaming file upload with progress tracking.
