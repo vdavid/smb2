@@ -7,6 +7,11 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-21
+
+First public release on crates.io. Bundles the FileWriter streaming write API with the Phase 3 Connection actor
+refactor (breaking API change).
+
 ### Changed
 
 - **Breaking: `Connection`'s send/receive API collapsed into `execute` / `execute_compound`** (Phase 3 of the
@@ -72,15 +77,22 @@ the canonical pattern. `MAX_PIPELINE_WINDOW` and `conn.credits()`-based pacing s
 
 ### Added
 
-- `FileWriter::abort()` -- fast-cancel companion to `finish()`. Discards any unsent data, drains in-flight
+- `FileWriter` — push-based streaming write API with pipelined I/O. Consumer drives the loop, pushing chunks via
+  `write_chunk()` with automatic backpressure (sliding window, credit-aware). Complement to `FileDownload` for reads.
+  Created via `SmbClient::create_file_writer()`.
+- `FileWriter::abort()` — fast-cancel companion to `finish()`. Discards any unsent data, drains in-flight
   WRITE responses to keep credits and message IDs in sync, skips the server-side FLUSH (fsync), and does a
   best-effort CLOSE. Errors during drain/close are swallowed so callers can exit quickly. Use on
-  cancellation or error paths where the partial remote file is going to be deleted anyway -- it saves the
+  cancellation or error paths where the partial remote file is going to be deleted anyway — it saves the
   fsync round-trip vs. calling `finish()`. The caller is responsible for deleting the partial file.
-- `Connection::receive_compound_expected(n)` -- gathers exactly `n` compound sub-responses, transparently
+- `Connection::receive_compound_expected(n)` — gathers exactly `n` compound sub-responses, transparently
   reading additional transport frames when the server splits the chain. All compound-using methods
   (`read_file_compound`, `write_file_compound`, `fs_info`, `stat`, `rename`, `delete_file`/`delete_directory`,
   and the batch `delete_files`/`rename_files`/`stat_files`) now use it.
+- 13 new Docker integration tests for `FileWriter`: basic, large (5 MB), empty, single byte, overwrite,
+  equivalence with `write_file_pipelined`, binary data integrity, 64 KB max-write-size, signing, encryption,
+  read-only rejection, 100 MB stress (guest), 100 MB stress (200ms latency)
+- 10 new unit tests for `FileWriter` pipelining, backpressure, chunk splitting, error handling
 
 ### Fixed
 
@@ -101,18 +113,6 @@ the canonical pattern. `MAX_PIPELINE_WINDOW` and `conn.credits()`-based pacing s
   server sends responses as separate frames instead of one compounded frame. Per MS-SMB2 3.3.4.1.3 the
   server SHOULD compound but MAY split, and Samba (including QNAP NAS firmware built on Samba) splits
   in some scenarios. Hit in the wild via `fs_info` against a QNAP NAS.
-
-## [0.7.0] - 2026-04-15
-
-### Added
-
-- `FileWriter` — push-based streaming write API with pipelined I/O. Consumer drives the loop, pushing chunks via
-  `write_chunk()` with automatic backpressure (sliding window, credit-aware). Complement to `FileDownload` for reads.
-  Created via `SmbClient::create_file_writer()`.
-- 13 new Docker integration tests: basic, large (5 MB), empty, single byte, overwrite, equivalence with
-  `write_file_pipelined`, binary data integrity, 64 KB max-write-size, signing, encryption, read-only rejection,
-  100 MB stress (guest), 100 MB stress (200ms latency)
-- 10 new unit tests for `FileWriter` pipelining, backpressure, chunk splitting, error handling
 
 ## [0.6.0] - 2026-04-15
 
