@@ -52,7 +52,7 @@ pub const FSCTL_VALIDATE_NEGOTIATE_INFO: u32 = 0x0014_0204;
 /// - Flags (4 bytes)
 /// - Reserved2 (4 bytes)
 /// - Buffer (variable, InputCount bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoctlRequest {
     /// The control code for the operation.
     pub ctl_code: u32,
@@ -182,7 +182,7 @@ impl Unpack for IoctlRequest {
 /// - Flags (4 bytes)
 /// - Reserved2 (4 bytes)
 /// - Buffer (variable -- may contain both input and output data)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoctlResponse {
     /// The control code echoed from the request.
     pub ctl_code: u32,

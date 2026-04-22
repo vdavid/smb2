@@ -67,7 +67,7 @@ impl SessionFlags {
 ///
 /// Sent by the client to establish an authenticated session. The security
 /// buffer carries a GSS/SPNEGO token (or other auth protocol token).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSetupRequest {
     /// Flags controlling the request (for example, session binding).
     pub flags: SessionSetupRequestFlags,
@@ -162,7 +162,7 @@ impl Unpack for SessionSetupRequest {
 ///
 /// Sent by the server in response to a SESSION_SETUP request. Contains
 /// session flags and a security buffer with the server's auth token.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSetupResponse {
     /// Flags indicating additional information about the session.
     pub session_flags: SessionFlags,

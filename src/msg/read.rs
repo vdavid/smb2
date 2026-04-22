@@ -33,7 +33,7 @@ pub const SMB2_CHANNEL_NONE: u32 = 0x0000_0000;
 /// - ReadChannelInfoOffset (2 bytes)
 /// - ReadChannelInfoLength (2 bytes)
 /// - Buffer (variable, typically empty for basic reads)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadRequest {
     /// Requested data placement offset in the response.
     pub padding: u8,
@@ -159,7 +159,7 @@ impl Unpack for ReadRequest {
 /// - DataRemaining (4 bytes)
 /// - Reserved2 (4 bytes)
 /// - Buffer (variable, DataLength bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadResponse {
     /// Offset from the start of the SMB2 header to the data.
     pub data_offset: u8,

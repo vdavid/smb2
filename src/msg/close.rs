@@ -19,7 +19,7 @@ pub const SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB: u16 = 0x0001;
 /// - Flags (2 bytes)
 /// - Reserved (4 bytes)
 /// - FileId (16 bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseRequest {
     /// Flags indicating how to process the close.
     /// Use `SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB` to request attributes.
@@ -85,7 +85,7 @@ impl Unpack for CloseRequest {
 /// - AllocationSize (8 bytes)
 /// - EndOfFile (8 bytes)
 /// - FileAttributes (4 bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseResponse {
     /// Flags echoed from the request. If `SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB`
     /// is set, the attribute fields below contain valid data.

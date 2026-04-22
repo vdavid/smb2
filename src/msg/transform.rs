@@ -66,7 +66,7 @@ pub const SMB2_COMPRESSION_FLAG_CHAINED: u16 = 0x0001;
 /// - SessionId (8 bytes)
 ///
 /// The encrypted message data follows immediately after this header.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformHeader {
     /// 16-byte AES signature over the encrypted message.
     pub signature: [u8; 16],
@@ -166,7 +166,7 @@ impl Unpack for TransformHeader {
 /// Note: The chained variant (Flags = SMB2_COMPRESSION_FLAG_CHAINED)
 /// interprets the last 4 bytes as Length instead of Offset. Chained
 /// compression is deferred to a future implementation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressionTransformHeader {
     /// Size of the original uncompressed data segment.
     pub original_compressed_segment_size: u32,

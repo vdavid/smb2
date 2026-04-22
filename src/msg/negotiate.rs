@@ -298,7 +298,7 @@ fn unpack_negotiate_contexts(
 ///
 /// Sent by the client to advertise which dialects and capabilities it
 /// supports. For SMB 3.1.1, includes negotiate contexts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiateRequest {
     /// Security mode indicating signing requirements.
     pub security_mode: SecurityMode,
@@ -452,7 +452,7 @@ impl Unpack for NegotiateRequest {
 ///
 /// Sent by the server to indicate the selected dialect, server capabilities,
 /// and (for SMB 3.1.1) negotiate contexts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiateResponse {
     /// Server security mode.
     pub security_mode: SecurityMode,

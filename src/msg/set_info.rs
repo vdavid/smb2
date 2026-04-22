@@ -19,7 +19,7 @@ pub use super::query_info::InfoType;
 ///
 /// Sent by the client to set information on a file, filesystem,
 /// security descriptor, or quota.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetInfoRequest {
     /// The type of information being set.
     pub info_type: InfoType,

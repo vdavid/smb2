@@ -69,7 +69,7 @@ impl QueryDirectoryFlags {
 /// SMB2 QUERY_DIRECTORY request (spec section 2.2.33).
 ///
 /// Sent by the client to enumerate files in a directory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryDirectoryRequest {
     /// The type of information to return for each directory entry.
     pub file_information_class: FileInformationClass,
@@ -198,7 +198,7 @@ impl Unpack for QueryDirectoryRequest {
 ///
 /// Contains directory enumeration data as raw bytes. The format depends
 /// on the `FileInformationClass` from the request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryDirectoryResponse {
     /// Raw output buffer containing directory entries.
     pub output_buffer: Vec<u8>,

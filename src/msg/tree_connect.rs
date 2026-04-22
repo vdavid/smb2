@@ -61,7 +61,7 @@ impl TreeConnectRequestFlags {
 ///
 /// Sent by the client to request access to a particular share on the
 /// server. The path is a Unicode string in the form `\\server\share`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeConnectRequest {
     /// Flags controlling the request (SMB 3.1.1 only, otherwise 0).
     pub flags: TreeConnectRequestFlags,
@@ -132,7 +132,7 @@ impl Unpack for TreeConnectRequest {
 ///
 /// Sent by the server when a TREE_CONNECT request is processed
 /// successfully. Contains share metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeConnectResponse {
     /// The type of share being accessed (disk, pipe, or print).
     pub share_type: ShareType,

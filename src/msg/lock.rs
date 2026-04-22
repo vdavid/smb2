@@ -77,7 +77,7 @@ impl Unpack for LockElement {
 /// - LockSequenceNumber/Index (4 bytes)
 /// - FileId (16 bytes)
 /// - Locks (variable, LockCount x 24 bytes each)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockRequest {
     /// Combined lock sequence number (4 bits) and index (28 bits).
     /// In SMB 2.0.2 this field is reserved (0).
@@ -142,7 +142,7 @@ impl Unpack for LockRequest {
 /// Sent by the server to confirm a lock operation. The structure is 4 bytes:
 /// - StructureSize (2 bytes, must be 4)
 /// - Reserved (2 bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockResponse;
 
 impl LockResponse {

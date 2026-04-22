@@ -49,7 +49,7 @@ impl TryFrom<u8> for InfoType {
 ///
 /// Sent by the client to query information about a file, filesystem,
 /// security descriptor, or quota.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryInfoRequest {
     /// The type of information being queried.
     pub info_type: InfoType,
@@ -178,7 +178,7 @@ impl Unpack for QueryInfoRequest {
 ///
 /// Contains the queried information as raw bytes. The format depends
 /// on the `InfoType` and `FileInfoClass` from the request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryInfoResponse {
     /// Raw output buffer containing the queried information.
     pub output_buffer: Vec<u8>,

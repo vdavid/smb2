@@ -132,7 +132,7 @@ impl TryFrom<u32> for CreateAction {
 /// Sent by the client to open or create a file on the server.
 /// The buffer contains the filename encoded as UTF-16LE, optionally
 /// followed by create context data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateRequest {
     /// Requested oplock level.
     pub requested_oplock_level: OplockLevel,
@@ -320,7 +320,7 @@ impl Unpack for CreateRequest {
 ///
 /// Returned by the server with the file handle and metadata about
 /// the created or opened file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateResponse {
     /// Oplock level granted by the server.
     pub oplock_level: OplockLevel,

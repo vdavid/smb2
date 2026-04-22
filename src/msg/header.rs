@@ -22,7 +22,7 @@ pub const PROTOCOL_ID: [u8; 4] = [0xFE, b'S', b'M', b'B'];
 ///
 /// Contains both sync and async variants. The `flags` field determines
 /// which interpretation of bytes 32-39 is correct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     /// Number of credits charged for this request.
     pub credit_charge: CreditCharge,
@@ -204,7 +204,7 @@ impl Unpack for Header {
 /// - Reserved (1 byte)
 /// - ByteCount (4 bytes)
 /// - ErrorData (variable, ByteCount bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorResponse {
     /// Number of error contexts (SMB 3.1.1 only, otherwise 0).
     pub error_context_count: u8,

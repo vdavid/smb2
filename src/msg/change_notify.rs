@@ -63,7 +63,7 @@ pub const FILE_NOTIFY_CHANGE_STREAM_WRITE: u32 = 0x0000_0800;
 /// - FileId (16 bytes)
 /// - CompletionFilter (4 bytes)
 /// - Reserved (4 bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeNotifyRequest {
     /// Flags controlling the notification. Use `SMB2_WATCH_TREE` for recursive.
     pub flags: u16,
@@ -140,7 +140,7 @@ impl Unpack for ChangeNotifyRequest {
 /// - OutputBufferOffset (2 bytes)
 /// - OutputBufferLength (4 bytes)
 /// - Buffer (variable, OutputBufferLength bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeNotifyResponse {
     /// Raw FILE_NOTIFY_INFORMATION data. Parsing individual entries is
     /// deferred to a higher layer.

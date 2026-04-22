@@ -29,7 +29,7 @@ pub const SMB2_WRITEFLAG_WRITE_UNBUFFERED: u32 = 0x0000_0002;
 /// - WriteChannelInfoLength (2 bytes)
 /// - Flags (4 bytes)
 /// - Buffer (variable, Length bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteRequest {
     /// Offset from the beginning of the SMB2 header to the write data.
     pub data_offset: u16,
@@ -135,7 +135,7 @@ impl Unpack for WriteRequest {
 /// - Remaining (4 bytes)
 /// - WriteChannelInfoOffset (2 bytes)
 /// - WriteChannelInfoLength (2 bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteResponse {
     /// Number of bytes written.
     pub count: u32,
