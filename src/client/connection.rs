@@ -1419,7 +1419,7 @@ fn decrypt_frame(data: &[u8], inner: &Inner) -> Result<Vec<u8>> {
 
 /// Split a preprocessed frame into sub-frames by `NextCommand` offsets.
 /// Returns the raw byte slices (as owned Vec<u8>) for each sub-frame.
-fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut results = Vec::new();
     let mut offset = 0usize;
 

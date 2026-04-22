@@ -1,0 +1,74 @@
+name: Fuzz
+
+# Short-duration fuzz run: weekly schedule + manual dispatch. Each target
+# runs for 5 minutes with the committed seed corpus. For longer hunts, run
+# locally: `cargo +nightly fuzz run <target> -- -max_total_time=1800`.
+#
+# We deliberately do NOT fuzz on every push -- runs are too long for that.
+
+on:
+  schedule:
+    # Mondays 04:15 UTC.
+    - cron: "15 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz time (seconds)"
+        required: false
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_header_parse
+          - fuzz_transform_header_parse
+          - fuzz_compression_transform_header_parse
+          - fuzz_compound_split
+          - fuzz_frame_parse
+          - fuzz_sub_frame_parse
+          - fuzz_negotiate_request_parse
+          - fuzz_negotiate_response_parse
+          - fuzz_create_request_parse
+          - fuzz_create_response_parse
+          - fuzz_query_info_response_parse
+          - fuzz_dfs_referral_response_parse
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz target
+        env:
+          DURATION: ${{ github.event.inputs.duration_seconds || '300' }}
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            -- -max_total_time="${DURATION}" -print_final_stats=1
+
+      - name: Upload crash artifacts (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

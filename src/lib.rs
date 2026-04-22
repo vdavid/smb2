@@ -57,6 +57,9 @@ pub mod testing;
 pub mod transport;
 pub mod types;
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
+
 // ── Re-exports: the simple-case imports ────────────────────────────────
 
 // Error types

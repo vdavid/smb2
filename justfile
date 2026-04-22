@@ -168,6 +168,27 @@ clean:
     cargo clean
     @echo "[+] Clean complete"
 
+# Run a single fuzz target for a short sweep (default: 5 minutes).
+# Example: `just fuzz fuzz_header_parse` or `just fuzz fuzz_frame_parse 1800`.
+# Requires the nightly toolchain and `cargo-fuzz` (run `cargo install cargo-fuzz`).
+fuzz target duration="300":
+    @if ! rustup run nightly rustc --version &> /dev/null; then \
+        echo "[!] Nightly toolchain not found. Install with: rustup toolchain install nightly"; \
+        exit 1; \
+    fi
+    @if ! command -v cargo-fuzz &> /dev/null; then \
+        echo "[!] cargo-fuzz not found. Install with: cargo install cargo-fuzz"; \
+        exit 1; \
+    fi
+    @echo "[*] Fuzzing {{target}} for {{duration}}s..."
+    cargo +nightly fuzz run {{target}} -- -max_total_time={{duration}} -print_final_stats=1
+
+# Regenerate the committed seed corpus under `fuzz/corpus/`.
+fuzz-seeds:
+    @echo "[*] Regenerating fuzz seed corpus..."
+    @cargo test --test fuzz_seeds -- --ignored --nocapture
+    @echo "[+] Seed corpus updated"
+
 # Install required development tools
 install-tools:
     @echo "[*] Installing development tools..."

@@ -35,3 +35,10 @@ Built by `Connection::send_compound`. Each sub-request's header has a `NextComma
 - **TCP framing is big-endian**: The 4-byte transport header (1 zero byte + 3-byte length) uses big-endian byte order. Everything inside the SMB2 message is little-endian. This is the only big-endian value in the entire protocol.
 - **StructureSize is "fixed"**: The spec says StructureSize is the size of the fixed-length portion of the struct. It does NOT include variable-length buffers. It's validated on unpack.
 - **`#![allow(missing_docs)]`**: This module opts out of doc requirements because wire format field names are self-documenting from the spec.
+- **Manual offset arithmetic requires careful bounds**: In `dfs.rs`, `parse_referral_entry` uses `ensure_remaining(buf, pos, N)` before raw `buf[pos..]` reads. Count the fixed fields carefully -- V2's body is **18** bytes (server_type+flags+proximity+ttl + three u16 offsets), not 16. An off-by-2 here lets a malformed `entry_size` slip past the initial guard and panic on the last offset read. Fuzz-caught in 0.7.2; regression test `resp_parse_v2_short_entry_returns_clean_error`.
+
+## Fuzzing
+
+Parse entry points are exposed via the `fuzzing` feature (`smb2::fuzzing`) and exercised by the `fuzz/` crate. See
+`fuzz/README.md` (if present) or run `just fuzz fuzz_header_parse 300` for a local sweep. Every new parser touching
+external bytes should get a fuzz target wrapper added in `src/fuzzing.rs` and a matching `fuzz/fuzz_targets/*.rs`.

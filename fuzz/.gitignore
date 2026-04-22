@@ -1,0 +1,14 @@
+target
+coverage
+
+# Ignore evolving corpus additions but keep seed_*.bin committed so new runs
+# start from a strong baseline (libfuzzer mutates from seeds outward).
+# Order matters: the negation must allow descending into corpus/<target>/
+# subdirs (don't ignore them wholesale), so we selectively ignore non-seed
+# files by name pattern.
+corpus/*/*
+!corpus/*/seed_*.bin
+
+# Crash artifacts are per-run; minimized regressions should be moved into
+# dedicated unit tests rather than committed here.
+artifacts/

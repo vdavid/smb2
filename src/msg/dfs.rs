@@ -154,7 +154,8 @@ fn parse_referral_entry(version: u16, buf: &[u8], entry_start: usize) -> Result<
         2 => {
             // V2: server_type(2) + flags(2) + proximity(4) + ttl(4) +
             //     dfs_path_offset(2) + dfs_alternate_path_offset(2) + network_address_offset(2)
-            ensure_remaining(buf, pos, 16)?;
+            //     = 18 bytes of fixed entry body after the 4-byte version/size prefix.
+            ensure_remaining(buf, pos, 18)?;
             let server_type = read_u16(buf, pos);
             pos += 2;
             let referral_entry_flags = read_u16(buf, pos);
@@ -614,6 +615,26 @@ mod tests {
         let buf = [0x00, 0x00, 0x01, 0x00];
         let mut cursor = ReadCursor::new(&buf);
         assert!(RespGetDfsReferral::unpack(&mut cursor).is_err());
+    }
+
+    /// Regression: fuzz-found crash. A V2 entry that claims `entry_size = 16`
+    /// used to panic inside the entry-body read. The V2 body needs 18 bytes
+    /// (server_type+flags+proximity+ttl + three u16 offsets), but the guard
+    /// only ensured 16 bytes were available, so the final offset read would
+    /// slip past the buffer. See fuzz target
+    /// `fuzz_dfs_referral_response_parse` crash
+    /// `a6933afd5a1ccec7166d914caed66154416a2fcb`.
+    #[test]
+    fn resp_parse_v2_short_entry_returns_clean_error() {
+        let crash_input: [u8; 28] = [
+            0x10, 0x00, 0x01, 0x00, 0x22, 0x23, 0x00, 0x03, // header
+            0x02, 0x00, 0x10, 0x00, 0x01, 0x00, 0x22, 0x23, // v2 entry start (size=16)
+            0x00, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // body bytes
+            0x00, 0x00, 0x00, 0x00, // tail
+        ];
+        let mut cursor = ReadCursor::new(&crash_input);
+        let result = RespGetDfsReferral::unpack(&mut cursor);
+        assert!(result.is_err(), "expected clean error, got {result:?}");
     }
 
     // ── Test helpers ──────────────────────────────────────────────────

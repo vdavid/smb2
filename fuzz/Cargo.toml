@@ -1,0 +1,108 @@
+[package]
+name = "smb2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Exclude from the outer `smb2` workspace -- fuzz targets use nightly-only
+# features (libfuzzer sanitizer instrumentation) and have their own
+# Cargo.lock managed by cargo-fuzz.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.12"
+arbitrary = { version = "=1.4.2", features = ["derive"] }
+
+[dependencies.smb2]
+path = ".."
+features = ["fuzzing"]
+
+# Each target is its own `bin` so libfuzzer can link a single entry point.
+# Keep `test`/`doc`/`bench` disabled: fuzz targets aren't standalone.
+
+[[bin]]
+name = "fuzz_header_parse"
+path = "fuzz_targets/fuzz_header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_transform_header_parse"
+path = "fuzz_targets/fuzz_transform_header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_compression_transform_header_parse"
+path = "fuzz_targets/fuzz_compression_transform_header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_compound_split"
+path = "fuzz_targets/fuzz_compound_split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_frame_parse"
+path = "fuzz_targets/fuzz_frame_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sub_frame_parse"
+path = "fuzz_targets/fuzz_sub_frame_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_negotiate_request_parse"
+path = "fuzz_targets/fuzz_negotiate_request_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_negotiate_response_parse"
+path = "fuzz_targets/fuzz_negotiate_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_create_request_parse"
+path = "fuzz_targets/fuzz_create_request_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_create_response_parse"
+path = "fuzz_targets/fuzz_create_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_query_info_response_parse"
+path = "fuzz_targets/fuzz_query_info_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dfs_referral_response_parse"
+path = "fuzz_targets/fuzz_dfs_referral_response_parse.rs"
+test = false
+doc = false
+bench = false
