@@ -7,6 +7,26 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-04-21
+
+### Fixed
+
+- DFS referral response parser (`msg::dfs::RespGetDfsReferral::unpack`): a V2 entry whose server-declared `entry_size`
+  was small enough to pass the initial `entry_size < 4` guard but short enough to truncate the fixed body would
+  trigger a panic (out-of-bounds) on the final `network_address_offset` read. The V2 body is 18 bytes after the
+  4-byte version/size prefix, not 16. Found by fuzzing; regression covered by
+  `msg::dfs::tests::resp_parse_v2_short_entry_returns_clean_error`.
+
+### Added
+
+- `fuzz/` crate using `cargo-fuzz` with 12 fuzz targets across the parse entry points: top-level SMB2 header,
+  TRANSFORM/COMPRESSION transform headers, compound-frame splitter, full frame + sub-frame body parse, Negotiate
+  request/response (negotiate contexts), Create request/response (create contexts), QueryInfo response, and DFS
+  referral response. Seed corpus generator at `tests/fuzz_seeds.rs` (run with
+  `cargo test --test fuzz_seeds -- --ignored`). Targets are feature-gated behind `fuzzing`; the feature exposes
+  parse entry points via `smb2::fuzzing` and is not meant for application use.
+- `.github/workflows/fuzz.yml`: weekly 5-minute-per-target fuzz run on schedule + manual dispatch.
+
 ## [0.7.1] - 2026-04-21
 
 ### Added
