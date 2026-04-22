@@ -332,3 +332,59 @@ mod tests {
         assert_eq!(decoded.file_attributes, 0);
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_file_id, arb_file_time};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn close_request_pack_unpack(
+            flags in any::<u16>(),
+            file_id in arb_file_id(),
+        ) {
+            let original = CloseRequest { flags, file_id };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = CloseRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn close_response_pack_unpack(
+            flags in any::<u16>(),
+            creation_time in arb_file_time(),
+            last_access_time in arb_file_time(),
+            last_write_time in arb_file_time(),
+            change_time in arb_file_time(),
+            allocation_size in any::<u64>(),
+            end_of_file in any::<u64>(),
+            file_attributes in any::<u32>(),
+        ) {
+            let original = CloseResponse {
+                flags,
+                creation_time,
+                last_access_time,
+                last_write_time,
+                change_time,
+                allocation_size,
+                end_of_file,
+                file_attributes,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = CloseResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

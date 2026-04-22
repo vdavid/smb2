@@ -209,6 +209,8 @@ mod tests {
         assert!(err.contains("structure size"), "error was: {err}");
     }
 
+    // Roundtrip property tests live in `roundtrip_props` at file end.
+
     #[test]
     fn oplock_break_reserved_fields_ignored() {
         let mut buf = [0u8; 24];
@@ -231,5 +233,30 @@ mod tests {
         assert_eq!(decoded.oplock_level, OplockLevel::LevelII);
         assert_eq!(decoded.file_id.persistent, 1);
         assert_eq!(decoded.file_id.volatile, 2);
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_file_id, arb_oplock_level};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn oplock_break_pack_unpack(
+            oplock_level in arb_oplock_level(),
+            file_id in arb_file_id(),
+        ) {
+            let original = OplockBreak { oplock_level, file_id };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = OplockBreak::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
     }
 }

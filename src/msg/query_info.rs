@@ -428,3 +428,52 @@ mod tests {
         assert!(InfoType::try_from(0x05).is_err());
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_bytes, arb_file_id, arb_info_type};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn query_info_request_pack_unpack(
+            info_type in arb_info_type(),
+            file_info_class in any::<u8>(),
+            output_buffer_length in any::<u32>(),
+            additional_information in any::<u32>(),
+            flags in any::<u32>(),
+            file_id in arb_file_id(),
+            input_buffer in arb_bytes(),
+        ) {
+            let original = QueryInfoRequest {
+                info_type,
+                file_info_class,
+                output_buffer_length,
+                additional_information,
+                flags,
+                file_id,
+                input_buffer,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = QueryInfoRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+
+        #[test]
+        fn query_info_response_pack_unpack(output_buffer in arb_bytes()) {
+            let original = QueryInfoResponse { output_buffer };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = QueryInfoResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+    }
+}

@@ -637,3 +637,40 @@ mod tests {
         out
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::arb_utf16_string;
+    use proptest::prelude::*;
+
+    /// Generate a UTF-16 string without interior null (U+0000). The encoder
+    /// terminates with a 0x0000 code unit, so an interior null would end
+    /// the string early on decode.
+    fn arb_utf16_no_nul(max: usize) -> impl Strategy<Value = String> {
+        arb_utf16_string(max).prop_filter("string must not contain interior U+0000", |s| {
+            !s.contains('\0')
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn req_get_dfs_referral_pack_unpack(
+            max_referral_level in any::<u16>(),
+            request_file_name in arb_utf16_no_nul(128),
+        ) {
+            let original = ReqGetDfsReferral {
+                max_referral_level,
+                request_file_name,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = ReqGetDfsReferral::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

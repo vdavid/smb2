@@ -421,3 +421,61 @@ mod tests {
         assert!(err.contains("structure size"), "error was: {err}");
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_capabilities, arb_small_bytes};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn session_setup_request_pack_unpack(
+            flags_raw in any::<u8>(),
+            // SESSION_SETUP packs SecurityMode as a single byte, so only the
+            // low 8 bits survive the roundtrip. Generate u8 values to avoid
+            // producing inputs the encoder would never emit from a real caller.
+            security_mode_raw in any::<u8>(),
+            capabilities in arb_capabilities(),
+            channel in any::<u32>(),
+            previous_session_id in any::<u64>(),
+            security_buffer in arb_small_bytes(),
+        ) {
+            let original = SessionSetupRequest {
+                flags: SessionSetupRequestFlags(flags_raw),
+                security_mode: SecurityMode::new(security_mode_raw as u16),
+                capabilities,
+                channel,
+                previous_session_id,
+                security_buffer,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = SessionSetupRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn session_setup_response_pack_unpack(
+            session_flags_raw in any::<u16>(),
+            security_buffer in arb_small_bytes(),
+        ) {
+            let original = SessionSetupResponse {
+                session_flags: SessionFlags(session_flags_raw),
+                security_buffer,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = SessionSetupResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

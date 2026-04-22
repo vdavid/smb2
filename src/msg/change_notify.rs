@@ -308,3 +308,48 @@ mod tests {
         assert!(err.contains("structure size"), "error was: {err}");
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_bytes, arb_file_id};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn change_notify_request_pack_unpack(
+            flags in any::<u16>(),
+            output_buffer_length in any::<u32>(),
+            file_id in arb_file_id(),
+            completion_filter in any::<u32>(),
+        ) {
+            let original = ChangeNotifyRequest {
+                flags,
+                output_buffer_length,
+                file_id,
+                completion_filter,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = ChangeNotifyRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn change_notify_response_pack_unpack(output_data in arb_bytes()) {
+            let original = ChangeNotifyResponse { output_data };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = ChangeNotifyResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

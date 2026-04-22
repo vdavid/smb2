@@ -379,3 +379,68 @@ mod tests {
         assert!(err.contains("structure size"), "error was: {err}");
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_bytes, arb_file_id};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn write_request_pack_unpack(
+            data_offset in any::<u16>(),
+            offset in any::<u64>(),
+            file_id in arb_file_id(),
+            channel in any::<u32>(),
+            remaining_bytes in any::<u32>(),
+            write_channel_info_offset in any::<u16>(),
+            write_channel_info_length in any::<u16>(),
+            flags in any::<u32>(),
+            data in arb_bytes(),
+        ) {
+            let original = WriteRequest {
+                data_offset,
+                offset,
+                file_id,
+                channel,
+                remaining_bytes,
+                write_channel_info_offset,
+                write_channel_info_length,
+                flags,
+                data,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = WriteRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn write_response_pack_unpack(
+            count in any::<u32>(),
+            remaining in any::<u32>(),
+            write_channel_info_offset in any::<u16>(),
+            write_channel_info_length in any::<u16>(),
+        ) {
+            let original = WriteResponse {
+                count,
+                remaining,
+                write_channel_info_offset,
+                write_channel_info_length,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = WriteResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

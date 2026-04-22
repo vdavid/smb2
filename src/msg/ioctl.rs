@@ -418,3 +418,62 @@ mod tests {
         assert!(err.contains("structure size"), "error was: {err}");
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_bytes, arb_file_id};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn ioctl_request_pack_unpack(
+            ctl_code in any::<u32>(),
+            file_id in arb_file_id(),
+            max_input_response in any::<u32>(),
+            max_output_response in any::<u32>(),
+            flags in any::<u32>(),
+            input_data in arb_bytes(),
+        ) {
+            let original = IoctlRequest {
+                ctl_code,
+                file_id,
+                max_input_response,
+                max_output_response,
+                flags,
+                input_data,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = IoctlRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn ioctl_response_pack_unpack(
+            ctl_code in any::<u32>(),
+            file_id in arb_file_id(),
+            flags in any::<u32>(),
+            output_data in arb_bytes(),
+        ) {
+            let original = IoctlResponse {
+                ctl_code,
+                file_id,
+                flags,
+                output_data,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = IoctlResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

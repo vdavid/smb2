@@ -293,3 +293,36 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_bytes, arb_file_id, arb_info_type};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn set_info_request_pack_unpack(
+            info_type in arb_info_type(),
+            file_info_class in any::<u8>(),
+            additional_information in any::<u32>(),
+            file_id in arb_file_id(),
+            buffer in arb_bytes(),
+        ) {
+            let original = SetInfoRequest {
+                info_type,
+                file_info_class,
+                additional_information,
+                file_id,
+                buffer,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = SetInfoRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+    }
+}

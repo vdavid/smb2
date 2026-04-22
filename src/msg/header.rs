@@ -556,3 +556,114 @@ mod tests {
         assert_eq!(decoded.error_data, original.error_data);
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{
+        arb_command, arb_credit_charge, arb_header_flags, arb_message_id, arb_nt_status,
+        arb_session_id, arb_small_bytes, arb_tree_id,
+    };
+    use proptest::prelude::*;
+
+    /// Generate a `Header` whose `flags.is_async()` matches which of
+    /// `tree_id`/`async_id` is set. Any other combination wouldn't round-trip
+    /// (pack writes one or the other based on flags, and clears the other on
+    /// unpack), so we never generate it.
+    fn arb_header() -> impl Strategy<Value = Header> {
+        (
+            arb_credit_charge(),
+            arb_nt_status(),
+            arb_command(),
+            any::<u16>(),
+            arb_header_flags(),
+            any::<u32>(),
+            arb_message_id(),
+            any::<bool>(),
+            arb_tree_id(),
+            any::<u64>(),
+            arb_session_id(),
+            any::<[u8; 16]>(),
+        )
+            .prop_map(
+                |(
+                    credit_charge,
+                    status,
+                    command,
+                    credits,
+                    raw_flags,
+                    next_command,
+                    message_id,
+                    make_async,
+                    tree_id,
+                    async_id,
+                    session_id,
+                    signature,
+                )| {
+                    // Force `flags.ASYNC_COMMAND` to match `make_async` so
+                    // the pack path and the `Option<T>` fields agree.
+                    let flags = if make_async {
+                        let mut f = raw_flags;
+                        f.set(HeaderFlags::ASYNC_COMMAND);
+                        f
+                    } else {
+                        let mut f = raw_flags;
+                        f.clear(HeaderFlags::ASYNC_COMMAND);
+                        f
+                    };
+                    let (tree_id, async_id) = if make_async {
+                        (None, Some(async_id))
+                    } else {
+                        (Some(tree_id), None)
+                    };
+                    Header {
+                        credit_charge,
+                        status,
+                        command,
+                        credits,
+                        flags,
+                        next_command,
+                        message_id,
+                        tree_id,
+                        async_id,
+                        session_id,
+                        signature,
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn header_pack_unpack(header in arb_header()) {
+            let mut w = WriteCursor::new();
+            header.pack(&mut w);
+            let bytes = w.into_inner();
+            prop_assert_eq!(bytes.len(), Header::SIZE);
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = Header::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, header);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn error_response_pack_unpack(
+            error_context_count in any::<u8>(),
+            error_data in arb_small_bytes(),
+        ) {
+            let original = ErrorResponse {
+                error_context_count,
+                error_data,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = ErrorResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

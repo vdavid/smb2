@@ -391,3 +391,62 @@ mod tests {
         assert_eq!(decoded.original_compressed_segment_size, 8192);
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::arb_session_id;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn transform_header_pack_unpack(
+            signature in any::<[u8; 16]>(),
+            nonce in any::<[u8; 16]>(),
+            original_message_size in any::<u32>(),
+            flags in any::<u16>(),
+            session_id in arb_session_id(),
+        ) {
+            let original = TransformHeader {
+                signature,
+                nonce,
+                original_message_size,
+                flags,
+                session_id,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+            prop_assert_eq!(bytes.len(), TransformHeader::SIZE);
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = TransformHeader::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn compression_transform_header_pack_unpack(
+            original_compressed_segment_size in any::<u32>(),
+            compression_algorithm in any::<u16>(),
+            flags in any::<u16>(),
+            offset_or_length in any::<u32>(),
+        ) {
+            let original = CompressionTransformHeader {
+                original_compressed_segment_size,
+                compression_algorithm,
+                flags,
+                offset_or_length,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+            prop_assert_eq!(bytes.len(), CompressionTransformHeader::SIZE);
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = CompressionTransformHeader::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

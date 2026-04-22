@@ -375,3 +375,71 @@ mod tests {
         assert_eq!(combined, 0x12);
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::arb_file_id;
+    use proptest::prelude::*;
+
+    fn arb_lock_element() -> impl Strategy<Value = LockElement> {
+        (any::<u64>(), any::<u64>(), any::<u32>()).prop_map(|(offset, length, flags)| LockElement {
+            offset,
+            length,
+            flags,
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn lock_element_pack_unpack(elem in arb_lock_element()) {
+            let mut w = WriteCursor::new();
+            elem.pack(&mut w);
+            let bytes = w.into_inner();
+            prop_assert_eq!(bytes.len(), LockElement::SIZE);
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = LockElement::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, elem);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn lock_request_pack_unpack(
+            lock_sequence in any::<u32>(),
+            file_id in arb_file_id(),
+            // MS-SMB2: LockCount must be >= 1, so generate 1..=8.
+            locks in prop::collection::vec(arb_lock_element(), 1..=8),
+        ) {
+            let original = LockRequest {
+                lock_sequence,
+                file_id,
+                locks,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = LockRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn lock_response_pack_unpack(_ in any::<bool>()) {
+            // LockResponse is a unit struct; there's nothing to vary, but
+            // running it through the proptest harness keeps the coverage
+            // map uniform.
+            let original = LockResponse;
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = LockResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

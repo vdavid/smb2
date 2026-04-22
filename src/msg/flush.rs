@@ -230,3 +230,25 @@ mod tests {
         flush_response_too_short
     );
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::arb_file_id;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn flush_request_pack_unpack(file_id in arb_file_id()) {
+            let original = FlushRequest { file_id };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = FlushRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

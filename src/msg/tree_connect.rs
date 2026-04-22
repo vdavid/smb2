@@ -395,6 +395,8 @@ mod tests {
         assert!(err.contains("share type"), "error was: {err}");
     }
 
+    // Roundtrip property tests live in `roundtrip_props` at file end.
+
     #[test]
     fn tree_connect_response_known_bytes() {
         // Known bytes from smb-rs test: share_type=Disk, share_flags=0x00000800,
@@ -416,5 +418,60 @@ mod tests {
             .share_flags
             .contains(ShareFlags::ACCESS_BASED_DIRECTORY_ENUM));
         assert_eq!(decoded.maximal_access, 0x001F_01FF);
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{
+        arb_share_capabilities, arb_share_flags, arb_share_type, arb_utf16_string,
+    };
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn tree_connect_request_pack_unpack(
+            flags_raw in any::<u16>(),
+            // Path is sent as UTF-16LE. Generate strings that survive that
+            // encoding cleanly (no unpaired surrogates).
+            path in arb_utf16_string(128),
+        ) {
+            let original = TreeConnectRequest {
+                flags: TreeConnectRequestFlags(flags_raw),
+                path,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = TreeConnectRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn tree_connect_response_pack_unpack(
+            share_type in arb_share_type(),
+            share_flags in arb_share_flags(),
+            capabilities in arb_share_capabilities(),
+            maximal_access in any::<u32>(),
+        ) {
+            let original = TreeConnectResponse {
+                share_type,
+                share_flags,
+                capabilities,
+                maximal_access,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = TreeConnectResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
     }
 }

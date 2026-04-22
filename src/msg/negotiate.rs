@@ -1086,3 +1086,143 @@ mod tests {
         assert_eq!(decoded, contexts);
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{
+        arb_capabilities, arb_dialect, arb_guid, arb_security_mode, arb_small_bytes,
+    };
+    use proptest::prelude::*;
+
+    fn arb_u16_vec(max: usize) -> impl Strategy<Value = Vec<u16>> {
+        prop::collection::vec(any::<u16>(), 0..=max)
+    }
+
+    /// Generate a `NegotiateContext`. The generator avoids the Unknown variant
+    /// with a context type that collides with a known one, since the decoder
+    /// would demote it back to the typed form and roundtrip would fail.
+    fn arb_negotiate_context() -> impl Strategy<Value = NegotiateContext> {
+        let known_types = [
+            NEGOTIATE_CONTEXT_PREAUTH_INTEGRITY,
+            NEGOTIATE_CONTEXT_ENCRYPTION,
+            NEGOTIATE_CONTEXT_COMPRESSION,
+            NEGOTIATE_CONTEXT_SIGNING,
+        ];
+
+        let preauth = (arb_u16_vec(8), prop::collection::vec(any::<u8>(), 0..=64)).prop_map(
+            |(hash_algorithms, salt)| NegotiateContext::PreauthIntegrity {
+                hash_algorithms,
+                salt,
+            },
+        );
+        let encryption =
+            arb_u16_vec(8).prop_map(|ciphers| NegotiateContext::Encryption { ciphers });
+        let compression = (any::<u32>(), arb_u16_vec(8))
+            .prop_map(|(flags, algorithms)| NegotiateContext::Compression { flags, algorithms });
+        let signing =
+            arb_u16_vec(8).prop_map(|algorithms| NegotiateContext::Signing { algorithms });
+        let unknown = (any::<u16>(), prop::collection::vec(any::<u8>(), 0..=64))
+            .prop_filter(
+                "type must not collide with a known variant",
+                move |(t, _)| !known_types.contains(t),
+            )
+            .prop_map(|(context_type, data)| NegotiateContext::Unknown { context_type, data });
+
+        prop_oneof![preauth, encryption, compression, signing, unknown]
+    }
+
+    /// Generate the tuple `(dialects, negotiate_contexts)` in a mutually
+    /// consistent way: contexts are present iff 3.1.1 is in the dialect list.
+    fn arb_dialects_and_contexts() -> impl Strategy<Value = (Vec<Dialect>, Vec<NegotiateContext>)> {
+        prop::collection::vec(arb_dialect(), 1..=5).prop_flat_map(|dialects| {
+            let has_311 = dialects.contains(&Dialect::Smb3_1_1);
+            let ctx_strat: BoxedStrategy<Vec<NegotiateContext>> = if has_311 {
+                prop::collection::vec(arb_negotiate_context(), 0..=4).boxed()
+            } else {
+                Just(Vec::new()).boxed()
+            };
+            (Just(dialects), ctx_strat)
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn negotiate_context_list_roundtrip(
+            contexts in prop::collection::vec(arb_negotiate_context(), 0..=6),
+        ) {
+            let mut w = WriteCursor::new();
+            pack_negotiate_contexts(&contexts, &mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = unpack_negotiate_contexts(&mut r, contexts.len()).unwrap();
+            prop_assert_eq!(decoded, contexts);
+        }
+
+        #[test]
+        fn negotiate_request_pack_unpack(
+            security_mode in arb_security_mode(),
+            capabilities in arb_capabilities(),
+            client_guid in arb_guid(),
+            (dialects, negotiate_contexts) in arb_dialects_and_contexts(),
+        ) {
+            let original = NegotiateRequest {
+                security_mode,
+                capabilities,
+                client_guid,
+                dialects,
+                negotiate_contexts,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = NegotiateRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+
+        #[test]
+        fn negotiate_response_pack_unpack(
+            security_mode in arb_security_mode(),
+            server_guid in arb_guid(),
+            capabilities in arb_capabilities(),
+            max_transact_size in any::<u32>(),
+            max_read_size in any::<u32>(),
+            max_write_size in any::<u32>(),
+            system_time in any::<u64>(),
+            server_start_time in any::<u64>(),
+            security_buffer in arb_small_bytes(),
+            dialect_revision in arb_dialect(),
+            contexts_if_311 in prop::collection::vec(arb_negotiate_context(), 0..=4),
+        ) {
+            // Contexts only present for SMB 3.1.1, per the spec / encoder.
+            let negotiate_contexts = if dialect_revision == Dialect::Smb3_1_1 {
+                contexts_if_311
+            } else {
+                Vec::new()
+            };
+            let original = NegotiateResponse {
+                security_mode,
+                dialect_revision,
+                server_guid,
+                capabilities,
+                max_transact_size,
+                max_read_size,
+                max_write_size,
+                system_time,
+                server_start_time,
+                security_buffer,
+                negotiate_contexts,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = NegotiateResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+    }
+}

@@ -123,6 +123,9 @@ macro_rules! trivial_message_tests {
 #[cfg(test)]
 pub(crate) use trivial_message_tests;
 
+#[cfg(test)]
+pub(crate) mod roundtrip_strategies;
+
 pub mod cancel;
 pub mod change_notify;
 pub mod close;

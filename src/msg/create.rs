@@ -781,3 +781,90 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{
+        arb_create_action, arb_create_disposition, arb_file_access_mask, arb_file_id,
+        arb_file_time, arb_impersonation_level, arb_oplock_level, arb_share_access,
+        arb_small_bytes, arb_utf16_string,
+    };
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn create_request_pack_unpack(
+            requested_oplock_level in arb_oplock_level(),
+            impersonation_level in arb_impersonation_level(),
+            desired_access in arb_file_access_mask(),
+            file_attributes in any::<u32>(),
+            share_access in arb_share_access(),
+            create_disposition in arb_create_disposition(),
+            create_options in any::<u32>(),
+            name in arb_utf16_string(128),
+            create_contexts in arb_small_bytes(),
+        ) {
+            let original = CreateRequest {
+                requested_oplock_level,
+                impersonation_level,
+                desired_access,
+                file_attributes,
+                share_access,
+                create_disposition,
+                create_options,
+                name,
+                create_contexts,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = CreateRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            // Note: pack may write a trailing 1-byte pad when name is empty
+            // and there are no create contexts. Unpack only advances through
+            // fields it reads, so the cursor may have 1 trailing byte in
+            // that corner case. That's fine for symmetry on struct contents.
+        }
+
+        #[test]
+        fn create_response_pack_unpack(
+            oplock_level in arb_oplock_level(),
+            flags in any::<u8>(),
+            create_action in arb_create_action(),
+            creation_time in arb_file_time(),
+            last_access_time in arb_file_time(),
+            last_write_time in arb_file_time(),
+            change_time in arb_file_time(),
+            allocation_size in any::<u64>(),
+            end_of_file in any::<u64>(),
+            file_attributes in any::<u32>(),
+            file_id in arb_file_id(),
+            create_contexts in arb_small_bytes(),
+        ) {
+            let original = CreateResponse {
+                oplock_level,
+                flags,
+                create_action,
+                creation_time,
+                last_access_time,
+                last_write_time,
+                change_time,
+                allocation_size,
+                end_of_file,
+                file_attributes,
+                file_id,
+                create_contexts,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = CreateResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+    }
+}

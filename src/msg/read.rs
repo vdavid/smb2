@@ -395,3 +395,68 @@ mod tests {
         assert!(err.contains("structure size"), "error was: {err}");
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{arb_bytes, arb_file_id, arb_small_bytes};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn read_request_pack_unpack(
+            padding in any::<u8>(),
+            flags in any::<u8>(),
+            length in any::<u32>(),
+            offset in any::<u64>(),
+            file_id in arb_file_id(),
+            minimum_count in any::<u32>(),
+            channel in any::<u32>(),
+            remaining_bytes in any::<u32>(),
+            read_channel_info in arb_small_bytes(),
+        ) {
+            let original = ReadRequest {
+                padding,
+                flags,
+                length,
+                offset,
+                file_id,
+                minimum_count,
+                channel,
+                remaining_bytes,
+                read_channel_info,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = ReadRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+
+        #[test]
+        fn read_response_pack_unpack(
+            data_offset in any::<u8>(),
+            data_remaining in any::<u32>(),
+            flags in any::<u32>(),
+            data in arb_bytes(),
+        ) {
+            let original = ReadResponse {
+                data_offset,
+                data_remaining,
+                flags,
+                data,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = ReadResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+            prop_assert!(r.is_empty());
+        }
+    }
+}

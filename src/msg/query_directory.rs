@@ -424,3 +424,53 @@ mod tests {
         assert!(FileInformationClass::try_from(0xFF).is_err());
     }
 }
+
+#[cfg(test)]
+mod roundtrip_props {
+    use super::*;
+    use crate::msg::roundtrip_strategies::{
+        arb_bytes, arb_file_id, arb_file_information_class, arb_utf16_string,
+    };
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn query_directory_request_pack_unpack(
+            file_information_class in arb_file_information_class(),
+            flags_raw in any::<u8>(),
+            file_index in any::<u32>(),
+            file_id in arb_file_id(),
+            output_buffer_length in any::<u32>(),
+            // Search pattern is UTF-16LE on the wire. Allow empty + typical.
+            file_name in arb_utf16_string(128),
+        ) {
+            let original = QueryDirectoryRequest {
+                file_information_class,
+                flags: QueryDirectoryFlags(flags_raw),
+                file_index,
+                file_id,
+                output_buffer_length,
+                file_name,
+            };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = QueryDirectoryRequest::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+
+        #[test]
+        fn query_directory_response_pack_unpack(output_buffer in arb_bytes()) {
+            let original = QueryDirectoryResponse { output_buffer };
+            let mut w = WriteCursor::new();
+            original.pack(&mut w);
+            let bytes = w.into_inner();
+
+            let mut r = ReadCursor::new(&bytes);
+            let decoded = QueryDirectoryResponse::unpack(&mut r).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+    }
+}
