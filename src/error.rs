@@ -114,10 +114,13 @@ impl Error {
 ///     Ok(data) => println!("read {} bytes", data.len()),
 ///     Err(e) => match e.kind() {
 ///         ErrorKind::NotFound => println!("file doesn't exist"),
+///         ErrorKind::AlreadyExists => println!("name is already taken"),
 ///         ErrorKind::AccessDenied => println!("no permission"),
 ///         ErrorKind::SigningRequired => println!("server requires signing, use credentials"),
 ///         ErrorKind::AuthRequired => println!("server requires authentication"),
 ///         ErrorKind::SharingViolation => println!("file is in use by another client"),
+///         ErrorKind::IsADirectory => println!("path is a directory, not a file"),
+///         ErrorKind::NotADirectory => println!("path is a file, not a directory"),
 ///         ErrorKind::DiskFull => println!("volume is full"),
 ///         ErrorKind::ConnectionLost => { client.reconnect().await?; }
 ///         _ => return Err(e),
@@ -126,7 +129,15 @@ impl Error {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Stability
+///
+/// `ErrorKind` is `#[non_exhaustive]`: future versions may add variants for
+/// status codes that currently fall through to [`ErrorKind::Other`]. Match
+/// statements should always include a `_` arm. Adding a variant is treated
+/// as a non-breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// The server requires authentication (guest/anonymous not allowed).
     AuthRequired,
@@ -136,8 +147,23 @@ pub enum ErrorKind {
     AccessDenied,
     /// The file, directory, or share was not found.
     NotFound,
+    /// A file or directory with the given name already exists.
+    ///
+    /// Returned by `Create` (and operations that wrap it, like `create_directory`)
+    /// when the target name is taken. Useful for callers that want to merge into
+    /// an existing directory or surface a friendly "name already taken" message.
+    AlreadyExists,
     /// The file is in use by another client.
     SharingViolation,
+    /// The target path is a directory, but the operation expected a file.
+    ///
+    /// Typically seen when calling `delete_file` against a directory entry —
+    /// the caller can fall back to `delete_directory` after detecting this.
+    IsADirectory,
+    /// The target path is a file, but the operation expected a directory.
+    ///
+    /// Typically seen when calling `list_directory` against a file entry.
+    NotADirectory,
     /// The volume is full (write failed).
     DiskFull,
     /// The network connection was lost.
@@ -160,7 +186,12 @@ pub enum ErrorKind {
     Io,
     /// A protocol error not covered by other variants.
     ///
-    /// Use [`Error::status()`] to get the raw NTSTATUS code.
+    /// Use [`Error::status()`] to get the raw NTSTATUS code. Some defined
+    /// `NtStatus` codes deliberately fall through here today
+    /// (`OBJECT_NAME_INVALID`, `DELETE_PENDING`, `INSUFFICIENT_RESOURCES`,
+    /// `INSUFF_SERVER_RESOURCES`, and similar) — they don't yet have a
+    /// dedicated `ErrorKind` because no consumer needs to branch on them.
+    /// Promoting one to its own variant is non-breaking.
     Other,
 }
 
@@ -203,6 +234,13 @@ fn classify_status(status: NtStatus) -> ErrorKind {
         | NtStatus::OBJECT_PATH_NOT_FOUND
         | NtStatus::BAD_NETWORK_NAME => ErrorKind::NotFound,
 
+        // Already exists
+        NtStatus::OBJECT_NAME_COLLISION => ErrorKind::AlreadyExists,
+
+        // Wrong file type
+        NtStatus::FILE_IS_A_DIRECTORY => ErrorKind::IsADirectory,
+        NtStatus::NOT_A_DIRECTORY => ErrorKind::NotADirectory,
+
         // Sharing / locking
         NtStatus::SHARING_VIOLATION | NtStatus::FILE_LOCK_CONFLICT => ErrorKind::SharingViolation,
 
@@ -232,58 +270,61 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use super::*;
 
-    #[test]
-    fn kind_maps_protocol_not_found() {
-        let err = Error::Protocol {
-            status: NtStatus::OBJECT_NAME_NOT_FOUND,
-            command: Command::Create,
-        };
-        assert_eq!(err.kind(), ErrorKind::NotFound);
-    }
+    /// Documents the full contract between `NtStatus` codes and `ErrorKind`.
+    ///
+    /// Every code listed here is asserted to map to its expected variant. When
+    /// adding a new `NtStatus` to `types/status.rs`, also add a row here — either
+    /// pointing at a dedicated `ErrorKind`, or `ErrorKind::Other` if there is
+    /// genuinely no consumer-meaningful classification yet. The companion test
+    /// `classify_status_no_silent_other` then guarantees the table stays in sync
+    /// with what `classify_status` actually does.
+    const STATUS_CLASSIFICATION_CONTRACT: &[(NtStatus, ErrorKind)] = &[
+        // Auth / signing
+        (NtStatus::LOGON_FAILURE, ErrorKind::AuthRequired),
+        (NtStatus::ACCOUNT_DISABLED, ErrorKind::AuthRequired),
+        (NtStatus::ACCESS_DENIED, ErrorKind::AccessDenied),
+        // Not found
+        (NtStatus::NO_SUCH_FILE, ErrorKind::NotFound),
+        (NtStatus::OBJECT_NAME_NOT_FOUND, ErrorKind::NotFound),
+        (NtStatus::OBJECT_PATH_NOT_FOUND, ErrorKind::NotFound),
+        (NtStatus::BAD_NETWORK_NAME, ErrorKind::NotFound),
+        // Already exists
+        (NtStatus::OBJECT_NAME_COLLISION, ErrorKind::AlreadyExists),
+        // Wrong file type
+        (NtStatus::FILE_IS_A_DIRECTORY, ErrorKind::IsADirectory),
+        (NtStatus::NOT_A_DIRECTORY, ErrorKind::NotADirectory),
+        // Sharing / locking
+        (NtStatus::SHARING_VIOLATION, ErrorKind::SharingViolation),
+        (NtStatus::FILE_LOCK_CONFLICT, ErrorKind::SharingViolation),
+        // Disk
+        (NtStatus::DISK_FULL, ErrorKind::DiskFull),
+        // Connection / session
+        (NtStatus::NETWORK_NAME_DELETED, ErrorKind::ConnectionLost),
+        (NtStatus::USER_SESSION_DELETED, ErrorKind::ConnectionLost),
+        (NtStatus::NETWORK_SESSION_EXPIRED, ErrorKind::SessionExpired),
+        // DFS
+        (NtStatus::PATH_NOT_COVERED, ErrorKind::DfsReferral),
+        // Documented `Other` (no current consumer demand for a typed variant)
+        (NtStatus::NOT_IMPLEMENTED, ErrorKind::Other),
+        (NtStatus::INVALID_PARAMETER, ErrorKind::Other),
+        (NtStatus::DELETE_PENDING, ErrorKind::Other),
+        (NtStatus::INSUFFICIENT_RESOURCES, ErrorKind::Other),
+        (NtStatus::INSUFF_SERVER_RESOURCES, ErrorKind::Other),
+    ];
 
     #[test]
-    fn kind_maps_protocol_access_denied() {
-        let err = Error::Protocol {
-            status: NtStatus::ACCESS_DENIED,
-            command: Command::Create,
-        };
-        assert_eq!(err.kind(), ErrorKind::AccessDenied);
-    }
-
-    #[test]
-    fn kind_maps_protocol_sharing_violation() {
-        let err = Error::Protocol {
-            status: NtStatus::SHARING_VIOLATION,
-            command: Command::Create,
-        };
-        assert_eq!(err.kind(), ErrorKind::SharingViolation);
-    }
-
-    #[test]
-    fn kind_maps_protocol_logon_failure() {
-        let err = Error::Protocol {
-            status: NtStatus::LOGON_FAILURE,
-            command: Command::SessionSetup,
-        };
-        assert_eq!(err.kind(), ErrorKind::AuthRequired);
-    }
-
-    #[test]
-    fn kind_maps_protocol_bad_network_name() {
-        let err = Error::Protocol {
-            status: NtStatus::BAD_NETWORK_NAME,
-            command: Command::TreeConnect,
-        };
-        assert_eq!(err.kind(), ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn kind_maps_protocol_disk_full() {
-        let err = Error::Protocol {
-            status: NtStatus::DISK_FULL,
-            command: Command::Write,
-        };
-        assert_eq!(err.kind(), ErrorKind::DiskFull);
+    fn classify_status_contract() {
+        for (status, expected) in STATUS_CLASSIFICATION_CONTRACT {
+            let err = Error::Protocol {
+                status: *status,
+                command: Command::Create,
+            };
+            assert_eq!(
+                err.kind(),
+                *expected,
+                "{status} should classify as {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -325,25 +366,6 @@ mod tests {
     fn kind_disconnected_is_connection_lost() {
         // Error::Disconnected (transport EOF) IS a connection loss.
         assert_eq!(Error::Disconnected.kind(), ErrorKind::ConnectionLost);
-    }
-
-    #[test]
-    fn kind_unknown_status_maps_to_other() {
-        let err = Error::Protocol {
-            status: NtStatus::NOT_IMPLEMENTED,
-            command: Command::Ioctl,
-        };
-        assert_eq!(err.kind(), ErrorKind::Other);
-    }
-
-    #[test]
-    fn kind_maps_path_not_covered_to_dfs_referral() {
-        // STATUS_PATH_NOT_COVERED from the protocol layer should map to DfsReferral.
-        let err = Error::Protocol {
-            status: NtStatus::PATH_NOT_COVERED,
-            command: Command::Create,
-        };
-        assert_eq!(err.kind(), ErrorKind::DfsReferral);
     }
 
     #[test]

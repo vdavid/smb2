@@ -7,6 +7,34 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-08
+
+### Changed
+
+- **Breaking: `ErrorKind` is now `#[non_exhaustive]`.** Match expressions over `ErrorKind` must include a `_` arm.
+  Adding a new variant in a future release is now a non-breaking change. Consumers that already use a `_` fallback
+  (the pattern recommended by the doc example) need no update.
+
+### Added
+
+- `ErrorKind::AlreadyExists` — `STATUS_OBJECT_NAME_COLLISION` (returned by `Create` when a file or directory of the
+  same name exists) now classifies as `AlreadyExists` instead of falling through to `Other`. Lets callers handle
+  "merge into existing directory" or surface a friendly "name taken" message without substring-matching the error
+  text.
+- `ErrorKind::IsADirectory` — `STATUS_FILE_IS_A_DIRECTORY` now classifies as `IsADirectory`. Useful for
+  delete-fast-path callers that try `delete_file` first and fall back to `delete_directory` on this kind.
+- `ErrorKind::NotADirectory` — `STATUS_NOT_A_DIRECTORY` now classifies as `NotADirectory` (e.g., `list_directory` on
+  a file).
+- `error::tests::classify_status_contract`: a single table-driven test that documents the full `NtStatus → ErrorKind`
+  mapping, including statuses intentionally left as `Other`. Replaces the per-arm classification tests so the contract
+  lives in one auditable place; adding a new `NtStatus` should also add a row here.
+
+### Notes
+
+- `STATUS_OBJECT_NAME_INVALID`, `STATUS_DELETE_PENDING`, `STATUS_INSUFFICIENT_RESOURCES`, and
+  `STATUS_INSUFF_SERVER_RESOURCES` deliberately still classify as `ErrorKind::Other` — no current consumer needs to
+  branch on them. Promoting any of these to its own variant is non-breaking under the `#[non_exhaustive]` policy.
+
 ## [0.7.2] - 2026-04-21
 
 ### Fixed
