@@ -1111,12 +1111,14 @@ impl Connection {
         }
         let (tx, rx) = oneshot::channel();
         waiters.insert(msg_id, tx);
+        trace!("register_waiter: msg_id={}", msg_id.0);
         Ok(rx)
     }
 
     /// Remove a waiter from the map (used on send error).
     fn remove_waiter(&self, msg_id: MessageId) {
         self.inner.waiters.lock().unwrap().remove(&msg_id);
+        trace!("remove_waiter: msg_id={}", msg_id.0);
     }
 
     #[cfg(test)]
@@ -1148,11 +1150,20 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             Ok(bytes) => bytes,
             Err(e) => {
                 debug!("receiver_loop: transport error: {}, shutting down", e);
+                let count = inner.waiters.lock().unwrap().len();
                 fan_error_to_waiters(&inner, &e);
+                warn!(
+                    "receiver_loop: exiting after fan-error to {} waiters",
+                    count
+                );
                 return;
             }
         };
         trace!("receiver_loop: received {} bytes", raw.len());
+        trace!(
+            "receiver_loop: tick, waiters={}",
+            inner.waiters.lock().unwrap().len()
+        );
 
         // Decrypt if TRANSFORM_HEADER. Per P3.4 / decision E6: on an
         // unrecoverable frame error (decrypt auth tag mismatch, decompress
@@ -1170,7 +1181,12 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                         "receiver_loop: decrypt failed: {}; tearing down connection",
                         e
                     );
+                    let count = inner.waiters.lock().unwrap().len();
                     fan_error_to_waiters(&inner, &e);
+                    warn!(
+                        "receiver_loop: exiting after fan-error to {} waiters",
+                        count
+                    );
                     return;
                 }
             }
@@ -1187,7 +1203,12 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                         "receiver_loop: decompress failed: {}; tearing down connection",
                         e
                     );
+                    let count = inner.waiters.lock().unwrap().len();
                     fan_error_to_waiters(&inner, &e);
+                    warn!(
+                        "receiver_loop: exiting after fan-error to {} waiters",
+                        count
+                    );
                     return;
                 }
             }
@@ -1203,7 +1224,12 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                     "receiver_loop: malformed frame: {}; tearing down connection",
                     e
                 );
+                let count = inner.waiters.lock().unwrap().len();
                 fan_error_to_waiters(&inner, &e);
+                warn!(
+                    "receiver_loop: exiting after fan-error to {} waiters",
+                    count
+                );
                 return;
             }
         };
@@ -1225,7 +1251,12 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                         "receiver_loop: sub-frame parse failed: {}; tearing down connection",
                         e
                     );
+                    let count = inner.waiters.lock().unwrap().len();
                     fan_error_to_waiters(&inner, &e);
+                    warn!(
+                        "receiver_loop: exiting after fan-error to {} waiters",
+                        count
+                    );
                     return;
                 }
             }
@@ -1239,13 +1270,30 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             let maybe_tx = inner.waiters.lock().unwrap().remove(&msg_id);
             match maybe_tx {
                 Some(tx) => {
+                    match &result {
+                        Ok(frame) => debug!(
+                            "recv: routed msg_id={}, status={:?}, cmd={:?}",
+                            msg_id.0, frame.header.status, frame.header.command
+                        ),
+                        Err(e) => debug!(
+                            "recv: routed error msg_id={}, err={}",
+                            msg_id.0, e
+                        ),
+                    }
                     if tx.send(result).is_err() {
                         trace!("recv: late arrival for dropped waiter, msg_id={}", msg_id.0);
                     }
                 }
-                None => {
-                    debug!("recv: orphan dropped, msg_id={}", msg_id.0);
-                }
+                None => match &result {
+                    Ok(frame) => debug!(
+                        "recv: orphan dropped, msg_id={}, status={:?}, cmd={:?}",
+                        msg_id.0, frame.header.status, frame.header.command
+                    ),
+                    Err(e) => debug!(
+                        "recv: orphan dropped (error) msg_id={}, err={}",
+                        msg_id.0, e
+                    ),
+                },
             }
         }
     }
@@ -1336,6 +1384,10 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
                 if let Err(e) =
                     signing::verify_signature(sub, &key, algo, header.message_id.0, false)
                 {
+                    warn!(
+                        "recv: sub-frame produced error for msg_id={}, reason=signature verify failed: {}",
+                        header.message_id.0, e
+                    );
                     return Ok(SubFrameAction::Route(header.message_id, Err(e)));
                 }
             }
@@ -1347,6 +1399,10 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
         warn!(
             "recv: session expired (STATUS_NETWORK_SESSION_EXPIRED), cmd={:?}, msg_id={}",
             header.command, header.message_id.0
+        );
+        warn!(
+            "recv: sub-frame produced error for msg_id={}, reason=session expired",
+            header.message_id.0
         );
         return Ok(SubFrameAction::Route(
             header.message_id,
