@@ -5,6 +5,7 @@
 //! renaming, stat, and directory creation.
 
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use log::{debug, info, trace, warn};
 
@@ -132,6 +133,7 @@ pub struct FsInfo {
 }
 
 /// A connection to a specific share (tree connect).
+#[derive(Clone)]
 pub struct Tree {
     /// The tree ID assigned by the server.
     pub tree_id: TreeId,
@@ -217,7 +219,7 @@ impl Tree {
     /// The server strips the first two path components to get the local path,
     /// and if the resulting path starts with a DFS link name, it returns
     /// `STATUS_PATH_NOT_COVERED` so the client can resolve the referral.
-    fn format_path(&self, path: &str) -> String {
+    pub(crate) fn format_path(&self, path: &str) -> String {
         let normalized = normalize_path(path);
         if self.is_dfs {
             // Extract hostname (strip port if present) for the DFS path prefix.
@@ -1974,25 +1976,24 @@ impl Tree {
         Ok(bytes_written)
     }
 
-    /// Create a push-based pipelined streaming writer.
+    /// Create a push-based pipelined streaming writer that owns its
+    /// `Connection` and `Arc<Tree>`.
     ///
-    /// Opens (or creates) the file for writing and returns a [`FileWriter`]
-    /// that accepts pushed chunks. The caller drives writes at their own pace
-    /// and calls [`FileWriter::finish`] to flush and close.
-    pub(crate) async fn create_file_writer<'a>(
-        &'a self,
-        conn: &'a mut Connection,
+    /// Opens (or creates) the file for writing and returns a
+    /// [`FileWriter`](super::stream::FileWriter) that accepts pushed
+    /// chunks. The caller drives writes at their own pace and calls
+    /// [`FileWriter::finish`](super::stream::FileWriter::finish) to
+    /// flush and close.
+    ///
+    /// The returned writer is `'static` — multiple writers built from
+    /// clones of the same `Connection` pipeline their WRITEs over a
+    /// single SMB session without external locking.
+    pub async fn create_file_writer(
+        self: &Arc<Self>,
+        conn: Connection,
         path: &str,
-    ) -> Result<super::stream::FileWriter<'a>> {
-        let normalized = self.format_path(path);
-        debug!("tree: create_file_writer path={}", normalized);
-
-        let file_id = self.open_file_for_write(conn, &normalized).await?;
-        let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-
-        Ok(super::stream::FileWriter::new(
-            self, conn, file_id, max_write,
-        ))
+    ) -> Result<super::stream::FileWriter> {
+        super::stream::open_file_writer(Arc::clone(self), conn, path).await
     }
 
     /// Create a directory.

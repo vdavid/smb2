@@ -7,6 +7,7 @@
 //! fast cancellation), and [`Progress`] for tracking transfer progress.
 
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use log::debug;
 
@@ -515,8 +516,8 @@ impl Drop for FileUpload<'_> {
 /// # Example
 ///
 /// ```no_run
-/// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
-/// let mut writer = client.create_file_writer(&share, "output.bin").await?;
+/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// let mut writer = client.create_file_writer(share, "output.bin").await?;
 /// writer.write_chunk(b"first part").await?;
 /// writer.write_chunk(b"second part").await?;
 /// let total = writer.finish().await?;
@@ -531,10 +532,16 @@ type BoxedWriteFut = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<crate::client::connection::Frame>> + Send>,
 >;
 
-/// Push-based streaming writer: see module-level docs for the example.
-pub struct FileWriter<'a> {
-    tree: &'a Tree,
-    conn: &'a mut Connection,
+/// Push-based streaming writer. Owns its `Connection` and `Arc<Tree>`,
+/// so the writer is `'static` and N concurrent writers pipeline over one
+/// SMB session without any external locking.
+///
+/// Both fields are cheap `Arc::clone`s. The receiver task multiplexes
+/// responses by `MessageId` so N independent `FileWriter`s can write to
+/// different files on the same connection concurrently.
+pub struct FileWriter {
+    tree: Arc<Tree>,
+    conn: Connection,
     file_id: FileId,
     max_write_size: u32,
     /// Next write offset in the file.
@@ -555,11 +562,46 @@ pub struct FileWriter<'a> {
     done: bool,
 }
 
-impl<'a> FileWriter<'a> {
+/// Open (or create) a file for writing and return a streaming [`FileWriter`]
+/// that owns its `Connection` and `Arc<Tree>`.
+///
+/// Use this when you hold a cloned `Connection` and want to drive a
+/// streaming write without holding any external lock for the upload's
+/// duration. The returned writer is `'static` — drop it, move it across
+/// tasks, hand it to `tokio::spawn`, it doesn't borrow from anything.
+///
+/// Multiple `FileWriter`s built from clones of the same `Connection`
+/// pipeline their WRITEs over a single SMB session.
+///
+/// `SmbClient::create_file_writer` and `Tree::create_file_writer` are
+/// thin convenience wrappers around this; reach for them when you already
+/// hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
+/// connection clone.
+pub async fn open_file_writer(
+    tree: Arc<Tree>,
+    mut conn: Connection,
+    path: &str,
+) -> Result<FileWriter> {
+    let normalized = tree.format_path(path);
+    debug!("stream: open_file_writer path={}", normalized);
+
+    let file_id = tree.open_file_for_write(&mut conn, &normalized).await?;
+    let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+
+    Ok(FileWriter::new(tree, conn, file_id, max_write))
+}
+
+impl FileWriter {
     /// Create a new push-based streaming writer.
+    ///
+    /// Most callers want [`open_file_writer`], [`Tree::create_file_writer`],
+    /// or [`SmbClient::create_file_writer`](crate::SmbClient::create_file_writer)
+    /// which issue the CREATE for you. Use this constructor when you've
+    /// already opened the file via [`Tree::open_file_for_write`] (for
+    /// example, to reuse a handle across multiple writers).
     pub(crate) fn new(
-        tree: &'a Tree,
-        conn: &'a mut Connection,
+        tree: Arc<Tree>,
+        conn: Connection,
         file_id: FileId,
         max_write_size: u32,
     ) -> Self {
@@ -639,10 +681,10 @@ impl<'a> FileWriter<'a> {
         self.drain_all().await?;
 
         // Flush to ensure data is persisted.
-        self.tree.flush_handle(self.conn, self.file_id).await?;
+        self.tree.flush_handle(&mut self.conn, self.file_id).await?;
 
         // Close the handle.
-        self.tree.close_handle(self.conn, self.file_id).await?;
+        self.tree.close_handle(&mut self.conn, self.file_id).await?;
 
         self.done = true;
         Ok(self.total_written)
@@ -694,11 +736,11 @@ impl<'a> FileWriter<'a> {
     /// ```no_run
     /// # use std::ops::ControlFlow;
     /// # async fn example(
-    /// #     client: &mut smb2::SmbClient,
+    /// #     client: &smb2::SmbClient,
     /// #     share: &smb2::Tree,
     /// #     cancel: impl Fn() -> bool,
     /// # ) -> Result<(), smb2::Error> {
-    /// let mut writer = client.create_file_writer(&share, "output.bin").await?;
+    /// let mut writer = client.create_file_writer(share, "output.bin").await?;
     /// for chunk in [b"first".as_slice(), b"second", b"third"] {
     ///     if cancel() {
     ///         let written = writer.abort().await?;
@@ -758,7 +800,7 @@ impl<'a> FileWriter<'a> {
         // 3. Skip flush_handle() — that's the whole point of abort().
 
         // 4. Best-effort CLOSE. If it fails, log and move on.
-        if let Err(e) = self.tree.close_handle(self.conn, self.file_id).await {
+        if let Err(e) = self.tree.close_handle(&mut self.conn, self.file_id).await {
             debug!(
                 "stream: FileWriter::abort() best-effort CLOSE failed, handle may leak \
                  server-side until session teardown: {}",
@@ -852,7 +894,7 @@ impl<'a> FileWriter<'a> {
             // Drain remaining in-flight (best-effort), then close handle.
             while self.in_flight.next().await.is_some() {}
             // Best-effort close.
-            let _ = self.tree.close_handle(self.conn, self.file_id).await;
+            let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
             self.done = true;
             return Err(Error::Protocol {
                 status: frame.header.status,
@@ -928,7 +970,7 @@ impl<'a> FileWriter<'a> {
     }
 }
 
-impl Drop for FileWriter<'_> {
+impl Drop for FileWriter {
     fn drop(&mut self) {
         if !self.done {
             debug!(
@@ -952,14 +994,14 @@ mod tests {
     use crate::types::{FileId, TreeId};
     use std::sync::Arc;
 
-    fn test_tree() -> Tree {
-        Tree {
+    fn test_tree() -> Arc<Tree> {
+        Arc::new(Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
-        }
+        })
     }
 
     fn test_file_id() -> FileId {
@@ -982,10 +1024,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[0u8; 100]).await.unwrap();
         assert_eq!(writer.bytes_written(), 0); // Not yet drained
         let total = writer.finish().await.unwrap();
@@ -1004,10 +1046,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[1u8; 100]).await.unwrap();
         writer.write_chunk(&[2u8; 100]).await.unwrap();
         writer.write_chunk(&[3u8; 100]).await.unwrap();
@@ -1025,11 +1067,11 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
         let writer = tree
-            .create_file_writer(&mut conn, "empty.bin")
+            .create_file_writer(conn, "empty.bin")
             .await
             .unwrap();
         let total = writer.finish().await.unwrap();
@@ -1050,10 +1092,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[]).await.unwrap(); // No-op
         writer.write_chunk(&[0u8; 50]).await.unwrap();
         let total = writer.finish().await.unwrap();
@@ -1084,10 +1126,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "big.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "big.bin").await.unwrap();
         writer.write_chunk(&vec![0u8; chunk_size]).await.unwrap();
         let total = writer.finish().await.unwrap();
         assert_eq!(total, (wire_1 + wire_2 + wire_3 + wire_4) as u64);
@@ -1105,10 +1147,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         let progress = writer.progress();
         assert!(progress.total_bytes.is_none());
         assert_eq!(progress.bytes_transferred, 0);
@@ -1126,10 +1168,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
 
         // After pushing but before finish, bytes_written reflects only drained responses.
         writer.write_chunk(&[0u8; 100]).await.unwrap();
@@ -1157,10 +1199,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
 
         // Fill the window.
         for _ in 0..MAX_PIPELINE_WINDOW {
@@ -1188,10 +1230,10 @@ mod tests {
         // CLOSE after error cleanup.
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[0u8; 100]).await.unwrap();
         let result = writer.finish().await;
         assert!(result.is_err());
@@ -1215,10 +1257,10 @@ mod tests {
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[0u8; 50]).await.unwrap();
         writer.write_chunk(&[0u8; 75]).await.unwrap();
         writer.write_chunk(&[0u8; 25]).await.unwrap();
@@ -1243,10 +1285,10 @@ mod tests {
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         let total = writer.abort().await.unwrap();
         assert_eq!(total, 0);
 
@@ -1269,10 +1311,10 @@ mod tests {
         // No FLUSH response — abort must not send FLUSH.
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[0u8; 50]).await.unwrap();
         writer.write_chunk(&[0u8; 75]).await.unwrap();
         writer.write_chunk(&[0u8; 25]).await.unwrap();
@@ -1301,10 +1343,10 @@ mod tests {
         mock.queue_response(build_write_error_response(NtStatus::DISK_FULL));
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[0u8; 100]).await.unwrap();
         writer.write_chunk(&[0u8; 100]).await.unwrap();
 
@@ -1327,10 +1369,10 @@ mod tests {
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
 
         // Inject a stashed chunk and pending buffer directly — in real traffic
         // these would accumulate when credits run out. Neither should get sent.
@@ -1357,10 +1399,10 @@ mod tests {
         // CLOSE returns an error. abort() must still return Ok.
         mock.queue_response(build_close_error_response(NtStatus::FILE_CLOSED));
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let mut writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         writer.write_chunk(&[0u8; 100]).await.unwrap();
 
         let result = writer.abort().await;
@@ -1387,10 +1429,10 @@ mod tests {
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
+        let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let writer = tree.create_file_writer(&mut conn, "out.bin").await.unwrap();
+        let writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
         let result = writer.abort().await;
         assert!(result.is_ok());
         // The writer has been consumed. `Drop` ran inside abort's frame

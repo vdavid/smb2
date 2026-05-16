@@ -7,6 +7,37 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-17
+
+### Changed
+
+- **Breaking: `FileWriter` owns its `Connection` and `Arc<Tree>` instead of borrowing `&'a mut Connection`.** The
+  lifetime parameter is gone; `FileWriter` is now `'static`. Multiple writers built from clones of the same
+  `Connection` pipeline their WRITEs over one SMB session, multiplexed by `MessageId` in the receiver task — no
+  external locking needed.
+- **Breaking: `Tree::create_file_writer` signature changed** from `(&self, conn: &mut Connection, path)` to
+  `(self: &Arc<Self>, conn: Connection, path)`. Callers that previously held an owned `Tree` need
+  `Arc::new(tree)` once; callers using `SmbClient::create_file_writer` are unaffected at the call site (the
+  client wraps the cloning internally).
+- **Breaking: `SmbClient::create_file_writer` takes `&self` instead of `&mut self`** and returns
+  `FileWriter` (no lifetime) instead of `FileWriter<'_>`. The previous `&mut self` requirement was the root cause
+  of a deadlock in the cmdr SMB volume's `write_from_stream` under sustained concurrent pressure on QNAP — the
+  consumer had to hold its session mutex for the entire streaming upload.
+- **Breaking: `Tree` is now `#[derive(Clone)]`.** Lets convenience constructors wrap a `Tree` in `Arc` without
+  reconstructing field-by-field. Cloning a `Tree` is cheap (one `TreeId`, three short `String`s, two bools).
+
+### Added
+
+- `client::stream::open_file_writer(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileWriter>` — free
+  function for building a `FileWriter` when you already hold a cloned `Connection` and an `Arc<Tree>` and don't
+  want the convenience-wrapper indirection. `Tree::create_file_writer` and `SmbClient::create_file_writer` both
+  delegate to it.
+
+### Notes
+
+- Internal callers in `Tree::write_file_pipelined` and `Tree::write_file_streamed` were not touched: they use
+  their own per-chunk `execute_with_credits` loop and never built a `FileWriter`.
+
 ## [0.8.0] - 2026-05-08
 
 ### Changed

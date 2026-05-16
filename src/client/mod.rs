@@ -832,26 +832,35 @@ impl SmbClient {
     /// Create a push-based pipelined streaming file writer.
     ///
     /// Opens (or creates) the file for writing and returns a [`FileWriter`]
-    /// that the caller drives by pushing data chunks. No DFS retry (the
-    /// returned handle borrows the tree for its lifetime).
+    /// that the caller drives by pushing data chunks. The returned writer
+    /// owns a cheap `Arc::clone` of `Connection` and an `Arc<Tree>` — it
+    /// is `'static` and does not borrow from the client. Multiple writers
+    /// built this way pipeline their WRITEs over a single SMB session
+    /// without external locking.
+    ///
+    /// No DFS retry; the writer pins to the connection it was built from.
     ///
     /// # Example
     ///
     /// ```no_run
-    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
-    /// let mut writer = client.create_file_writer(&share, "output.bin").await?;
+    /// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// let mut writer = client.create_file_writer(share, "output.bin").await?;
     /// writer.write_chunk(b"hello").await?;
     /// writer.write_chunk(b" world").await?;
     /// let total = writer.finish().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn create_file_writer<'a>(
-        &'a mut self,
-        tree: &'a Tree,
+    pub async fn create_file_writer(
+        &self,
+        tree: &Tree,
         path: &str,
-    ) -> Result<stream::FileWriter<'a>> {
-        tree.create_file_writer(&mut self.conn, path).await
+    ) -> Result<stream::FileWriter> {
+        // Convenience wrapper: clone the primary connection (cheap
+        // `Arc::clone`) and the `Tree` into an `Arc`, then build a writer
+        // that owns both. The client's connection is not borrowed for the
+        // upload's duration, so concurrent writers proceed in parallel.
+        stream::open_file_writer(std::sync::Arc::new(tree.clone()), self.conn.clone(), path).await
     }
 
     /// Read a file with progress reporting and cancellation.
