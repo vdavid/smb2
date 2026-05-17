@@ -115,6 +115,7 @@ const DEFAULT_SYNOLOGY_PORT: u16 = 10490;
 const DEFAULT_LINUX_PORT: u16 = 10491;
 const DEFAULT_FLAKY_PORT: u16 = 10492;
 const DEFAULT_SLOW_PORT: u16 = 10493;
+const DEFAULT_MAXREADSIZE_PORT: u16 = 10494;
 
 /// Resolve a port from an environment variable, falling back to a default.
 fn port(env_var: &str, default: u16) -> u16 {
@@ -192,6 +193,16 @@ pub fn flaky_port() -> u16 {
 /// Port for the slow container.
 pub fn slow_port() -> u16 {
     port("SMB_CONSUMER_SLOW_PORT", DEFAULT_SLOW_PORT)
+}
+
+/// Port for the max-read-size container.
+///
+/// The server enforces `smb2 max read = 65536` and `smb2 max write = 65536`,
+/// so every transfer larger than 64 KB is chunked. Consumers can target this
+/// fixture to exercise the streaming write/read fallback paths without
+/// needing the internal-fixture `smb-maxreadsize` container.
+pub fn maxreadsize_port() -> u16 {
+    port("SMB_CONSUMER_MAXREADSIZE_PORT", DEFAULT_MAXREADSIZE_PORT)
 }
 
 // ── Embedded files ──────────────────────────────────────────────────────
@@ -290,6 +301,12 @@ const SLOW_DOCKERFILE: &str =
 const SLOW_SMB_CONF: &str = include_str!("../../tests/docker/consumer/smb-consumer-slow/smb.conf");
 const SLOW_ENTRYPOINT: &str =
     include_str!("../../tests/docker/consumer/smb-consumer-slow/entrypoint.sh");
+
+// smb-consumer-maxreadsize
+const MAXREADSIZE_DOCKERFILE: &str =
+    include_str!("../../tests/docker/consumer/smb-consumer-maxreadsize/Dockerfile");
+const MAXREADSIZE_SMB_CONF: &str =
+    include_str!("../../tests/docker/consumer/smb-consumer-maxreadsize/smb.conf");
 
 // ── Embedded file manifest ──────────────────────────────────────────────
 
@@ -494,6 +511,17 @@ fn embedded_files() -> Vec<EmbeddedFile> {
             relative_path: "smb-consumer-slow/entrypoint.sh",
             contents: SLOW_ENTRYPOINT,
             executable: true,
+        },
+        // maxreadsize
+        EmbeddedFile {
+            relative_path: "smb-consumer-maxreadsize/Dockerfile",
+            contents: MAXREADSIZE_DOCKERFILE,
+            executable: false,
+        },
+        EmbeddedFile {
+            relative_path: "smb-consumer-maxreadsize/smb.conf",
+            contents: MAXREADSIZE_SMB_CONF,
+            executable: false,
         },
     ]
 }
@@ -1074,7 +1102,7 @@ mod tests {
         // Verify top-level compose file.
         assert!(dir.join("docker-compose.yml").exists());
 
-        // Verify all 14 container directories exist with Dockerfiles.
+        // Verify all 15 container directories exist with Dockerfiles.
         let containers = [
             "smb-consumer-guest",
             "smb-consumer-auth",
@@ -1090,6 +1118,7 @@ mod tests {
             "smb-consumer-linux",
             "smb-consumer-flaky",
             "smb-consumer-slow",
+            "smb-consumer-maxreadsize",
         ];
         for name in containers {
             let dockerfile = dir.join(name).join("Dockerfile");

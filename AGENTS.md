@@ -101,7 +101,7 @@ tests/
   docker_integration.rs   # Tests against Docker Samba containers (#[ignore])
   consumer_integration.rs # Tests against consumer Docker containers (#[ignore])
   docker/                 # Docker infrastructure (Dockerfiles, compose, scripts)
-    consumer/             # Consumer test harness containers (14 containers)
+    consumer/             # Consumer test harness containers (15 containers)
 
 examples/
   list_shares.rs          # Connect and enumerate shares
@@ -267,6 +267,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 | smb-consumer-linux     | 10491 | Default Linux Samba server                    |
 | smb-consumer-flaky     | 10492 | Error recovery UI, reconnect handling         |
 | smb-consumer-slow      | 10493 | Loading spinners, progress bars, timeouts     |
+| smb-consumer-maxreadsize | 10494 | Streaming-fallback chunking (64 KB max read/write) |
 
 ### Tested hardware
 

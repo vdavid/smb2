@@ -22,12 +22,12 @@ All 35 Docker files (compose, Dockerfiles, smb.conf, scripts) are embedded via `
 
 ## Port scheme
 
-14 containers on ports 10480-10493. Each port has an env-var override (`SMB_CONSUMER_*_PORT`). The `port()` function checks the env var, falls back to the hardcoded default.
+15 containers on ports 10480-10494. Each port has an env-var override (`SMB_CONSUMER_*_PORT`). The `port()` function checks the env var, falls back to the hardcoded default.
 
 ## Profiles
 
 - **Minimal**: guest + auth only (2 containers, fast startup).
-- **All**: all 14 containers.
+- **All**: all 15 containers.
 
 Calling a `*_client()` method for a container not in the current profile returns `Error::ContainerNotStarted`.
 

@@ -7,6 +7,17 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-17
+
+### Added
+
+- New consumer-class fixture `smb-consumer-maxreadsize` (port 10494, env `SMB_CONSUMER_MAXREADSIZE_PORT`)
+  with `smb2 max read = smb2 max write = 65536`. Mirrors the internal-fixture
+  `smb-maxreadsize` so consumer apps can guard against streaming-fallback regressions
+  (every transfer >64 KB is chunked, exercising the same code path that hung pre-0.9.0)
+  without standing up smb2's `internal/` fixtures. Exposed via `smb2::testing::maxreadsize_port()`
+  and shipped through `write_compose_files`.
+
 ## [0.9.0] - 2026-05-17
 
 ### Changed

@@ -113,6 +113,7 @@ cargo test --test consumer_integration -- --ignored   # repeat
 | smb-consumer-linux | 10491 | Default Linux Samba server |
 | smb-consumer-flaky | 10492 | Error recovery UI, reconnect handling |
 | smb-consumer-slow | 10493 | Loading spinners, progress bars, timeouts |
+| smb-consumer-maxreadsize | 10494 | Streaming-fallback chunking (64 KB max read/write) |
 
 **Using containers without Rust (Layers 2/3):**
 
@@ -123,7 +124,7 @@ smb2::testing::TestServers::write_compose_files(Path::new("./test-infra")).unwra
 
 ```sh
 cd test-infra && docker compose up -d
-# Containers available at localhost:10480-10493
+# Containers available at localhost:10480-10494
 ```
 
 ## How to run

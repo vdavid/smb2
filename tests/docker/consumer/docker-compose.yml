@@ -84,3 +84,9 @@ services:
       - "${SMB_CONSUMER_SLOW_PORT:-10493}:445"
     cap_add:
       - NET_ADMIN
+
+  smb-consumer-maxreadsize:
+    build:
+      context: smb-consumer-maxreadsize
+    ports:
+      - "${SMB_CONSUMER_MAXREADSIZE_PORT:-10494}:445"
