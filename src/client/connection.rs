@@ -1275,10 +1275,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                             "recv: routed msg_id={}, status={:?}, cmd={:?}",
                             msg_id.0, frame.header.status, frame.header.command
                         ),
-                        Err(e) => debug!(
-                            "recv: routed error msg_id={}, err={}",
-                            msg_id.0, e
-                        ),
+                        Err(e) => debug!("recv: routed error msg_id={}, err={}", msg_id.0, e),
                     }
                     if tx.send(result).is_err() {
                         trace!("recv: late arrival for dropped waiter, msg_id={}", msg_id.0);

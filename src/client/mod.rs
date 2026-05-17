@@ -851,11 +851,7 @@ impl SmbClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn create_file_writer(
-        &self,
-        tree: &Tree,
-        path: &str,
-    ) -> Result<stream::FileWriter> {
+    pub async fn create_file_writer(&self, tree: &Tree, path: &str) -> Result<stream::FileWriter> {
         // Convenience wrapper: clone the primary connection (cheap
         // `Arc::clone`) and the `Tree` into an `Arc`, then build a writer
         // that owns both. The client's connection is not borrowed for the

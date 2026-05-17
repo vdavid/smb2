@@ -1070,10 +1070,7 @@ mod tests {
         let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let writer = tree
-            .create_file_writer(conn, "empty.bin")
-            .await
-            .unwrap();
+        let writer = tree.create_file_writer(conn, "empty.bin").await.unwrap();
         let total = writer.finish().await.unwrap();
         assert_eq!(total, 0);
 
