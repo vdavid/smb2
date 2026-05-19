@@ -7,6 +7,24 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-19
+
+### Changed
+
+- **Breaking: `Watcher` owns its `Connection` and `Tree` instead of borrowing them.** The lifetime parameter is gone; `Watcher` is now `'static`. `Tree::watch` and `SmbClient::watch` lose their `'a` parameter and return `Watcher` instead of `Watcher<'a>`. Existing call sites that wrote `let mut w = client.watch(&tree, "path", true).await?;` keep compiling unchanged — only code that explicitly named the type as `Watcher<'_>` needs the `<'_>` removed. The connection clone is cheap (`Arc::clone`, multiplexes over the same SMB session), so the caller is free to keep using their `Connection` for other ops while a watcher runs. The previous "use a separate `SmbClient` to perform operations while watching" workaround is no longer needed.
+
+### Fixed
+
+- **CHANGE_NOTIFY consumer-side loss window closed.** `Watcher::next_events` now keeps one CHANGE_NOTIFY request continuously outstanding on the wire by pre-issuing the next request before awaiting the current response. Without this, server-side events that arrived during the consumer's response-processing window were dropped silently by strict servers (older Samba builds, NAS firmware) that don't queue events between consecutive CHANGE_NOTIFY requests. Reproduced in the field as 9 file copies → 4 watcher events delivered. Confirmed against Docker Samba, QNAP TS-464, and Windows-shape servers via `tests/integration.rs::nas_accepts_stacked_change_notify` and the new unit test in `src/client/watcher.rs::loss_window_tests`.
+
+### Added
+
+- `Connection::dispatch` / `Connection::dispatch_with_credits` (crate-internal): variant of `execute` that returns once `transport.send().await` completes, handing back the response `oneshot::Receiver` for the caller to await separately. Enables pipelining patterns where the next request must be on the wire before the previous one's response is processed.
+
+### Notes
+
+- **Server compatibility check**: the fix relies on the server accepting two simultaneous CHANGE_NOTIFY requests on the same `FileId`. MS-SMB2 allows it; Windows, modern Samba (Docker fixtures), and QNAP TS-464 firmware all confirmed-good. Servers that reject would surface `Err(Error::Protocol { status: ..., command: ChangeNotify })` on the second `next_events()` call. If you hit this on a particular NAS, please file an issue with the NTSTATUS — a config-flag fallback to depth-0 (pre-issue off) is straightforward to add but hasn't been needed yet.
+
 ## [0.9.1] - 2026-05-17
 
 ### Added
