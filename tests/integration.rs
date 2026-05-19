@@ -1504,6 +1504,130 @@ async fn watch_directory_on_nas() {
         .await;
 }
 
+/// Probes whether the QNAP accepts **two simultaneous CHANGE_NOTIFY
+/// requests on the same directory handle** — the property the pipelined-
+/// watcher fix depends on.
+///
+/// `Watcher::next_events` dispatches the next CHANGE_NOTIFY before
+/// awaiting the current one's response, so on every iteration there are
+/// two outstanding requests on the same `FileId`. MS-SMB2 allows this;
+/// Windows and modern Samba accept it; what's untested is exactly what
+/// older NAS firmware does. If the QNAP rejects, the rejected request's
+/// response carries an error NTSTATUS, surfaced through `next_events()`
+/// as `Err(Error::Protocol { status: ..., command: ChangeNotify })`.
+///
+/// This test does 5 watch cycles back to back (each writes one file and
+/// pulls one event) so we exercise the stacking path 5 times rather than
+/// just the cold-start single shot.
+#[tokio::test]
+#[ignore]
+async fn nas_accepts_stacked_change_notify() {
+    use smb2::FileNotifyAction;
+
+    let _ = env_logger::try_init();
+
+    const N_CYCLES: usize = 5;
+    const DIR: &str = "_test_stacked_notify";
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut watcher_client = connect_client_to_nas().await;
+            let mut watcher_share = watcher_client
+                .connect_share("naspi")
+                .await
+                .expect("tree connect (watcher)");
+
+            // Clean from any prior run.
+            for i in 0..N_CYCLES {
+                let _ = watcher_client
+                    .delete_file(&mut watcher_share, &format!("{DIR}/file_{i:02}.tmp"))
+                    .await;
+            }
+            let _ = watcher_client
+                .delete_directory(&mut watcher_share, DIR)
+                .await;
+            watcher_client
+                .create_directory(&mut watcher_share, DIR)
+                .await
+                .expect("create test dir");
+
+            let mut watcher = watcher_client
+                .watch(&watcher_share, &format!("{DIR}/"), false)
+                .await
+                .expect("watch");
+
+            // Writer: one file every 300 ms. The slow pace gives the
+            // watcher easy time to process each response — the test is
+            // about whether stacking is *accepted*, not about loss-
+            // window behavior.
+            let writer_task = tokio::task::spawn_local(async move {
+                let mut writer_client = connect_client_to_nas().await;
+                let mut writer_share = writer_client
+                    .connect_share("naspi")
+                    .await
+                    .expect("tree connect (writer)");
+                for i in 0..N_CYCLES {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    writer_client
+                        .write_file(&mut writer_share, &format!("{DIR}/file_{i:02}.tmp"), b"x")
+                        .await
+                        .unwrap_or_else(|e| panic!("write file_{i:02}.tmp: {e}"));
+                }
+                (writer_client, writer_share)
+            });
+
+            // Pull one event per cycle. The cold-start of next_events
+            // dispatches req1 + req2 on the same handle; every subsequent
+            // call takes the previously-pre-issued rx and dispatches one
+            // more. If the QNAP rejects the stacked request, the second
+            // iteration (which awaits the first stacked-rx) surfaces the
+            // failure with the exact NTSTATUS.
+            let mut seen = std::collections::HashSet::new();
+            for i in 0..N_CYCLES {
+                let res =
+                    tokio::time::timeout(Duration::from_secs(10), watcher.next_events()).await;
+                let events = match res {
+                    Ok(Ok(events)) => events,
+                    Ok(Err(e)) => panic!(
+                        "next_events cycle #{i} returned error — likely the QNAP rejected \
+                         a stacked CHANGE_NOTIFY on the same FileId. Error: {e:?}"
+                    ),
+                    Err(_) => panic!(
+                        "next_events cycle #{i} timed out after 10 s — the QNAP may have \
+                         silently parked the stacked request without responding"
+                    ),
+                };
+                for e in events {
+                    if e.action == FileNotifyAction::Added && e.filename.starts_with("file_") {
+                        println!("cycle {i}: saw {}", e.filename);
+                        seen.insert(e.filename);
+                    }
+                }
+            }
+
+            // Cleanup.
+            watcher.close().await.expect("watcher close");
+            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            for i in 0..N_CYCLES {
+                let _ = writer_client
+                    .delete_file(&mut writer_share, &format!("{DIR}/file_{i:02}.tmp"))
+                    .await;
+            }
+            let _ = writer_client.delete_directory(&mut writer_share, DIR).await;
+            let _ = writer_client.disconnect_share(&writer_share).await;
+
+            assert_eq!(
+                seen.len(),
+                N_CYCLES,
+                "expected all {N_CYCLES} files' Added events; got {seen:?}. \
+                 Missing events suggest either loss-window regressions or \
+                 server-side rejection of stacked CHANGE_NOTIFY."
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn kerberos_auth_against_docker_kdc() {
