@@ -858,6 +858,200 @@ async fn guest_watch_directory() {
         .await;
 }
 
+/// Contract test for the CHANGE_NOTIFY loss window between consecutive requests.
+///
+/// Today's `Watcher::next_events()` issues one CHANGE_NOTIFY, awaits the
+/// response, returns. Between response and the consumer's next call there
+/// is no outstanding request on the wire. Servers that drop events without
+/// an outstanding request (cmdr-on-naspi field repro: 9 files written, 4
+/// watcher events delivered) will silently lose them; servers that queue
+/// generously (Docker Samba with the parameters below) will not.
+///
+/// **Honest status**: this test **does not currently fail on Docker Samba**.
+/// Tuned to its threshold of pain it either still buffers everything OR
+/// flips to `STATUS_NOTIFY_ENUM_DIR` (server-side overflow signal,
+/// different code path). The test stays in as:
+///
+/// 1. A pin against regressions on less-forgiving servers (older Samba,
+///    Synology firmware, QNAP firmware — where naspi reproduced).
+/// 2. A behavioral contract: under realistic concurrent load, the watcher
+///    delivers every Added event for every file.
+///
+/// To get a Docker-side failing test for the loss window, see the
+/// follow-up `watcher_keeps_request_outstanding_between_responses` test
+/// (separate file, uses `MockTransport` to control wire timing precisely)
+/// — but that needs a small lib-side hook to expose request-send and
+/// response-receive instants, which we haven't added yet.
+#[tokio::test]
+#[ignore]
+async fn watcher_does_not_lose_events_during_consumer_processing_delay() {
+    use smb2::FileNotifyAction;
+
+    let _ = env_logger::try_init();
+
+    // Realistic concurrent load. Below the NOTIFY_ENUM_DIR overflow
+    // threshold on Docker Samba; calibrated against the cmdr-on-naspi
+    // field reproduction (9 files, ~1 file/sec, slow consumer-side stat).
+    const N: usize = 50;
+    const CONCURRENT_WRITERS: usize = 3;
+    const CONSUMER_PROCESSING: Duration = Duration::from_millis(250);
+    const OVERALL_DEADLINE: Duration = Duration::from_secs(30);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Watcher and writer each on their own SmbClient. Today's
+            // API forces this: `Watcher` borrows `&mut Connection`.
+            let mut watcher_client = guest_client().await;
+            let mut watcher_share = watcher_client
+                .connect_share("public")
+                .await
+                .expect("tree connect failed (watcher)");
+
+            // Clean from any prior run. Deleting individual files first
+            // because delete_directory only works on empty dirs.
+            for i in 0..N {
+                let _ = watcher_client
+                    .delete_file(
+                        &mut watcher_share,
+                        &format!("_test_watch_loss/file_{i:03}.txt"),
+                    )
+                    .await;
+            }
+            let _ = watcher_client
+                .delete_directory(&mut watcher_share, "_test_watch_loss")
+                .await;
+            watcher_client
+                .create_directory(&mut watcher_share, "_test_watch_loss")
+                .await
+                .expect("create _test_watch_loss");
+
+            let mut watcher = watcher_client
+                .watch(&watcher_share, "_test_watch_loss/", true)
+                .await
+                .expect("watch failed");
+
+            // Writers: CONCURRENT_WRITERS independent clients, each
+            // responsible for a slice of the N files. Concurrent connections
+            // hammer Samba harder than a single serial writer, increasing
+            // event arrival rate during the consumer's processing window.
+            let writers_done = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let writer_handles: Vec<_> = (0..CONCURRENT_WRITERS)
+                .map(|writer_idx| {
+                    let writers_done = writers_done.clone();
+                    tokio::task::spawn_local(async move {
+                        let mut writer_client = guest_client().await;
+                        let mut writer_share = writer_client
+                            .connect_share("public")
+                            .await
+                            .expect("tree connect failed (writer)");
+
+                        // Brief lead so the watcher is armed before the first write.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+
+                        let per_writer = N / CONCURRENT_WRITERS;
+                        let start = writer_idx * per_writer;
+                        let end = if writer_idx == CONCURRENT_WRITERS - 1 {
+                            N
+                        } else {
+                            start + per_writer
+                        };
+                        for i in start..end {
+                            let path = format!("_test_watch_loss/file_{i:03}.txt");
+                            writer_client
+                                .write_file(&mut writer_share, &path, b"x")
+                                .await
+                                .unwrap_or_else(|e| panic!("write_file {path}: {e}"));
+                        }
+                        writers_done.set(writers_done.get() + 1);
+                        (writer_client, writer_share)
+                    })
+                })
+                .collect();
+
+            // Consumer: pull events with a deliberate processing delay
+            // between iterations. This delay is the loss window today.
+            let mut seen = std::collections::HashSet::new();
+            let mut got_notify_enum_dir = false;
+            let deadline = tokio::time::Instant::now() + OVERALL_DEADLINE;
+            while tokio::time::Instant::now() < deadline && seen.len() < N {
+                let res =
+                    tokio::time::timeout(Duration::from_millis(500), watcher.next_events()).await;
+                match res {
+                    Ok(Ok(events)) => {
+                        for e in events {
+                            if e.action == FileNotifyAction::Added
+                                && e.filename.starts_with("file_")
+                            {
+                                seen.insert(e.filename);
+                            }
+                        }
+                        // Realistic consumer work (stat each new entry, update
+                        // UI, etc). On servers with a real loss window, this
+                        // delay is where events get dropped.
+                        tokio::time::sleep(CONSUMER_PROCESSING).await;
+                    }
+                    Ok(Err(smb2::Error::Protocol { status, .. }))
+                        if status == smb2::types::status::NtStatus::NOTIFY_ENUM_DIR =>
+                    {
+                        // Server's per-handle event buffer overflowed: the
+                        // consumer is expected to re-scan the dir and resume
+                        // watching. This test isn't trying to assert the
+                        // overflow path; it's the cleaner loss window. Note
+                        // it and break — overflow means the parameters are
+                        // too aggressive for this server's buffer.
+                        got_notify_enum_dir = true;
+                        break;
+                    }
+                    Ok(Err(e)) => panic!("watcher error: {e}"),
+                    Err(_) => continue, // 500 ms wait elapsed; loop back
+                }
+            }
+
+            // Best-effort cleanup before assertion so a failed assert
+            // doesn't leave the dir behind.
+            watcher.close().await.expect("watcher close failed");
+            let mut cleanup_client_share: Option<(SmbClient, Tree)> = None;
+            for h in writer_handles {
+                let (c, s) = h.await.unwrap();
+                cleanup_client_share = Some((c, s));
+            }
+            if let Some((mut cleanup_client, mut cleanup_share)) = cleanup_client_share {
+                for i in 0..N {
+                    let _ = cleanup_client
+                        .delete_file(
+                            &mut cleanup_share,
+                            &format!("_test_watch_loss/file_{i:03}.txt"),
+                        )
+                        .await;
+                }
+                let _ = cleanup_client
+                    .delete_directory(&mut cleanup_share, "_test_watch_loss")
+                    .await;
+                let _ = cleanup_client.disconnect_share(&cleanup_share).await;
+            }
+
+            assert!(
+                !got_notify_enum_dir,
+                "load too aggressive for this server's CHANGE_NOTIFY buffer: \
+                 got NOTIFY_ENUM_DIR. Reduce N or CONCURRENT_WRITERS — that path \
+                 is server-side overflow, not the consumer-side loss window."
+            );
+            assert_eq!(
+                seen.len(),
+                N,
+                "watcher lost events during consumer-side processing delay: saw {}/{N}. \
+                 Missing files: {:?}",
+                seen.len(),
+                (0..N)
+                    .map(|i| format!("file_{i:03}.txt"))
+                    .filter(|name| !seen.contains(name))
+                    .collect::<Vec<_>>()
+            );
+        })
+        .await;
+}
+
 // ── Mandatory signing (smb-signing) ──────────────────────────────────
 
 #[tokio::test]
