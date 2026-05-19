@@ -818,6 +818,132 @@ impl Connection {
         await_frame(rx).await
     }
 
+    /// Send a request and return its response receiver without awaiting it.
+    ///
+    /// Same wire-level work as [`execute`](Self::execute) — allocate
+    /// `MessageId`, register waiter, sign / encrypt, send bytes — but
+    /// stops as soon as `transport.send().await` returns and hands back
+    /// the `oneshot::Receiver` for the response. Use this for pipelining:
+    /// dispatch the next request before awaiting the previous response,
+    /// keeping the wire continuously armed.
+    ///
+    /// **Eager-send guarantee**: when this future resolves to `Ok(rx)`,
+    /// the request bytes have been handed to the transport. The caller
+    /// can rely on "after this `.await` completes, the request is on
+    /// the wire."
+    ///
+    /// The returned `Receiver` follows the same drop-safety contract as
+    /// [`execute`]'s internal one: dropping it without awaiting causes
+    /// the receiver task to discard the late response silently when it
+    /// arrives (credits still apply).
+    ///
+    /// Currently used by [`Watcher`](crate::Watcher) to pre-issue the
+    /// next CHANGE_NOTIFY before awaiting the current one. Other call
+    /// sites should prefer [`execute`] / [`execute_with_credits`] unless
+    /// they specifically need the pipelining shape.
+    pub(crate) async fn dispatch(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+    ) -> Result<oneshot::Receiver<Result<Frame>>> {
+        self.dispatch_with_credits(command, body, tree_id, CreditCharge(1))
+            .await
+    }
+
+    /// Variant of [`dispatch`](Self::dispatch) with a caller-specified credit charge.
+    pub(crate) async fn dispatch_with_credits(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+    ) -> Result<oneshot::Receiver<Result<Frame>>> {
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        let charge = credit_charge.0.max(1);
+        let msg_id = self.allocate_msg_id(charge as u64);
+
+        let mut header = Header::new_request(command);
+        header.message_id = msg_id;
+        header.credits = 256;
+        header.credit_charge = CreditCharge(charge);
+        header.session_id = self.session_id();
+        if let Some(tid) = tree_id {
+            header.tree_id = Some(tid);
+        }
+
+        let (should_sign, should_encrypt) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (c.should_sign, c.should_encrypt)
+        };
+
+        if should_sign && !should_encrypt {
+            header.flags.set_signed();
+        }
+        if self.should_set_dfs_flag(tree_id) {
+            header.flags |= HeaderFlags::new(HeaderFlags::DFS_OPERATIONS);
+        }
+
+        let mut msg_bytes = pack_message(&header, body);
+
+        let rx = self.register_waiter(msg_id)?;
+
+        let wire_bytes = if should_encrypt {
+            match self.encrypt_bytes(&msg_bytes) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    self.remove_waiter(msg_id);
+                    return Err(e);
+                }
+            }
+        } else {
+            if should_sign {
+                let c = self.inner.crypto.lock().unwrap();
+                if let (Some(key), Some(algo)) = (&c.signing_key, &c.signing_algorithm) {
+                    if let Err(e) =
+                        signing::sign_message(&mut msg_bytes, key, *algo, msg_id.0, false)
+                    {
+                        drop(c);
+                        self.remove_waiter(msg_id);
+                        return Err(e);
+                    }
+                }
+            }
+            if self.compression_enabled() && msg_bytes.len() > Header::SIZE {
+                if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
+                    let framed = build_compressed_frame(&compressed);
+                    match self.inner.sender.send(&framed).await {
+                        Ok(()) => {
+                            debug!(
+                                "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
+                                command, msg_id.0, charge, tree_id, should_sign,
+                                msg_bytes.len(), framed.len()
+                            );
+                            return Ok(rx);
+                        }
+                        Err(e) => {
+                            self.remove_waiter(msg_id);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            msg_bytes
+        };
+
+        if let Err(e) = self.inner.sender.send(&wire_bytes).await {
+            self.remove_waiter(msg_id);
+            return Err(e);
+        }
+        debug!(
+            "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
+            command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
+        );
+        Ok(rx)
+    }
+
     /// Send a compound SMB2 request (multiple operations in one transport
     /// frame) and return the per-sub-op responses.
     ///
@@ -1531,7 +1657,7 @@ pub(crate) fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
 ///   every pending waiter, so we only see a raw canceled channel if
 ///   the whole map was dropped without that call, i.e. Arc teardown).
 ///   Map it to `Error::Disconnected`.
-async fn await_frame(rx: oneshot::Receiver<Result<Frame>>) -> Result<Frame> {
+pub(crate) async fn await_frame(rx: oneshot::Receiver<Result<Frame>>) -> Result<Frame> {
     match rx.await {
         Ok(Ok(frame)) => Ok(frame),
         Ok(Err(e)) => Err(e),

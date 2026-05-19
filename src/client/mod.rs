@@ -1054,15 +1054,10 @@ impl SmbClient {
     ///
     /// Set `recursive` to `true` to watch the entire subtree.
     ///
-    /// The returned `Watcher` borrows the connection mutably, so no other
-    /// operations can run on this client while watching. Use a separate
-    /// `SmbClient` (second TCP connection) to perform operations during a watch.
-    pub async fn watch<'a>(
-        &'a mut self,
-        tree: &'a Tree,
-        path: &str,
-        recursive: bool,
-    ) -> Result<Watcher<'a>> {
+    /// The returned `Watcher` owns a cloned connection (cheap `Arc::clone`,
+    /// all clones multiplex over the same SMB session), so this client
+    /// remains usable for other operations while watching.
+    pub async fn watch(&mut self, tree: &Tree, path: &str, recursive: bool) -> Result<Watcher> {
         tree.watch(&mut self.conn, path, recursive).await
     }
 

@@ -74,10 +74,21 @@ Reactive DFS resolution with multi-target failover. When a convenience method ge
 **Key design decisions:**
 - Convenience methods take `&mut Tree` (not `&Tree`) so DFS can update the tree in-place
 - `disconnect_share` stays as `&Tree` (no redirect on teardown)
-- Streaming methods (`download`, `upload`, `watch`) keep `&Tree` because they return handles that borrow the tree for their lifetime
+- Streaming methods (`download`, `upload`) keep `&Tree` because they return handles that borrow the tree for their lifetime
+- `watch` now returns an *owned* `Watcher` (no lifetime); see the [Watcher pipelining](#watcher-pipelining) section
 - Batch methods (`delete_files`, `rename_files`, `stat_files`) don't retry per-file; the caller should trigger one single-file operation first to resolve the redirect
 - `dfs_enabled` flag on `ClientConfig` (default `true`) gates all DFS resolution
 - Borrow checker requires inlining the connection lookup in `handle_dfs_redirect` to avoid double `&mut self` borrows
+
+## Watcher pipelining
+
+`Watcher` keeps **one CHANGE_NOTIFY request pre-issued on the wire at all times** after the first `next_events()` call. The wire never sits idle between responses. This closes the response→re-arm loss window that strict servers (older Samba builds, NAS firmware) drop events through.
+
+Shape: `Watcher` owns a cloned `Connection` (cheap `Arc::clone`, all clones multiplex over the same SMB session) and a `Tree` clone — no lifetime parameter, no borrow against the caller's `Connection`. `next_events` dispatches the next request via `Connection::dispatch` (a sibling to `execute` that returns once `transport.send().await` completes, handing back the `oneshot::Receiver` for the response) *before* awaiting the previous response. So when control returns to the consumer, the server already has somewhere to put new events.
+
+Decision/Why — eager-send `dispatch` vs `tokio::spawn(conn.execute(...))`: the spawn-based approach defers the send to when the spawned task is polled, which under tokio's `current_thread` scheduler may not happen until the spawning task yields. That left a gap where the simulator-modeled strict server dropped events. `dispatch` awaits transport.send() inline, so the eager-send guarantee is "after `.await` returns, the request is on the wire" — independent of scheduler.
+
+Pinned by `client::watcher::loss_window_tests::watcher_does_not_lose_events_between_consecutive_requests`: a strict-server simulator drops events that arrive with no outstanding request. Pre-fix: 5/5 gap events dropped. Post-fix: 0/5 dropped.
 
 ## Pipelined I/O
 

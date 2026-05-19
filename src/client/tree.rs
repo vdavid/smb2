@@ -450,15 +450,16 @@ impl Tree {
     ///
     /// Set `recursive` to `true` to watch the entire subtree.
     ///
-    /// The returned `Watcher` borrows the connection mutably, so no other
-    /// operations can run on it while watching. Use a separate connection
-    /// (a second `SmbClient`) if you need to perform operations while watching.
-    pub async fn watch<'a>(
-        &'a self,
-        conn: &'a mut Connection,
+    /// The returned `Watcher` owns a cloned `Connection` (cheap
+    /// `Arc::clone`, all clones multiplex over the same SMB session), so
+    /// the caller is free to perform other operations on `conn` while
+    /// watching. No second `SmbClient` is required.
+    pub async fn watch(
+        &self,
+        conn: &mut Connection,
         path: &str,
         recursive: bool,
-    ) -> Result<crate::client::watcher::Watcher<'a>> {
+    ) -> Result<crate::client::watcher::Watcher> {
         let normalized = self.format_path(path);
         debug!(
             "tree: watch path={}, recursive={}, tree_id={}",
@@ -470,8 +471,14 @@ impl Tree {
         // the lifetime of the watcher.
         let file_id = self.open_directory(conn, &normalized).await?;
 
+        // Hand the watcher an owned Tree clone and an owned Connection
+        // clone so it can pipeline CHANGE_NOTIFY requests independently
+        // of the caller's connection use.
         Ok(crate::client::watcher::Watcher::new(
-            self, conn, file_id, recursive,
+            self.clone(),
+            conn.clone(),
+            file_id,
+            recursive,
         ))
     }
 

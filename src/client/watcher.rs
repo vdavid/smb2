@@ -7,7 +7,7 @@
 
 use log::debug;
 
-use crate::client::connection::Connection;
+use crate::client::connection::{await_frame, Connection, Frame};
 use crate::client::tree::Tree;
 use crate::error::Result;
 use crate::msg::change_notify::{
@@ -19,6 +19,7 @@ use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
 use crate::types::{Command, FileId};
 use crate::Error;
+use tokio::sync::oneshot;
 
 /// Default completion filter: watch for most common changes.
 const DEFAULT_COMPLETION_FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
@@ -107,33 +108,54 @@ pub struct FileNotifyEvent {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Watcher<'a> {
-    tree: &'a Tree,
-    conn: &'a mut Connection,
+///
+/// **Pipelining**: `Watcher` keeps one CHANGE_NOTIFY request pre-issued on
+/// the wire at all times after the first call to
+/// [`next_events`](Self::next_events). The wire never sits idle between
+/// consecutive responses, so server-side events that arrive while the
+/// consumer is processing the previous batch are still delivered to an
+/// outstanding request — they don't fall in a response→re-arm gap where
+/// strict servers (older Samba, NAS firmware) drop them silently.
+///
+/// The watcher owns a cloned [`Connection`] (cheap `Arc::clone`, all
+/// clones multiplex over the same SMB session), so the caller doesn't
+/// need a second `SmbClient` to perform other operations while watching.
+pub struct Watcher {
+    tree: Tree,
+    conn: Connection,
     file_id: FileId,
     recursive: bool,
+    /// In-flight CHANGE_NOTIFY response receiver. Populated lazily on the
+    /// first `next_events()` call and re-populated before awaiting each
+    /// response, so there is always exactly one outstanding request on
+    /// the wire from that point on.
+    pending: Option<oneshot::Receiver<Result<Frame>>>,
 }
 
-impl<'a> Watcher<'a> {
+impl Watcher {
     /// Create a new watcher (called by `Tree::watch`).
-    pub(crate) fn new(
-        tree: &'a Tree,
-        conn: &'a mut Connection,
-        file_id: FileId,
-        recursive: bool,
-    ) -> Self {
+    pub(crate) fn new(tree: Tree, conn: Connection, file_id: FileId, recursive: bool) -> Self {
         Watcher {
             tree,
             conn,
             file_id,
             recursive,
+            pending: None,
         }
     }
 
     /// Wait for the next batch of change events.
     ///
-    /// Sends a CHANGE_NOTIFY request and waits for the server to respond.
-    /// The server holds the request until changes occur, so this call
+    /// Dispatches a CHANGE_NOTIFY request (if one isn't already pre-issued
+    /// from the previous call), then — before awaiting the response —
+    /// dispatches the *next* CHANGE_NOTIFY. This keeps the wire
+    /// continuously armed: from the moment the first call returns until
+    /// the watcher is dropped, the server always has an outstanding
+    /// request to deliver events into. Closes the response→re-arm loss
+    /// window that strict servers (older Samba, NAS firmware) drop events
+    /// through.
+    ///
+    /// The server holds each request until changes occur, so this call
     /// may block for a long time.
     ///
     /// Returns `Ok(events)` with one or more events when changes are detected.
@@ -142,24 +164,27 @@ impl<'a> Watcher<'a> {
     ///
     /// Returns `Error::Protocol` with `STATUS_NOTIFY_ENUM_DIR` if too many
     /// changes occurred and the server could not fit them in the response
-    /// buffer. In this case, the caller should re-scan the directory.
+    /// buffer. In this case, the caller should re-scan the directory and
+    /// keep watching — by the time control returns, the pipelined-next
+    /// request is already on the wire so no events arriving during the
+    /// re-scan get lost.
     pub async fn next_events(&mut self) -> Result<Vec<FileNotifyEvent>> {
-        let flags = if self.recursive { SMB2_WATCH_TREE } else { 0 };
+        // Cold start: no request has been issued yet. Dispatch the first.
+        if self.pending.is_none() {
+            let rx = self.dispatch_next().await?;
+            self.pending = Some(rx);
+        }
+        // Take the currently in-flight receiver, then immediately
+        // pre-issue the next request before awaiting this one. The
+        // `dispatch` call below `.await`s only the transport.send(), so
+        // when it returns, the next CHANGE_NOTIFY is on the wire and the
+        // server has somewhere to put new events even while we process
+        // the response for the previous one.
+        let in_flight = self.pending.take().expect("pending populated above");
+        let next_rx = self.dispatch_next().await?;
+        self.pending = Some(next_rx);
 
-        let req = ChangeNotifyRequest {
-            flags,
-            output_buffer_length: OUTPUT_BUFFER_LENGTH,
-            file_id: self.file_id,
-            completion_filter: DEFAULT_COMPLETION_FILTER,
-        };
-
-        // `execute` handles STATUS_PENDING transparently: the receiver task
-        // keeps the waiter registered through interim responses and only
-        // resolves the oneshot when the real (non-pending) response arrives.
-        let frame = self
-            .conn
-            .execute(Command::ChangeNotify, &req, Some(self.tree.tree_id))
-            .await?;
+        let frame = await_frame(in_flight).await?;
 
         if frame.header.status == NtStatus::NOTIFY_ENUM_DIR {
             return Err(Error::Protocol {
@@ -183,12 +208,47 @@ impl<'a> Watcher<'a> {
         Ok(events)
     }
 
+    /// Build a CHANGE_NOTIFY request and dispatch it on the cloned
+    /// connection, returning the response receiver. `Connection::dispatch`
+    /// awaits only up to and including `transport.send()`, so when this
+    /// returns the request is on the wire — the caller can rely on the
+    /// "outstanding on the wire" invariant for whatever comes next.
+    async fn dispatch_next(&self) -> Result<oneshot::Receiver<Result<Frame>>> {
+        let flags = if self.recursive { SMB2_WATCH_TREE } else { 0 };
+        let req = ChangeNotifyRequest {
+            flags,
+            output_buffer_length: OUTPUT_BUFFER_LENGTH,
+            file_id: self.file_id,
+            completion_filter: DEFAULT_COMPLETION_FILTER,
+        };
+        self.conn
+            .dispatch(Command::ChangeNotify, &req, Some(self.tree.tree_id))
+            .await
+    }
+
     /// Close the directory handle.
     ///
-    /// This stops watching for changes. If not called explicitly,
-    /// the handle will be leaked (there is no async drop in Rust).
-    pub async fn close(self) -> Result<()> {
-        self.tree.close_handle(self.conn, self.file_id).await
+    /// Drops the pre-issued CHANGE_NOTIFY receiver (the `Connection`
+    /// receiver task discards the late response silently when it
+    /// arrives — same contract `Connection::execute` already documents),
+    /// then issues a CLOSE on the file handle. If `close` is not called
+    /// explicitly, the `Drop` impl drops the pre-issued receiver but the
+    /// server-side handle leaks until the session ends (there is no
+    /// async drop in Rust).
+    pub async fn close(mut self) -> Result<()> {
+        self.pending.take();
+        self.tree.close_handle(&mut self.conn, self.file_id).await
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        // The pre-issued response receiver (if any) drops with the
+        // Watcher. The `Connection` receiver task discards the late
+        // frame silently when it arrives, matching the contract on
+        // `Connection::execute`. The directory handle itself leaks
+        // server-side until the session ends — the docstring on `close`
+        // already warns about this.
     }
 }
 
@@ -634,7 +694,7 @@ mod loss_window_tests {
         const N_CYCLES: usize = 5;
 
         let sim = Arc::new(LossySim::new());
-        let mut conn = setup_connection(&sim);
+        let conn = setup_connection(&sim);
         let tree = test_tree();
 
         let scenario_sim = sim.clone();
@@ -650,6 +710,15 @@ mod loss_window_tests {
                 // On the fix, a pre-issued request is still outstanding,
                 // so it lands in the "buffer" branch.
                 sim.push_event(&format!("gap_{round:02}"));
+                // Models "time passes between server-side events". Real
+                // workloads have at least a syscall worth of latency
+                // between events, which is enough for the watcher task
+                // to wake up, process the previous response, and
+                // re-dispatch. The pipelining fix only guarantees one
+                // outstanding through the response-processing window,
+                // not through arbitrary back-to-back synchronous
+                // delivers within a single scheduler quantum.
+                tokio::task::yield_now().await;
             }
             // Flush: drive one more cycle to push any buffered gap events
             // out the door for the fix path.
@@ -664,8 +733,8 @@ mod loss_window_tests {
         });
 
         let mut watcher = Watcher::new(
-            &tree,
-            &mut conn,
+            tree,
+            conn,
             crate::types::FileId {
                 persistent: 0x1111,
                 volatile: 0x2222,
