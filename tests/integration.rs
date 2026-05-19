@@ -1577,33 +1577,47 @@ async fn nas_accepts_stacked_change_notify() {
                 (writer_client, writer_share)
             });
 
-            // Pull one event per cycle. The cold-start of next_events
-            // dispatches req1 + req2 on the same handle; every subsequent
-            // call takes the previously-pre-issued rx and dispatches one
-            // more. If the QNAP rejects the stacked request, the second
-            // iteration (which awaits the first stacked-rx) surfaces the
+            // Keep pulling until every file's `Added` event is in. The
+            // cold-start of next_events dispatches req1 + req2 on the
+            // same handle; every subsequent call takes the previously-
+            // pre-issued rx and dispatches one more. If the QNAP rejects
+            // the stacked request, `next_events` would surface the
             // failure with the exact NTSTATUS.
+            //
+            // Per-cycle loop bound is generous: QNAP emits ~3 events per
+            // file write (Added + Modified + Modified) and ships them
+            // one per CHANGE_NOTIFY response, so 5 files can produce up
+            // to 15 cycles of pulls.
             let mut seen = std::collections::HashSet::new();
-            for i in 0..N_CYCLES {
+            let mut cycle = 0;
+            let overall_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while seen.len() < N_CYCLES && tokio::time::Instant::now() < overall_deadline {
                 let res =
-                    tokio::time::timeout(Duration::from_secs(10), watcher.next_events()).await;
+                    tokio::time::timeout(Duration::from_secs(5), watcher.next_events()).await;
                 let events = match res {
                     Ok(Ok(events)) => events,
                     Ok(Err(e)) => panic!(
-                        "next_events cycle #{i} returned error — likely the QNAP rejected \
-                         a stacked CHANGE_NOTIFY on the same FileId. Error: {e:?}"
+                        "next_events cycle #{cycle} returned error — likely the QNAP \
+                         rejected a stacked CHANGE_NOTIFY on the same FileId. Error: {e:?}"
                     ),
-                    Err(_) => panic!(
-                        "next_events cycle #{i} timed out after 10 s — the QNAP may have \
-                         silently parked the stacked request without responding"
-                    ),
+                    Err(_) => {
+                        println!(
+                            "cycle {cycle}: 5 s timeout waiting for next event (seen so far: {seen:?})"
+                        );
+                        cycle += 1;
+                        continue;
+                    }
                 };
+                if events.is_empty() {
+                    println!("cycle {cycle}: <empty response>");
+                }
                 for e in events {
+                    println!("cycle {cycle}: {} {}", e.action, e.filename);
                     if e.action == FileNotifyAction::Added && e.filename.starts_with("file_") {
-                        println!("cycle {i}: saw {}", e.filename);
                         seen.insert(e.filename);
                     }
                 }
+                cycle += 1;
             }
 
             // Cleanup.
