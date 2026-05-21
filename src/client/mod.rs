@@ -7,6 +7,7 @@
 
 pub mod connection;
 pub(crate) mod dfs;
+pub mod diagnostics;
 pub mod pipeline;
 pub mod session;
 pub mod shares;
@@ -18,6 +19,11 @@ pub mod watcher;
 
 pub use crate::crypto::encryption::Cipher;
 pub use connection::{CompoundOp, Connection, Frame, NegotiatedParams};
+pub use diagnostics::{
+    ClientInfo, ClientMetricsSnapshot, CompressionInfo, ConnectionDiagnostics, CreditInfo,
+    DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
+    SessionDiagnostics, SigningInfo,
+};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
@@ -30,6 +36,7 @@ pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use log::{debug, info};
@@ -120,6 +127,9 @@ pub struct SmbClient {
     extra_connections: HashMap<String, ConnectionEntry>,
     /// DFS referral resolver with TTL-based cache.
     dfs_resolver: DfsResolver,
+    /// Client-level counter: how many times `reconnect()` ran. Survives
+    /// each reconnect (per-connection counters do not).
+    reconnects: AtomicU64,
 }
 
 impl SmbClient {
@@ -156,6 +166,7 @@ impl SmbClient {
             primary_server,
             extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
+            reconnects: AtomicU64::new(0),
         })
     }
 
@@ -170,6 +181,7 @@ impl SmbClient {
             primary_server,
             extra_connections: HashMap::new(),
             dfs_resolver: DfsResolver::new(),
+            reconnects: AtomicU64::new(0),
         }
     }
 
@@ -230,6 +242,7 @@ impl SmbClient {
     /// credentials. This is the core reconnection logic, separated from
     /// TCP connect so it can be tested with mock transports.
     async fn reconnect_with(&mut self, mut conn: Connection) -> Result<()> {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
         conn.set_compression_requested(self.config.compression);
         conn.negotiate().await?;
 
@@ -276,6 +289,60 @@ impl SmbClient {
     /// Estimated round-trip time from the negotiate exchange.
     pub fn estimated_rtt(&self) -> Option<Duration> {
         self.conn.estimated_rtt()
+    }
+
+    /// Capture a tree of diagnostics: client config, primary + DFS-extra
+    /// connections, the session on each connection, per-connection
+    /// counters, the DFS referral cache, and client-level counters.
+    ///
+    /// See [`crate::client::diagnostics`] for the consistency model. In
+    /// short: eventually consistent, snapshot survives connection
+    /// teardown, per-connection counters reset on
+    /// [`Self::reconnect`], client-level counters survive.
+    pub fn diagnostics(&self) -> crate::client::diagnostics::Diagnostics {
+        use crate::client::diagnostics::{
+            ClientInfo, ClientMetricsSnapshot, Diagnostics, SessionDiagnostics,
+        };
+
+        let (cache_hits, referrals_resolved) = self.dfs_resolver.counters();
+        let client = ClientInfo {
+            primary_server: self.primary_server.clone(),
+            timeout: self.config.timeout,
+            auto_reconnect: self.config.auto_reconnect,
+            dfs_enabled: self.config.dfs_enabled,
+            metrics: ClientMetricsSnapshot {
+                reconnects: self.reconnects.load(Ordering::Relaxed),
+                dfs_referrals_resolved: referrals_resolved,
+                dfs_cache_hits: cache_hits,
+            },
+        };
+
+        let session_for = |s: &Session| SessionDiagnostics {
+            session_id: s.session_id,
+            should_sign: s.should_sign,
+            should_encrypt: s.should_encrypt,
+            signing_algorithm: s.signing_algorithm,
+        };
+
+        let mut primary = self.conn.diagnostics();
+        primary.session = Some(session_for(&self.session));
+
+        let extra_connections = self
+            .extra_connections
+            .values()
+            .map(|entry| {
+                let mut d = entry.conn.diagnostics();
+                d.session = Some(session_for(&entry.session));
+                d
+            })
+            .collect();
+
+        Diagnostics {
+            client,
+            primary,
+            extra_connections,
+            dfs_cache: self.dfs_resolver.cache_entries(),
+        }
     }
 
     /// Get a mutable reference to the underlying connection.

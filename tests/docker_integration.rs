@@ -3356,3 +3356,84 @@ async fn slow_file_writer_stress_100mb() {
         .await
         .expect("disconnect failed");
 }
+
+// ── Diagnostics (M3) ──────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn diagnostics_basic_counters_against_smb_guest() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    let _entries = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list_directory failed");
+
+    let d = client.diagnostics();
+
+    // Negotiated parameters look real.
+    let n = d.primary.negotiated.expect("negotiated after connect");
+    assert!(
+        n.dialect as u16 >= 0x0210,
+        "expected SMB 2.1+, got {:?}",
+        n.dialect
+    );
+    assert!(n.max_read_size > 0);
+
+    // Counters reflect at least negotiate + session setup + tree connect + list.
+    assert!(d.primary.metrics.requests_sent >= 4);
+    assert!(d.primary.metrics.responses_routed_ok >= 4);
+    assert!(d.primary.metrics.wire_bytes_sent > 0);
+    assert!(d.primary.metrics.wire_bytes_received > 0);
+    assert_eq!(d.primary.metrics.requests_returned_err, 0);
+    assert_eq!(d.primary.metrics.responses_stray, 0);
+    assert_eq!(d.primary.metrics.responses_late_after_drop, 0);
+
+    // Session is populated.
+    let s = d.primary.session.expect("session after setup");
+    assert_ne!(s.session_id, smb2::types::SessionId::NONE);
+
+    // Server name matches the address.
+    assert!(
+        d.primary.server.starts_with("127.0.0.1"),
+        "server: {:?}",
+        d.primary.server
+    );
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn diagnostics_reconnects_counter_survives_reconnect() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    let _ = client.list_directory(&mut tree, "").await;
+    let before = client.diagnostics();
+    assert_eq!(before.client.metrics.reconnects, 0);
+
+    client.reconnect().await.expect("reconnect failed");
+    // Per-conn counters reset to a fresh `Inner` and only reflect the
+    // post-reconnect negotiate + session setup; client-level survives.
+    let after = client.diagnostics();
+    assert_eq!(after.client.metrics.reconnects, 1);
+    assert!(
+        after.primary.metrics.responses_routed_ok < before.primary.metrics.responses_routed_ok,
+        "per-conn counters reset across reconnect: before {} → after {}",
+        before.primary.metrics.responses_routed_ok,
+        after.primary.metrics.responses_routed_ok,
+    );
+}

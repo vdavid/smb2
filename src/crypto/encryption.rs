@@ -38,6 +38,7 @@ type Aes256Ccm = ccm::Ccm<Aes256, U16, U11>;
 
 /// Encryption cipher, determined during negotiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Cipher {
     /// AES-128-CCM (SMB 3.0+) -- 11-byte nonce.
     Aes128Ccm,

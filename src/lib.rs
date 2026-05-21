@@ -81,6 +81,14 @@ pub use client::pipeline::{Op, OpResult, Pipeline};
 pub use client::connection::{CompoundOp, Frame, NegotiatedParams};
 pub use client::session::Session;
 
+// Diagnostics: snapshot tree returned by `SmbClient::diagnostics()` /
+// `Connection::diagnostics()`.
+pub use client::diagnostics::{
+    ClientInfo, ClientMetricsSnapshot, CompressionInfo, ConnectionDiagnostics, CreditInfo,
+    DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
+    SessionDiagnostics, SigningInfo,
+};
+
 // File watching
 pub use client::watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 

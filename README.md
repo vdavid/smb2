@@ -180,6 +180,49 @@ use std::ops::ControlFlow;
 All write methods (`write_file`, `write_file_pipelined`, `write_file_with_progress`) flush data to persistent storage
 before closing the file handle.
 
+## Diagnostics
+
+`SmbClient::diagnostics()` captures a snapshot of the client's state — negotiated dialect, credits, in-flight requests,
+per-connection counters (bytes sent/received, request outcomes, protocol events), DFS cache, sessions — for dashboards,
+MCP tools, log dumps, and tests that want to assert on counter ticks rather than scrape logs.
+
+```rust
+# async fn example(client: &mut smb2::SmbClient) -> Result<(), smb2::Error> {
+let diag = client.diagnostics();
+println!("{}", diag);                                  // compact terminal view
+assert!(diag.primary.metrics.responses_routed_ok > 0); // typed assertions
+
+// Optional: with `--features serde`:
+#[cfg(feature = "serde")]
+println!("{}", serde_json::to_string_pretty(&diag).unwrap());
+# Ok(())
+# }
+```
+
+The snapshot is eventually consistent (each field is loaded independently), survives connection teardown, and is
+cheap (a handful of atomic loads + short critical sections). Counter semantics and the four-way routing partition are
+documented on `smb2::MetricsSnapshot`. See [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md) for the
+design.
+
+Two runnable examples to see it in action:
+
+```sh
+# One-shot: connect, list a directory, dump the snapshot.
+SMB2_PASS=secret cargo run --example diagnostics
+SMB2_PASS=secret cargo run --example diagnostics --features serde -- --json
+
+# Live: download N files in parallel, tail the snapshot every interval ms.
+SMB2_PASS=secret SMB2_FILE=big.bin \
+  cargo run --example diagnostics_live -- --parallel 7 --interval 200
+```
+
+Env vars used by both: `SMB2_HOST` (`host:port`), `SMB2_USER`, `SMB2_PASS`, `SMB2_SHARE`. The live example also takes
+`SMB2_FILE`. Useful pairings: `RUST_LOG=smb2=info` for the lib's own log lines on top, or the slow Docker container
+(`SMB2_HOST=127.0.0.1:10451`, see [tests/CLAUDE.md](tests/CLAUDE.md)) to watch the dumper tick while the wire is busy.
+
+Consumers wanting live charts, MCP tools, or Prometheus integration build on top of `Diagnostics` / `MetricsSnapshot`
+in their own crates — smb2 stays a protocol library; presentation belongs to the application.
+
 ## Installation
 
 Add to your `Cargo.toml`:

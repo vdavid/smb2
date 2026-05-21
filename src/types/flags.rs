@@ -166,8 +166,19 @@ impl_flags!(SecurityMode, u16);
 // ── Capabilities ────────────────────────────────────────────────────────
 
 /// Server/client capability flags (32-bit field from MS-SMB2 2.2.3/2.2.4).
+///
+/// With the `serde` feature on, this serializes as the underlying `u32`
+/// bits, **not** a JSON object of named flags. Decode against the
+/// associated constants on this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities(pub u32);
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Capabilities {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_u32(self.0)
+    }
+}
 
 impl Capabilities {
     /// Distributed File System (DFS) support.

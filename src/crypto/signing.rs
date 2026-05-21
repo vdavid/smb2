@@ -22,6 +22,7 @@ const MIN_MESSAGE_LEN: usize = 64;
 
 /// Signing algorithm, determined by negotiated dialect and capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum SigningAlgorithm {
     /// HMAC-SHA256 truncated to 16 bytes (SMB 2.0.2, 2.1).
     HmacSha256,

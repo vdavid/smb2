@@ -48,6 +48,7 @@ impl TryFrom<u8> for OplockLevel {
 
 /// 64-bit session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
 pub struct SessionId(pub u64);
 
 impl SessionId {
@@ -63,6 +64,7 @@ impl fmt::Display for SessionId {
 
 /// 64-bit message identifier for request/response correlation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
 pub struct MessageId(pub u64);
 
 impl MessageId {
@@ -78,6 +80,7 @@ impl fmt::Display for MessageId {
 
 /// 32-bit tree connect identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
 pub struct TreeId(pub u32);
 
 impl fmt::Display for TreeId {
@@ -188,6 +191,7 @@ impl fmt::Display for Command {
     num_enum::TryFromPrimitive,
     num_enum::IntoPrimitive,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[repr(u16)]
 pub enum Dialect {
     /// SMB 2.0.2 dialect.

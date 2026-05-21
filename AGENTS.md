@@ -309,6 +309,21 @@ Run `just check` before committing. This runs `cargo fmt --check`, `cargo clippy
 - Newtypes for all protocol IDs
 - `thiserror` for error types
 
+## Diagnostics
+
+`SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 17
+`AtomicU64` counters per connection (`requests_sent`, `wire_bytes_*`, the disjoint routing partition `responses_*`,
+`status_pending_loops`, `signature_failures`, etc.) and three client-level counters (`reconnects`,
+`dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, per-connection
+counters reset on reconnect. `Display` impl for terminal output; optional `serde` feature for JSON.
+
+Spec: [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md). Quick smoke test:
+
+```sh
+SMB2_PASS=secret cargo run --example diagnostics
+SMB2_PASS=secret cargo run --example diagnostics --features serde -- --json
+```
+
 ## Logging
 
 The crate uses `log` (a facade) for structured logging. The application picks the backend (for example, `env_logger`,

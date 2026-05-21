@@ -12,7 +12,13 @@ use super::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::error::Result;
 
 /// A 128-bit GUID in mixed-endian wire format (MS-DTYP 2.3.4).
+///
+/// With the `serde` feature on, the JSON form mirrors the in-memory
+/// field shape (`{data1, data2, data3, data4}`), **not** the wire byte
+/// order — the wire layout is mixed-endian and round-tripping it through
+/// JSON would just be confusing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Guid {
     /// First component (bytes 0-3, little-endian on wire).
     pub data1: u32,

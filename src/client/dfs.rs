@@ -10,6 +10,7 @@
 // DFS resolver is used by SmbClient for reactive DFS path resolution.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use log::debug;
@@ -218,6 +219,9 @@ struct CachedReferral {
 /// falling back to an IOCTL referral request on cache miss.
 pub(crate) struct DfsResolver {
     cache: HashMap<String, CachedReferral>,
+    /// Counters surfaced through [`SmbClient::diagnostics`].
+    cache_hits: AtomicU64,
+    referrals_resolved: AtomicU64,
 }
 
 impl DfsResolver {
@@ -225,7 +229,35 @@ impl DfsResolver {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            cache_hits: AtomicU64::new(0),
+            referrals_resolved: AtomicU64::new(0),
         }
+    }
+
+    /// `(cache_hits, referrals_resolved)` for diagnostics.
+    pub(crate) fn counters(&self) -> (u64, u64) {
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.referrals_resolved.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Iterate the cache entries (including expired ones — eviction is
+    /// lazy). Used by [`SmbClient::diagnostics`].
+    pub(crate) fn cache_entries(&self) -> Vec<crate::client::diagnostics::DfsCacheEntry> {
+        let now = Instant::now();
+        self.cache
+            .values()
+            .map(|e| crate::client::diagnostics::DfsCacheEntry {
+                path_prefix: e.dfs_path_prefix.clone(),
+                target_count: e.targets.len(),
+                expires_in: if e.expires_at > now {
+                    Some(e.expires_at - now)
+                } else {
+                    None
+                },
+            })
+            .collect()
     }
 
     /// Resolve a UNC path by checking the cache first, then querying the server.
@@ -239,6 +271,7 @@ impl DfsResolver {
     ) -> Result<Vec<ResolvedPath>> {
         // 1. Check cache (longest prefix match)
         if let Some(resolved) = self.resolve_from_cache(unc_path) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("dfs: cache hit for {:?}", unc_path);
             return Ok(resolved);
         }
@@ -254,6 +287,7 @@ impl DfsResolver {
 
         debug!("dfs: cache miss, sending referral for {:?}", referral_path);
         let resp = get_dfs_referral(conn, referral_path).await?;
+        self.referrals_resolved.fetch_add(1, Ordering::Relaxed);
 
         // 3. Cache the result
         self.cache_referral(&resp);

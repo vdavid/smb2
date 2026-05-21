@@ -7,6 +7,18 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-21
+
+### Added
+
+- **In-process diagnostics.** `SmbClient::diagnostics()` and `Connection::diagnostics()` return a `Diagnostics` / `ConnectionDiagnostics` snapshot of the client's current state — negotiated dialect, credits + in-flight count + next `MessageId`, signing/encryption/compression status, RTT estimate, DFS cache, the per-connection session, and a `MetricsSnapshot` of 17 monotonic `AtomicU64` counters (requests sent, wire bytes sent/received, the four disjoint routing outcomes — `responses_routed_ok`, `responses_routed_err`, `responses_late_after_drop`, `responses_stray` — plus `status_pending_loops`, `unsolicited_notifications_received`, `signature_failures`, `decrypt_failures`, `decompress_failures`, `malformed_frames`, `session_expired_events`, `compound_requests_sent`, `explicit_cancels_sent`, `requests_returned_err`). Counters survive connection teardown; per-connection counters reset on `SmbClient::reconnect`, client-level counters (`reconnects`, `dfs_referrals_resolved`, `dfs_cache_hits`) survive. A `Display` impl renders a compact terminal view. See [`docs/specs/diagnostics-plan.md`](docs/specs/diagnostics-plan.md).
+- **Optional `serde` feature** (off by default): `Serialize` impls on every diagnostics type plus the protocol enums they embed (`Dialect`, `Cipher`, `SigningAlgorithm`, `Capabilities`, `Guid`, `SessionId`, `TreeId`, `MessageId`). For consumers building MCP tools, dashboards, or any structured exporter. JSON form is the in-memory shape (newtypes are `transparent`, `Capabilities` is the raw `u32` bits).
+- **`examples/diagnostics.rs`**: connect, run a couple of ops, dump the snapshot via `Display` — or `--json` when built with `--features serde`.
+
+### Fixed
+
+- **Stale `src/client/CLAUDE.md` gotcha** about silent frame discard on decrypt/decompress/malformed-header errors. Phase 3 P3.4 fixed this — the receiver task tears down the connection on those paths and fans `Err(Disconnected)` to every pending waiter. Note now matches the code, and the diagnostics counters above attribute each tear-down to its trigger.
+
 ## [0.10.0] - 2026-05-19
 
 ### Changed

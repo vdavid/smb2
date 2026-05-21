@@ -227,6 +227,10 @@ struct Inner {
     preauth_hasher: StdMutex<PreauthHasher>,
     /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
     dfs_trees: StdMutex<HashSet<TreeId>>,
+    /// Counters for diagnostics. Snapshotted via [`Inner::metrics_snapshot`].
+    /// Survives connection teardown — counters are read off the still-alive
+    /// `Arc<Inner>` after the receiver task has exited.
+    metrics: Metrics,
 }
 
 impl Inner {
@@ -246,6 +250,91 @@ impl Inner {
             compression_requested: AtomicBool::new(true),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
             dfs_trees: StdMutex::new(HashSet::new()),
+            metrics: Metrics::default(),
+        }
+    }
+
+    /// Send raw wire bytes through the transport and bump the
+    /// `wire_bytes_sent` counter. The single funnel for every outbound
+    /// frame — keeps `wire_bytes_sent` from drifting as new send sites
+    /// are added.
+    async fn send_and_count(&self, bytes: &[u8]) -> Result<()> {
+        self.metrics
+            .wire_bytes_sent
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.sender.send(bytes).await
+    }
+
+    /// Snapshot the counters into a plain-value `MetricsSnapshot`.
+    ///
+    /// M2 promotes this to `Connection::diagnostics()`'s caller — until
+    /// then it's crate-internal so M1 tests can assert counter ticks
+    /// without committing to the public snapshot API shape.
+    pub(crate) fn metrics_snapshot(&self) -> crate::client::diagnostics::MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+}
+
+/// Per-connection counters, all `AtomicU64`, all `Relaxed` reads/writes.
+///
+/// Lives on [`Inner`] and outlives the receiver task; a snapshot taken
+/// after the connection has torn down returns the final values at the
+/// moment of death.
+///
+/// See `docs/specs/diagnostics-plan.md` § Counters for the rationale
+/// behind each field and the disjoint partition of the receive-side
+/// routing branches.
+#[derive(Default)]
+pub(crate) struct Metrics {
+    // Send path
+    pub requests_sent: AtomicU64,
+    pub compound_requests_sent: AtomicU64,
+    pub wire_bytes_sent: AtomicU64,
+    pub explicit_cancels_sent: AtomicU64,
+
+    // Receive path: four disjoint routing outcomes
+    pub responses_routed_ok: AtomicU64,
+    pub responses_routed_err: AtomicU64,
+    pub responses_late_after_drop: AtomicU64,
+    pub responses_stray: AtomicU64,
+    pub wire_bytes_received: AtomicU64,
+
+    // Protocol events
+    pub status_pending_loops: AtomicU64,
+    pub unsolicited_notifications_received: AtomicU64,
+    pub signature_failures: AtomicU64,
+    pub decrypt_failures: AtomicU64,
+    pub decompress_failures: AtomicU64,
+    pub malformed_frames: AtomicU64,
+    pub session_expired_events: AtomicU64,
+
+    // Caller-observed outcomes
+    pub requests_returned_err: AtomicU64,
+}
+
+impl Metrics {
+    fn snapshot(&self) -> crate::client::diagnostics::MetricsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::client::diagnostics::MetricsSnapshot {
+            requests_sent: self.requests_sent.load(Relaxed),
+            compound_requests_sent: self.compound_requests_sent.load(Relaxed),
+            wire_bytes_sent: self.wire_bytes_sent.load(Relaxed),
+            explicit_cancels_sent: self.explicit_cancels_sent.load(Relaxed),
+            responses_routed_ok: self.responses_routed_ok.load(Relaxed),
+            responses_routed_err: self.responses_routed_err.load(Relaxed),
+            responses_late_after_drop: self.responses_late_after_drop.load(Relaxed),
+            responses_stray: self.responses_stray.load(Relaxed),
+            wire_bytes_received: self.wire_bytes_received.load(Relaxed),
+            status_pending_loops: self.status_pending_loops.load(Relaxed),
+            unsolicited_notifications_received: self
+                .unsolicited_notifications_received
+                .load(Relaxed),
+            signature_failures: self.signature_failures.load(Relaxed),
+            decrypt_failures: self.decrypt_failures.load(Relaxed),
+            decompress_failures: self.decompress_failures.load(Relaxed),
+            malformed_frames: self.malformed_frames.load(Relaxed),
+            session_expired_events: self.session_expired_events.load(Relaxed),
+            requests_returned_err: self.requests_returned_err.load(Relaxed),
         }
     }
 }
@@ -364,7 +453,7 @@ impl Connection {
         let rx = self.register_waiter(msg_id)?;
 
         let rtt_start = std::time::Instant::now();
-        if let Err(e) = self.inner.sender.send(&req_bytes).await {
+        if let Err(e) = self.inner.send_and_count(&req_bytes).await {
             self.remove_waiter(msg_id);
             return Err(e);
         }
@@ -565,7 +654,11 @@ impl Connection {
         self.inner.credits.load(Ordering::Acquire) as u16
     }
 
-    /// Get the next message ID (without incrementing).
+    /// The `MessageId` that will be assigned to the next request.
+    ///
+    /// Starts at 0 on a fresh connection and increments by `credit_charge`
+    /// per allocation. Pre-first-send this is `0`; after a single
+    /// single-credit `execute` it's `1`.
     pub fn next_message_id(&self) -> u64 {
         self.inner.next_message_id.load(Ordering::Acquire)
     }
@@ -639,6 +732,25 @@ impl Connection {
         tree_id: Option<TreeId>,
         credit_charge: CreditCharge,
     ) -> Result<(Frame, Vec<u8>)> {
+        let result = self
+            .execute_with_credits_capturing_request_inner(command, body, tree_id, credit_charge)
+            .await;
+        if result.is_err() {
+            self.inner
+                .metrics
+                .requests_returned_err
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn execute_with_credits_capturing_request_inner(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+    ) -> Result<(Frame, Vec<u8>)> {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
@@ -695,7 +807,7 @@ impl Connection {
             msg_bytes
         };
 
-        if let Err(e) = self.inner.sender.send(&wire_bytes).await {
+        if let Err(e) = self.inner.send_and_count(&wire_bytes).await {
             self.remove_waiter(msg_id);
             return Err(e);
         }
@@ -720,6 +832,25 @@ impl Connection {
     /// it's safe to call from multiple tasks on clones of the same
     /// `Connection`.
     pub async fn execute_with_credits(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+    ) -> Result<Frame> {
+        let result = self
+            .execute_with_credits_inner(command, body, tree_id, credit_charge)
+            .await;
+        if result.is_err() {
+            self.inner
+                .metrics
+                .requests_returned_err
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn execute_with_credits_inner(
         &self,
         command: Command,
         body: &dyn Pack,
@@ -788,7 +919,7 @@ impl Connection {
             if self.compression_enabled() && msg_bytes.len() > Header::SIZE {
                 if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
                     let framed = build_compressed_frame(&compressed);
-                    match self.inner.sender.send(&framed).await {
+                    match self.inner.send_and_count(&framed).await {
                         Ok(()) => {
                             debug!(
                                 "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
@@ -807,7 +938,7 @@ impl Connection {
             msg_bytes
         };
 
-        if let Err(e) = self.inner.sender.send(&wire_bytes).await {
+        if let Err(e) = self.inner.send_and_count(&wire_bytes).await {
             self.remove_waiter(msg_id);
             return Err(e);
         }
@@ -914,7 +1045,7 @@ impl Connection {
             if self.compression_enabled() && msg_bytes.len() > Header::SIZE {
                 if let Some(compressed) = compress_message(&msg_bytes, Header::SIZE) {
                     let framed = build_compressed_frame(&compressed);
-                    match self.inner.sender.send(&framed).await {
+                    match self.inner.send_and_count(&framed).await {
                         Ok(()) => {
                             debug!(
                                 "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
@@ -933,7 +1064,7 @@ impl Connection {
             msg_bytes
         };
 
-        if let Err(e) = self.inner.sender.send(&wire_bytes).await {
+        if let Err(e) = self.inner.send_and_count(&wire_bytes).await {
             self.remove_waiter(msg_id);
             return Err(e);
         }
@@ -969,6 +1100,21 @@ impl Connection {
     ///   a later READ fail — so callers typically match on each inner
     ///   result individually.
     pub async fn execute_compound(&self, ops: &[CompoundOp<'_>]) -> Result<Vec<Result<Frame>>> {
+        self.inner
+            .metrics
+            .compound_requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+        let result = self.execute_compound_inner(ops).await;
+        if result.is_err() {
+            self.inner
+                .metrics
+                .requests_returned_err
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn execute_compound_inner(&self, ops: &[CompoundOp<'_>]) -> Result<Vec<Result<Frame>>> {
         if ops.is_empty() {
             return Err(Error::invalid_data(
                 "compound request must have at least one operation",
@@ -1066,7 +1212,7 @@ impl Connection {
 
         let send_result = if should_encrypt {
             match self.encrypt_bytes(&compound_buf) {
-                Ok(enc) => self.inner.sender.send(&enc).await,
+                Ok(enc) => self.inner.send_and_count(&enc).await,
                 Err(e) => {
                     for id in &registered {
                         self.remove_waiter(*id);
@@ -1075,7 +1221,7 @@ impl Connection {
                 }
             }
         } else {
-            self.inner.sender.send(&compound_buf).await
+            self.inner.send_and_count(&compound_buf).await
         };
 
         if let Err(e) = send_result {
@@ -1114,6 +1260,11 @@ impl Connection {
     ) -> Result<()> {
         use crate::msg::cancel::CancelRequest;
 
+        self.inner
+            .metrics
+            .explicit_cancels_sent
+            .fetch_add(1, Ordering::Relaxed);
+
         let (should_sign, should_encrypt) = {
             let c = self.inner.crypto.lock().unwrap();
             (c.should_sign, c.should_encrypt)
@@ -1140,7 +1291,7 @@ impl Connection {
 
         if should_encrypt {
             let encrypted = self.encrypt_bytes(&msg_bytes)?;
-            self.inner.sender.send(&encrypted).await?;
+            self.inner.send_and_count(&encrypted).await?;
             debug!(
                 "send_cancel: msg_id={}, async_id={:?}, encrypted",
                 original_msg_id.0, async_id
@@ -1152,7 +1303,7 @@ impl Connection {
                     signing::sign_message(&mut msg_bytes, key, *algo, original_msg_id.0, false)?;
                 }
             }
-            self.inner.sender.send(&msg_bytes).await?;
+            self.inner.send_and_count(&msg_bytes).await?;
             debug!(
                 "send_cancel: msg_id={}, async_id={:?}, signed={}",
                 original_msg_id.0, async_id, should_sign
@@ -1211,11 +1362,22 @@ impl Connection {
     }
 
     /// Allocate `charge` consecutive MessageIds and return the first.
+    ///
+    /// Also bumps the `requests_sent` metric — this is the single funnel
+    /// every send path (`negotiate`, `execute`, `execute_with_credits`,
+    /// `execute_capturing_request`, `dispatch`, `execute_compound`'s loop)
+    /// goes through, so counting here can't drift as new send sites land.
+    /// `send_cancel` reuses an existing msg_id and is counted separately by
+    /// `explicit_cancels_sent`.
     fn allocate_msg_id(&self, charge: u64) -> MessageId {
         let first = self
             .inner
             .next_message_id
             .fetch_add(charge, Ordering::SeqCst);
+        self.inner
+            .metrics
+            .requests_sent
+            .fetch_add(1, Ordering::Relaxed);
         MessageId(first)
     }
 
@@ -1263,6 +1425,105 @@ impl Connection {
     pub(crate) fn set_next_message_id(&mut self, id: u64) {
         self.inner.next_message_id.store(id, Ordering::Release);
     }
+
+    /// Snapshot the diagnostics counters on this connection.
+    ///
+    /// Crate-internal; the public surface is [`Self::diagnostics`].
+    pub(crate) fn metrics(&self) -> crate::client::diagnostics::MetricsSnapshot {
+        self.inner.metrics_snapshot()
+    }
+
+    /// Capture a snapshot of this connection's state and counters.
+    ///
+    /// **Eventually consistent.** Each field is loaded independently —
+    /// `credits.available` and `credits.in_flight` are sampled at slightly
+    /// different moments, so their sum is *not* invariant. Documented on
+    /// [`crate::client::diagnostics::CreditInfo`].
+    ///
+    /// **Survives teardown.** Counters live on the `Arc<Inner>` that
+    /// outlives the receiver task; calling this on a torn-down connection
+    /// (`disconnected: true`) returns final values.
+    ///
+    /// **Lock order.** Internally takes the `crypto`, `waiters`,
+    /// `dfs_trees`, and `estimated_rtt` locks one at a time, in that
+    /// order, and only as long as it takes to copy primitives out. No
+    /// lock is held across an `.await`.
+    pub fn diagnostics(&self) -> crate::client::diagnostics::ConnectionDiagnostics {
+        use crate::client::diagnostics::{
+            CompressionInfo, ConnectionDiagnostics, CreditInfo, EncryptionInfo, NegotiatedSummary,
+            SigningInfo,
+        };
+
+        // ── 1. crypto lock: signing / encryption snapshot ────────────────
+        let (signing, encryption) = {
+            let c = self.inner.crypto.lock().unwrap();
+            (
+                SigningInfo {
+                    active: c.should_sign,
+                    algorithm: c.signing_algorithm,
+                },
+                EncryptionInfo {
+                    active: c.should_encrypt,
+                    cipher: c.encryption_cipher,
+                },
+            )
+        };
+
+        // ── 2. waiters lock: in-flight count ────────────────────────────
+        let in_flight = self.inner.waiters.lock().unwrap().len();
+
+        // ── 3. dfs_trees lock: cloned snapshot ──────────────────────────
+        let dfs_trees: Vec<TreeId> = self
+            .inner
+            .dfs_trees
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+
+        // ── 4. estimated_rtt lock: cloned snapshot ──────────────────────
+        let rtt_estimate = *self.inner.estimated_rtt.lock().unwrap();
+
+        // Wait-free reads.
+        let credits = CreditInfo {
+            available: (self.inner.credits.load(Ordering::Acquire) & 0xFFFF) as u16,
+            in_flight,
+            next_message_id: self.inner.next_message_id.load(Ordering::Acquire),
+        };
+        let disconnected = self.inner.disconnected.load(Ordering::Acquire);
+        let compression = CompressionInfo {
+            requested: self.inner.compression_requested.load(Ordering::Acquire),
+            negotiated: self.inner.compression_enabled.load(Ordering::Acquire),
+        };
+
+        let negotiated = self.inner.params.get().map(|p| NegotiatedSummary {
+            dialect: p.dialect,
+            max_read_size: p.max_read_size,
+            max_write_size: p.max_write_size,
+            max_transact_size: p.max_transact_size,
+            server_guid: p.server_guid,
+            signing_required: p.signing_required,
+            capabilities: p.capabilities,
+            gmac_negotiated: p.gmac_negotiated,
+            cipher: p.cipher,
+            compression_supported: p.compression_supported,
+        });
+
+        ConnectionDiagnostics {
+            server: self.inner.server_name.clone(),
+            negotiated,
+            credits,
+            signing,
+            encryption,
+            compression,
+            rtt_estimate,
+            disconnected,
+            dfs_trees,
+            session: None, // populated by SmbClient when assembling the full tree
+            metrics: self.metrics(),
+        }
+    }
 }
 
 // `Connection`'s teardown lives on `Inner::drop`: the receiver task is
@@ -1285,6 +1546,10 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                 return;
             }
         };
+        inner
+            .metrics
+            .wire_bytes_received
+            .fetch_add(raw.len() as u64, Ordering::Relaxed);
         trace!("receiver_loop: received {} bytes", raw.len());
         trace!(
             "receiver_loop: tick, waiters={}",
@@ -1303,6 +1568,10 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             match decrypt_frame(&raw, &inner) {
                 Ok(plain) => (plain, true),
                 Err(e) => {
+                    inner
+                        .metrics
+                        .decrypt_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "receiver_loop: decrypt failed: {}; tearing down connection",
                         e
@@ -1325,6 +1594,10 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             match decompress_response(&decoded) {
                 Ok(plain) => plain,
                 Err(e) => {
+                    inner
+                        .metrics
+                        .decompress_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "receiver_loop: decompress failed: {}; tearing down connection",
                         e
@@ -1346,6 +1619,10 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
         let sub_frames = match split_compound(&decoded) {
             Ok(subs) => subs,
             Err(e) => {
+                inner
+                    .metrics
+                    .malformed_frames
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "receiver_loop: malformed frame: {}; tearing down connection",
                     e
@@ -1373,6 +1650,10 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                 Ok(SubFrameAction::Route(msg_id, result)) => routable.push((msg_id, result)),
                 Ok(SubFrameAction::Skip) => { /* oplock break / STATUS_PENDING */ }
                 Err(e) => {
+                    inner
+                        .metrics
+                        .malformed_frames
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "receiver_loop: sub-frame parse failed: {}; tearing down connection",
                         e
@@ -1396,6 +1677,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             let maybe_tx = inner.waiters.lock().unwrap().remove(&msg_id);
             match maybe_tx {
                 Some(tx) => {
+                    let was_err = result.is_err();
                     match &result {
                         Ok(frame) => debug!(
                             "recv: routed msg_id={}, status={:?}, cmd={:?}",
@@ -1404,19 +1686,45 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                         Err(e) => debug!("recv: routed error msg_id={}, err={}", msg_id.0, e),
                     }
                     if tx.send(result).is_err() {
+                        // Caller's oneshot::Receiver was dropped — typical
+                        // spawn/abort pattern. Counted distinctly from
+                        // stray frames (None branch below).
+                        inner
+                            .metrics
+                            .responses_late_after_drop
+                            .fetch_add(1, Ordering::Relaxed);
                         trace!("recv: late arrival for dropped waiter, msg_id={}", msg_id.0);
+                    } else if was_err {
+                        inner
+                            .metrics
+                            .responses_routed_err
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        inner
+                            .metrics
+                            .responses_routed_ok
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                None => match &result {
-                    Ok(frame) => debug!(
-                        "recv: orphan dropped, msg_id={}, status={:?}, cmd={:?}",
-                        msg_id.0, frame.header.status, frame.header.command
-                    ),
-                    Err(e) => debug!(
-                        "recv: orphan dropped (error) msg_id={}, err={}",
-                        msg_id.0, e
-                    ),
-                },
+                None => {
+                    // True orphan: msg_id never registered (server sent
+                    // something for an id we didn't allocate, or a
+                    // send-error cleanup raced with arrival).
+                    inner
+                        .metrics
+                        .responses_stray
+                        .fetch_add(1, Ordering::Relaxed);
+                    match &result {
+                        Ok(frame) => debug!(
+                            "recv: orphan dropped, msg_id={}, status={:?}, cmd={:?}",
+                            msg_id.0, frame.header.status, frame.header.command
+                        ),
+                        Err(e) => debug!(
+                            "recv: orphan dropped (error) msg_id={}, err={}",
+                            msg_id.0, e
+                        ),
+                    }
+                }
             }
         }
     }
@@ -1469,6 +1777,10 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
 
     // Oplock break notification: MessageId=UNSOLICITED. Skip silently.
     if header.message_id == MessageId::UNSOLICITED {
+        inner
+            .metrics
+            .unsolicited_notifications_received
+            .fetch_add(1, Ordering::Relaxed);
         debug!(
             "recv: skipping unsolicited oplock break notification, cmd={:?}",
             header.command
@@ -1478,6 +1790,10 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
 
     // STATUS_PENDING is an interim response — don't forward, keep waiter.
     if header.status.is_pending() {
+        inner
+            .metrics
+            .status_pending_loops
+            .fetch_add(1, Ordering::Relaxed);
         debug!(
             "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}",
             header.command, header.message_id.0
@@ -1507,6 +1823,10 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
                 if let Err(e) =
                     signing::verify_signature(sub, &key, algo, header.message_id.0, false)
                 {
+                    inner
+                        .metrics
+                        .signature_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "recv: sub-frame produced error for msg_id={}, reason=signature verify failed: {}",
                         header.message_id.0, e
@@ -1519,6 +1839,10 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
 
     // Special status handling: session expired → error.
     if header.status == NtStatus::NETWORK_SESSION_EXPIRED {
+        inner
+            .metrics
+            .session_expired_events
+            .fetch_add(1, Ordering::Relaxed);
         warn!(
             "recv: session expired (STATUS_NETWORK_SESSION_EXPIRED), cmd={:?}, msg_id={}",
             header.command, header.message_id.0
