@@ -1695,25 +1695,32 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                         ),
                         Err(e) => debug!("recv: routed error msg_id={}, err={}", msg_id.0, e),
                     }
+                    // Bump the routing counter BEFORE handing the response to
+                    // the caller. The caller's `await` resumes as soon as
+                    // `tx.send` lands, so a fetch_add ordered after the send
+                    // races: tests that snapshot metrics right after the
+                    // awaited call would see the increment land late. If the
+                    // send fails (caller dropped its Receiver), rebalance:
+                    // subtract from ok/err and credit `late_after_drop`. The
+                    // rebalance window is only observable to another thread
+                    // snapshotting mid-send during a caller-drop, which is
+                    // benign (eventually consistent counters by design).
+                    let counter = if was_err {
+                        &inner.metrics.responses_routed_err
+                    } else {
+                        &inner.metrics.responses_routed_ok
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
                     if tx.send(result).is_err() {
                         // Caller's oneshot::Receiver was dropped — typical
                         // spawn/abort pattern. Counted distinctly from
                         // stray frames (None branch below).
+                        counter.fetch_sub(1, Ordering::Relaxed);
                         inner
                             .metrics
                             .responses_late_after_drop
                             .fetch_add(1, Ordering::Relaxed);
                         trace!("recv: late arrival for dropped waiter, msg_id={}", msg_id.0);
-                    } else if was_err {
-                        inner
-                            .metrics
-                            .responses_routed_err
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        inner
-                            .metrics
-                            .responses_routed_ok
-                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 None => {

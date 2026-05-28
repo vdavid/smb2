@@ -685,9 +685,12 @@ mod tests {
 
         plain_mock.queue_response(echo_ok(MessageId(999_999)));
 
-        // Wait for the receiver to consume it.
+        // Poll the counter — `pending_responses() == 0` only proves the
+        // transport drained, not that the receiver finished processing the
+        // frame and bumped `responses_stray`. The latter is the actual
+        // signal we're testing.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while plain_mock.pending_responses() > 0 && std::time::Instant::now() < deadline {
+        while conn.metrics().responses_stray == 0 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
