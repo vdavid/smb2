@@ -3078,59 +3078,75 @@ mod tests {
     /// reality: responses always arrive AFTER the client sent them.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_execute_on_one_connection_all_succeed() {
-        const N: u64 = 20;
+        // Wrap the whole body in a hard timeout. This test has been
+        // observed to hang on CI runners (rare, but kills a job for hours
+        // when it does — Windows-stable on 2026-05-28, macos-1.85 on
+        // v0.10.0). Until the root cause is understood, treat a hang as
+        // an immediate test failure rather than a billed CI stall.
+        // Panics inside the future still surface normally; only true
+        // hangs trip the timeout.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            const N: u64 = 20;
 
-        let mock = Arc::new(MockTransport::new());
-        mock.enable_auto_rewrite_msg_id();
+            let mock = Arc::new(MockTransport::new());
+            mock.enable_auto_rewrite_msg_id();
 
-        let conn = Connection::from_transport(
-            Box::new(mock.clone()),
-            Box::new(mock.clone()),
-            "test-server",
-        );
+            let conn = Connection::from_transport(
+                Box::new(mock.clone()),
+                Box::new(mock.clone()),
+                "test-server",
+            );
 
-        // Spawn N tasks FIRST — they register waiters and send requests.
-        let mut handles = Vec::with_capacity(N as usize);
-        for _ in 0..N {
-            let c = conn.clone();
-            handles.push(tokio::spawn(async move {
-                c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
-                    .await
-            }));
-        }
-
-        // Wait until all N requests have been sent AND all waiters are
-        // registered. Poll `sent_count` rather than hardcode a sleep.
-        // `execute` registers the waiter BEFORE calling `sender.send`,
-        // so `sent_count >= N` implies all N waiters are live.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while mock.sent_count() < N as usize {
-            if std::time::Instant::now() > deadline {
-                panic!(
-                    "tasks did not send all {} requests in 5s (got {})",
-                    N,
-                    mock.sent_count()
-                );
+            // Spawn N tasks FIRST — they register waiters and send requests.
+            let mut handles = Vec::with_capacity(N as usize);
+            for _ in 0..N {
+                let c = conn.clone();
+                handles.push(tokio::spawn(async move {
+                    c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                        .await
+                }));
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
 
-        // Now queue responses for msg_ids 0..N. Each one routes to a
-        // registered waiter.
-        for i in 0..N {
-            mock.queue_response(build_echo_response_with_msg_id(MessageId(i)));
-        }
+            // Wait until all N requests have been sent AND all waiters are
+            // registered. Poll `sent_count` rather than hardcode a sleep.
+            // `execute` registers the waiter BEFORE calling `sender.send`,
+            // so `sent_count >= N` implies all N waiters are live.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while mock.sent_count() < N as usize {
+                if std::time::Instant::now() > deadline {
+                    panic!(
+                        "tasks did not send all {} requests in 5s (got {})",
+                        N,
+                        mock.sent_count()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
 
-        let mut got_ids: Vec<u64> = Vec::with_capacity(N as usize);
-        for h in handles {
-            let frame = h.await.unwrap().unwrap();
-            assert_eq!(frame.header.command, Command::Echo);
-            got_ids.push(frame.header.message_id.0);
-        }
-        got_ids.sort_unstable();
-        assert_eq!(got_ids, (0..N).collect::<Vec<_>>());
+            // Now queue responses for msg_ids 0..N. Each one routes to a
+            // registered waiter.
+            for i in 0..N {
+                mock.queue_response(build_echo_response_with_msg_id(MessageId(i)));
+            }
 
-        mock.assert_fully_consumed();
+            let mut got_ids: Vec<u64> = Vec::with_capacity(N as usize);
+            for h in handles {
+                let frame = h.await.unwrap().unwrap();
+                assert_eq!(frame.header.command, Command::Echo);
+                got_ids.push(frame.header.message_id.0);
+            }
+            got_ids.sort_unstable();
+            assert_eq!(got_ids, (0..N).collect::<Vec<_>>());
+
+            mock.assert_fully_consumed();
+        })
+        .await
+        .expect(
+            "concurrent_execute_on_one_connection_all_succeed exceeded 30s — \
+             likely deadlock between Connection's receiver task and the test's \
+             N spawned execute() callers. Root-cause still under investigation; \
+             this timeout exists to keep CI from stalling for hours.",
+        );
     }
 
     /// Dropping 2 of 5 execute futures before their responses arrive does
