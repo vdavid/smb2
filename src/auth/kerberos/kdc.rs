@@ -805,14 +805,43 @@ mod tests {
     #[tokio::test]
     async fn send_to_kdc_udp_too_big_falls_back_to_tcp() {
         // Set up a UDP server that returns KRB_ERR_RESPONSE_TOO_BIG
-        // and a TCP server that returns a real response.
-        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // and a TCP server that returns a real response. The fallback
+        // path uses one `KdcConfig.address`, so both servers must share
+        // a port.
+        //
+        // Bind TCP first (more restrictive) and then UDP to its port.
+        // On Windows Server, the OS port allocator can hand out an
+        // ephemeral port that's in an excluded range for the other
+        // protocol (WSAEACCES / 10013). Retry a few times if so;
+        // a fresh `:0` lottery picks a different port each attempt.
+        let (udp_server, tcp_listener) = {
+            let mut last_err: Option<std::io::Error> = None;
+            let mut bound = None;
+            for _ in 0..10 {
+                let tcp = match TcpListener::bind("127.0.0.1:0").await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+                let port = tcp.local_addr().unwrap().port();
+                match UdpSocket::bind(format!("127.0.0.1:{port}")).await {
+                    Ok(udp) => {
+                        bound = Some((udp, tcp));
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        // TCP listener drops here; try a new port.
+                    }
+                }
+            }
+            bound.unwrap_or_else(|| {
+                panic!("could not co-bind UDP+TCP on a shared loopback port in 10 attempts: {last_err:?}")
+            })
+        };
         let udp_addr = udp_server.local_addr().unwrap();
-
-        // TCP server on the same port.
-        let tcp_listener = TcpListener::bind(format!("127.0.0.1:{}", udp_addr.port()))
-            .await
-            .unwrap();
 
         let udp_task = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_MAX_SIZE];
