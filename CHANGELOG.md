@@ -7,6 +7,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-05-28
+
+### Added
+
+- **Exclusive-create file writers.** `Tree::create_file_writer_exclusive` and `SmbClient::create_file_writer_exclusive` mirror their `create_file_writer` siblings but issue the underlying CREATE with `FileCreate` disposition instead of `FileOverwriteIf`. If the file already exists the server returns `STATUS_OBJECT_NAME_COLLISION`, which maps to `ErrorKind::AlreadyExists`. Use this for race-free "create only if absent" writes (file managers' "New File" actions, ID-claim files, etc.) where silently truncating an existing file is unsafe. Pinned by `client::tree::tests::open_file_for_exclusive_create_*` and the Docker integration `guest_create_file_writer_exclusive_fails_on_existing`.
+
 ## [0.11.1] - 2026-05-28
 
 ### Changed

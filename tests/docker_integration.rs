@@ -2742,6 +2742,66 @@ async fn guest_file_writer_basic() {
 
 #[tokio::test]
 #[ignore]
+async fn guest_create_file_writer_exclusive_fails_on_existing() {
+    // Regression for the exclusive-create writer (`FileCreate` disposition):
+    // creating a name that already exists must error with
+    // `ErrorKind::AlreadyExists` instead of truncating the existing file.
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+
+    let test_path = "smb2_test_file_writer_exclusive.bin";
+    // Best-effort cleanup from a previous failed run.
+    let _ = client.delete_file(&mut tree, test_path).await;
+
+    // 1. First creation succeeds and writes "original" bytes.
+    let original = b"original payload";
+    let mut writer = client
+        .create_file_writer_exclusive(&tree, test_path)
+        .await
+        .expect("first exclusive-create must succeed");
+    writer
+        .write_chunk(original)
+        .await
+        .expect("write_chunk failed");
+    writer.finish().await.expect("finish failed");
+
+    // 2. Second exclusive-create against the same path must error.
+    match client.create_file_writer_exclusive(&tree, test_path).await {
+        Ok(_) => panic!("second exclusive-create on existing path must error, got Ok"),
+        Err(e) => assert_eq!(
+            e.kind(),
+            smb2::ErrorKind::AlreadyExists,
+            "expected AlreadyExists, got: {e}"
+        ),
+    }
+
+    // 3. The original bytes must survive untouched (no clobber).
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(
+        data, original,
+        "exclusive-create must not have truncated the existing file"
+    );
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn guest_file_writer_large() {
     let _ = env_logger::try_init();
 

@@ -591,6 +591,29 @@ pub async fn open_file_writer(
     Ok(FileWriter::new(tree, conn, file_id, max_write))
 }
 
+/// Exclusive-create sibling of [`open_file_writer`]. Opens the CREATE with
+/// `FileCreate` disposition: if the file already exists the open fails with
+/// [`crate::ErrorKind::AlreadyExists`] instead of
+/// truncating it.
+///
+/// `Tree::create_file_writer_exclusive` is the convenience wrapper most
+/// callers want.
+pub async fn open_file_writer_exclusive(
+    tree: Arc<Tree>,
+    mut conn: Connection,
+    path: &str,
+) -> Result<FileWriter> {
+    let normalized = tree.format_path(path);
+    debug!("stream: open_file_writer_exclusive path={}", normalized);
+
+    let file_id = tree
+        .open_file_for_exclusive_create(&mut conn, &normalized)
+        .await?;
+    let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+
+    Ok(FileWriter::new(tree, conn, file_id, max_write))
+}
+
 impl FileWriter {
     /// Create a new push-based streaming writer.
     ///

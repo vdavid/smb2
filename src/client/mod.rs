@@ -926,6 +926,27 @@ impl SmbClient {
         stream::open_file_writer(std::sync::Arc::new(tree.clone()), self.conn.clone(), path).await
     }
 
+    /// Exclusive-create sibling of [`create_file_writer`](Self::create_file_writer).
+    ///
+    /// Same shape, but the CREATE uses `FileCreate` disposition: if the file
+    /// already exists the open fails with
+    /// [`crate::ErrorKind::AlreadyExists`]. Use
+    /// this for race-free "create only if absent" writes — for example, a
+    /// file manager's "New File" action where silently clobbering an
+    /// existing file is unsafe.
+    pub async fn create_file_writer_exclusive(
+        &self,
+        tree: &Tree,
+        path: &str,
+    ) -> Result<stream::FileWriter> {
+        stream::open_file_writer_exclusive(
+            std::sync::Arc::new(tree.clone()),
+            self.conn.clone(),
+            path,
+        )
+        .await
+    }
+
     /// Read a file with progress reporting and cancellation.
     ///
     /// Uses pipelined I/O for performance, calling `on_progress` after each

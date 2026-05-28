@@ -2003,6 +2003,27 @@ impl Tree {
         super::stream::open_file_writer(Arc::clone(self), conn, path).await
     }
 
+    /// Open a push-based pipelined file writer with **exclusive-create**
+    /// semantics. Same shape as [`Tree::create_file_writer`], but the CREATE
+    /// uses `FileCreate` disposition: if the file already exists the open
+    /// fails with [`crate::ErrorKind::AlreadyExists`]
+    /// instead of truncating it.
+    ///
+    /// Use this when the consumer needs a race-free "create only if absent"
+    /// write — for example, a file manager's "New File" action where
+    /// silently clobbering an existing file is unsafe.
+    ///
+    /// The returned writer is `'static` and behaves identically to
+    /// `create_file_writer` from there on; chunks are pipelined over the
+    /// shared SMB session.
+    pub async fn create_file_writer_exclusive(
+        self: &Arc<Self>,
+        conn: Connection,
+        path: &str,
+    ) -> Result<super::stream::FileWriter> {
+        super::stream::open_file_writer_exclusive(Arc::clone(self), conn, path).await
+    }
+
     /// Create a directory.
     ///
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
@@ -2250,6 +2271,23 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<FileId> {
+        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOverwriteIf)
+            .await
+    }
+
+    /// Open a file for writing using a specific `CreateDisposition`.
+    ///
+    /// Shared body of [`open_file_for_write`](Self::open_file_for_write)
+    /// (`FileOverwriteIf`) and
+    /// [`open_file_for_exclusive_create`](Self::open_file_for_exclusive_create)
+    /// (`FileCreate`). Held private so the disposition stays a strict
+    /// allow-list inside the crate.
+    async fn open_file_for_write_with_disposition(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        create_disposition: CreateDisposition,
+    ) -> Result<FileId> {
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2260,7 +2298,7 @@ impl Tree {
             ),
             file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
             share_access: ShareAccess(0),
-            create_disposition: CreateDisposition::FileOverwriteIf,
+            create_disposition,
             create_options: FILE_NON_DIRECTORY_FILE,
             name: path.to_string(),
             create_contexts: vec![],
@@ -2280,6 +2318,26 @@ impl Tree {
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
         Ok(resp.file_id)
+    }
+
+    /// Open a file for writing with `FileCreate` disposition (exclusive create).
+    ///
+    /// Returns the file handle on success. When the file already exists the
+    /// server returns `STATUS_OBJECT_NAME_COLLISION`, which surfaces as
+    /// [`crate::ErrorKind::AlreadyExists`]. Used by
+    /// [`Tree::create_file_writer_exclusive`](Self::create_file_writer_exclusive)
+    /// so consumers can implement a race-free "create only if absent" file
+    /// write.
+    ///
+    /// Pairs with [`open_file_for_write`](Self::open_file_for_write), which
+    /// uses `FileOverwriteIf` (truncating).
+    pub(crate) async fn open_file_for_exclusive_create(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<FileId> {
+        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileCreate)
+            .await
     }
 
     /// Loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES.
@@ -3202,7 +3260,8 @@ mod tests {
     use super::*;
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
-        build_close_response, build_create_response, build_tree_connect_response, setup_connection,
+        build_close_response, build_create_error_response, build_create_response,
+        build_tree_connect_response, setup_connection,
     };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
@@ -4421,6 +4480,70 @@ mod tests {
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert_eq!(req.create_disposition, CreateDisposition::FileCreate);
         assert_ne!(req.create_options & FILE_DIRECTORY_FILE, 0);
+    }
+
+    // ── Exclusive-create writer open tests ────────────────────────────
+
+    #[tokio::test]
+    async fn open_file_for_exclusive_create_sends_file_create_disposition() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+        mock.queue_response(build_create_response(file_id, 0));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        tree.open_file_for_exclusive_create(&mut conn, "new.bin")
+            .await
+            .unwrap();
+
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let req = CreateRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(
+            req.create_disposition,
+            CreateDisposition::FileCreate,
+            "exclusive-create writer must use FileCreate, not FileOverwriteIf"
+        );
+        // File, not directory.
+        assert_ne!(req.create_options & FILE_NON_DIRECTORY_FILE, 0);
+    }
+
+    #[tokio::test]
+    async fn open_file_for_exclusive_create_maps_collision_to_already_exists() {
+        let mock = Arc::new(MockTransport::new());
+        // STATUS_OBJECT_NAME_COLLISION = 0xC0000035; the server response any
+        // time `FileCreate` hits an existing file.
+        mock.queue_response(build_create_error_response(NtStatus::OBJECT_NAME_COLLISION));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let err = tree
+            .open_file_for_exclusive_create(&mut conn, "existing.bin")
+            .await
+            .expect_err("exclusive-create on an existing file must error");
+        assert_eq!(
+            err.kind(),
+            crate::ErrorKind::AlreadyExists,
+            "STATUS_OBJECT_NAME_COLLISION must map to ErrorKind::AlreadyExists, got: {err}"
+        );
     }
 
     // ── Delete directory tests ───────────────────────────────────────
