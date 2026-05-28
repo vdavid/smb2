@@ -3078,75 +3078,111 @@ mod tests {
     /// reality: responses always arrive AFTER the client sent them.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_execute_on_one_connection_all_succeed() {
-        // Wrap the whole body in a hard timeout. This test has been
-        // observed to hang on CI runners (rare, but kills a job for hours
-        // when it does — Windows-stable on 2026-05-28, macos-1.85 on
-        // v0.10.0). Until the root cause is understood, treat a hang as
-        // an immediate test failure rather than a billed CI stall.
-        // Panics inside the future still surface normally; only true
-        // hangs trip the timeout.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            const N: u64 = 20;
+        const N: u64 = 20;
 
-            let mock = Arc::new(MockTransport::new());
-            mock.enable_auto_rewrite_msg_id();
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
 
-            let conn = Connection::from_transport(
-                Box::new(mock.clone()),
-                Box::new(mock.clone()),
-                "test-server",
-            );
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
 
-            // Spawn N tasks FIRST — they register waiters and send requests.
-            let mut handles = Vec::with_capacity(N as usize);
-            for _ in 0..N {
-                let c = conn.clone();
-                handles.push(tokio::spawn(async move {
-                    c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
-                        .await
-                }));
+        // Spawn into a JoinSet so a timeout-side panic can introspect
+        // which tasks haven't returned yet (`set.len()`). Plain
+        // `Vec<JoinHandle>` moves into the await loop and we lose that.
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..N {
+            let c = conn.clone();
+            set.spawn(async move {
+                c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                    .await
+            });
+        }
+
+        // Wait until all N requests have been sent AND all waiters are
+        // registered. Poll `sent_count` rather than hardcode a sleep.
+        // `execute` registers the waiter BEFORE calling `sender.send`,
+        // so `sent_count >= N` implies all N waiters are live.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < N as usize {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "tasks did not send all {} requests in 5s (got {})",
+                    N,
+                    mock.sent_count()
+                );
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
-            // Wait until all N requests have been sent AND all waiters are
-            // registered. Poll `sent_count` rather than hardcode a sleep.
-            // `execute` registers the waiter BEFORE calling `sender.send`,
-            // so `sent_count >= N` implies all N waiters are live.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while mock.sent_count() < N as usize {
-                if std::time::Instant::now() > deadline {
-                    panic!(
-                        "tasks did not send all {} requests in 5s (got {})",
-                        N,
-                        mock.sent_count()
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        // Queue N responses with msg_id=0 so auto-rewrite pairs each one
+        // with the FIFO head of `pending_sent_msg_ids` — i.e. with whatever
+        // msg_id was actually sent on the wire in that position. Hard-coding
+        // 0..N here was the original bug: the multi_thread runtime can send
+        // requests in any order, so the spawned tasks' allocated msg_ids
+        // don't line up with 0..N in send order. Auto-rewrite would then
+        // overwrite the i=0 response with FIFO[0] (say msg_id=5) and route
+        // it to waiter 5, then keep i=5's hard-coded msg_id=5 and re-route
+        // to the now-removed waiter 5 — the second arrival counted as
+        // stray, and the original waiter-5's task hung forever waiting for
+        // a response that was redirected to waiter 0 (which doesn't exist
+        // in the FIFO ordering).
+        for _ in 0..N {
+            mock.queue_response(build_echo_response_with_msg_id(MessageId(0)));
+        }
 
-            // Now queue responses for msg_ids 0..N. Each one routes to a
-            // registered waiter.
-            for i in 0..N {
-                mock.queue_response(build_echo_response_with_msg_id(MessageId(i)));
-            }
-
-            let mut got_ids: Vec<u64> = Vec::with_capacity(N as usize);
-            for h in handles {
-                let frame = h.await.unwrap().unwrap();
-                assert_eq!(frame.header.command, Command::Echo);
+        // Drain the set with a hard timeout. The test has hung on multiple
+        // CI runners (Ubuntu stable, Windows-2025 rust 1.85, macos-1.85
+        // historically). Until the root cause is understood, a hang turns
+        // into a 30 s clean failure instead of a multi-hour CI stall — and
+        // the panic dumps the smoking-gun state so the next failure has
+        // diagnostic value.
+        let mut got_ids: Vec<u64> = Vec::with_capacity(N as usize);
+        let drain = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(joined) = set.join_next().await {
+                let frame = joined.unwrap().unwrap();
                 got_ids.push(frame.header.message_id.0);
             }
-            got_ids.sort_unstable();
-            assert_eq!(got_ids, (0..N).collect::<Vec<_>>());
-
-            mock.assert_fully_consumed();
         })
-        .await
-        .expect(
-            "concurrent_execute_on_one_connection_all_succeed exceeded 30s — \
-             likely deadlock between Connection's receiver task and the test's \
-             N spawned execute() callers. Root-cause still under investigation; \
-             this timeout exists to keep CI from stalling for hours.",
-        );
+        .await;
+
+        if drain.is_err() {
+            let pending = set.len();
+            let m = conn.metrics();
+            let waiters: Vec<u64> = {
+                let g = conn.inner.waiters.lock().unwrap();
+                g.keys().map(|mid| mid.0).collect()
+            };
+            let receiver_alive = !conn.inner.disconnected.load(Ordering::Acquire);
+            set.abort_all();
+            panic!(
+                "concurrent_execute_on_one_connection_all_succeed exceeded 30 s.\n\
+                 {pending} of {N} execute() futures still pending.\n\
+                 receiver_alive={receiver_alive}\n\
+                 mock.sent_count={sent}, mock.pending_responses={pending_resps}\n\
+                 still-registered waiters (msg_ids): {waiters:?}\n\
+                 counters: requests_sent={req_sent} \
+                 responses_routed_ok={ok} responses_routed_err={err} \
+                 responses_late_after_drop={late} responses_stray={stray} \
+                 status_pending_loops={pl} unsolicited_notifications_received={uns}",
+                sent = mock.sent_count(),
+                pending_resps = mock.pending_responses(),
+                req_sent = m.requests_sent,
+                ok = m.responses_routed_ok,
+                err = m.responses_routed_err,
+                late = m.responses_late_after_drop,
+                stray = m.responses_stray,
+                pl = m.status_pending_loops,
+                uns = m.unsolicited_notifications_received,
+            );
+        }
+
+        got_ids.sort_unstable();
+        assert_eq!(got_ids, (0..N).collect::<Vec<_>>());
+
+        mock.assert_fully_consumed();
     }
 
     /// Dropping 2 of 5 execute futures before their responses arrive does
