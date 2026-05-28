@@ -1539,10 +1539,20 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
                 debug!("receiver_loop: transport error: {}, shutting down", e);
                 let count = inner.waiters.lock().unwrap().len();
                 fan_error_to_waiters(&inner, &e);
-                warn!(
-                    "receiver_loop: exiting after fan-error to {} waiters",
-                    count
-                );
+                // Idle teardown (no in-flight requests) is routine: the server
+                // or OS reaps a session that's been quiet long enough. Real
+                // disconnects with pending waiters stay at WARN because they
+                // affect callers. The decrypt / decompress / malformed-frame
+                // teardowns below stay WARN regardless of waiter count — those
+                // are protocol corruption, always worth surfacing.
+                if count == 0 {
+                    debug!("receiver_loop: idle teardown (no waiters)");
+                } else {
+                    warn!(
+                        "receiver_loop: exiting after fan-error to {} waiters",
+                        count
+                    );
+                }
                 return;
             }
         };

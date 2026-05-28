@@ -7,6 +7,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-05-28
+
+### Changed
+
+- **`receiver_loop` log levels.** Idle teardowns (transport error with no in-flight waiters — the routine "server or OS reaped a quiet session" case) drop from WARN to DEBUG. The decrypt / decompress / malformed-frame teardowns stay at WARN since those are protocol corruption regardless of how many waiters were affected, and transport teardowns *with* pending waiters also stay at WARN since they surface real disconnects to callers. No behavior change beyond log levels — cuts a meaningful amount of false-positive noise in long-running clients (cmdr was logging 6 WARNs per session on idle SMB connections).
+
 ## [0.11.0] - 2026-05-21
 
 ### Added
