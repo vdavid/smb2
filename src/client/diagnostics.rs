@@ -1015,13 +1015,17 @@ mod tests {
         // Stray frame for a msg_id no one allocated.
         mock.queue_response(echo_ok(MessageId(999_999)));
 
-        // Wait until both the late and stray frames are consumed.
+        // Poll the actual signals — `pending_responses() == 0` only proves
+        // the transport drained, not that the receiver finished bumping the
+        // counters. `responses_routed_ok` is already 1 (h1.await guarantees
+        // it after the receiver_loop fix); `late_after_drop` and
+        // `responses_stray` each tick once when their frame is processed.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while mock.pending_responses() > 0 && std::time::Instant::now() < deadline {
+        while (conn.metrics().responses_late_after_drop == 0 || conn.metrics().responses_stray == 0)
+            && std::time::Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // And the counters propagate.
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let m = conn.metrics();
         assert_eq!(m.responses_routed_ok, 1);
