@@ -7,6 +7,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-06-01
+
+### Fixed
+
+- **Share enumeration on servers that fragment the srvsvc reply.** `list_shares` (and `SmbClient::list_shares`) now reassembles a `NetShareEnum` response that the server splits across multiple DCE/RPC fragments — `PFC_LAST_FRAG` set only on the last (MS-RPCE 2.2.2.6) — and follows `STATUS_BUFFER_OVERFLOW` on pipe reads (MS-SMB2 3.3.5.10) instead of treating it as a fatal error. Previously a listing larger than one 4280-byte RPC fragment or one 64 KiB pipe read came back as an error or a truncated list against older Samba builds and some NAS firmware (many shares and/or long comments). New `parse_response_fragment` reports the last-fragment flag; the read loop stitches fragments before NDR-decoding. Pinned by unit tests on both seams plus the `smb-manyshares` Docker fixture (200 long-comment shares — real Samba fragments the reply into 26 RPC fragments, all reassembled).
+
 ## [0.11.2] - 2026-05-28
 
 ### Added
