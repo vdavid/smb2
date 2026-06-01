@@ -116,7 +116,7 @@ async fn rpc_bind_and_request(
     debug!("shares: sent RPC BIND ({} bytes)", bind_data.len());
 
     // 4. Read RPC BIND_ACK
-    let bind_ack_data = read_pipe(conn, tree_id, file_id).await?;
+    let bind_ack_data = read_pipe_message(conn, tree_id, file_id).await?;
     rpc::parse_bind_ack(&bind_ack_data)?;
     debug!("shares: received BIND_ACK, context accepted");
 
@@ -129,10 +129,26 @@ async fn rpc_bind_and_request(
         request_data.len()
     );
 
-    // 6. Read RPC RESPONSE
-    let response_data = read_pipe(conn, tree_id, file_id).await?;
-    let shares = srvsvc::parse_net_share_enum_all_response(&response_data)?;
-    debug!("shares: received {} shares in response", shares.len());
+    // 6. Read RPC RESPONSE, reassembling DCE/RPC fragments (MS-RPCE 2.2.2.6).
+    // A large NetShareEnum reply may arrive as several fragment PDUs, each its
+    // own pipe message, with PFC_LAST_FRAG set only on the last.
+    let mut stub = Vec::new();
+    let mut fragments = 0;
+    loop {
+        let pdu = read_pipe_message(conn, tree_id, file_id).await?;
+        let (frag_stub, is_last) = rpc::parse_response_fragment(&pdu)?;
+        stub.extend_from_slice(frag_stub);
+        fragments += 1;
+        if is_last {
+            break;
+        }
+    }
+    let shares = srvsvc::parse_net_share_enum_all_stub(&stub)?;
+    debug!(
+        "shares: received {} shares in response ({} RPC fragment(s))",
+        shares.len(),
+        fragments
+    );
 
     Ok(shares)
 }
@@ -203,33 +219,64 @@ async fn write_pipe(
     Ok(())
 }
 
-/// Read data from the pipe.
-async fn read_pipe(conn: &mut Connection, tree_id: TreeId, file_id: FileId) -> Result<Vec<u8>> {
-    let req = ReadRequest {
-        padding: 0x50,
-        flags: 0,
-        length: PIPE_READ_BUFFER_SIZE,
-        offset: 0,
-        file_id,
-        minimum_count: 0,
-        channel: SMB2_CHANNEL_NONE,
-        remaining_bytes: 0,
-        read_channel_info: vec![],
-    };
+/// Read one complete pipe message, following `STATUS_BUFFER_OVERFLOW`.
+///
+/// A pipe message larger than our read buffer comes back as one or more
+/// `STATUS_BUFFER_OVERFLOW` reads carrying partial data, terminated by a
+/// `STATUS_SUCCESS` read with the remainder (MS-SMB2 3.3.5.10). We append each
+/// chunk until a `SUCCESS` read completes the message.
+async fn read_pipe_message(
+    conn: &mut Connection,
+    tree_id: TreeId,
+    file_id: FileId,
+) -> Result<Vec<u8>> {
+    let mut message = Vec::new();
 
-    let frame = conn.execute(Command::Read, &req, Some(tree_id)).await?;
+    loop {
+        let req = ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length: PIPE_READ_BUFFER_SIZE,
+            offset: 0,
+            file_id,
+            minimum_count: 0,
+            channel: SMB2_CHANNEL_NONE,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
 
-    if frame.header.status != NtStatus::SUCCESS {
-        return Err(Error::Protocol {
-            status: frame.header.status,
-            command: Command::Read,
-        });
+        let frame = conn.execute(Command::Read, &req, Some(tree_id)).await?;
+
+        let status = frame.header.status;
+        // BUFFER_OVERFLOW is a warning meaning "partial data, read again", not a
+        // failure -- accept it alongside SUCCESS.
+        if !status.is_success_or_partial() {
+            return Err(Error::Protocol {
+                status,
+                command: Command::Read,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&frame.body);
+        let resp = ReadResponse::unpack(&mut cursor)?;
+        let chunk_len = resp.data.len();
+        message.extend_from_slice(&resp.data);
+
+        // SUCCESS completes the message; BUFFER_OVERFLOW means read more.
+        if status != NtStatus::BUFFER_OVERFLOW {
+            break;
+        }
+        // Guard against a server that signals overflow but sends no data, which
+        // would otherwise spin forever.
+        if chunk_len == 0 {
+            return Err(Error::invalid_data(
+                "pipe read returned BUFFER_OVERFLOW with no data",
+            ));
+        }
     }
 
-    let mut cursor = ReadCursor::new(&frame.body);
-    let resp = ReadResponse::unpack(&mut cursor)?;
-    debug!("shares: read {} bytes from pipe", resp.data.len());
-    Ok(resp.data)
+    debug!("shares: read {} bytes from pipe", message.len());
+    Ok(message)
 }
 
 /// Close a file handle.
@@ -301,9 +348,18 @@ pub(crate) mod tests {
     }
 
     fn build_read_response(data: Vec<u8>) -> Vec<u8> {
+        build_read_response_with_status(data, NtStatus::SUCCESS)
+    }
+
+    /// Build a READ response with an explicit NTSTATUS.
+    ///
+    /// Pipe reads use `STATUS_BUFFER_OVERFLOW` to mean "this read returned a
+    /// partial message; read again for the rest."
+    fn build_read_response_with_status(data: Vec<u8>, status: NtStatus) -> Vec<u8> {
         let mut h = Header::new_request(Command::Read);
         h.flags.set_response();
         h.credits = 32;
+        h.status = status;
 
         let body = ReadResp {
             data_offset: 0x50,
@@ -369,8 +425,8 @@ pub(crate) mod tests {
         w.into_inner()
     }
 
-    /// Build a canned RPC RESPONSE with NetShareEnumAll data.
-    fn build_share_enum_response(shares: &[(&str, u32, &str)]) -> Vec<u8> {
+    /// Build the NDR stub for a NetShareEnumAll RESPONSE (no RPC envelope).
+    fn build_share_enum_stub(shares: &[(&str, u32, &str)]) -> Vec<u8> {
         use crate::pack::WriteCursor;
 
         // Build NDR stub
@@ -415,30 +471,43 @@ pub(crate) mod tests {
             w.write_u32_le(0); // return value
         }
 
-        let stub = w.into_inner();
+        w.into_inner()
+    }
 
-        // Wrap in RPC RESPONSE envelope
-        let mut w2 = WriteCursor::with_capacity(24 + stub.len());
-        w2.write_u8(5);
-        w2.write_u8(0);
-        w2.write_u8(2); // RESPONSE
-        w2.write_u8(0x03);
-        w2.write_bytes(&[0x10, 0x00, 0x00, 0x00]);
-        let frag_len_pos = w2.position();
-        w2.write_u16_le(0);
-        w2.write_u16_le(0);
-        w2.write_u32_le(2); // call id
+    /// Wrap NDR stub bytes in an RPC RESPONSE PDU with the given PFC flags.
+    ///
+    /// `pfc_flags` lets a caller emit a fragment (for example, `PFC_FIRST_FRAG`
+    /// alone for a non-final fragment) instead of the usual `FIRST | LAST`.
+    fn wrap_rpc_response_pdu(stub_chunk: &[u8], pfc_flags: u8) -> Vec<u8> {
+        use crate::pack::WriteCursor;
 
-        w2.write_u32_le(stub.len() as u32); // alloc hint
-        w2.write_u16_le(0); // context id
-        w2.write_u8(0); // cancel count
-        w2.write_u8(0); // reserved
+        let mut w = WriteCursor::with_capacity(24 + stub_chunk.len());
+        w.write_u8(5);
+        w.write_u8(0);
+        w.write_u8(2); // RESPONSE
+        w.write_u8(pfc_flags);
+        w.write_bytes(&[0x10, 0x00, 0x00, 0x00]);
+        let frag_len_pos = w.position();
+        w.write_u16_le(0);
+        w.write_u16_le(0);
+        w.write_u32_le(2); // call id
 
-        w2.write_bytes(&stub);
+        w.write_u32_le(stub_chunk.len() as u32); // alloc hint
+        w.write_u16_le(0); // context id
+        w.write_u8(0); // cancel count
+        w.write_u8(0); // reserved
 
-        let total_len = w2.position();
-        w2.set_u16_le_at(frag_len_pos, total_len as u16);
-        w2.into_inner()
+        w.write_bytes(stub_chunk);
+
+        let total_len = w.position();
+        w.set_u16_le_at(frag_len_pos, total_len as u16);
+        w.into_inner()
+    }
+
+    /// Build a canned single-fragment RPC RESPONSE with NetShareEnumAll data.
+    fn build_share_enum_response(shares: &[(&str, u32, &str)]) -> Vec<u8> {
+        // 0x03 = PFC_FIRST_FRAG | PFC_LAST_FRAG (a complete, single-fragment PDU).
+        wrap_rpc_response_pdu(&build_share_enum_stub(shares), 0x03)
     }
 
     fn write_ndr_string(w: &mut crate::pack::WriteCursor, s: &str) {
@@ -480,6 +549,110 @@ pub(crate) mod tests {
         mock.queue_response(build_close_response());
         // 8. TREE_DISCONNECT response
         mock.queue_response(build_tree_disconnect_response());
+    }
+
+    /// Like `queue_share_listing_responses`, but the server splits a single
+    /// RPC RESPONSE PDU across two pipe reads: the first read returns
+    /// `STATUS_BUFFER_OVERFLOW` with the leading bytes, the second returns
+    /// `SUCCESS` with the rest. The client must stitch them before parsing.
+    fn queue_overflow_share_listing_responses(mock: &MockTransport, shares: &[(&str, u32, &str)]) {
+        let tree_id = TreeId(42);
+        let file_id = FileId {
+            persistent: 0xAAAA,
+            volatile: 0xBBBB,
+        };
+
+        let pdu = build_share_enum_response(shares);
+        let split = pdu.len() / 2;
+        let (first, rest) = pdu.split_at(split);
+
+        mock.queue_response(build_tree_connect_response(tree_id, ShareType::Pipe));
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(72));
+        mock.queue_response(build_read_response(build_bind_ack()));
+        mock.queue_response(build_write_response(100));
+        // The response PDU arrives in two chunks: overflow then success.
+        mock.queue_response(build_read_response_with_status(
+            first.to_vec(),
+            NtStatus::BUFFER_OVERFLOW,
+        ));
+        mock.queue_response(build_read_response_with_status(
+            rest.to_vec(),
+            NtStatus::SUCCESS,
+        ));
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_tree_disconnect_response());
+    }
+
+    /// Like `queue_share_listing_responses`, but the RPC RESPONSE is split into
+    /// two DCE/RPC fragments (each its own pipe message): the first carries
+    /// `PFC_FIRST_FRAG`, the second `PFC_LAST_FRAG`. The client must reassemble
+    /// the stub across fragments before parsing.
+    fn queue_fragmented_share_listing_responses(
+        mock: &MockTransport,
+        shares: &[(&str, u32, &str)],
+    ) {
+        let tree_id = TreeId(42);
+        let file_id = FileId {
+            persistent: 0xAAAA,
+            volatile: 0xBBBB,
+        };
+
+        let stub = build_share_enum_stub(shares);
+        let split = stub.len() / 2;
+        let (first, rest) = stub.split_at(split);
+        let frag1 = wrap_rpc_response_pdu(first, 0x01); // PFC_FIRST_FRAG only
+        let frag2 = wrap_rpc_response_pdu(rest, 0x02); // PFC_LAST_FRAG only
+
+        mock.queue_response(build_tree_connect_response(tree_id, ShareType::Pipe));
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(72));
+        mock.queue_response(build_read_response(build_bind_ack()));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_read_response(frag1));
+        mock.queue_response(build_read_response(frag2));
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_tree_disconnect_response());
+    }
+
+    #[tokio::test]
+    async fn list_shares_reassembles_buffer_overflow_reads() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        queue_overflow_share_listing_responses(
+            &mock,
+            &[
+                ("Documents", STYPE_DISKTREE, "Shared docs"),
+                ("Photos", STYPE_DISKTREE, "Family photos"),
+            ],
+        );
+
+        let shares = list_shares(&mut conn).await.unwrap();
+
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].name, "Documents");
+        assert_eq!(shares[1].name, "Photos");
+    }
+
+    #[tokio::test]
+    async fn list_shares_reassembles_rpc_fragments() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        queue_fragmented_share_listing_responses(
+            &mock,
+            &[
+                ("Documents", STYPE_DISKTREE, "Shared docs"),
+                ("Photos", STYPE_DISKTREE, "Family photos"),
+            ],
+        );
+
+        let shares = list_shares(&mut conn).await.unwrap();
+
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].name, "Documents");
+        assert_eq!(shares[1].name, "Photos");
     }
 
     #[tokio::test]

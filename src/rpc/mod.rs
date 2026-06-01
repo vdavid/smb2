@@ -226,11 +226,14 @@ pub fn build_request(call_id: u32, opnum: u16, stub_data: &[u8]) -> Vec<u8> {
     w.into_inner()
 }
 
-/// Parse an RPC RESPONSE PDU, returning the stub data.
+/// Parse a single RPC RESPONSE PDU, returning its stub data and whether it is
+/// the final fragment (`PFC_LAST_FRAG` set).
 ///
-/// Validates the PDU header and extracts the embedded stub data for
-/// further NDR decoding.
-pub fn parse_response(data: &[u8]) -> Result<&[u8]> {
+/// DCE/RPC servers may split a large response across several fragment PDUs,
+/// clearing `PFC_LAST_FRAG` on every fragment but the last (MS-RPCE 2.2.2.6).
+/// Callers reassemble by concatenating each fragment's stub until `is_last` is
+/// `true`. See `client::shares` for the read-and-reassemble loop.
+pub fn parse_response_fragment(data: &[u8]) -> Result<(&[u8], bool)> {
     let mut r = ReadCursor::new(data);
 
     // Common header
@@ -249,9 +252,9 @@ pub fn parse_response(data: &[u8]) -> Result<&[u8]> {
         )));
     }
 
-    let _flags = r.read_u8()?;
+    let flags = r.read_u8()?;
     let _data_rep = r.read_bytes(4)?;
-    let frag_length = r.read_u16_le()?;
+    let frag_length = r.read_u16_le()? as usize;
     let _auth_length = r.read_u16_le()?;
     let _call_id = r.read_u32_le()?;
 
@@ -261,11 +264,26 @@ pub fn parse_response(data: &[u8]) -> Result<&[u8]> {
     let _cancel_count = r.read_u8()?;
     let _reserved = r.read_u8()?;
 
-    // Stub data is the rest (up to frag_length)
-    let stub_len = frag_length as usize - r.position();
-    let stub_data = r.read_bytes(stub_len)?;
+    // Stub data is the rest (up to frag_length).
+    let header_consumed = r.position();
+    if frag_length < header_consumed {
+        return Err(Error::invalid_data(format!(
+            "RPC frag_length {frag_length} shorter than header {header_consumed}"
+        )));
+    }
+    let stub_data = r.read_bytes(frag_length - header_consumed)?;
 
-    Ok(stub_data)
+    let is_last = flags & PFC_LAST_FRAG != 0;
+    Ok((stub_data, is_last))
+}
+
+/// Parse an RPC RESPONSE PDU, returning the stub data.
+///
+/// Validates the PDU header and extracts the embedded stub data for
+/// further NDR decoding. Assumes a single, complete fragment; for fragmented
+/// responses use [`parse_response_fragment`] and reassemble.
+pub fn parse_response(data: &[u8]) -> Result<&[u8]> {
+    parse_response_fragment(data).map(|(stub, _is_last)| stub)
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +441,31 @@ mod tests {
     fn parse_response_wrong_version() {
         let mut pdu = build_test_response(1, b"data");
         pdu[0] = 4; // wrong version
+        assert!(parse_response(&pdu).is_err());
+    }
+
+    #[test]
+    fn parse_response_fragment_reports_last_flag() {
+        // build_test_response sets PFC_FIRST_FRAG | PFC_LAST_FRAG.
+        let pdu = build_test_response(1, b"stub");
+        let (stub, is_last) = parse_response_fragment(&pdu).unwrap();
+        assert_eq!(stub, b"stub");
+        assert!(is_last, "FIRST|LAST PDU should be the last fragment");
+
+        // Clear PFC_LAST_FRAG in the flags byte: now it's a non-final fragment.
+        let mut frag = pdu.clone();
+        frag[3] &= !PFC_LAST_FRAG;
+        let (stub, is_last) = parse_response_fragment(&frag).unwrap();
+        assert_eq!(stub, b"stub");
+        assert!(!is_last, "FIRST-only PDU should not be the last fragment");
+    }
+
+    #[test]
+    fn parse_response_rejects_frag_length_shorter_than_header() {
+        let mut pdu = build_test_response(1, b"data");
+        // FragLength lives at offset 8 (u16 LE); set it below the 24-byte header.
+        pdu[8] = 4;
+        pdu[9] = 0;
         assert!(parse_response(&pdu).is_err());
     }
 

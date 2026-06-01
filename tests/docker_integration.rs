@@ -22,6 +22,7 @@ const FLAKY_ADDR: &str = "127.0.0.1:10450";
 const SLOW_ADDR: &str = "127.0.0.1:10451";
 const ENCRYPTION_ADDR: &str = "127.0.0.1:10452";
 const SHARES50_ADDR: &str = "127.0.0.1:10453";
+const MANYSHARES_ADDR: &str = "127.0.0.1:10458";
 const MAXREAD_ADDR: &str = "127.0.0.1:10454";
 const ENCRYPTION_AES128_ADDR: &str = "127.0.0.1:10455";
 const DFS_ROOT_ADDR: &str = "127.0.0.1:10456";
@@ -1672,6 +1673,60 @@ async fn shares50_list_all() {
     // Verify naming pattern.
     assert!(user_shares.iter().any(|s| s.name == "share_01"));
     assert!(user_shares.iter().any(|s| s.name == "share_50"));
+}
+
+// ── Many-share server (smb-manyshares) ───────────────────────────────
+//
+// smb-manyshares serves 200 shares with long comments, so the srvsvc
+// NetShareEnum reply is ~90 KiB -- well past one 64 KiB pipe read. Getting all
+// 200 back proves the client reassembled a response that arrived as multiple
+// DCE/RPC fragments (or chunked STATUS_BUFFER_OVERFLOW reads). The old
+// single-read / single-fragment code fails this either way: it would parse only
+// the first ~4280-byte fragment (truncated) or error on the first overflow read.
+// smb-50shares can't catch this -- its reply fits in one fragment.
+
+#[tokio::test]
+#[ignore]
+async fn manyshares_list_all_spans_multiple_fragments() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(MANYSHARES_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("session setup failed");
+
+    let shares = list_shares(&mut conn).await.expect("list_shares failed");
+
+    let user_shares: Vec<_> = shares.iter().filter(|s| !s.name.ends_with('$')).collect();
+
+    assert_eq!(
+        user_shares.len(),
+        200,
+        "expected 200 user shares, got {} (total including admin: {})",
+        user_shares.len(),
+        shares.len()
+    );
+
+    // First and last shares present -> nothing dropped at the fragment seams.
+    assert!(user_shares.iter().any(|s| s.name == "share_001"));
+    assert!(user_shares.iter().any(|s| s.name == "share_200"));
+
+    // The long comment must survive reassembly intact (it straddles fragment
+    // boundaries), so a truncated/misjoined stub would corrupt or drop it.
+    let sample = user_shares
+        .iter()
+        .find(|s| s.name == "share_100")
+        .expect("share_100 missing");
+    assert!(
+        sample
+            .comment
+            .starts_with("This is a deliberately long share comment"),
+        "comment came back corrupted/truncated: {:?}",
+        sample.comment
+    );
 }
 
 #[tokio::test]

@@ -216,6 +216,7 @@ discover a new pitfall that involves 2+ modules, add it to this list.
     loop.
 12. **NTLM MIC** ✅ -- Computed when MsvAvTimestamp present, using retained raw bytes. See `auth/ntlm.rs`.
 13. **Server may split compound responses** ✅ -- MS-SMB2 3.3.4.1.3: the server SHOULD compound responses but MAY send them as separate frames (Samba/QNAP do this in some cases). Compound-using methods call `Connection::receive_compound_expected(n)`, which gathers additional frames transparently. See `connection.rs` + `tree.rs`.
+14. **Share-enum responses split two ways** ✅ -- A srvsvc `NetShareEnum` reply can arrive as multiple DCE/RPC fragments (MS-RPCE 2.2.2.6, `PFC_LAST_FRAG` only on the last) and/or as `STATUS_BUFFER_OVERFLOW` pipe reads (MS-SMB2 3.3.5.10) when it exceeds one read buffer. `client::shares::read_pipe_message` follows the overflow chain; `rpc_bind_and_request` loops `rpc::parse_response_fragment` until the last fragment, then NDR-decodes the joined stub. Treating either as a hard error (the old behavior) truncated or failed listings on servers that chunk large replies. Spans `rpc/` + `client/shares.rs`.
 
 ## Testing
 
@@ -229,7 +230,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 
 ### Docker test containers
 
-13 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+14 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
@@ -242,6 +243,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 | smb-slow              | 10451 | 200ms latency, pipelining under delay         |
 | smb-encryption        | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1) |
 | smb-50shares          | 10453 | 50 shares, RPC enumeration at scale           |
+| smb-manyshares        | 10458 | 200 long-comment shares, multi-fragment srvsvc reassembly |
 | smb-maxreadsize       | 10454 | 64 KB max read/write, chunking edge cases     |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
 | smb-dfs-root          | 10456 | DFS namespace root with msdfs link            |

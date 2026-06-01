@@ -37,7 +37,7 @@ Connect to the real NAS, send a NegotiateRequest, capture the server's raw respo
 
 ## Docker integration tests (`tests/docker_integration.rs`)
 
-Tests against 13 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR. See `docs/specs/docker-test-infrastructure.md` for the full plan.
+Tests against 14 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR. See `docs/specs/docker-test-infrastructure.md` for the full plan.
 
 Containers live in `tests/docker/internal/`.
 
@@ -65,7 +65,8 @@ cargo test --test docker_integration -- --ignored   # repeat (~8s)
 | smb-flaky | 10450 | 5s up / 5s down: connect during up, get clean error when down |
 | smb-slow | 10451 | 200ms latency: operations still work, pipelining under delay |
 | smb-encryption | 10452 | Mandatory encryption (AES-128-GCM, SMB 3.1.1): write/read, pipelined, streamed write, share listing |
-| smb-50shares | 10453 | 50 shares: RPC enumeration returns all 50 |
+| smb-50shares | 10453 | 50 shares: RPC enumeration returns all 50 (single fragment) |
+| smb-manyshares | 10458 | 200 long-comment shares (~90 KiB reply): multi-fragment / overflow srvsvc reassembly |
 | smb-maxreadsize | 10454 | 64 KB max read/write: pipelined 512 KB, streamed write, streaming download chunk count |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2): different cipher family |
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target |

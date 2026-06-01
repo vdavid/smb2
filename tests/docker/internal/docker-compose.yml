@@ -61,6 +61,12 @@ services:
     ports:
       - "10453:445"
 
+  smb-manyshares:
+    build:
+      context: smb-manyshares
+    ports:
+      - "10458:445"
+
   smb-maxreadsize:
     build:
       context: smb-maxreadsize

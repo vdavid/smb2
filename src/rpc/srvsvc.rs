@@ -107,7 +107,10 @@ pub fn parse_net_share_enum_all_response(data: &[u8]) -> Result<Vec<ShareInfo>> 
 }
 
 /// Parse the NDR stub data directly (without the RPC envelope).
-fn parse_net_share_enum_all_stub(stub: &[u8]) -> Result<Vec<ShareInfo>> {
+///
+/// Used by the share-enumeration reassembly path, which concatenates the stub
+/// of each RPC fragment before decoding.
+pub(crate) fn parse_net_share_enum_all_stub(stub: &[u8]) -> Result<Vec<ShareInfo>> {
     let mut r = ReadCursor::new(stub);
 
     // Level (u32) -- should be 1
