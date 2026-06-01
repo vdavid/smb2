@@ -24,6 +24,11 @@ exclude = [
     "clippy.toml",
     "rustfmt.toml",
     "related-repos/",
+    # tests/ is dev-only: integration tests + Docker fixtures for smb2's own
+    # suite. Fixtures the published crate embeds (the `testing` feature's
+    # consumer Docker files, the ccache test vectors) live under src/, so
+    # excluding tests/ wholesale ships nothing the crate needs.
+    "tests/",
 ]
 
 [package.metadata.docs.rs]

@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn parse_v4_ccache_from_fixture() {
-        let data = include_bytes!("../../../tests/fixtures/test.ccache");
+        let data = include_bytes!("fixtures/test.ccache");
         let ccache = parse_ccache(data).expect("failed to parse v4 ccache");
 
         assert_eq!(ccache.version, 0x0504);
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn parse_v3_ccache_from_fixture() {
-        let data = include_bytes!("../../../tests/fixtures/test_v3.ccache");
+        let data = include_bytes!("fixtures/test_v3.ccache");
         let ccache = parse_ccache(data).expect("failed to parse v3 ccache");
 
         assert_eq!(ccache.version, 0x0503);
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn tgt_credential_has_correct_fields() {
-        let data = include_bytes!("../../../tests/fixtures/test.ccache");
+        let data = include_bytes!("fixtures/test.ccache");
         let ccache = parse_ccache(data).unwrap();
 
         let tgt = &ccache.credentials[0];
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn service_ticket_has_correct_fields() {
-        let data = include_bytes!("../../../tests/fixtures/test.ccache");
+        let data = include_bytes!("fixtures/test.ccache");
         let ccache = parse_ccache(data).unwrap();
 
         let svc = &ccache.credentials[1];
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn find_tgt_by_realm() {
-        let data = include_bytes!("../../../tests/fixtures/test.ccache");
+        let data = include_bytes!("fixtures/test.ccache");
         let ccache = parse_ccache(data).unwrap();
 
         let tgt = ccache.find_tgt("TEST.LOCAL");
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn find_service_ticket_by_spn() {
-        let data = include_bytes!("../../../tests/fixtures/test.ccache");
+        let data = include_bytes!("fixtures/test.ccache");
         let ccache = parse_ccache(data).unwrap();
 
         let svc = ccache.find_service_ticket("cifs", "server.test.local", "TEST.LOCAL");
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn find_tgt_case_insensitive() {
-        let data = include_bytes!("../../../tests/fixtures/test.ccache");
+        let data = include_bytes!("fixtures/test.ccache");
         let ccache = parse_ccache(data).unwrap();
 
         assert!(ccache.find_tgt("test.local").is_some());
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn v3_ccache_tgt_has_aes256_key() {
-        let data = include_bytes!("../../../tests/fixtures/test_v3.ccache");
+        let data = include_bytes!("fixtures/test_v3.ccache");
         let ccache = parse_ccache(data).unwrap();
 
         let tgt = ccache.find_tgt("EXAMPLE.COM").unwrap();

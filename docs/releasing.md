@@ -9,8 +9,12 @@ How to release a new version of smb2. Publishing is manual — no CI automation.
 - Docker running locally (the Docker integration suites are part of the pre-release gate)
 - Optional: a NAS + Pi reachable via the credentials in `.env` for `just check-live` against real hardware
 
-The `exclude` list in `Cargo.toml` keeps the published package small — it strips `.github/`, `docs/`, `tests/docker/`,
-`fuzz/`, the `justfile`, and similar dev-only paths. Re-check it if you've added a new top-level dir that shouldn't ship.
+The `exclude` list in `Cargo.toml` keeps the published package small — it strips `.github/`, `AGENTS.md`, `docs/`,
+`tests/`, the `justfile`, and the lint configs (`fuzz/` and `benchmarks/` are auto-excluded by Cargo as nested
+packages). Fixtures the published crate embeds — the `testing` feature's consumer Docker files and the ccache test
+vectors — live under `src/` (`src/testing/fixtures/`, `src/auth/kerberos/fixtures/`), so excluding `tests/` wholesale
+ships nothing the crate needs. Re-check the list if you've added a new top-level dir that shouldn't ship, or a new
+`include_str!`/`include_bytes!` that reaches outside `src/`.
 
 ## Steps
 

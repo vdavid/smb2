@@ -208,105 +208,83 @@ pub fn maxreadsize_port() -> u16 {
 // ── Embedded files ──────────────────────────────────────────────────────
 
 // docker-compose.yml
-const COMPOSE_YML: &str = include_str!("../../tests/docker/consumer/docker-compose.yml");
+const COMPOSE_YML: &str = include_str!("fixtures/consumer/docker-compose.yml");
 
 // smb-consumer-guest
-const GUEST_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-guest/Dockerfile");
-const GUEST_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-guest/smb.conf");
+const GUEST_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-guest/Dockerfile");
+const GUEST_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-guest/smb.conf");
 
 // smb-consumer-auth
-const AUTH_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-auth/Dockerfile");
-const AUTH_SMB_CONF: &str = include_str!("../../tests/docker/consumer/smb-consumer-auth/smb.conf");
+const AUTH_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-auth/Dockerfile");
+const AUTH_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-auth/smb.conf");
 
 // smb-consumer-both
-const BOTH_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-both/Dockerfile");
-const BOTH_SMB_CONF: &str = include_str!("../../tests/docker/consumer/smb-consumer-both/smb.conf");
+const BOTH_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-both/Dockerfile");
+const BOTH_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-both/smb.conf");
 
 // smb-consumer-50shares
 const SHARES50_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-50shares/Dockerfile");
-const SHARES50_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-50shares/smb.conf");
+    include_str!("fixtures/consumer/smb-consumer-50shares/Dockerfile");
+const SHARES50_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-50shares/smb.conf");
 const SHARES50_GENERATE_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-50shares/generate-conf.sh");
+    include_str!("fixtures/consumer/smb-consumer-50shares/generate-conf.sh");
 
 // smb-consumer-unicode
-const UNICODE_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-unicode/Dockerfile");
-const UNICODE_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-unicode/smb.conf");
-const UNICODE_POPULATE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-unicode/populate.sh");
+const UNICODE_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-unicode/Dockerfile");
+const UNICODE_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-unicode/smb.conf");
+const UNICODE_POPULATE: &str = include_str!("fixtures/consumer/smb-consumer-unicode/populate.sh");
 
 // smb-consumer-longnames
 const LONGNAMES_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-longnames/Dockerfile");
-const LONGNAMES_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-longnames/smb.conf");
+    include_str!("fixtures/consumer/smb-consumer-longnames/Dockerfile");
+const LONGNAMES_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-longnames/smb.conf");
 const LONGNAMES_POPULATE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-longnames/populate.sh");
+    include_str!("fixtures/consumer/smb-consumer-longnames/populate.sh");
 
 // smb-consumer-deepnest
 const DEEPNEST_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-deepnest/Dockerfile");
-const DEEPNEST_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-deepnest/smb.conf");
-const DEEPNEST_POPULATE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-deepnest/populate.sh");
+    include_str!("fixtures/consumer/smb-consumer-deepnest/Dockerfile");
+const DEEPNEST_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-deepnest/smb.conf");
+const DEEPNEST_POPULATE: &str = include_str!("fixtures/consumer/smb-consumer-deepnest/populate.sh");
 
 // smb-consumer-manyfiles
 const MANYFILES_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-manyfiles/Dockerfile");
-const MANYFILES_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-manyfiles/smb.conf");
+    include_str!("fixtures/consumer/smb-consumer-manyfiles/Dockerfile");
+const MANYFILES_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-manyfiles/smb.conf");
 
 // smb-consumer-readonly
 const READONLY_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-readonly/Dockerfile");
-const READONLY_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-readonly/smb.conf");
+    include_str!("fixtures/consumer/smb-consumer-readonly/Dockerfile");
+const READONLY_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-readonly/smb.conf");
 
 // smb-consumer-windows
-const WINDOWS_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-windows/Dockerfile");
-const WINDOWS_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-windows/smb.conf");
+const WINDOWS_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-windows/Dockerfile");
+const WINDOWS_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-windows/smb.conf");
 
 // smb-consumer-synology
 const SYNOLOGY_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-synology/Dockerfile");
-const SYNOLOGY_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-synology/smb.conf");
+    include_str!("fixtures/consumer/smb-consumer-synology/Dockerfile");
+const SYNOLOGY_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-synology/smb.conf");
 
 // smb-consumer-linux
-const LINUX_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-linux/Dockerfile");
-const LINUX_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-linux/smb.conf");
+const LINUX_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-linux/Dockerfile");
+const LINUX_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-linux/smb.conf");
 
 // smb-consumer-flaky
-const FLAKY_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-flaky/Dockerfile");
-const FLAKY_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-flaky/smb.conf");
-const FLAKY_CYCLE: &str = include_str!("../../tests/docker/consumer/smb-consumer-flaky/cycle.sh");
+const FLAKY_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-flaky/Dockerfile");
+const FLAKY_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-flaky/smb.conf");
+const FLAKY_CYCLE: &str = include_str!("fixtures/consumer/smb-consumer-flaky/cycle.sh");
 
 // smb-consumer-slow
-const SLOW_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-slow/Dockerfile");
-const SLOW_SMB_CONF: &str = include_str!("../../tests/docker/consumer/smb-consumer-slow/smb.conf");
-const SLOW_ENTRYPOINT: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-slow/entrypoint.sh");
+const SLOW_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-slow/Dockerfile");
+const SLOW_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-slow/smb.conf");
+const SLOW_ENTRYPOINT: &str = include_str!("fixtures/consumer/smb-consumer-slow/entrypoint.sh");
 
 // smb-consumer-maxreadsize
 const MAXREADSIZE_DOCKERFILE: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-maxreadsize/Dockerfile");
+    include_str!("fixtures/consumer/smb-consumer-maxreadsize/Dockerfile");
 const MAXREADSIZE_SMB_CONF: &str =
-    include_str!("../../tests/docker/consumer/smb-consumer-maxreadsize/smb.conf");
+    include_str!("fixtures/consumer/smb-consumer-maxreadsize/smb.conf");
 
 // ── Embedded file manifest ──────────────────────────────────────────────
 

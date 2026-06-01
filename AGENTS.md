@@ -78,6 +78,7 @@ src/
 
   testing/                # Consumer test harness (feature-gated: `testing`)
     mod.rs                # TestServers API, embedded Docker infrastructure
+    fixtures/consumer/    # Consumer Docker fixtures, embedded via include_str! (shipped in the crate)
     CLAUDE.md
 
   fuzzing.rs              # Parse entry points exposed under the `fuzzing` feature (used by `fuzz/`)
@@ -100,8 +101,8 @@ tests/
   integration.rs          # Tests against real NAS/Pi (#[ignore])
   docker_integration.rs   # Tests against Docker Samba containers (#[ignore])
   consumer_integration.rs # Tests against consumer Docker containers (#[ignore])
-  docker/                 # Docker infrastructure (Dockerfiles, compose, scripts)
-    consumer/             # Consumer test harness containers (15 containers)
+  docker/                 # Docker infrastructure for smb2's own integration tests
+    internal/             # Internal-suite containers (consumer fixtures live in src/testing/fixtures/)
 
 examples/
   list_shares.rs          # Connect and enumerate shares
@@ -251,7 +252,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 
 ### Consumer test containers
 
-14 Samba containers in `tests/docker/consumer/`, used by apps that depend on smb2 to test their SMB integration. Exposed via the `smb2::testing` module (requires `testing` feature flag).
+14 Samba containers embedded in the crate under `src/testing/fixtures/consumer/`, used by apps that depend on smb2 to test their SMB integration. Exposed via the `smb2::testing` module (requires `testing` feature flag). They live in `src/` (not `tests/`) because the published crate embeds them via `include_str!`.
 
 | Container              | Port  | What it tests                                 |
 |------------------------|-------|-----------------------------------------------|

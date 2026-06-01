@@ -18,7 +18,7 @@ Three-layer testing model:
 
 ## Embedded files
 
-All 35 Docker files (compose, Dockerfiles, smb.conf, scripts) are embedded via `include_str!` at compile time. At runtime, `write_compose_files()` writes them to a temp directory. Docker Compose runs from there.
+The consumer Docker files (compose, Dockerfiles, smb.conf, scripts) are embedded via `include_str!` at compile time and live next to this module under `src/testing/fixtures/consumer/`. They sit in `src/` (not `tests/`) precisely because the published crate embeds them — keeping them here lets `Cargo.toml` exclude `tests/` wholesale without breaking the `testing` feature or the docs.rs all-features build. At runtime, `write_compose_files()` writes them to a temp directory; Docker Compose runs from there. The dev rig (`tests/docker/start.sh consumer`) points at this same `src/testing/fixtures/consumer/` directory.
 
 ## Port scheme
 
