@@ -4,16 +4,14 @@ Pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. S
 
 ## Quick commands
 
-| Command           | Description                                           |
-|-------------------|-------------------------------------------------------|
-| `just`            | Fast checks: format, lint, test, doc (~2s)            |
-| `just check-live` | Fast checks + integration tests on real servers (~6s) |
-| `just fix`        | Auto-fix formatting and clippy warnings               |
-| `just check-all`  | Include MSRV check, security audit, and license check |
-| `just test-consumer` | Consumer integration tests (needs Docker, ~30s)    |
-| `cargo test`      | Run unit tests (mock transport, no server needed)     |
-| `just fuzz <target> [duration]` | Fuzz a single parse entry point (nightly, cargo-fuzz) |
-| `just fuzz-seeds` | Regenerate the committed `fuzz/corpus/` seeds         |
+- `just`: Fast checks: format, lint, test, doc (~2s)
+- `just check-live`: Fast checks + integration tests on real servers (~6s)
+- `just fix`: Auto-fix formatting and clippy warnings
+- `just check-all`: Include MSRV check, security audit, and license check
+- `just test-consumer`: Consumer integration tests (needs Docker, ~30s)
+- `cargo test`: Run unit tests (mock transport, no server needed)
+- `just fuzz <target> [duration]`: Fuzz a single parse entry point (nightly, cargo-fuzz)
+- `just fuzz-seeds`: Regenerate the committed `fuzz/corpus/` seeds
 
 ## Project structure
 
