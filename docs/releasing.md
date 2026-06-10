@@ -23,6 +23,8 @@ ships nothing the crate needs. Re-check the list if you've added a new top-level
      is breaking. When unsure, search for the symbol in `apps/desktop/src-tauri/` of the cmdr repo (the only known
      consumer today) — if a `_ =>` fallback handles it, bump minor; if not, bump minor regardless and call it out
      in the changelog.
+   - When the **minor** changes, also bump the `smb2 = "X.Y"` install snippet in `README.md` (it pins major.minor, so
+     patch releases don't touch it). Stale here is what shipped `smb2 = "0.2"` long after the crate reached 0.11.
 2. **Update `CHANGELOG.md`** — replace `[Unreleased]` with the new version + ISO date. Keep the keep-a-changelog
    sections (`Added`, `Changed`, `Fixed`, `Notes`). Lead with **Breaking** entries when present.
 3. **Update `fuzz/Cargo.lock`** so the fuzz crate sees the new version:

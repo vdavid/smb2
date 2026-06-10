@@ -27,7 +27,7 @@ slow because it sends one read at a time. Native OS SMB clients pipeline their r
 - Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds, compound delete/rename/stat)
 - Batch operations (delete, rename, stat multiple files -- all requests sent before waiting for responses)
 - Pipelined I/O with sliding window for large file transfers
-- SMB 3.x signing (HMAC-SHA256, AES-CMAC, AES-GMAC) and encryption (AES-128/256-CCM/GCM)
+- SMB 2.x (HMAC-SHA256) and 3.x (AES-CMAC, AES-GMAC) signing, and encryption (AES-128/256-CCM/GCM)
 - LZ4 compression
 - Share enumeration (list shares on a server via IPC$ + srvsvc RPC)
 - Streaming downloads and uploads with progress reporting and cancellation
@@ -57,8 +57,6 @@ Not planned:
 ## Quick start
 
 ```rust
-use smb2::{SmbClient, ClientConfig};
-
 #[tokio::main]
 async fn main() -> Result<(), smb2::Error> {
     let mut client = smb2::connect("192.168.1.100:445", "user", "pass").await?;
@@ -229,7 +227,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.2"
+smb2 = "0.11"
 ```
 
 You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is
