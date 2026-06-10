@@ -10,8 +10,9 @@ A pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI.
 operations: 1.3-5x faster on uploads, downloads, listings, and deletes.
 
 I built this because I needed fast SMB access for [Cmdr](https://github.com/vdavid/cmdr) (my file manager), and the
-existing Rust SMB options weren't cutting it. The `smb` crate works fine for listing files but downloads are painfully
-slow because it sends one read at a time. Native OS SMB clients pipeline their reads, and so does this library.
+existing Rust SMB options weren't good enough. The `smb` crate works fine for listing files but downloads are painfully
+slow because it sends one read at a time. Native OS SMB clients pipeline their reads, and so does this library, and here
+we have more control to reach even better speeds.
 
 **Why this matters:**
 
@@ -180,9 +181,19 @@ before closing the file handle.
 
 ## Diagnostics
 
-`SmbClient::diagnostics()` captures a snapshot of the client's state — negotiated dialect, credits, in-flight requests,
-per-connection counters (bytes sent/received, request outcomes, protocol events), DFS cache, sessions — for dashboards,
-MCP tools, log dumps, and tests that want to assert on counter ticks rather than scrape logs.
+`SmbClient::diagnostics()` captures a snapshot of the client's state for dashboards, MCP tools, log dumps, and tests
+that want to assert on counter ticks rather than scrape logs.
+
+The state captured:
+
+- negotiated dialect
+- credits
+- in-flight requests,
+- per-connection counters (bytes sent/received
+- request outcomes
+- protocol events)
+- DFS cache
+- sessions
 
 ```rust
 # async fn example(client: &mut smb2::SmbClient) -> Result<(), smb2::Error> {
@@ -218,8 +229,8 @@ Env vars used by both: `SMB2_HOST` (`host:port`), `SMB2_USER`, `SMB2_PASS`, `SMB
 `SMB2_FILE`. Useful pairings: `RUST_LOG=smb2=info` for the lib's own log lines on top, or the slow Docker container
 (`SMB2_HOST=127.0.0.1:10451`, see [tests/CLAUDE.md](tests/CLAUDE.md)) to watch the dumper tick while the wire is busy.
 
-Consumers wanting live charts, MCP tools, or Prometheus integration build on top of `Diagnostics` / `MetricsSnapshot`
-in their own crates — smb2 stays a protocol library; presentation belongs to the application.
+To consumers wanting live charts, MCP tools, or Prometheus integration build on top of `Diagnostics` / `MetricsSnapshot`
+in their own crates: smb2 is a protocol library and it'll stay so. Presentation belongs to your app.
 
 ## Installation
 
@@ -244,46 +255,46 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 For when you want to do one thing and get the result:
 
-- `smb2::connect()` -- connect and authenticate (shorthand)
-- `SmbClient::connect()` -- connect with full config
-- `client.list_shares()` -- list available shares
-- `client.connect_share()` -- connect to a share
-- `client.list_directory(&mut share, path)` -- list a directory
-- `client.read_file(&mut share, path)` -- download a file
-- `client.write_file(&mut share, path, data)` -- upload a file
-- `client.delete_file(&mut share, path)` -- delete a file
-- `client.delete_files(&mut share, &paths)` -- batch delete (all requests sent before waiting)
-- `client.stat(&mut share, path)` -- get file metadata
-- `client.stat_files(&mut share, &paths)` -- batch stat
-- `client.rename(&mut share, from, to)` -- rename a file
-- `client.rename_files(&mut share, &renames)` -- batch rename
-- `client.create_directory(&mut share, path)` -- create a directory
-- `client.delete_directory(&mut share, path)` -- remove a directory
-- `client.download(&share, path)` -- streaming download with progress (memory-efficient)
-- `client.upload(&share, path, data)` -- streaming upload with progress
-- `client.write_file_streamed(&mut share, path, callback)` -- write from a streaming source (memory-efficient, pipelined)
-- `client.watch(&share, path, recursive)` -- watch for file changes (CHANGE_NOTIFY)
-- `client.fs_info(&mut share)` -- disk space (total, free, used)
-- `client.reconnect()` -- reconnect after network failure
-- `client.credits()` -- current available credits
-- `client.estimated_rtt()` -- round-trip time from negotiate
-- `client.disconnect_share(&share)` -- disconnect from a share
+- `smb2::connect()`: Connect and authenticate (shorthand)
+- `SmbClient::connect()`: Connect with full config
+- `client.list_shares()`: List available shares
+- `client.connect_share()`: Connect to a share
+- `client.list_directory(&mut share, path)`: List a directory
+- `client.read_file(&mut share, path)`: Download a file
+- `client.write_file(&mut share, path, data)`: Upload a file
+- `client.delete_file(&mut share, path)`: Delete a file
+- `client.delete_files(&mut share, &paths)`: Batch delete (all requests sent before waiting)
+- `client.stat(&mut share, path)`: Get file metadata
+- `client.stat_files(&mut share, &paths)`: Batch stat
+- `client.rename(&mut share, from, to)`: Rename a file
+- `client.rename_files(&mut share, &renames)`: Batch rename
+- `client.create_directory(&mut share, path)`: Create a directory
+- `client.delete_directory(&mut share, path)`: Remove a directory
+- `client.download(&share, path)`: Streaming download with progress (memory-efficient)
+- `client.upload(&share, path, data)`: Streaming upload with progress
+- `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)
+- `client.watch(&share, path, recursive)`: Watch for file changes (CHANGE_NOTIFY)
+- `client.fs_info(&mut share)`: Disk space (total, free, used)
+- `client.reconnect()`: Reconnect after network failure
+- `client.credits()`: Current available credits
+- `client.estimated_rtt()`: Round-trip time from negotiate
+- `client.disconnect_share(&share)`: Disconnect from a share
 
 ### Pipeline API
 
 For when you have many operations and want them fast:
 
-- `Pipeline::new(conn, &share)` -- create a pipeline
-- `pipeline.execute(ops)` -- run a batch of operations
+- `Pipeline::new(conn, &share)`: Create a pipeline
+- `pipeline.execute(ops)`: Run a batch of operations
 
 ### Low-level API
 
 For advanced use cases, the underlying types are available:
 
-- `Connection` -- message exchange, credit tracking
-- `Session` -- NTLM authentication, key derivation
-- `Tree` -- share-level file operations (take `&mut Connection`)
-- `NegotiatedParams` -- protocol parameters from negotiate
+- `Connection`: Message exchange, credit tracking
+- `Session`: NTLM authentication, key derivation
+- `Tree`: Share-level file operations (take `&mut Connection`)
+- `NegotiatedParams`: Protocol parameters from negotiate
 
 ## Performance
 
