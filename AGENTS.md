@@ -335,8 +335,8 @@ The crate uses `log` (a facade) for structured logging. The application picks th
 | Level   | Use for                                   | Examples                                                                                                                    |
 |---------|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
 | `info`  | Major lifecycle events users care about   | Connected, negotiated dialect, session established, tree connected/disconnected                                             |
-| `debug` | Protocol details useful for debugging     | Negotiate params, session setup rounds, signing activation, credit changes, each request/response                           |
-| `trace` | Very verbose, byte-level                  | Raw message sizes, signature bytes (first 4), nonce values, preauth hash updates, TCP framing, individual directory entries |
+| `debug` | Protocol details useful for debugging     | Negotiate params, session setup rounds, signing activation, credit changes, per-operation mutations (rename/delete/write), routing errors and orphan frames |
+| `trace` | Very verbose, per-frame / byte-level      | Per-frame request/response plumbing (per-message signing, `execute`/`execute_compound` dispatch, success routing, per-listing directory ops), raw message sizes, signature bytes (first 4), nonce values, preauth hash updates, TCP framing, individual directory entries |
 | `warn`  | Unexpected but recoverable                | Signature verification skipped, credit starvation, retryable errors                                                         |
 | `error` | Should not happen during normal operation | Protocol violations, decryption/signature failures, connection drops                                                        |
 

@@ -8,7 +8,7 @@
 //!
 //! Reference: MS-SMB2 sections 3.1.4.1 (signing) and 3.1.5.1 (verification).
 
-use log::{debug, error, trace};
+use log::{error, trace};
 
 use crate::types::Dialect;
 use crate::Error;
@@ -88,9 +88,17 @@ pub fn sign_message(
     // Step 3: write the signature back.
     message[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].copy_from_slice(&signature);
 
-    debug!(
+    // TRACE, not DEBUG: fires once per outgoing message (per-frame plumbing), and the
+    // signature bytes are byte-level detail. At DEBUG it floods a consumer during
+    // high-throughput operations (e.g. a recursive directory scan). See AGENTS.md § Logging.
+    trace!(
         "signing: signed msg_id={}, algo={:?}, sig={:02x}{:02x}{:02x}{:02x}...",
-        message_id, algorithm, signature[0], signature[1], signature[2], signature[3]
+        message_id,
+        algorithm,
+        signature[0],
+        signature[1],
+        signature[2],
+        signature[3]
     );
     Ok(())
 }

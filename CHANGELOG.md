@@ -7,6 +7,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-06-28
+
+### Changed
+
+- **Per-frame protocol logging moved from DEBUG to TRACE.** Per-message signing (`signing: signed …`), per-request dispatch (`execute …`, `execute_cap …`, `execute_compound …`), per-response success routing (`recv: routed …`), and per-listing directory ops (`tree: list_directory …`) now log at TRACE instead of DEBUG. These fire once per SMB frame, so on a high-throughput operation — a recursive directory scan walking millions of dirs — they flooded a consumer logging at DEBUG (one report: ~170 MB of logs in 25 min, ~90% of it this plumbing, so a rotating buffer held only minutes of history). Lifecycle (connect, negotiate, session, tree connect), credit changes, per-operation mutations (rename/delete/write), and the low-volume error/orphan/late-arrival routing diagnostics stay at DEBUG; routing error and orphan frames stay visible. No behavior change beyond log levels. Get the per-frame detail back with `RUST_LOG=smb2=trace`. The AGENTS.md logging table is updated to match (per-frame request/response is TRACE, not DEBUG).
+
 ## [0.11.3] - 2026-06-01
 
 ### Fixed

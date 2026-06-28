@@ -244,7 +244,10 @@ impl Tree {
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
         let normalized = self.format_path(path);
-        debug!("tree: list_directory path={}", normalized);
+        // TRACE, not DEBUG: a recursive scan calls list_directory once per directory
+        // (millions of times on a large share), so at DEBUG it dominates a consumer's
+        // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
+        trace!("tree: list_directory path={}", normalized);
 
         // Open the directory.
         let file_id = self.open_directory(conn, &normalized).await?;
@@ -258,7 +261,7 @@ impl Tree {
         // Return the query result, or if it succeeded, check the close result.
         let entries = result?;
         close_result?;
-        debug!("tree: list_directory done, entries={}", entries.len());
+        trace!("tree: list_directory done, entries={}", entries.len());
         Ok(entries)
     }
 

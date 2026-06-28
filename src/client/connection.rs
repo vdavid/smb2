@@ -811,7 +811,10 @@ impl Connection {
             self.remove_waiter(msg_id);
             return Err(e);
         }
-        debug!(
+        // TRACE, not DEBUG: per-request frame plumbing. Fires for every request, so at
+        // DEBUG it floods a consumer during high-throughput ops (e.g. a recursive
+        // directory scan). Lifecycle/errors stay at DEBUG. See AGENTS.md § Logging.
+        trace!(
             "execute_cap: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt
         );
@@ -921,7 +924,8 @@ impl Connection {
                     let framed = build_compressed_frame(&compressed);
                     match self.inner.send_and_count(&framed).await {
                         Ok(()) => {
-                            debug!(
+                            // TRACE: per-request frame plumbing (see execute_cap above).
+                            trace!(
                                 "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
                                 command, msg_id.0, charge, tree_id, should_sign,
                                 msg_bytes.len(), framed.len()
@@ -942,7 +946,8 @@ impl Connection {
             self.remove_waiter(msg_id);
             return Err(e);
         }
-        debug!(
+        // TRACE: per-request frame plumbing (see execute_cap above).
+        trace!(
             "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
         );
@@ -1231,7 +1236,8 @@ impl Connection {
             return Err(e);
         }
 
-        debug!(
+        // TRACE: per-request frame plumbing (see execute_cap above).
+        trace!(
             "execute_compound: {} operations, total_len={}, msg_ids={:?}, signed={}, encrypted={}",
             ops.len(),
             compound_buf.len(),
@@ -1688,10 +1694,15 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             match maybe_tx {
                 Some(tx) => {
                     let was_err = result.is_err();
+                    // Success routing is per-response frame plumbing → TRACE (floods at
+                    // DEBUG during scans). The error variant stays DEBUG: it's low-volume
+                    // and a real signal. See AGENTS.md § Logging.
                     match &result {
-                        Ok(frame) => debug!(
+                        Ok(frame) => trace!(
                             "recv: routed msg_id={}, status={:?}, cmd={:?}",
-                            msg_id.0, frame.header.status, frame.header.command
+                            msg_id.0,
+                            frame.header.status,
+                            frame.header.command
                         ),
                         Err(e) => debug!("recv: routed error msg_id={}, err={}", msg_id.0, e),
                     }
