@@ -202,6 +202,10 @@ FileWriter provides push-based pipelined writes. The consumer pushes chunks at t
 
 Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
 
+## Incremental directory enumeration (`DirectoryReader`)
+
+`DirectoryReader` owns a cloned `Connection`, a cloned `Tree`, and one open directory handle. `next_batch()` issues exactly one QUERY_DIRECTORY and returns that response's entries, so memory use is bounded by the negotiated query buffer instead of the directory's total entry count. The first query sets `SMB2_RESTART_SCANS`; later queries continue the same enumeration. `STATUS_NO_MORE_FILES` closes automatically and returns `None`; early exit requires explicit `close()`. Query failures preserve the query error while attempting CLOSE, matching `list_directory`'s error precedence. `list_directory` now collects this reader, keeping the one-shot API and streaming API on the same wire path.
+
 ## Server-side copy (`copy.rs`)
 
 `FSCTL_SRV_COPYCHUNK` copies byte ranges between two files *on the server* — the data never crosses the wire. Two tiers, both on `Tree` (with `SmbClient` wrappers that route via `connection_for_tree`):

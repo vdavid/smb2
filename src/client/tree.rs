@@ -228,6 +228,107 @@ pub struct Tree {
     pub encrypt_data: bool,
 }
 
+/// Incremental directory enumeration over one open SMB directory handle.
+///
+/// Each call to [`next_batch`](Self::next_batch) issues one
+/// `QUERY_DIRECTORY` request and returns only the entries from that server
+/// response. This keeps memory bounded for large directories; batch sizes are
+/// chosen by the server and are not a stable page size.
+///
+/// Reaching the end of the directory closes the handle automatically. If the
+/// caller stops before then, it must call [`close`](Self::close). Rust has no
+/// asynchronous drop, so dropping a live reader can leave the server handle
+/// open until the SMB session ends.
+///
+/// ```no_run
+/// # async fn example(
+/// #     client: &mut smb2::SmbClient,
+/// #     share: &mut smb2::Tree,
+/// # ) -> Result<(), smb2::Error> {
+/// let mut reader = client.open_directory_reader(share, "projects").await?;
+/// while let Some(entries) = reader.next_batch().await? {
+///     for entry in entries {
+///         println!("{}", entry.name);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "consume the directory reader to EOF or call close()"]
+pub struct DirectoryReader {
+    tree: Tree,
+    conn: Connection,
+    file_id: Option<FileId>,
+    output_buffer_length: u32,
+    restart: bool,
+}
+
+impl DirectoryReader {
+    /// Return the next server-provided batch of directory entries.
+    ///
+    /// `Ok(Some(entries))` contains one `QUERY_DIRECTORY` response.
+    /// `Ok(None)` means the enumeration is complete and the directory handle
+    /// has been closed. Calls after completion continue to return `Ok(None)`
+    /// without sending more requests.
+    pub async fn next_batch(&mut self) -> Result<Option<Vec<DirectoryEntry>>> {
+        let Some(file_id) = self.file_id else {
+            return Ok(None);
+        };
+
+        let result = self
+            .tree
+            .query_directory_step(
+                &mut self.conn,
+                file_id,
+                self.restart,
+                self.output_buffer_length,
+            )
+            .await;
+
+        match result {
+            Ok(QueryStepOutcome::Entries { entries, .. }) => {
+                self.restart = false;
+                Ok(Some(entries))
+            }
+            Ok(QueryStepOutcome::NoMoreFiles { .. }) => {
+                self.close_inner().await?;
+                Ok(None)
+            }
+            Err(error) => {
+                // Preserve the query failure, matching `list_directory`'s
+                // error precedence, while still avoiding a leaked handle.
+                let _ = self.close_inner().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Close the directory handle before reaching the end of the enumeration.
+    ///
+    /// Consumes the reader so it cannot be used after it has been closed.
+    pub async fn close(mut self) -> Result<()> {
+        self.close_inner().await
+    }
+
+    async fn close_inner(&mut self) -> Result<()> {
+        let Some(file_id) = self.file_id.take() else {
+            return Ok(());
+        };
+        self.tree.close_handle(&mut self.conn, file_id).await
+    }
+}
+
+impl Drop for DirectoryReader {
+    fn drop(&mut self) {
+        if self.file_id.is_some() {
+            debug!(
+                "tree: DirectoryReader dropped without close(), directory handle may leak until \
+                 session teardown"
+            );
+        }
+    }
+}
+
 impl Tree {
     /// Connect to a share on the server.
     ///
@@ -312,6 +413,32 @@ impl Tree {
         }
     }
 
+    /// Open a directory for incremental enumeration.
+    ///
+    /// The returned [`DirectoryReader`] owns a cheap clone of the connection,
+    /// so it does not borrow this tree or the caller's connection. Each
+    /// [`DirectoryReader::next_batch`] call performs one `QUERY_DIRECTORY`
+    /// round trip and keeps at most one response batch in memory.
+    pub async fn open_directory_reader(
+        &self,
+        mut conn: Connection,
+        path: &str,
+    ) -> Result<DirectoryReader> {
+        let normalized = self.format_path(path);
+        trace!("tree: open_directory_reader path={}", normalized);
+
+        let output_buffer_length = Self::default_query_buffer_len(&conn);
+        let file_id = self.open_directory(&mut conn, &normalized).await?;
+
+        Ok(DirectoryReader {
+            tree: self.clone(),
+            conn,
+            file_id: Some(file_id),
+            output_buffer_length,
+            restart: true,
+        })
+    }
+
     /// List files in a directory.
     ///
     /// Opens the directory with CREATE, queries entries with QUERY_DIRECTORY
@@ -326,20 +453,14 @@ impl Tree {
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
         trace!("tree: list_directory path={}", path);
 
-        // Open the directory.
-        let file_id = self.open_directory(conn, path).await?;
+        let mut reader = self.open_directory_reader(conn.clone(), path).await?;
+        let mut all_entries = Vec::new();
+        while let Some(entries) = reader.next_batch().await? {
+            all_entries.extend(entries);
+        }
 
-        // Query directory entries.
-        let result = self.query_directory_loop(conn, file_id).await;
-
-        // Close the handle regardless of query result.
-        let close_result = self.close_handle(conn, file_id).await;
-
-        // Return the query result, or if it succeeded, check the close result.
-        let entries = result?;
-        close_result?;
-        trace!("tree: list_directory done, entries={}", entries.len());
-        Ok(entries)
+        trace!("tree: list_directory done, entries={}", all_entries.len());
+        Ok(all_entries)
     }
 
     /// List a directory while recording a per-phase timing breakdown.
@@ -2312,7 +2433,7 @@ impl Tree {
     /// Issue one QUERY_DIRECTORY round trip and parse its reply.
     ///
     /// The single-source of the CREATE-less half of a listing: both
-    /// [`query_directory_loop`](Self::query_directory_loop) and
+    /// [`DirectoryReader::next_batch`] and
     /// [`list_directory_instrumented`](Self::list_directory_instrumented) drive
     /// this, so they always exercise the same wire request.
     ///
@@ -2377,29 +2498,6 @@ impl Tree {
             );
         }
         Ok(QueryStepOutcome::Entries { entries, bytes })
-    }
-
-    async fn query_directory_loop(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-    ) -> Result<Vec<DirectoryEntry>> {
-        let output_buffer_length = Self::default_query_buffer_len(conn);
-        let mut all_entries = Vec::new();
-        let mut restart = true;
-
-        loop {
-            match self
-                .query_directory_step(conn, file_id, restart, output_buffer_length)
-                .await?
-            {
-                QueryStepOutcome::NoMoreFiles { .. } => break,
-                QueryStepOutcome::Entries { entries, .. } => all_entries.extend(entries),
-            }
-            restart = false;
-        }
-
-        Ok(all_entries)
     }
 
     /// Read file data in chunks.
@@ -3399,6 +3497,135 @@ mod tests {
         assert!(!entries[0].is_directory);
         assert_eq!(entries[1].name, "subdir");
         assert!(entries[1].is_directory);
+    }
+
+    #[tokio::test]
+    async fn directory_reader_yields_one_response_at_a_time_and_closes_at_eof() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::SUCCESS,
+            build_file_both_dir_info("first.txt", 10, false, 0),
+        ));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::SUCCESS,
+            build_file_both_dir_info("second.txt", 20, false, 0),
+        ));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut reader = tree.open_directory_reader(conn, "somedir").await.unwrap();
+        assert_eq!(mock.sent_count(), 1, "opening must not prefetch entries");
+
+        let first = reader.next_batch().await.unwrap().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "first.txt");
+        assert_eq!(mock.sent_count(), 2);
+
+        let second = reader.next_batch().await.unwrap().unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].name, "second.txt");
+        assert_eq!(mock.sent_count(), 3);
+
+        assert!(reader.next_batch().await.unwrap().is_none());
+        assert_eq!(mock.sent_count(), 5, "EOF must issue exactly one CLOSE");
+        assert!(reader.next_batch().await.unwrap().is_none());
+        assert_eq!(mock.sent_count(), 5, "reads after EOF must stay local");
+
+        let first_query = mock.sent_message(1).unwrap();
+        let mut first_cursor = ReadCursor::new(&first_query);
+        Header::unpack(&mut first_cursor).unwrap();
+        let first_request = QueryDirectoryRequest::unpack(&mut first_cursor).unwrap();
+        assert_eq!(first_request.flags.0, QueryDirectoryFlags::RESTART_SCANS);
+
+        let second_query = mock.sent_message(2).unwrap();
+        let mut second_cursor = ReadCursor::new(&second_query);
+        Header::unpack(&mut second_cursor).unwrap();
+        let second_request = QueryDirectoryRequest::unpack(&mut second_cursor).unwrap();
+        assert_eq!(second_request.flags.0, 0);
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn directory_reader_can_close_before_requesting_entries() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        tree.open_directory_reader(conn, "somedir")
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+
+        assert_eq!(mock.sent_count(), 2);
+        let close = mock.sent_message(1).unwrap();
+        let mut cursor = ReadCursor::new(&close);
+        assert_eq!(Header::unpack(&mut cursor).unwrap().command, Command::Close);
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn directory_reader_closes_after_query_failure() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::ACCESS_DENIED,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut reader = tree.open_directory_reader(conn, "somedir").await.unwrap();
+        let error = reader.next_batch().await.unwrap_err();
+        assert_eq!(error.status(), Some(NtStatus::ACCESS_DENIED));
+        assert_eq!(mock.sent_count(), 3, "query failure must still issue CLOSE");
+        assert!(reader.next_batch().await.unwrap().is_none());
+        assert_eq!(mock.sent_count(), 3);
+        mock.assert_fully_consumed();
     }
 
     #[tokio::test]

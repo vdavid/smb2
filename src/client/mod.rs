@@ -37,7 +37,7 @@ pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
-pub use tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
+pub use tree::{DirectoryEntry, DirectoryReader, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
@@ -704,6 +704,32 @@ impl SmbClient {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.list_directory(conn, path).await
+            }
+            other => other,
+        }
+    }
+
+    /// Open a directory for incremental, bounded-memory enumeration.
+    ///
+    /// Each [`DirectoryReader::next_batch`] call returns one server-provided
+    /// `QUERY_DIRECTORY` batch. The reader owns its connection clone, so the
+    /// client remains available for other requests while enumeration is in
+    /// progress. If the initial open encounters a DFS referral, this method
+    /// resolves it before returning the reader.
+    pub async fn open_directory_reader(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+    ) -> Result<DirectoryReader> {
+        let result = {
+            let conn = self.connection_for_tree(tree).clone();
+            tree.open_directory_reader(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree).clone();
+                tree.open_directory_reader(conn, &new_path).await
             }
             other => other,
         }

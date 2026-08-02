@@ -325,6 +325,7 @@ For when you want to do one thing and get the result:
 - `client.list_shares()`: List available shares
 - `client.connect_share()`: Connect to a share
 - `client.list_directory(&mut share, path)`: List a directory
+- `client.open_directory_reader(&mut share, path)`: Enumerate a large directory one server response batch at a time
 - `client.read_file(&mut share, path)`: Download a file
 - `client.write_file(&mut share, path, data)`: Upload a file
 - `client.delete_file(&mut share, path)`: Delete a file
