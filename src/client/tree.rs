@@ -34,7 +34,7 @@ use crate::types::flags::FileAccessMask;
 use crate::types::status::NtStatus;
 #[cfg(test)]
 use crate::types::MessageId;
-use crate::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
+use crate::types::{Command, CreditCharge, FileId, OplockLevel, SessionId, TreeId};
 use crate::Error;
 
 /// Maximum number of requests to keep in flight during pipelining.
@@ -266,7 +266,10 @@ pub struct Tree {
 /// [`next_batch`](Self::next_batch) is cancellation-safe: cancelling a call
 /// retains its in-flight QUERY_DIRECTORY (or EOF CLOSE), and the next call
 /// resumes that same request. A transport or session error is terminal because
-/// SMB directory cursors cannot be resumed portably after reconnecting.
+/// SMB directory cursors cannot be resumed portably after reconnecting. The
+/// reader also tracks the connection generation and session ID. Once it
+/// detects an in-place reconnect, it rejects the old tree and file IDs rather
+/// than reusing them against the replacement session.
 ///
 /// ```no_run
 /// # async fn example(
@@ -286,6 +289,8 @@ pub struct Tree {
 pub struct DirectoryReader {
     tree_id: TreeId,
     conn: Connection,
+    generation: u64,
+    session_id: SessionId,
     file_id: FileId,
     output_buffer_length: u32,
     state: DirectoryReaderState,
@@ -385,21 +390,45 @@ impl DirectoryReader {
     fn begin_query(&mut self, restart: bool) {
         let tree_id = self.tree_id;
         let mut conn = self.conn.clone();
+        let generation = self.generation;
+        let session_id = self.session_id;
         let file_id = self.file_id;
         let output_buffer_length = self.output_buffer_length;
         self.state = DirectoryReaderState::Querying(Box::pin(async move {
-            Tree::query_directory_step(tree_id, &mut conn, file_id, restart, output_buffer_length)
-                .await
+            if conn.generation() != generation || conn.session_id() != session_id {
+                return Err(Error::Disconnected);
+            }
+            let result = Tree::query_directory_step(
+                tree_id,
+                &mut conn,
+                file_id,
+                restart,
+                output_buffer_length,
+            )
+            .await;
+            if conn.generation() != generation || conn.session_id() != session_id {
+                return Err(Error::Disconnected);
+            }
+            result
         }));
     }
 
     fn begin_close(&mut self, after: DirectoryReaderAfterClose) {
         let tree_id = self.tree_id;
         let mut conn = self.conn.clone();
+        let generation = self.generation;
+        let session_id = self.session_id;
         let file_id = self.file_id;
         self.state = DirectoryReaderState::Closing {
             future: Box::pin(async move {
-                Tree::close_handle_for_tree(tree_id, &mut conn, file_id).await
+                if conn.generation() != generation || conn.session_id() != session_id {
+                    return Ok(());
+                }
+                let result = Tree::close_handle_for_tree(tree_id, &mut conn, file_id).await;
+                if conn.generation() != generation || conn.session_id() != session_id {
+                    return Ok(());
+                }
+                result
             }),
             after,
         };
@@ -520,6 +549,9 @@ impl Tree {
     /// caller's connection. Each [`DirectoryReader::next_batch`] call performs
     /// one `QUERY_DIRECTORY` round trip and keeps at most one response batch in
     /// memory.
+    ///
+    /// If the connection is revived while the directory is being opened, the
+    /// open fails rather than returning a handle tied to the old session.
     pub async fn open_directory_reader(
         &self,
         mut conn: Connection,
@@ -528,12 +560,20 @@ impl Tree {
         let normalized = self.format_path(path);
         trace!("tree: open_directory_reader path={}", normalized);
 
+        let generation = conn.generation();
+        let session_id = conn.session_id();
         let output_buffer_length = Self::default_query_buffer_len(&conn);
-        let file_id = self.open_directory(&mut conn, &normalized).await?;
+        let open_result = self.open_directory(&mut conn, &normalized).await;
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
+        let file_id = open_result?;
 
         Ok(DirectoryReader {
             tree_id: self.tree_id,
             conn,
+            generation,
+            session_id,
             file_id,
             output_buffer_length,
             state: DirectoryReaderState::Ready { restart: true },
@@ -3674,6 +3714,63 @@ mod tests {
         Header::unpack(&mut second_cursor).unwrap();
         let second_request = QueryDirectoryRequest::unpack(&mut second_cursor).unwrap();
         assert_eq!(second_request.flags.0, 0);
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn directory_reader_rejects_changed_connection_identity_without_sending() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        mock.queue_responses(vec![
+            build_create_response(file_id, 0),
+            build_create_response(file_id, 0),
+        ]);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut querying_reader = tree
+            .open_directory_reader(conn.clone(), "somedir")
+            .await
+            .unwrap();
+        let mut closing_reader = tree
+            .open_directory_reader(conn.clone(), "somedir")
+            .await
+            .unwrap();
+        assert_eq!(mock.sent_count(), 2);
+
+        // install_transport clears the old SessionId before reauthentication
+        // and before generation increments. Model that reconnect window while
+        // proving the generation-only guard would not catch it.
+        let generation = conn.generation();
+        let session_id = conn.session_id();
+        conn.set_session_id(SessionId(0));
+        assert_eq!(conn.generation(), generation);
+
+        let error = querying_reader.next_batch().await.unwrap_err();
+        assert!(matches!(error, Error::Disconnected));
+        assert!(querying_reader.next_batch().await.unwrap().is_none());
+
+        // A completed reconnect changes the generation as well. Restore the
+        // session ID so this close exercises that independent guard.
+        conn.set_session_id(session_id);
+        closing_reader.generation += 1;
+        closing_reader.close().await.unwrap();
+
+        assert_eq!(
+            mock.sent_count(),
+            2,
+            "stale readers must not send QUERY_DIRECTORY or CLOSE"
+        );
         mock.assert_fully_consumed();
     }
 

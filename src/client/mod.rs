@@ -715,7 +715,9 @@ impl SmbClient {
     /// `QUERY_DIRECTORY` batch. The reader owns its connection clone, so the
     /// client remains available for other requests while enumeration is in
     /// progress. If the initial open encounters a DFS referral, this method
-    /// resolves it before returning the reader.
+    /// resolves it before returning the reader. If that initial open finds a
+    /// dead session, it may reconnect and retry before any entries have been
+    /// delivered; an enumeration already in progress is never replayed.
     pub async fn open_directory_reader(
         &mut self,
         tree: &mut Tree,
@@ -730,6 +732,11 @@ impl SmbClient {
                 let new_path = self.handle_dfs_redirect(tree, path).await?;
                 let conn = self.connection_for_tree(tree).clone();
                 tree.open_directory_reader(conn, &new_path).await
+            }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree).clone();
+                tree.open_directory_reader(conn, path).await
             }
             other => other,
         }
@@ -1748,12 +1755,17 @@ mod tests {
         assert_eq!(client.params().unwrap().server_guid, old_server_guid);
     }
 
-    /// A reviver that brings up a whole working share: negotiate, session
-    /// setup, tree connect, and one compound CREATE+READ+CLOSE ready to serve.
+    enum RevivedOperation {
+        Read(Vec<u8>),
+        OpenDirectory(FileId),
+    }
+
+    /// A reviver that brings up a whole working share and one operation ready
+    /// to serve after reconnecting.
     struct RevivedShare {
         session_id: SessionId,
         tree_id: TreeId,
-        contents: Vec<u8>,
+        operation: RevivedOperation,
         dialed: std::sync::atomic::AtomicUsize,
     }
 
@@ -1774,19 +1786,29 @@ mod tests {
                 self.tree_id,
                 ShareType::Disk,
             ));
-            mock.queue_response(crate::client::test_helpers::build_compound_response_frame(
-                &[
-                    crate::client::test_helpers::build_create_response(
-                        FileId {
-                            persistent: 9,
-                            volatile: 9,
-                        },
-                        self.contents.len() as u64,
-                    ),
-                    crate::client::test_helpers::build_read_response(self.contents.clone()),
-                    crate::client::test_helpers::build_close_response(),
-                ],
-            ));
+            match &self.operation {
+                RevivedOperation::Read(contents) => {
+                    mock.queue_response(
+                        crate::client::test_helpers::build_compound_response_frame(&[
+                            crate::client::test_helpers::build_create_response(
+                                FileId {
+                                    persistent: 9,
+                                    volatile: 9,
+                                },
+                                contents.len() as u64,
+                            ),
+                            crate::client::test_helpers::build_read_response(contents.clone()),
+                            crate::client::test_helpers::build_close_response(),
+                        ]),
+                    );
+                }
+                RevivedOperation::OpenDirectory(file_id) => {
+                    mock.queue_responses(vec![
+                        crate::client::test_helpers::build_create_response(*file_id, 0),
+                        crate::client::test_helpers::build_close_response(),
+                    ]);
+                }
+            }
             Ok((Box::new(mock.clone()), Box::new(mock)))
         }
 
@@ -1822,7 +1844,7 @@ mod tests {
         let reviver = Arc::new(RevivedShare {
             session_id: SessionId(0x2222),
             tree_id: TreeId(77),
-            contents: b"survived the blip".to_vec(),
+            operation: RevivedOperation::Read(b"survived the blip".to_vec()),
             dialed: std::sync::atomic::AtomicUsize::new(0),
         });
         let (mut client, mut tree) = client_on_a_dead_session(reviver.clone()).await;
@@ -1850,6 +1872,41 @@ mod tests {
         assert_eq!(client.session().session_id, SessionId(0x2222));
     }
 
+    #[tokio::test]
+    async fn directory_reader_open_on_a_dead_session_reconnects_before_returning() {
+        let reviver = Arc::new(RevivedShare {
+            session_id: SessionId(0x2222),
+            tree_id: TreeId(77),
+            operation: RevivedOperation::OpenDirectory(FileId {
+                persistent: 9,
+                volatile: 9,
+            }),
+            dialed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (mut client, mut tree) = client_on_a_dead_session(reviver.clone()).await;
+
+        let reader = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.open_directory_reader(&mut tree, "documents"),
+        )
+        .await
+        .expect("the directory open hung")
+        .expect("the initial CREATE is safe to retry after reconnecting");
+
+        assert_eq!(
+            reviver.dialed.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one death, one dial"
+        );
+        assert_eq!(
+            tree.tree_id,
+            TreeId(77),
+            "the reader must use the tree re-established on the new session"
+        );
+        assert_eq!(client.session().session_id, SessionId(0x2222));
+        reader.close().await.unwrap();
+    }
+
     /// The data-safety boundary: a mutating operation is NEVER replayed across
     /// a reconnect.
     ///
@@ -1863,7 +1920,7 @@ mod tests {
         let reviver = Arc::new(RevivedShare {
             session_id: SessionId(0x2222),
             tree_id: TreeId(77),
-            contents: Vec::new(),
+            operation: RevivedOperation::Read(Vec::new()),
             dialed: std::sync::atomic::AtomicUsize::new(0),
         });
         let (mut client, mut tree) = client_on_a_dead_session(reviver.clone()).await;
