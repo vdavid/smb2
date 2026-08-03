@@ -12,6 +12,7 @@ use log::trace;
 use crate::Error;
 use digest::{Digest, KeyInit};
 use hmac::{Hmac, Mac};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacMd5 = Hmac<md5::Md5>;
 
@@ -89,6 +90,9 @@ const MSV_AV_TARGET_NAME: u16 = 0x0009;
 // ---------------------------------------------------------------------------
 
 /// Credentials for NTLM authentication.
+///
+/// The owned authentication strings are zeroized on drop. Consequently,
+/// callers must borrow or clone public fields instead of moving them out.
 pub struct NtlmCredentials {
     /// The username.
     pub username: String,
@@ -96,6 +100,22 @@ pub struct NtlmCredentials {
     pub password: String,
     /// The domain (can be empty for local accounts).
     pub domain: String,
+}
+
+impl Zeroize for NtlmCredentials {
+    fn zeroize(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+        self.domain.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for NtlmCredentials {}
+
+impl Drop for NtlmCredentials {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 /// Stateful NTLM authenticator that manages the 3-message exchange.

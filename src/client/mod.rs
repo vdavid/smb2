@@ -47,11 +47,13 @@ pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 // (SmbClient, ClientConfig, and connect are defined below in this file.)
 
 use std::collections::HashMap;
+use std::fmt;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use log::debug;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::client::dfs::DfsResolver;
 use crate::error::{ErrorKind, Result};
@@ -61,7 +63,11 @@ use crate::types::FileId;
 use crate::Error;
 
 /// Configuration for an SMB client connection.
-#[derive(Debug, Clone)]
+///
+/// Authentication strings are zeroized when this value is dropped. Because
+/// that requires a `Drop` implementation, individual public fields cannot be
+/// moved out of an owned config; borrow or clone a field instead.
+#[derive(Clone)]
 pub struct ClientConfig {
     /// Server address (host:port).
     pub addr: String,
@@ -73,7 +79,9 @@ pub struct ClientConfig {
     ///
     /// **Security note:** The password is stored in memory so that the client
     /// can reconnect without asking the user again. It is not encrypted in
-    /// memory. Ensure the `SmbClient` is dropped when no longer needed.
+    /// memory. It is always redacted from `Debug`, and the username, password,
+    /// and domain buffers are zeroized when each config clone is dropped.
+    /// Ensure the `SmbClient` is dropped when no longer needed.
     pub password: String,
     /// Domain (empty for local).
     pub domain: String,
@@ -121,6 +129,39 @@ pub struct ClientConfig {
     pub dfs_target_overrides: std::collections::HashMap<String, String>,
 }
 
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientConfig")
+            .field("addr", &self.addr)
+            .field("timeout", &self.timeout)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("auto_reconnect", &self.auto_reconnect)
+            .field("compression", &self.compression)
+            .field("dfs_enabled", &self.dfs_enabled)
+            .field("dfs_target_overrides", &self.dfs_target_overrides)
+            .finish()
+    }
+}
+
+impl Zeroize for ClientConfig {
+    fn zeroize(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+        self.domain.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ClientConfig {}
+
+impl Drop for ClientConfig {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 /// Dials and re-authenticates on a consumer's behalf when a session dies.
 ///
 /// Holds a snapshot of the client's config rather than a back-reference to the
@@ -130,7 +171,8 @@ pub struct ClientConfig {
 ///
 /// **Security note:** it keeps the password for the life of the client, which
 /// is the same trade [`SmbClient`] already makes to reconnect without
-/// re-prompting.
+/// re-prompting. Its username, password, and domain buffers are zeroized when
+/// the last connection-owned reviver is dropped.
 struct ClientReviver {
     addr: String,
     timeout: Duration,
@@ -138,6 +180,22 @@ struct ClientReviver {
     username: String,
     password: String,
     domain: String,
+}
+
+impl Zeroize for ClientReviver {
+    fn zeroize(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+        self.domain.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ClientReviver {}
+
+impl Drop for ClientReviver {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 impl ClientReviver {
@@ -1465,6 +1523,97 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
         dfs_target_overrides: std::collections::HashMap::new(),
     })
     .await
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use zeroize::{Zeroize, ZeroizeOnDrop};
+
+    fn test_secret() -> String {
+        "x".repeat(32)
+    }
+
+    fn test_config(secret: String) -> ClientConfig {
+        ClientConfig {
+            addr: "server:445".to_string(),
+            timeout: Duration::from_secs(5),
+            username: String::new(),
+            password: secret,
+            domain: String::new(),
+            auto_reconnect: false,
+            compression: true,
+            dfs_enabled: true,
+            dfs_target_overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn client_config_debug_always_redacts_the_password() {
+        let secret = test_secret();
+        let rendered = format!("{:?}", test_config(secret.clone()));
+        assert!(!rendered.contains(&secret));
+        assert!(rendered.contains("password: \"<redacted>\""));
+
+        let guest_rendered = format!("{:?}", test_config(String::new()));
+        assert!(guest_rendered.contains("password: \"<redacted>\""));
+    }
+
+    #[test]
+    fn every_password_holder_zeroizes_its_retained_credentials() {
+        fn assert_zeroizes_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroizes_on_drop::<ClientConfig>();
+        assert_zeroizes_on_drop::<ClientReviver>();
+        assert_zeroizes_on_drop::<crate::auth::ntlm::NtlmCredentials>();
+        assert_zeroizes_on_drop::<crate::auth::kerberos::KerberosCredentials>();
+
+        let secret = test_secret();
+        let mut config = test_config(secret.clone());
+        let mut reviver = ClientReviver::from_config(&config);
+        let mut ntlm = crate::auth::ntlm::NtlmCredentials {
+            username: String::new(),
+            password: secret.clone(),
+            domain: String::new(),
+        };
+        let mut kerberos = crate::auth::kerberos::KerberosCredentials {
+            username: String::new(),
+            password: secret,
+            realm: "TEST.INVALID".to_string(),
+            kdc_address: "kdc.invalid:88".to_string(),
+        };
+
+        config.zeroize();
+        reviver.zeroize();
+        ntlm.zeroize();
+        kerberos.zeroize();
+
+        assert!(config.username.is_empty());
+        assert!(config.password.is_empty());
+        assert!(config.domain.is_empty());
+        assert!(reviver.username.is_empty());
+        assert!(reviver.password.is_empty());
+        assert!(reviver.domain.is_empty());
+        assert!(ntlm.username.is_empty());
+        assert!(ntlm.password.is_empty());
+        assert!(ntlm.domain.is_empty());
+        assert!(kerberos.username.is_empty());
+        assert!(kerberos.password.is_empty());
+        assert!(kerberos.realm.is_empty());
+    }
+
+    #[test]
+    fn kerberos_credential_debug_redacts_the_password() {
+        let secret = test_secret();
+        let credentials = crate::auth::kerberos::KerberosCredentials {
+            username: String::new(),
+            password: secret.clone(),
+            realm: "TEST.INVALID".to_string(),
+            kdc_address: "kdc.invalid:88".to_string(),
+        };
+        let rendered = format!("{credentials:?}");
+        assert!(!rendered.contains(&secret));
+        assert!(rendered.contains("password: \"<redacted>\""));
+    }
 }
 
 #[cfg(test)]

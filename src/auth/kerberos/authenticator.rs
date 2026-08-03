@@ -11,7 +11,9 @@
 //! session key.
 
 use log::{debug, trace};
+use std::fmt;
 use std::time::Duration;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::auth::kerberos::crypto::{
     compute_checksum, etype_from_i32, kerberos_decrypt, kerberos_encrypt, string_to_key_aes,
@@ -84,7 +86,11 @@ const PA_PAC_REQUEST: i32 = 128;
 // ---------------------------------------------------------------------------
 
 /// Credentials for Kerberos authentication.
-#[derive(Debug, Clone)]
+///
+/// The password is redacted from `Debug`, and the owned authentication
+/// strings are zeroized on drop. Consequently, callers must borrow or clone
+/// public fields instead of moving them out.
+#[derive(Clone)]
 pub struct KerberosCredentials {
     /// Username (without realm).
     pub username: String,
@@ -94,6 +100,34 @@ pub struct KerberosCredentials {
     pub realm: String,
     /// KDC address (host:port or host, port defaults to 88).
     pub kdc_address: String,
+}
+
+impl fmt::Debug for KerberosCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KerberosCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("realm", &self.realm)
+            .field("kdc_address", &self.kdc_address)
+            .finish()
+    }
+}
+
+impl Zeroize for KerberosCredentials {
+    fn zeroize(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+        self.realm.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for KerberosCredentials {}
+
+impl Drop for KerberosCredentials {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 /// Stateful Kerberos authenticator.

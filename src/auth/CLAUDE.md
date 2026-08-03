@@ -90,6 +90,7 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **`test_random_session_key` override**: Tests can inject a deterministic session key for reproducibility. Never used in production.
 - **Subkey in AP-REQ Authenticator**: The Kerberos authenticator includes a random subkey, which becomes the SMB session key. This provides forward secrecy.
 - **No full `authenticate()` unit tests**: The full flow requires a real KDC. Unit tests cover individual steps (encrypt/decrypt roundtrip, message encoding, etype parsing). Integration tests with Docker are planned.
+- **Credential lifetime**: `NtlmCredentials` and `KerberosCredentials` zeroize their owned username, password, and domain-or-realm buffers on drop; Kerberos `Debug` always redacts the password. The client layer applies the same rule to retained reconnect credentials. This clears each currently owned buffer, but cannot erase caller-owned clones, allocator copies, or swapped memory.
 
 ## Gotchas
 

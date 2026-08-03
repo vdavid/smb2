@@ -60,6 +60,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # Error handling
 thiserror = "2"
 
+# Clear retained authentication material when its owner is dropped.
+zeroize = "1.9"
+
 # Enum conversion derives
 num_enum = "0.7"
 
