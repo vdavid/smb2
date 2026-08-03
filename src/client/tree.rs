@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use log::{debug, info, trace, warn};
 
 use crate::client::connection::{CompoundOp, Connection};
+use crate::client::durable::FileIdentity;
 use crate::client::stream::{FileDownload, Progress};
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
@@ -103,6 +104,10 @@ const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
 
 /// A directory entry returned by [`Tree::list_directory`] or
 /// [`DirectoryReader::next_batch`].
+///
+/// This result type is non-exhaustive so future protocol metadata can be
+/// exposed without repeatedly breaking callers that only read its fields.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
     /// The file or directory name.
@@ -115,6 +120,26 @@ pub struct DirectoryEntry {
     pub created: FileTime,
     /// The last modification time.
     pub modified: FileTime,
+    /// The last metadata or content change time.
+    pub changed: FileTime,
+    /// The server-provided 64-bit file index, when the file system supports it.
+    ///
+    /// A zero value is reported as `None` because the protocol requires clients
+    /// to ignore it when stable file IDs are unavailable.
+    pub file_index: Option<u64>,
+}
+
+/// Controls the server-side semantics of an SMB rename.
+///
+/// The replacement decision is encoded in the single atomic
+/// `FileRenameInformation` operation. The client never emulates replacement by
+/// deleting the destination first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenameOptions {
+    /// Replace an existing destination when the server supports it.
+    ///
+    /// `false` preserves [`Tree::rename`]'s no-replace behavior.
+    pub replace_if_exists: bool,
 }
 
 /// One QUERY_DIRECTORY round trip within a directory listing, captured by
@@ -203,6 +228,10 @@ enum DirectoryReaderState {
 }
 
 /// File metadata returned by [`Tree::stat`].
+///
+/// This result type is non-exhaustive so future protocol metadata can be
+/// exposed without repeatedly breaking callers that only read its fields.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct FileInfo {
     /// The file size in bytes.
@@ -215,6 +244,136 @@ pub struct FileInfo {
     pub modified: FileTime,
     /// The last access time.
     pub accessed: FileTime,
+    /// The last metadata or content change time.
+    pub changed: FileTime,
+    /// Stable identity for this file, when the server exposes a non-zero
+    /// `FileInternalInformation` index.
+    pub identity: Option<FileIdentity>,
+}
+
+/// An open source handle for an identity-checked rename or deletion.
+///
+/// The metadata was captured from the same CREATE that produced `file_id`, so
+/// a caller can validate a version token and then mutate this handle without a
+/// path-based time-of-check/time-of-use window. Call [`rename`](Self::rename),
+/// [`delete`](Self::delete), or [`close`](Self::close); dropping a live handle
+/// cannot perform the asynchronous CLOSE and leaves cleanup to session teardown.
+#[must_use = "rename, delete, or close the mutation handle"]
+pub struct MutationHandle {
+    tree: Arc<Tree>,
+    conn: Connection,
+    file_id: FileId,
+    info: FileInfo,
+    closed: bool,
+}
+
+impl MutationHandle {
+    /// Metadata captured when this exact handle was opened.
+    #[must_use]
+    pub fn info(&self) -> &FileInfo {
+        &self.info
+    }
+
+    /// Atomically rename this open source handle.
+    ///
+    /// Replacement is encoded directly in `FileRenameInformation`; no target
+    /// deletion is performed. A failed SET_INFO leaves the handle open only
+    /// long enough for a best-effort CLOSE before the error is returned.
+    pub async fn rename(mut self, destination: &str, options: RenameOptions) -> Result<()> {
+        let request = SetInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_RENAME_INFORMATION,
+            additional_information: 0,
+            file_id: self.file_id,
+            buffer: build_rename_info_buffer(
+                &normalize_path(destination),
+                options.replace_if_exists,
+            ),
+        };
+        let frame = self
+            .conn
+            .execute(Command::SetInfo, &request, Some(self.tree.tree_id))
+            .await;
+        match frame {
+            Ok(frame) if frame.header.status == NtStatus::SUCCESS => {
+                // The rename committed in SET_INFO. CLOSE failure cannot undo
+                // it and is therefore non-fatal, matching Tree::rename.
+                if let Err(error) = self.tree.close_handle(&mut self.conn, self.file_id).await {
+                    debug!("tree: mutation-handle CLOSE after rename failed: {error}");
+                }
+                self.closed = true;
+                Ok(())
+            }
+            Ok(frame) => {
+                let error = Error::Protocol {
+                    status: frame.header.status,
+                    command: Command::SetInfo,
+                };
+                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
+                self.closed = true;
+                Err(error)
+            }
+            Err(error) => {
+                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Mark this exact open handle for deletion and close it.
+    ///
+    /// Directories must be empty. The returned result includes CLOSE because
+    /// delete-pending takes final effect when the handle closes.
+    pub async fn delete(mut self) -> Result<()> {
+        let request = SetInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_DISPOSITION_INFORMATION,
+            additional_information: 0,
+            file_id: self.file_id,
+            buffer: vec![1],
+        };
+        let frame = self
+            .conn
+            .execute(Command::SetInfo, &request, Some(self.tree.tree_id))
+            .await;
+        match frame {
+            Ok(frame) if frame.header.status == NtStatus::SUCCESS => {
+                let result = self.tree.close_handle(&mut self.conn, self.file_id).await;
+                self.closed = true;
+                result
+            }
+            Ok(frame) => {
+                let error = Error::Protocol {
+                    status: frame.header.status,
+                    command: Command::SetInfo,
+                };
+                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
+                self.closed = true;
+                Err(error)
+            }
+            Err(error) => {
+                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Close without mutating the entry.
+    pub async fn close(mut self) -> Result<()> {
+        let result = self.tree.close_handle(&mut self.conn, self.file_id).await;
+        self.closed = true;
+        result
+    }
+}
+
+impl Drop for MutationHandle {
+    fn drop(&mut self) {
+        if !self.closed {
+            debug!("tree: MutationHandle dropped without rename(), delete(), or close()")
+        }
+    }
 }
 
 /// File system space information for a share.
@@ -961,7 +1120,9 @@ impl Tree {
     /// Get file metadata (size, timestamps, is_directory) using a compound request (1 round-trip).
     ///
     /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
-    /// QUERY_INFO (FileStandardInformation) + CLOSE as a single compound message.
+    /// QUERY_INFO (FileStandardInformation) + QUERY_INFO
+    /// (FileInternalInformation) + QUERY_INFO (FileFsVolumeInformation) +
+    /// CLOSE as a single compound message.
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
         let normalized = self.format_path(path);
         trace!("tree: stat (compound) path={}", normalized);
@@ -1007,6 +1168,12 @@ impl Tree {
             input_buffer: vec![],
         };
 
+        // Optional stable 64-bit file index. Servers that do not support it
+        // return an error for this sub-operation; stat still succeeds with a
+        // `None` identity.
+        let identity_req = FileIdentity::index_query();
+        let volume_req = FileIdentity::volume_query();
+
         // CLOSE with sentinel FileId.
         let close_req = CloseRequest {
             flags: 0,
@@ -1033,6 +1200,18 @@ impl Tree {
                 credit_charge: CreditCharge(1),
             },
             CompoundOp {
+                command: Command::QueryInfo,
+                body: &identity_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &volume_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
                 command: Command::Close,
                 body: &close_req,
                 tree_id: Some(self.tree_id),
@@ -1048,7 +1227,9 @@ impl Tree {
         let basic_body = &responses[1].body;
         let std_header = &responses[2].header;
         let std_body = &responses[2].body;
-        let close_header = &responses[3].header;
+        let identity_frame = &responses[3];
+        let volume_frame = &responses[4];
+        let close_header = &responses[5].header;
 
         // If CREATE failed, all ops cascade. No handle to clean up.
         if create_header.status != NtStatus::SUCCESS {
@@ -1091,7 +1272,7 @@ impl Tree {
         let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
         let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
         let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
-        let _change_time = u64::from_le_bytes(basic_buf[24..32].try_into().unwrap());
+        let changed = FileTime(u64::from_le_bytes(basic_buf[24..32].try_into().unwrap()));
         let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
 
         // Check second QUERY_INFO (standard). If it failed, issue standalone CLOSE.
@@ -1152,6 +1333,8 @@ impl Tree {
             created,
             modified,
             accessed,
+            changed,
+            identity: FileIdentity::from_frames(Some(identity_frame), Some(volume_frame)),
         })
     }
 
@@ -1333,14 +1516,32 @@ impl Tree {
     /// Rename or move a file within the same share using a compound request (1 round-trip).
     ///
     /// Sends CREATE + SET_INFO (FileRenameInformation) + CLOSE as a single
-    /// compound message.
+    /// compound message. Existing destinations are not replaced.
     pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
+        self.rename_with_options(conn, from, to, RenameOptions::default())
+            .await
+    }
+
+    /// Rename or move a file within the same share with explicit replacement
+    /// semantics.
+    ///
+    /// This is one SMB `FileRenameInformation` mutation. When
+    /// [`RenameOptions::replace_if_exists`] is true, `ReplaceIfExists` is sent
+    /// to the server directly; this method never performs delete-then-rename.
+    pub async fn rename_with_options(
+        &self,
+        conn: &mut Connection,
+        from: &str,
+        to: &str,
+        options: RenameOptions,
+    ) -> Result<()> {
         let from_normalized = self.format_path(from);
         let to_normalized = normalize_path(to);
         trace!(
-            "tree: rename (compound) from={} to={}",
+            "tree: rename (compound) from={} to={} replace_if_exists={}",
             from_normalized,
-            to_normalized
+            to_normalized,
+            options.replace_if_exists
         );
 
         // Build CREATE request with DELETE access (required for rename).
@@ -1368,7 +1569,7 @@ impl Tree {
             file_info_class: FILE_RENAME_INFORMATION,
             additional_information: 0,
             file_id: FileId::SENTINEL,
-            buffer: build_rename_info_buffer(&to_normalized),
+            buffer: build_rename_info_buffer(&to_normalized, options.replace_if_exists),
         };
 
         // Build CLOSE request with sentinel FileId.
@@ -2054,6 +2255,26 @@ impl Tree {
         super::stream::open_file_reader(Arc::clone(self), conn, path).await
     }
 
+    /// Open a source handle for an identity-checked rename or deletion.
+    ///
+    /// The returned metadata belongs to the same handle the mutation methods
+    /// operate on, eliminating a path replacement between stat and mutation.
+    pub async fn open_mutation_handle(
+        self: &Arc<Self>,
+        mut conn: Connection,
+        path: &str,
+    ) -> Result<MutationHandle> {
+        let normalized = self.format_path(path);
+        let (file_id, info) = self.open_file_for_mutation(&mut conn, &normalized).await?;
+        Ok(MutationHandle {
+            tree: Arc::clone(self),
+            conn,
+            file_id,
+            info,
+            closed: false,
+        })
+    }
+
     /// Create a push-based pipelined streaming writer that owns its
     /// `Connection` and `Arc<Tree>`.
     ///
@@ -2381,6 +2602,90 @@ impl Tree {
         Ok((resp.file_id, resp.end_of_file))
     }
 
+    /// Open a file or directory with DELETE access and capture metadata for
+    /// that exact handle.
+    async fn open_file_for_mutation(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<(FileId, FileInfo)> {
+        let request = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::DELETE
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: path.to_owned(),
+            create_contexts: vec![],
+        };
+        let frame = conn
+            .execute(Command::Create, &request, Some(self.tree_id))
+            .await?;
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::Create,
+            });
+        }
+        let response = CreateResponse::unpack(&mut ReadCursor::new(&frame.body))?;
+
+        let mut index_request = FileIdentity::index_query();
+        index_request.file_id = response.file_id;
+        let mut volume_request = FileIdentity::volume_query();
+        volume_request.file_id = response.file_id;
+        let operations = [
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &index_request,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &volume_request,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+        ];
+        let frames = match conn.execute_compound(&operations).await {
+            Ok(frames) => match all_or_first_err(frames) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    let _ = self.close_handle(conn, response.file_id).await;
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                let _ = self.close_handle(conn, response.file_id).await;
+                return Err(error);
+            }
+        };
+        let identity = FileIdentity::from_frames(frames.first(), frames.get(1));
+        let is_directory = response.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        Ok((
+            response.file_id,
+            FileInfo {
+                size: response.end_of_file,
+                is_directory,
+                created: response.creation_time,
+                modified: response.last_write_time,
+                accessed: response.last_access_time,
+                changed: response.change_time,
+                identity,
+            },
+        ))
+    }
+
     /// Open (or create) a file for writing, returning the file handle.
     ///
     /// Uses `FileOverwriteIf` disposition (create if absent, overwrite if present)
@@ -2585,7 +2890,7 @@ impl Tree {
         output_buffer_length: u32,
     ) -> Result<QueryStepOutcome> {
         let req = QueryDirectoryRequest {
-            file_information_class: FileInformationClass::FileBothDirectoryInformation,
+            file_information_class: FileInformationClass::FileIdBothDirectoryInformation,
             flags: QueryDirectoryFlags(if restart {
                 QueryDirectoryFlags::RESTART_SCANS
             } else {
@@ -2620,8 +2925,8 @@ impl Tree {
         let resp = QueryDirectoryResponse::unpack(&mut cursor)?;
         let bytes = resp.output_buffer.len();
 
-        // Parse FileBothDirectoryInformation entries from the output buffer.
-        let entries = parse_file_both_directory_info(&resp.output_buffer)?;
+        // Parse FileIdBothDirectoryInformation entries from the output buffer.
+        let entries = parse_file_id_both_directory_info(&resp.output_buffer)?;
         for e in &entries {
             trace!(
                 "tree: dir_entry name={}, size={}, is_dir={}",
@@ -3337,12 +3642,12 @@ impl Tree {
 }
 
 /// Build a FileRenameInformation buffer (MS-FSCC 2.4.34.2).
-fn build_rename_info_buffer(new_name: &str) -> Vec<u8> {
+fn build_rename_info_buffer(new_name: &str, replace_if_exists: bool) -> Vec<u8> {
     let name_u16: Vec<u16> = new_name.encode_utf16().collect();
     let name_byte_len = name_u16.len() * 2;
 
     let mut buf = Vec::with_capacity(20 + name_byte_len);
-    buf.push(0); // ReplaceIfExists = false
+    buf.push(u8::from(replace_if_exists)); // ReplaceIfExists
     buf.extend_from_slice(&[0u8; 7]); // Reserved
     buf.extend_from_slice(&0u64.to_le_bytes()); // RootDirectory
     buf.extend_from_slice(&(name_byte_len as u32).to_le_bytes()); // FileNameLength
@@ -3361,7 +3666,7 @@ fn normalize_path(path: &str) -> String {
     crate::name::encode_path(path)
 }
 
-/// Parse `FileBothDirectoryInformation` entries from raw bytes.
+/// Parse `FileIdBothDirectoryInformation` entries from raw bytes.
 ///
 /// Each entry has:
 /// - NextEntryOffset (4 bytes)
@@ -3378,38 +3683,75 @@ fn normalize_path(path: &str) -> String {
 /// - ShortNameLength (1 byte)
 /// - Reserved (1 byte)
 /// - ShortName (24 bytes)
+/// - Reserved2 (2 bytes)
+/// - FileId (8 bytes)
 /// - FileName (variable, FileNameLength bytes)
-fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
+fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
     let mut entries = Vec::new();
     let mut offset = 0usize;
 
-    loop {
-        if offset + 94 > data.len() {
-            // Not enough data for the fixed part.
-            break;
+    while offset < data.len() {
+        let remaining = data.len() - offset;
+        if remaining < 104 {
+            return Err(Error::invalid_data(format!(
+                "FileIdBothDirectoryInformation fixed record is truncated at byte {offset}"
+            )));
         }
 
-        let entry_data = &data[offset..];
+        let next_entry_offset = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .expect("four-byte slice"),
+        ) as usize;
+        let record_len = if next_entry_offset == 0 {
+            remaining
+        } else {
+            if next_entry_offset < 104
+                || next_entry_offset > remaining
+                || next_entry_offset % 8 != 0
+            {
+                return Err(Error::invalid_data(format!(
+                    "invalid FileIdBothDirectoryInformation NextEntryOffset {next_entry_offset} at byte {offset}"
+                )));
+            }
+            next_entry_offset
+        };
+
+        let entry_data = &data[offset..offset + record_len];
         let mut cursor = ReadCursor::new(entry_data);
 
-        let next_entry_offset = cursor.read_u32_le()? as usize;
+        let parsed_next_entry_offset = cursor.read_u32_le()? as usize;
+        debug_assert_eq!(parsed_next_entry_offset, next_entry_offset);
         let _file_index = cursor.read_u32_le()?;
         let creation_time = FileTime::unpack(&mut cursor)?;
         let _last_access_time = FileTime::unpack(&mut cursor)?;
         let last_write_time = FileTime::unpack(&mut cursor)?;
-        let _change_time = FileTime::unpack(&mut cursor)?;
+        let change_time = FileTime::unpack(&mut cursor)?;
         let end_of_file = cursor.read_u64_le()?;
         let _allocation_size = cursor.read_u64_le()?;
         let file_attributes = cursor.read_u32_le()?;
         let file_name_length = cursor.read_u32_le()? as usize;
         let _ea_size = cursor.read_u32_le()?;
-        let _short_name_length = cursor.read_u8()?;
+        let short_name_length = cursor.read_u8()? as usize;
+        if short_name_length > 24 || short_name_length % 2 != 0 {
+            return Err(Error::invalid_data(format!(
+                "invalid FileIdBothDirectoryInformation ShortNameLength {short_name_length} at byte {offset}"
+            )));
+        }
         let _reserved = cursor.read_u8()?;
         // ShortName: 24 bytes (fixed, null-padded).
         cursor.skip(24)?;
+        // Reserved2 + stable 64-bit FileId.
+        cursor.skip(2)?;
+        let file_index = cursor.read_u64_le()?;
         // FileName: FileNameLength bytes in UTF-16LE. A single component, so
         // it decodes with `decode_name`, not `decode_path`: a `\` that comes
         // back here is a character in the name (see `crate::name`).
+        if file_name_length % 2 != 0 || file_name_length > cursor.remaining() {
+            return Err(Error::invalid_data(format!(
+                "invalid FileIdBothDirectoryInformation FileNameLength {file_name_length} at byte {offset}"
+            )));
+        }
         let name = if file_name_length > 0 {
             crate::name::decode_name(&cursor.read_utf16_le(file_name_length)?).into_owned()
         } else {
@@ -3424,12 +3766,16 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
             is_directory,
             created: creation_time,
             modified: last_write_time,
+            changed: change_time,
+            file_index: (file_index != 0).then_some(file_index),
         });
 
         if next_entry_offset == 0 {
             break;
         }
-        offset += next_entry_offset;
+        offset = offset
+            .checked_add(next_entry_offset)
+            .ok_or_else(|| Error::invalid_data("FileIdBothDirectoryInformation offset overflow"))?;
     }
 
     Ok(entries)
@@ -3441,7 +3787,7 @@ mod tests {
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
         build_close_response, build_create_error_response, build_create_response,
-        build_tree_connect_response, setup_connection,
+        build_query_info_error_response, build_tree_connect_response, setup_connection,
     };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
@@ -3524,12 +3870,28 @@ mod tests {
         pack_message(&h, &body)
     }
 
-    /// Build a single FileBothDirectoryInformation entry.
-    fn build_file_both_dir_info(
+    /// Build a single FileIdBothDirectoryInformation entry.
+    fn build_file_id_both_dir_info(
         name: &str,
         size: u64,
         is_directory: bool,
         next_offset: u32,
+    ) -> Vec<u8> {
+        build_file_id_both_dir_info_with_index(
+            name,
+            size,
+            is_directory,
+            next_offset,
+            0x1122_3344_5566_7788,
+        )
+    }
+
+    fn build_file_id_both_dir_info_with_index(
+        name: &str,
+        size: u64,
+        is_directory: bool,
+        next_offset: u32,
+        file_index: u64,
     ) -> Vec<u8> {
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         let name_bytes_len = name_u16.len() * 2;
@@ -3568,6 +3930,9 @@ mod tests {
         buf.push(0);
         // ShortName (24 bytes, zero-padded)
         buf.extend_from_slice(&[0u8; 24]);
+        // Reserved2 (2) + FileId (8)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&file_index.to_le_bytes());
         // FileName (variable)
         for &u in &name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());
@@ -3614,11 +3979,12 @@ mod tests {
         };
 
         // Build two directory entries.
-        let entry1 = build_file_both_dir_info("file1.txt", 1024, false, 0);
-        let total_entry_len = entry1.len();
-        let entry1_with_next =
-            build_file_both_dir_info("file1.txt", 1024, false, total_entry_len as u32);
-        let entry2 = build_file_both_dir_info("subdir", 0, true, 0);
+        let entry1 = build_file_id_both_dir_info("file1.txt", 1024, false, 0);
+        let total_entry_len = entry1.len().next_multiple_of(8);
+        let mut entry1_with_next =
+            build_file_id_both_dir_info("file1.txt", 1024, false, total_entry_len as u32);
+        entry1_with_next.resize(total_entry_len, 0);
+        let entry2 = build_file_id_both_dir_info("subdir", 0, true, 0);
 
         let mut entries_data = entry1_with_next;
         entries_data.extend_from_slice(&entry2);
@@ -3651,6 +4017,15 @@ mod tests {
         assert!(!entries[0].is_directory);
         assert_eq!(entries[1].name, "subdir");
         assert!(entries[1].is_directory);
+
+        let sent = mock.sent_message(1).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        let request = QueryDirectoryRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(
+            request.file_information_class,
+            FileInformationClass::FileIdBothDirectoryInformation
+        );
     }
 
     #[tokio::test]
@@ -3664,11 +4039,11 @@ mod tests {
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_both_dir_info("first.txt", 10, false, 0),
+            build_file_id_both_dir_info("first.txt", 10, false, 0),
         ));
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_both_dir_info("second.txt", 20, false, 0),
+            build_file_id_both_dir_info("second.txt", 20, false, 0),
         ));
         mock.queue_response(build_query_directory_response(
             NtStatus::NO_MORE_FILES,
@@ -3785,7 +4160,7 @@ mod tests {
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_both_dir_info("first.txt", 10, false, 0),
+            build_file_id_both_dir_info("first.txt", 10, false, 0),
         ));
 
         let conn = setup_connection(&mock);
@@ -3815,7 +4190,7 @@ mod tests {
 
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_both_dir_info("preserved.txt", 20, false, 0),
+            build_file_id_both_dir_info("preserved.txt", 20, false, 0),
         ));
         wait_for_mock_counts(&mock, 3, 3).await;
 
@@ -3911,7 +4286,7 @@ mod tests {
         mock.queue_responses(vec![
             build_query_directory_response(
                 NtStatus::SUCCESS,
-                build_file_both_dir_info("discarded.txt", 10, false, 0),
+                build_file_id_both_dir_info("discarded.txt", 10, false, 0),
             ),
             build_close_response(),
         ]);
@@ -4000,10 +4375,12 @@ mod tests {
             volatile: 0x2222,
         };
 
-        let entry1 = build_file_both_dir_info("file1.txt", 1024, false, 0);
-        let entry1_with_next =
-            build_file_both_dir_info("file1.txt", 1024, false, entry1.len() as u32);
-        let entry2 = build_file_both_dir_info("subdir", 0, true, 0);
+        let entry1 = build_file_id_both_dir_info("file1.txt", 1024, false, 0);
+        let entry1_len = entry1.len().next_multiple_of(8);
+        let mut entry1_with_next =
+            build_file_id_both_dir_info("file1.txt", 1024, false, entry1_len as u32);
+        entry1_with_next.resize(entry1_len, 0);
+        let entry2 = build_file_id_both_dir_info("subdir", 0, true, 0);
         let mut entries_data = entry1_with_next;
         entries_data.extend_from_slice(&entry2);
         let payload_len = entries_data.len();
@@ -4211,13 +4588,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_file_both_dir_info_single_entry() {
-        let data = build_file_both_dir_info("test.txt", 42, false, 0);
-        let entries = parse_file_both_directory_info(&data).unwrap();
+    async fn parse_file_id_both_dir_info_single_entry() {
+        let data = build_file_id_both_dir_info("test.txt", 42, false, 0);
+        let entries = parse_file_id_both_directory_info(&data).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.txt");
         assert_eq!(entries[0].size, 42);
         assert!(!entries[0].is_directory);
+        assert_eq!(entries[0].changed, FileTime(133_000_000_000_000_000));
+        assert_eq!(entries[0].file_index, Some(0x1122_3344_5566_7788));
+    }
+
+    #[test]
+    fn parse_file_id_both_dir_info_ignores_zero_file_id() {
+        let data = build_file_id_both_dir_info_with_index("unstable.txt", 42, false, 0, 0);
+        let entries = parse_file_id_both_directory_info(&data).unwrap();
+        assert_eq!(entries[0].file_index, None);
+    }
+
+    #[test]
+    fn parse_file_id_both_dir_info_rejects_truncated_record() {
+        let error = parse_file_id_both_directory_info(&[0u8; 103]).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_file_id_both_dir_info_rejects_bad_next_offset() {
+        let mut data = build_file_id_both_dir_info("bad.txt", 42, false, 0);
+        data[0..4].copy_from_slice(&105u32.to_le_bytes());
+        let error = parse_file_id_both_directory_info(&data).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_file_id_both_dir_info_rejects_name_crossing_record() {
+        let mut first = build_file_id_both_dir_info("first.txt", 42, false, 0);
+        let record_len = first.len().next_multiple_of(8);
+        first.resize(record_len, 0);
+        first[0..4].copy_from_slice(&(record_len as u32).to_le_bytes());
+        first[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        first.extend_from_slice(&build_file_id_both_dir_info("second.txt", 1, false, 0));
+
+        let error = parse_file_id_both_directory_info(&first).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -4266,6 +4679,18 @@ mod tests {
         build_query_info_response, build_query_info_response_with_status, build_set_info_response,
     };
 
+    fn sent_rename_request(mock: &MockTransport, message: usize) -> SetInfoRequest {
+        let sent = mock.sent_message(message).unwrap();
+        let mut create_cursor = ReadCursor::new(&sent);
+        let create_header = Header::unpack(&mut create_cursor).unwrap();
+        let set_info_offset = create_header.next_command as usize;
+        assert!(set_info_offset > Header::SIZE);
+
+        let mut set_info_cursor = ReadCursor::new(&sent[set_info_offset..]);
+        let set_info_header = Header::unpack(&mut set_info_cursor).unwrap();
+        assert_eq!(set_info_header.command, Command::SetInfo);
+        SetInfoRequest::unpack(&mut set_info_cursor).unwrap()
+    }
     /// Build a FileBasicInformation buffer (40 bytes).
     fn build_file_basic_info(
         creation_time: u64,
@@ -4299,6 +4724,20 @@ mod tests {
         buf.push(if delete_pending { 1 } else { 0 });
         buf.push(if directory { 1 } else { 0 });
         buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        buf
+    }
+
+    /// Build a FileInternalInformation buffer containing a 64-bit file ID.
+    fn build_file_internal_info(index_number: u64) -> Vec<u8> {
+        index_number.to_le_bytes().to_vec()
+    }
+
+    /// Build the fixed prefix of FileFsVolumeInformation used by identity.
+    fn build_file_fs_volume_info(volume_serial: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 8]; // VolumeCreationTime
+        buf.extend_from_slice(&volume_serial.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // VolumeLabelLength
+        buf.extend_from_slice(&[0, 0]); // SupportsObjects + Reserved
         buf
     }
 
@@ -4498,7 +4937,7 @@ mod tests {
             volatile: 0xFF,
         };
 
-        // STAT = compound CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
+        // STAT = CREATE + basic + standard + internal + volume + CLOSE.
         let create_resp = build_create_response(file_id, 0);
         let basic = build_file_basic_info(
             132_000_000_000_000_000,
@@ -4510,9 +4949,18 @@ mod tests {
         let basic_resp = build_query_info_response(basic);
         let std_info = build_file_standard_info(4096, 2048, 1, false, false);
         let std_resp = build_query_info_response(std_info);
+        let identity_resp = build_query_info_response(build_file_internal_info(0x1234));
+        let volume_resp = build_query_info_response(build_file_fs_volume_info(0xABCD));
         let close_resp = build_close_response();
 
-        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            basic_resp,
+            std_resp,
+            identity_resp,
+            volume_resp,
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -4530,8 +4978,47 @@ mod tests {
         assert_eq!(info.created, FileTime(132_000_000_000_000_000));
         assert_eq!(info.modified, FileTime(133_000_000_000_000_000));
         assert_eq!(info.accessed, FileTime(132_100_000_000_000_000));
+        assert_eq!(info.changed, FileTime(133_000_000_000_000_000));
+        assert_eq!(
+            info.identity,
+            Some(FileIdentity {
+                volume_serial: 0xABCD,
+                index_number: 0x1234,
+            })
+        );
         // One compound frame sent.
         assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stat_succeeds_when_server_declines_file_identity() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xEE,
+            volatile: 0xFF,
+        };
+        let responses = [
+            build_create_response(file_id, 0),
+            build_query_info_response(build_file_basic_info(1, 2, 3, 4, 0x20)),
+            build_query_info_response(build_file_standard_info(4096, 2048, 1, false, false)),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_close_response(),
+        ];
+        mock.queue_response(build_compound_response_frame(&responses));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let info = tree.stat(&mut conn, "doc.txt").await.unwrap();
+        assert_eq!(info.identity, None);
+        assert_eq!(info.changed, FileTime(4));
     }
 
     #[tokio::test]
@@ -4567,7 +5054,14 @@ mod tests {
         close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
         let close_resp = pack_message(&close_hdr, &err_body);
 
-        let frame = build_compound_response_frame(&[create_resp, q1_resp, q2_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            q1_resp,
+            q2_resp,
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -4622,7 +5116,14 @@ mod tests {
         close_hdr.status = NtStatus::UNSUCCESSFUL;
         let close_resp = pack_message(&close_hdr, &err_body);
 
-        let frame = build_compound_response_frame(&[create_resp, q1_resp, q2_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            q1_resp,
+            q2_resp,
+            build_query_info_error_response(NtStatus::UNSUCCESSFUL),
+            build_query_info_error_response(NtStatus::UNSUCCESSFUL),
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         // Queue response for the standalone CLOSE retry.
@@ -4649,7 +5150,7 @@ mod tests {
     async fn stat_files_batch_happy_path() {
         let mock = Arc::new(MockTransport::new());
 
-        // Queue 3 compound responses (CREATE+QUERY+QUERY+CLOSE each).
+        // Queue 3 compound responses (CREATE + four QUERY_INFO + CLOSE each).
         for i in 0..3u64 {
             let file_id = FileId {
                 persistent: i + 1,
@@ -4666,11 +5167,15 @@ mod tests {
             let basic_resp = build_query_info_response(basic);
             let std_info = build_file_standard_info(4096, 1024 * (i + 1), 1, false, false);
             let std_resp = build_query_info_response(std_info);
+            let identity_resp = build_query_info_response(build_file_internal_info(i + 1));
+            let volume_resp = build_query_info_response(build_file_fs_volume_info(0xABCD));
             let close_resp = build_close_response();
             mock.queue_response(build_compound_response_frame(&[
                 create_resp,
                 basic_resp,
                 std_resp,
+                identity_resp,
+                volume_resp,
                 close_resp,
             ]));
         }
@@ -4720,11 +5225,15 @@ mod tests {
         let basic_resp = build_query_info_response(basic);
         let std_info = build_file_standard_info(4096, 512, 1, false, false);
         let std_resp = build_query_info_response(std_info);
+        let identity_resp = build_query_info_response(build_file_internal_info(1));
+        let volume_resp = build_query_info_response(build_file_fs_volume_info(0xABCD));
         let close_resp = build_close_response();
         mock.queue_response(build_compound_response_frame(&[
             create_resp,
             basic_resp,
             std_resp,
+            identity_resp,
+            volume_resp,
             close_resp,
         ]));
 
@@ -4753,7 +5262,12 @@ mod tests {
         close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
         let close_err = pack_message(&close_hdr, &err_body);
         mock.queue_response(build_compound_response_frame(&[
-            create_err, q1_err, q2_err, close_err,
+            create_err,
+            q1_err,
+            q2_err,
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            close_err,
         ]));
 
         let mut conn = setup_connection(&mock);
@@ -4831,6 +5345,195 @@ mod tests {
         let _header = Header::unpack(&mut cursor).unwrap();
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert!(req.desired_access.contains(FileAccessMask::DELETE));
+
+        let rename = sent_rename_request(&mock, 0);
+        assert_eq!(rename.file_info_class, FILE_RENAME_INFORMATION);
+        assert_eq!(rename.buffer[0], 0, "rename defaults to no-replace");
+        assert_eq!(&rename.buffer[1..8], &[0; 7]);
+        assert_eq!(&rename.buffer[8..16], &0u64.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(rename.buffer[16..20].try_into().unwrap()),
+            14,
+            "new.txt is seven UTF-16 code units"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_with_replace_encodes_one_atomic_server_mutation() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(file_id, 0),
+            build_set_info_response(),
+            build_close_response(),
+        ]));
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        tree.rename_with_options(
+            &mut conn,
+            "old.txt",
+            "new.txt",
+            RenameOptions {
+                replace_if_exists: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mock.sent_count(), 1, "replacement is not delete + rename");
+        let rename = sent_rename_request(&mock, 0);
+        assert_eq!(rename.buffer[0], 1, "SMB ReplaceIfExists must be set");
+    }
+
+    #[tokio::test]
+    async fn mutation_handle_renames_the_same_identity_checked_open() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x31,
+            volatile: 0x32,
+        };
+        let mut volume = vec![0u8; 16];
+        volume[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        mock.queue_response(build_create_response(file_id, 42));
+        mock.queue_response(build_compound_response_frame(&[
+            build_query_info_response(0x8877_6655_4433_2211u64.to_le_bytes().to_vec()),
+            build_query_info_response(volume),
+        ]));
+        mock.queue_response(build_set_info_response());
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = Arc::new(Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        });
+        let handle = tree.open_mutation_handle(conn, "old.txt").await.unwrap();
+        assert_eq!(
+            handle.info().identity,
+            Some(FileIdentity {
+                volume_serial: 0x1234_5678,
+                index_number: 0x8877_6655_4433_2211,
+            })
+        );
+        handle
+            .rename(
+                "new.txt",
+                RenameOptions {
+                    replace_if_exists: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(mock.sent_count(), 4, "the source is opened exactly once");
+        let sent = mock.sent_message(2).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let header = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(header.command, Command::SetInfo);
+        let request = SetInfoRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(request.file_id, file_id);
+        assert_eq!(request.file_info_class, FILE_RENAME_INFORMATION);
+        assert_eq!(request.buffer[0], 1);
+    }
+
+    #[tokio::test]
+    async fn mutation_handle_deletes_by_file_id_then_closes() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x41,
+            volatile: 0x42,
+        };
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_compound_response_frame(&[
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+        ]));
+        mock.queue_response(build_set_info_response());
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = Arc::new(Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        });
+        let handle = tree.open_mutation_handle(conn, "empty-dir").await.unwrap();
+        assert_eq!(handle.info().identity, None);
+        handle.delete().await.unwrap();
+
+        let sent = mock.sent_message(2).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let header = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(header.command, Command::SetInfo);
+        let request = SetInfoRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(request.file_id, file_id);
+        assert_eq!(request.file_info_class, FILE_DISPOSITION_INFORMATION);
+        assert_eq!(request.buffer, vec![1]);
+        assert_eq!(mock.sent_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn no_replace_surfaces_an_existing_destination_conflict() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x11,
+            volatile: 0x22,
+        };
+        let create_resp = build_create_response(file_id, 0);
+        let mut setinfo_hdr = Header::new_request(Command::SetInfo);
+        setinfo_hdr.flags.set_response();
+        setinfo_hdr.credits = 32;
+        setinfo_hdr.status = NtStatus::OBJECT_NAME_COLLISION;
+        let error = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+        let setinfo_resp = pack_message(&setinfo_hdr, &error);
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::OBJECT_NAME_COLLISION;
+        let close_resp = pack_message(&close_hdr, &error);
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            setinfo_resp,
+            close_resp,
+        ]));
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let error = tree
+            .rename(&mut conn, "old.txt", "occupied.txt")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), Some(NtStatus::OBJECT_NAME_COLLISION));
+        assert_eq!(error.kind(), crate::ErrorKind::AlreadyExists);
+        assert_eq!(sent_rename_request(&mock, 0).buffer[0], 0);
     }
 
     #[tokio::test]
@@ -6767,7 +7470,7 @@ mod tests {
             volatile: 0xDD,
         };
 
-        // STAT = compound CREATE + QUERY_INFO(basic, BUFFER_OVERFLOW) + QUERY_INFO(standard) + CLOSE
+        // STAT = CREATE + basic (BUFFER_OVERFLOW) + standard + identity + volume + CLOSE.
         let create_resp = build_create_response(file_id, 0);
 
         let basic = build_file_basic_info(
@@ -6781,10 +7484,19 @@ mod tests {
 
         let std_info = build_file_standard_info(4096, 1024, 1, false, false);
         let std_resp = build_query_info_response(std_info);
+        let identity_resp = build_query_info_response(build_file_internal_info(0x1234));
+        let volume_resp = build_query_info_response(build_file_fs_volume_info(0xABCD));
 
         let close_resp = build_close_response();
 
-        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            basic_resp,
+            std_resp,
+            identity_resp,
+            volume_resp,
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);

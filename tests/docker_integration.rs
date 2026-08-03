@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tree};
+use smb2::client::{
+    list_shares, ClientConfig, Connection, RenameOptions, Session, SmbClient, Tree,
+};
 
 const GUEST_ADDR: &str = "127.0.0.1:10445";
 const AUTH_ADDR: &str = "127.0.0.1:10446";
@@ -139,6 +141,60 @@ async fn guest_write_read_delete() {
         .await
         .expect("delete_file failed");
 
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_rename_honors_atomic_replace_option() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+    let source = "docker_test_rename_source.tmp";
+    let destination = "docker_test_rename_destination.tmp";
+    let _ = tree.delete_file(&mut conn, source).await;
+    let _ = tree.delete_file(&mut conn, destination).await;
+
+    tree.write_file(&mut conn, source, b"source")
+        .await
+        .expect("write source failed");
+    tree.write_file(&mut conn, destination, b"destination")
+        .await
+        .expect("write destination failed");
+
+    let conflict = tree
+        .rename(&mut conn, source, destination)
+        .await
+        .expect_err("no-replace rename must preserve an existing destination");
+    assert_eq!(conflict.kind(), smb2::ErrorKind::AlreadyExists);
+    assert_eq!(tree.read_file(&mut conn, source).await.unwrap(), b"source");
+    assert_eq!(
+        tree.read_file(&mut conn, destination).await.unwrap(),
+        b"destination"
+    );
+
+    tree.rename_with_options(
+        &mut conn,
+        source,
+        destination,
+        RenameOptions {
+            replace_if_exists: true,
+        },
+    )
+    .await
+    .expect("replace rename failed");
+    assert_eq!(
+        tree.read_file(&mut conn, destination).await.unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        tree.stat(&mut conn, source).await.unwrap_err().kind(),
+        smb2::ErrorKind::NotFound
+    );
+
+    tree.delete_file(&mut conn, destination)
+        .await
+        .expect("cleanup failed");
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
 

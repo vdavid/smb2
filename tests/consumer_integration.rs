@@ -417,16 +417,26 @@ async fn manyfiles_list_directory() {
 
     let mut client = connect_guest(&manyfiles_addr()).await;
     let mut tree = client.connect_share("public").await.expect("connect_share");
-    let entries = client
-        .list_directory(&mut tree, "")
+    let mut reader = client
+        .open_directory_reader(&mut tree, "")
         .await
-        .expect("list_directory");
+        .expect("open_directory_reader");
+    let mut count = 0usize;
+    let mut largest_batch = 0usize;
+    while let Some(entries) = reader.next_batch().await.expect("directory batch") {
+        largest_batch = largest_batch.max(entries.len());
+        count += entries.len();
+    }
 
     // The Dockerfile creates file_1.txt through file_10000.txt.
     assert!(
-        entries.len() >= 10_000,
+        count >= 10_000,
         "expected at least 10,000 files, got {}",
-        entries.len()
+        count
+    );
+    assert!(
+        largest_batch < count,
+        "10,000-entry enumeration was not delivered incrementally"
     );
 
     client.disconnect_share(&tree).await.expect("disconnect");

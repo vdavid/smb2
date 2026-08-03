@@ -309,8 +309,8 @@ mod tests {
         buf
     }
 
-    /// Build a single FileBothDirectoryInformation entry.
-    fn build_file_both_dir_info(
+    /// Build a single FileIdBothDirectoryInformation entry.
+    fn build_file_id_both_dir_info(
         name: &str,
         size: u64,
         is_directory: bool,
@@ -335,6 +335,8 @@ mod tests {
         buf.push(0); // ShortNameLength
         buf.push(0); // Reserved
         buf.extend_from_slice(&[0u8; 24]); // ShortName
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
+        buf.extend_from_slice(&1u64.to_le_bytes()); // FileId
         for &u in &name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());
         }
@@ -436,7 +438,7 @@ mod tests {
 
         // Op 3: ListDirectory -- CREATE + QUERY_DIR + QUERY_DIR(NO_MORE) + CLOSE
         mock.queue_response(build_create_response_directory(file_id));
-        let entry = build_file_both_dir_info("test.txt", 100, false, 0);
+        let entry = build_file_id_both_dir_info("test.txt", 100, false, 0);
         mock.queue_response(build_query_directory_response(NtStatus::SUCCESS, entry));
         mock.queue_response(build_query_directory_response(
             NtStatus::NO_MORE_FILES,
@@ -560,7 +562,7 @@ mod tests {
             volatile: 2,
         };
 
-        // STAT = compound CREATE + QUERY_INFO(basic) + QUERY_INFO(standard) + CLOSE
+        // STAT = CREATE + basic + standard + internal + volume + CLOSE.
         let create_resp = build_create_response(file_id, 0);
 
         let basic_info = build_file_basic_info(
@@ -581,9 +583,23 @@ mod tests {
         );
         let std_resp = build_query_info_response(std_info);
 
+        let identity_resp = build_query_info_response(1u64.to_le_bytes().to_vec());
+        let mut volume_info = vec![0u8; 8];
+        volume_info.extend_from_slice(&0xABCDu32.to_le_bytes());
+        volume_info.extend_from_slice(&0u32.to_le_bytes());
+        volume_info.extend_from_slice(&[0, 0]);
+        let volume_resp = build_query_info_response(volume_info);
+
         let close_resp = build_close_response();
 
-        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            basic_resp,
+            std_resp,
+            identity_resp,
+            volume_resp,
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);

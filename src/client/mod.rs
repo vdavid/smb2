@@ -32,12 +32,15 @@ pub use diagnostics::{
     DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
     SessionDiagnostics, SigningInfo,
 };
-pub use durable::{DurableHandle, DurableOpen};
+pub use durable::{DurableHandle, DurableOpen, FileIdentity};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
-pub use tree::{DirectoryEntry, DirectoryReader, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
+pub use tree::{
+    DirectoryEntry, DirectoryReader, FileInfo, FsInfo, ListingTrace, MutationHandle, QueryStep,
+    RenameOptions, Tree,
+};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
@@ -970,15 +973,27 @@ impl SmbClient {
 
     /// Rename a file or directory on the given share.
     pub async fn rename(&mut self, tree: &mut Tree, from: &str, to: &str) -> Result<()> {
+        self.rename_with_options(tree, from, to, RenameOptions::default())
+            .await
+    }
+
+    /// Rename a file or directory with explicit atomic replacement semantics.
+    pub async fn rename_with_options(
+        &mut self,
+        tree: &mut Tree,
+        from: &str,
+        to: &str,
+        options: RenameOptions,
+    ) -> Result<()> {
         let result = {
             let conn = self.connection_for_tree(tree);
-            tree.rename(conn, from, to).await
+            tree.rename_with_options(conn, from, to, options).await
         };
         match result {
             Err(e) if self.should_retry_dfs(&e) => {
                 let new_path = self.handle_dfs_redirect(tree, from).await?;
                 let conn = self.connection_for_tree(tree);
-                tree.rename(conn, &new_path, to).await
+                tree.rename_with_options(conn, &new_path, to, options).await
             }
             other => other,
         }

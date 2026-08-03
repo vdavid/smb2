@@ -30,11 +30,11 @@
 //!    server implementing the `CreateGuid` comparison correctly, which is the
 //!    point of having two.
 //!
-//!    The index number is required; the volume serial is best-effort. A server
-//!    that will not answer it reports 0 on both sides, so the comparison
-//!    degrades to the index number alone and never to a weaker match than
-//!    that — while a server that answers on one side and not the other fails
-//!    the comparison, which is the safe direction.
+//!    Both the index number and volume serial are required. An index is only
+//!    unique within its volume, so a server that will not answer either query
+//!    gets a working ordinary handle but no resumable one. A zero index is the
+//!    protocol's explicit "identity unavailable" value and is treated the same
+//!    way.
 //!
 //! All of it is **compounded onto the CREATE**, so neither proof costs a round
 //! trip.
@@ -108,7 +108,7 @@ const FS_VOLUME_SERIAL_OFFSET: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileIdentity {
     /// The serial number of the volume the file lives on
-    /// (`FileFsVolumeInformation`), or `0` on a server that will not say.
+    /// (`FileFsVolumeInformation`).
     pub volume_serial: u32,
     /// The file's index number within that volume
     /// (`FileInternalInformation`) — its inode, on a POSIX server.
@@ -119,7 +119,7 @@ impl FileIdentity {
     /// The `QUERY_INFO` that reads the index number, for compounding onto a
     /// CREATE. `FileId::SENTINEL` makes the server substitute the handle the
     /// CREATE ahead of it just produced.
-    fn index_query() -> QueryInfoRequest {
+    pub(crate) fn index_query() -> QueryInfoRequest {
         QueryInfoRequest {
             info_type: InfoType::File,
             file_info_class: FILE_INTERNAL_INFORMATION,
@@ -132,7 +132,7 @@ impl FileIdentity {
     }
 
     /// The `QUERY_INFO` that reads the volume serial.
-    fn volume_query() -> QueryInfoRequest {
+    pub(crate) fn volume_query() -> QueryInfoRequest {
         QueryInfoRequest {
             info_type: InfoType::Filesystem,
             file_info_class: FS_VOLUME_INFORMATION,
@@ -146,7 +146,7 @@ impl FileIdentity {
     }
 
     fn payload(frame: &Frame) -> Option<Vec<u8>> {
-        if frame.header.status != NtStatus::SUCCESS {
+        if !frame.header.status.is_success_or_partial() {
             return None;
         }
         Some(
@@ -156,20 +156,19 @@ impl FileIdentity {
         )
     }
 
-    /// Assemble one from the two compounded answers. `None` when the index
-    /// number — the part that actually discriminates — is missing.
-    fn from_frames(index: Option<&Frame>, volume: Option<&Frame>) -> Option<Self> {
+    /// Assemble one from the two compounded answers. Both halves are required:
+    /// an index without its volume is not a stable cross-volume identity.
+    pub(crate) fn from_frames(index: Option<&Frame>, volume: Option<&Frame>) -> Option<Self> {
         let index_number = {
             let body = Self::payload(index?)?;
             ReadCursor::new(&body).read_u64_le().ok()?
         };
-        let volume_serial = volume
-            .and_then(Self::payload)
-            .and_then(|body| {
-                let slice = body.get(FS_VOLUME_SERIAL_OFFSET..FS_VOLUME_SERIAL_OFFSET + 4)?;
-                Some(u32::from_le_bytes(slice.try_into().ok()?))
-            })
-            .unwrap_or(0);
+        if index_number == 0 {
+            return None;
+        }
+        let volume_body = Self::payload(volume?)?;
+        let volume_slice = volume_body.get(FS_VOLUME_SERIAL_OFFSET..FS_VOLUME_SERIAL_OFFSET + 4)?;
+        let volume_serial = u32::from_le_bytes(volume_slice.try_into().ok()?);
         Some(Self {
             volume_serial,
             index_number,
@@ -515,7 +514,7 @@ mod tests {
     use crate::client::test_helpers::{
         build_close_response, build_compound_response_frame, build_create_error_response,
         build_create_response_with_contexts, build_query_info_error_response,
-        build_query_info_response, setup_connection,
+        build_query_info_response, build_query_info_response_with_status, setup_connection,
     };
     use crate::msg::create_context::CreateContext;
     use crate::transport::MockTransport;
@@ -962,12 +961,10 @@ mod tests {
         );
     }
 
-    /// A server that answers the index number but not the volume still gets a
-    /// resume: the comparison degrades to the index alone, which is never
-    /// weaker than having no proof, and is symmetric so it cannot produce a
-    /// false match.
+    /// An index is unique only within a volume, so it is not enough to prove
+    /// identity on its own. The CREATE still succeeds; only resume is withheld.
     #[tokio::test]
-    async fn a_server_that_will_not_name_the_volume_still_gets_a_resume() {
+    async fn a_server_that_will_not_name_the_volume_is_not_resumable() {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
         smb3(&mut conn);
@@ -977,19 +974,60 @@ mod tests {
             Some(OURS),
             false,
         ));
+        let open = a_share()
+            .open_file_durable(&mut conn, "big.iso")
+            .await
+            .unwrap();
+
+        assert_eq!(open.file_id, a_file_id(1));
+        assert!(open.durable.is_none(), "an index without a volume is weak");
+    }
+
+    /// MS-FSCC says index zero means the filesystem does not support stable
+    /// file IDs and clients must ignore it.
+    #[tokio::test]
+    async fn a_zero_index_is_not_resumable() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        smb3(&mut conn);
+        mock.queue_response(answer(
+            a_file_id(1),
+            &[granted(180_000)],
+            Some(FileIdentity {
+                volume_serial: OURS.volume_serial,
+                index_number: 0,
+            }),
+        ));
+
+        let open = a_share()
+            .open_file_durable(&mut conn, "big.iso")
+            .await
+            .unwrap();
+
+        assert_eq!(open.file_id, a_file_id(1));
+        assert!(open.durable.is_none());
+    }
+
+    /// A filesystem query may return BUFFER_OVERFLOW when its variable volume
+    /// label does not fit. The fixed serial-number prefix is still valid.
+    #[tokio::test]
+    async fn a_partial_volume_answer_keeps_the_fixed_identity_prefix() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        smb3(&mut conn);
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response_with_contexts(a_file_id(1), 0, &[granted(180_000)]),
+            build_query_info_response(index_body(OURS)),
+            build_query_info_response_with_status(NtStatus::BUFFER_OVERFLOW, volume_body(OURS)),
+        ]));
+
         let durable = a_share()
             .open_file_durable(&mut conn, "big.iso")
             .await
             .unwrap()
             .durable
-            .expect("the index number alone is enough to identify the file");
-        assert_eq!(durable.identity().volume_serial, 0, "not answered");
-
-        mock.queue_response(answer_with(a_file_id(2), &[], Some(OURS), false));
-        a_share()
-            .reclaim_durable_handle(&mut conn, &durable, "big.iso")
-            .await
-            .expect("same index number, same file");
+            .expect("BUFFER_OVERFLOW still carries the fixed volume prefix");
+        assert_eq!(durable.identity(), OURS);
     }
 
     /// A server that named the volume at open and won't at reclaim fails the
@@ -1012,7 +1050,7 @@ mod tests {
             matches!(
                 outcome,
                 Err(Error::DurableHandleLost {
-                    reason: DurableLoss::IdentityMismatch,
+                    reason: DurableLoss::IdentityUnavailable,
                     ..
                 })
             ),
