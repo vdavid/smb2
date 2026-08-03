@@ -284,7 +284,7 @@ pub struct Tree {
 /// ```
 #[must_use = "consume the directory reader to EOF or call close()"]
 pub struct DirectoryReader {
-    tree: Arc<Tree>,
+    tree_id: TreeId,
     conn: Connection,
     file_id: FileId,
     output_buffer_length: u32,
@@ -383,22 +383,24 @@ impl DirectoryReader {
     }
 
     fn begin_query(&mut self, restart: bool) {
-        let tree = Arc::clone(&self.tree);
+        let tree_id = self.tree_id;
         let mut conn = self.conn.clone();
         let file_id = self.file_id;
         let output_buffer_length = self.output_buffer_length;
         self.state = DirectoryReaderState::Querying(Box::pin(async move {
-            tree.query_directory_step(&mut conn, file_id, restart, output_buffer_length)
+            Tree::query_directory_step(tree_id, &mut conn, file_id, restart, output_buffer_length)
                 .await
         }));
     }
 
     fn begin_close(&mut self, after: DirectoryReaderAfterClose) {
-        let tree = Arc::clone(&self.tree);
+        let tree_id = self.tree_id;
         let mut conn = self.conn.clone();
         let file_id = self.file_id;
         self.state = DirectoryReaderState::Closing {
-            future: Box::pin(async move { tree.close_handle(&mut conn, file_id).await }),
+            future: Box::pin(async move {
+                Tree::close_handle_for_tree(tree_id, &mut conn, file_id).await
+            }),
             after,
         };
     }
@@ -513,10 +515,11 @@ impl Tree {
 
     /// Open a directory for incremental enumeration.
     ///
-    /// The returned [`DirectoryReader`] owns a cheap clone of the connection,
-    /// so it does not borrow this tree or the caller's connection. Each
-    /// [`DirectoryReader::next_batch`] call performs one `QUERY_DIRECTORY`
-    /// round trip and keeps at most one response batch in memory.
+    /// The returned [`DirectoryReader`] owns a cheap clone of the connection
+    /// and a copy of this tree's ID, so it does not borrow this tree or the
+    /// caller's connection. Each [`DirectoryReader::next_batch`] call performs
+    /// one `QUERY_DIRECTORY` round trip and keeps at most one response batch in
+    /// memory.
     pub async fn open_directory_reader(
         &self,
         mut conn: Connection,
@@ -529,7 +532,7 @@ impl Tree {
         let file_id = self.open_directory(&mut conn, &normalized).await?;
 
         Ok(DirectoryReader {
-            tree: Arc::new(self.clone()),
+            tree_id: self.tree_id,
             conn,
             file_id,
             output_buffer_length,
@@ -590,9 +593,7 @@ impl Tree {
         let mut restart = true;
         let query_result = loop {
             let step_start = Instant::now();
-            match self
-                .query_directory_step(conn, file_id, restart, buffer_len)
-                .await
+            match Self::query_directory_step(self.tree_id, conn, file_id, restart, buffer_len).await
             {
                 Ok(QueryStepOutcome::Entries { entries, bytes }) => {
                     queries.push(QueryStep {
@@ -2537,7 +2538,7 @@ impl Tree {
     /// `output_buffer_length` above 65536 needs a matching multi-credit charge;
     /// this computes it as ceil(len / 65536).
     async fn query_directory_step(
-        &self,
+        tree_id: TreeId,
         conn: &mut Connection,
         file_id: FileId,
         restart: bool,
@@ -2559,12 +2560,7 @@ impl Tree {
             CreditCharge((output_buffer_length as u64).div_ceil(65536).max(1) as u16);
 
         let frame = conn
-            .execute_with_credits(
-                Command::QueryDirectory,
-                &req,
-                Some(self.tree_id),
-                credit_charge,
-            )
+            .execute_with_credits(Command::QueryDirectory, &req, Some(tree_id), credit_charge)
             .await?;
 
         if frame.header.status == NtStatus::NO_MORE_FILES {
@@ -3223,15 +3219,21 @@ impl Tree {
     /// and did not hand to a streaming type (which close themselves) must be
     /// closed with this, or it leaks server-side until session teardown.
     pub async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
+        Self::close_handle_for_tree(self.tree_id, conn, file_id).await
+    }
+
+    async fn close_handle_for_tree(
+        tree_id: TreeId,
+        conn: &mut Connection,
+        file_id: FileId,
+    ) -> Result<()> {
         // A no-op for the handles that never held an oplock, which is nearly
         // all of them. Done before the CLOSE so a break arriving in the gap
         // isn't acknowledged on a handle that is on its way out.
         conn.forget_oplock(file_id);
         let req = CloseRequest { flags: 0, file_id };
 
-        let frame = conn
-            .execute(Command::Close, &req, Some(self.tree_id))
-            .await?;
+        let frame = conn.execute(Command::Close, &req, Some(tree_id)).await?;
 
         if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
