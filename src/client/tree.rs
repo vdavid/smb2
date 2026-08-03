@@ -4,7 +4,9 @@
 //! It provides methods for directory listing, file reading/writing, deletion,
 //! renaming, stat, and directory creation.
 
+use std::future::Future;
 use std::ops::ControlFlow;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,7 +101,8 @@ const FILE_DISPOSITION_INFORMATION: u8 = 13;
 /// FileFsFullSizeInformation class for QUERY_INFO (MS-FSCC 2.5.4).
 const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
 
-/// A directory entry returned by [`Tree::list_directory`].
+/// A directory entry returned by [`Tree::list_directory`] or
+/// [`DirectoryReader::next_batch`].
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
     /// The file or directory name.
@@ -179,6 +182,26 @@ enum QueryStepOutcome {
     NoMoreFiles { bytes: usize },
 }
 
+type BoxedDirectoryQuery = Pin<Box<dyn Future<Output = Result<QueryStepOutcome>> + Send + 'static>>;
+type BoxedDirectoryClose = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+enum DirectoryReaderAfterClose {
+    Eof,
+    QueryFailed(Error),
+}
+
+enum DirectoryReaderState {
+    Ready {
+        restart: bool,
+    },
+    Querying(BoxedDirectoryQuery),
+    Closing {
+        future: BoxedDirectoryClose,
+        after: DirectoryReaderAfterClose,
+    },
+    Done,
+}
+
 /// File metadata returned by [`Tree::stat`].
 #[derive(Debug, Clone)]
 pub struct FileInfo {
@@ -240,6 +263,11 @@ pub struct Tree {
 /// asynchronous drop, so dropping a live reader can leave the server handle
 /// open until the SMB session ends.
 ///
+/// [`next_batch`](Self::next_batch) is cancellation-safe: cancelling a call
+/// retains its in-flight QUERY_DIRECTORY (or EOF CLOSE), and the next call
+/// resumes that same request. A transport or session error is terminal because
+/// SMB directory cursors cannot be resumed portably after reconnecting.
+///
 /// ```no_run
 /// # async fn example(
 /// #     client: &mut smb2::SmbClient,
@@ -256,11 +284,11 @@ pub struct Tree {
 /// ```
 #[must_use = "consume the directory reader to EOF or call close()"]
 pub struct DirectoryReader {
-    tree: Tree,
+    tree: Arc<Tree>,
     conn: Connection,
-    file_id: Option<FileId>,
+    file_id: FileId,
     output_buffer_length: u32,
-    restart: bool,
+    state: DirectoryReaderState,
 }
 
 impl DirectoryReader {
@@ -270,57 +298,127 @@ impl DirectoryReader {
     /// `Ok(None)` means the enumeration is complete and the directory handle
     /// has been closed. Calls after completion continue to return `Ok(None)`
     /// without sending more requests.
+    ///
+    /// This method is cancellation-safe: if its future is dropped after the
+    /// request has been sent, the same in-flight request is resumed by the
+    /// next call rather than silently skipping the server's response batch.
     pub async fn next_batch(&mut self) -> Result<Option<Vec<DirectoryEntry>>> {
-        let Some(file_id) = self.file_id else {
-            return Ok(None);
-        };
+        loop {
+            if matches!(&self.state, DirectoryReaderState::Done) {
+                return Ok(None);
+            }
 
-        let result = self
-            .tree
-            .query_directory_step(
-                &mut self.conn,
-                file_id,
-                self.restart,
-                self.output_buffer_length,
-            )
-            .await;
+            let restart = match &self.state {
+                DirectoryReaderState::Ready { restart } => Some(*restart),
+                _ => None,
+            };
+            if let Some(restart) = restart {
+                self.begin_query(restart);
+                continue;
+            }
 
-        match result {
-            Ok(QueryStepOutcome::Entries { entries, .. }) => {
-                self.restart = false;
-                Ok(Some(entries))
+            if matches!(&self.state, DirectoryReaderState::Querying(_)) {
+                let result = match &mut self.state {
+                    DirectoryReaderState::Querying(future) => future.as_mut().await,
+                    _ => unreachable!("query state checked above"),
+                };
+
+                match result {
+                    Ok(QueryStepOutcome::Entries { entries, .. }) => {
+                        self.state = DirectoryReaderState::Ready { restart: false };
+                        return Ok(Some(entries));
+                    }
+                    Ok(QueryStepOutcome::NoMoreFiles { .. }) => {
+                        self.begin_close(DirectoryReaderAfterClose::Eof);
+                    }
+                    Err(error) => {
+                        // Preserve the query failure, matching `list_directory`'s
+                        // error precedence, while still avoiding a leaked handle.
+                        self.begin_close(DirectoryReaderAfterClose::QueryFailed(error));
+                    }
+                }
+                continue;
             }
-            Ok(QueryStepOutcome::NoMoreFiles { .. }) => {
-                self.close_inner().await?;
-                Ok(None)
-            }
-            Err(error) => {
-                // Preserve the query failure, matching `list_directory`'s
-                // error precedence, while still avoiding a leaked handle.
-                let _ = self.close_inner().await;
-                Err(error)
-            }
+
+            let (close_result, after) = self.await_close().await;
+            return match after {
+                DirectoryReaderAfterClose::Eof => {
+                    close_result?;
+                    Ok(None)
+                }
+                DirectoryReaderAfterClose::QueryFailed(error) => {
+                    let _ = close_result;
+                    Err(error)
+                }
+            };
         }
     }
 
     /// Close the directory handle before reaching the end of the enumeration.
     ///
-    /// Consumes the reader so it cannot be used after it has been closed.
+    /// Consumes the reader so it cannot be used after it has been closed. If a
+    /// cancelled [`next_batch`](Self::next_batch) left a query in flight, this
+    /// first drains that response so QUERY_DIRECTORY and CLOSE cannot race on
+    /// the stateful server handle.
     pub async fn close(mut self) -> Result<()> {
-        self.close_inner().await
+        if matches!(&self.state, DirectoryReaderState::Done) {
+            return Ok(());
+        }
+
+        // A cancelled `next_batch` may have left one QUERY_DIRECTORY in
+        // flight. Drain it before CLOSE so operations on the stateful server
+        // enumeration handle cannot race each other.
+        if matches!(&self.state, DirectoryReaderState::Querying(_)) {
+            let _ = match &mut self.state {
+                DirectoryReaderState::Querying(future) => future.as_mut().await,
+                _ => unreachable!("query state checked above"),
+            };
+            self.begin_close(DirectoryReaderAfterClose::Eof);
+        } else if matches!(&self.state, DirectoryReaderState::Ready { .. }) {
+            self.begin_close(DirectoryReaderAfterClose::Eof);
+        }
+
+        let (result, _) = self.await_close().await;
+        result
     }
 
-    async fn close_inner(&mut self) -> Result<()> {
-        let Some(file_id) = self.file_id.take() else {
-            return Ok(());
+    fn begin_query(&mut self, restart: bool) {
+        let tree = Arc::clone(&self.tree);
+        let mut conn = self.conn.clone();
+        let file_id = self.file_id;
+        let output_buffer_length = self.output_buffer_length;
+        self.state = DirectoryReaderState::Querying(Box::pin(async move {
+            tree.query_directory_step(&mut conn, file_id, restart, output_buffer_length)
+                .await
+        }));
+    }
+
+    fn begin_close(&mut self, after: DirectoryReaderAfterClose) {
+        let tree = Arc::clone(&self.tree);
+        let mut conn = self.conn.clone();
+        let file_id = self.file_id;
+        self.state = DirectoryReaderState::Closing {
+            future: Box::pin(async move { tree.close_handle(&mut conn, file_id).await }),
+            after,
         };
-        self.tree.close_handle(&mut self.conn, file_id).await
+    }
+
+    async fn await_close(&mut self) -> (Result<()>, DirectoryReaderAfterClose) {
+        let result = match &mut self.state {
+            DirectoryReaderState::Closing { future, .. } => future.as_mut().await,
+            _ => unreachable!("await_close requires a closing reader"),
+        };
+        let state = std::mem::replace(&mut self.state, DirectoryReaderState::Done);
+        let DirectoryReaderState::Closing { after, .. } = state else {
+            unreachable!("closing state replaced above")
+        };
+        (result, after)
     }
 }
 
 impl Drop for DirectoryReader {
     fn drop(&mut self) {
-        if self.file_id.is_some() {
+        if !matches!(&self.state, DirectoryReaderState::Done) {
             debug!(
                 "tree: DirectoryReader dropped without close(), directory handle may leak until \
                  session teardown"
@@ -431,11 +529,11 @@ impl Tree {
         let file_id = self.open_directory(&mut conn, &normalized).await?;
 
         Ok(DirectoryReader {
-            tree: self.clone(),
+            tree: Arc::new(self.clone()),
             conn,
-            file_id: Some(file_id),
+            file_id,
             output_buffer_length,
-            restart: true,
+            state: DirectoryReaderState::Ready { restart: true },
         })
     }
 
@@ -2418,7 +2516,6 @@ impl Tree {
         Ok((resp.file_id, resp.end_of_file))
     }
 
-    /// Loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES.
     /// Default per-QUERY_DIRECTORY output-buffer length.
     ///
     /// Capped at 65536 so that CreditCharge=1 is valid: the spec requires
@@ -3345,6 +3442,21 @@ mod tests {
         pack_message(&h, &body)
     }
 
+    async fn wait_for_mock_counts(mock: &MockTransport, sent: usize, received: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mock.sent_count() < sent || mock.received_count() < received {
+            if Instant::now() > deadline {
+                panic!(
+                    "mock counts did not reach sent={sent}, received={received}: got sent={}, \
+                     received={}",
+                    mock.sent_count(),
+                    mock.received_count()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn build_read_response(status: NtStatus, data: Vec<u8>) -> Vec<u8> {
         let mut h = Header::new_request(Command::Read);
         h.flags.set_response();
@@ -3560,6 +3672,158 @@ mod tests {
         Header::unpack(&mut second_cursor).unwrap();
         let second_request = QueryDirectoryRequest::unpack(&mut second_cursor).unwrap();
         assert_eq!(second_request.flags.0, 0);
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn directory_reader_resumes_cancelled_query_without_skipping_its_batch() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::SUCCESS,
+            build_file_both_dir_info("first.txt", 10, false, 0),
+        ));
+
+        let conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut reader = tree.open_directory_reader(conn, "somedir").await.unwrap();
+        assert_eq!(
+            reader.next_batch().await.unwrap().unwrap()[0].name,
+            "first.txt"
+        );
+
+        // Poll the second call until its QUERY_DIRECTORY is on the wire, then
+        // cancel only the outer `next_batch` future. The reader must retain
+        // the inner request and deliver its eventual response on the next call.
+        let mut pending = Box::pin(reader.next_batch());
+        tokio::select! {
+            result = &mut pending => panic!("query unexpectedly completed: {result:?}"),
+            () = wait_for_mock_counts(&mock, 3, 2) => {}
+        }
+        drop(pending);
+
+        mock.queue_response(build_query_directory_response(
+            NtStatus::SUCCESS,
+            build_file_both_dir_info("preserved.txt", 20, false, 0),
+        ));
+        wait_for_mock_counts(&mock, 3, 3).await;
+
+        let resumed = tokio::time::timeout(Duration::from_secs(1), reader.next_batch())
+            .await
+            .expect("resumed call must use the already-sent request")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed[0].name, "preserved.txt");
+        assert_eq!(mock.sent_count(), 3, "resume must not send another QUERY");
+
+        mock.queue_responses(vec![
+            build_query_directory_response(NtStatus::NO_MORE_FILES, vec![]),
+            build_close_response(),
+        ]);
+        assert!(reader.next_batch().await.unwrap().is_none());
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn directory_reader_resumes_cancelled_eof_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
+
+        let conn = setup_connection(&mock);
+        let metrics_conn = conn.clone();
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut reader = tree.open_directory_reader(conn, "somedir").await.unwrap();
+        let mut pending = Box::pin(reader.next_batch());
+        tokio::select! {
+            result = &mut pending => panic!("close unexpectedly completed: {result:?}"),
+            () = wait_for_mock_counts(&mock, 3, 2) => {}
+        }
+        drop(pending);
+
+        mock.queue_response(build_close_response());
+        wait_for_mock_counts(&mock, 3, 3).await;
+
+        assert!(reader.next_batch().await.unwrap().is_none());
+        assert_eq!(mock.sent_count(), 3, "resume must not send a second CLOSE");
+        assert_eq!(
+            metrics_conn.metrics().responses_late_after_drop,
+            0,
+            "the CLOSE waiter must survive cancellation"
+        );
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn directory_reader_close_drains_a_cancelled_query() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+
+        let conn = setup_connection(&mock);
+        let metrics_conn = conn.clone();
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut reader = tree.open_directory_reader(conn, "somedir").await.unwrap();
+        let mut pending = Box::pin(reader.next_batch());
+        tokio::select! {
+            result = &mut pending => panic!("query unexpectedly completed: {result:?}"),
+            () = wait_for_mock_counts(&mock, 2, 1) => {}
+        }
+        drop(pending);
+
+        mock.queue_responses(vec![
+            build_query_directory_response(
+                NtStatus::SUCCESS,
+                build_file_both_dir_info("discarded.txt", 10, false, 0),
+            ),
+            build_close_response(),
+        ]);
+        reader.close().await.unwrap();
+
+        assert_eq!(mock.sent_count(), 3, "close must not issue another QUERY");
+        assert_eq!(
+            metrics_conn.metrics().responses_late_after_drop,
+            0,
+            "explicit close must drain the retained QUERY waiter"
+        );
         mock.assert_fully_consumed();
     }
 
