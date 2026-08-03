@@ -2332,6 +2332,20 @@ impl Tree {
         super::stream::open_file_writer_at(Arc::clone(self), conn, path, offset).await
     }
 
+    /// Open an existing file for positioned streaming writes.
+    ///
+    /// Unlike [`create_file_writer_at`](Self::create_file_writer_at), this
+    /// never creates a missing file. It is the safe resume primitive when the
+    /// caller has already validated a durable remote checkpoint.
+    pub async fn open_existing_file_writer_at(
+        self: &Arc<Self>,
+        conn: Connection,
+        path: &str,
+        offset: u64,
+    ) -> Result<super::stream::FileWriter> {
+        super::stream::open_existing_file_writer_at(Arc::clone(self), conn, path, offset).await
+    }
+
     /// Create a directory.
     ///
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
@@ -2780,6 +2794,20 @@ impl Tree {
         path: &str,
     ) -> Result<FileId> {
         self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOpenIf)
+            .await
+    }
+
+    /// Open an existing file for positioned writes without truncating it.
+    ///
+    /// Uses `FileOpen`, so a path that disappeared after a caller validated
+    /// its checkpoint fails with `STATUS_OBJECT_NAME_NOT_FOUND` instead of
+    /// silently creating a sparse replacement.
+    pub(crate) async fn open_existing_file_for_write_at(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<FileId> {
+        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOpen)
             .await
     }
 
