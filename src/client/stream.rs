@@ -14,13 +14,14 @@ use std::sync::Arc;
 use log::{debug, trace};
 
 use crate::client::connection::Connection;
+use crate::client::durable::FileIdentity;
 use crate::client::tree::Tree;
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
-use crate::types::{Command, FileId};
+use crate::types::{Command, FileId, SessionId};
 use crate::Error;
 
 /// Maximum number of pipelined write requests in flight.
@@ -734,6 +735,8 @@ type BoxedWriteFut = std::pin::Pin<
 pub struct FileWriter {
     tree: Arc<Tree>,
     conn: Connection,
+    generation: u64,
+    session_id: SessionId,
     file_id: FileId,
     max_write_size: u32,
     /// Next write offset in the file.
@@ -777,10 +780,19 @@ pub async fn open_file_writer(
 ) -> Result<FileWriter> {
     trace!("stream: open_file_writer path={}", path);
 
-    let file_id = tree.open_file_for_write(&mut conn, path).await?;
+    let generation = conn.generation();
+    let session_id = conn.session_id();
+    let file_id = tree
+        .open_file_for_write_bound(&mut conn, path, generation, session_id)
+        .await?;
+    if conn.generation() != generation || conn.session_id() != session_id {
+        return Err(Error::Disconnected);
+    }
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
-    Ok(FileWriter::new(tree, conn, file_id, max_write))
+    Ok(FileWriter::new(
+        tree, conn, generation, session_id, file_id, max_write,
+    ))
 }
 
 /// Exclusive-create sibling of [`open_file_writer`]. Opens the CREATE with
@@ -797,10 +809,19 @@ pub async fn open_file_writer_exclusive(
 ) -> Result<FileWriter> {
     trace!("stream: open_file_writer_exclusive path={}", path);
 
-    let file_id = tree.open_file_for_exclusive_create(&mut conn, path).await?;
+    let generation = conn.generation();
+    let session_id = conn.session_id();
+    let file_id = tree
+        .open_file_for_exclusive_create_bound(&mut conn, path, generation, session_id)
+        .await?;
+    if conn.generation() != generation || conn.session_id() != session_id {
+        return Err(Error::Disconnected);
+    }
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
-    Ok(FileWriter::new(tree, conn, file_id, max_write))
+    Ok(FileWriter::new(
+        tree, conn, generation, session_id, file_id, max_write,
+    ))
 }
 
 /// Open a file for writing at an arbitrary starting offset, returning a
@@ -840,10 +861,17 @@ pub async fn open_file_writer_at(
         offset
     );
 
-    let file_id = tree.open_file_for_write_at(&mut conn, path).await?;
+    let generation = conn.generation();
+    let session_id = conn.session_id();
+    let file_id = tree
+        .open_file_for_write_at_bound(&mut conn, path, generation, session_id)
+        .await?;
+    if conn.generation() != generation || conn.session_id() != session_id {
+        return Err(Error::Disconnected);
+    }
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
-    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
+    let mut writer = FileWriter::new(tree, conn, generation, session_id, file_id, max_write);
     writer.offset = offset;
     writer.durable_offset = offset;
     Ok(writer)
@@ -852,14 +880,18 @@ pub async fn open_file_writer_at(
 /// Open an existing file for positioned writes without truncating or creating
 /// it.
 ///
-/// This is the resume-safe sibling of [`open_file_writer_at`]. A missing path
-/// is an error, which prevents a checkpoint validation/open race from creating
-/// a sparse replacement at a non-zero offset.
+/// This is the resume-safe sibling of [`open_file_writer_at`]. The file's
+/// identity and current length are checked on the exact handle retained for
+/// writing, closing both the replacement-file and truncation races. Pass the
+/// identity stored with the durable checkpoint (normally obtained from
+/// [`Tree::stat`]); a server that cannot expose stable identity cannot safely
+/// use this resume path.
 pub async fn open_existing_file_writer_at(
     tree: Arc<Tree>,
     mut conn: Connection,
     path: &str,
     offset: u64,
+    expected_identity: FileIdentity,
 ) -> Result<FileWriter> {
     let normalized = tree.format_path(path);
     debug!(
@@ -867,12 +899,35 @@ pub async fn open_existing_file_writer_at(
         normalized, offset
     );
 
-    let file_id = tree
-        .open_existing_file_for_write_at(&mut conn, &normalized)
+    let generation = conn.generation();
+    let session_id = conn.session_id();
+    let (file_id, file_size, identity) = tree
+        .open_existing_file_for_write_at(&mut conn, path, generation, session_id)
         .await?;
+    if conn.generation() != generation || conn.session_id() != session_id {
+        return Err(Error::Disconnected);
+    }
+
+    let resume_error = if identity != Some(expected_identity) {
+        Some(format!(
+            "resume target identity changed or is unavailable (expected volume {:#x}, file {:#x})",
+            expected_identity.volume_serial, expected_identity.index_number
+        ))
+    } else if file_size < offset {
+        Some(format!(
+            "resume offset {offset} exceeds the current file length {file_size}"
+        ))
+    } else {
+        None
+    };
+    if let Some(message) = resume_error {
+        let _ = Tree::close_handle_bound(tree.tree_id, &mut conn, file_id, generation, session_id)
+            .await;
+        return Err(Error::invalid_data(message));
+    }
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
-    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
+    let mut writer = FileWriter::new(tree, conn, generation, session_id, file_id, max_write);
     writer.offset = offset;
     writer.durable_offset = offset;
     Ok(writer)
@@ -889,12 +944,16 @@ impl FileWriter {
     pub(crate) fn new(
         tree: Arc<Tree>,
         conn: Connection,
+        generation: u64,
+        session_id: SessionId,
         file_id: FileId,
         max_write_size: u32,
     ) -> Self {
         Self {
             tree,
             conn,
+            generation,
+            session_id,
             file_id,
             max_write_size,
             offset: 0,
@@ -917,6 +976,7 @@ impl FileWriter {
     ///
     /// Empty chunks are no-ops.
     pub async fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        self.ensure_current()?;
         if data.is_empty() {
             return Ok(());
         }
@@ -952,16 +1012,11 @@ impl FileWriter {
     /// to prevent write-after-close at compile time.
     pub async fn finish(mut self) -> Result<u64> {
         if let Err(error) = self.flush_checkpoint().await {
-            if !self.done {
-                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
-                self.done = true;
-            }
+            let _ = self.close_current().await;
             return Err(error);
         }
 
-        let close = self.tree.close_handle(&mut self.conn, self.file_id).await;
-        self.done = true;
-        close?;
+        self.close_current().await?;
         Ok(self.total_written)
     }
 
@@ -977,9 +1032,18 @@ impl FileWriter {
     /// in-flight writes owned by the writer, so a later checkpoint can safely
     /// finish the work. The handle remains open.
     pub async fn flush_checkpoint(&mut self) -> Result<u64> {
+        self.ensure_current()?;
         self.send_all_pending().await?;
         self.drain_all().await?;
-        self.tree.flush_handle(&mut self.conn, self.file_id).await?;
+        self.ensure_current()?;
+        self.tree
+            .flush_handle_bound(
+                &mut self.conn,
+                self.file_id,
+                self.generation,
+                self.session_id,
+            )
+            .await?;
         self.durable_offset = self.offset;
         Ok(self.durable_offset)
     }
@@ -1051,6 +1115,11 @@ impl FileWriter {
     pub async fn abort(mut self) -> Result<u64> {
         use futures_util::stream::StreamExt;
 
+        if !self.is_current() {
+            self.done = true;
+            return Ok(self.total_written);
+        }
+
         // 1. Discard anything we have not yet put on the wire. Unsent data
         //    means nothing to the server and carries no credits.
         self.pending_data.clear();
@@ -1095,14 +1164,13 @@ impl FileWriter {
 
         // 4. Best-effort CLOSE. If it fails, log and move on.
         if !self.done {
-            if let Err(e) = self.tree.close_handle(&mut self.conn, self.file_id).await {
+            if let Err(e) = self.close_current().await {
                 debug!(
                     "stream: FileWriter::abort() best-effort CLOSE failed, handle may leak \
                      server-side until session teardown: {}",
                     e
                 );
             }
-            self.done = true;
         }
 
         // 5. Silence the Drop warning — we finalized cleanly.
@@ -1125,6 +1193,36 @@ impl FileWriter {
             bytes_transferred: self.total_written,
             total_bytes: None,
         }
+    }
+
+    fn is_current(&self) -> bool {
+        self.conn.generation() == self.generation && self.conn.session_id() == self.session_id
+    }
+
+    fn ensure_current(&mut self) -> Result<()> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            self.done = true;
+            Err(Error::Disconnected)
+        }
+    }
+
+    async fn close_current(&mut self) -> Result<()> {
+        if self.done || !self.is_current() {
+            self.done = true;
+            return Ok(());
+        }
+        let result = Tree::close_handle_bound(
+            self.tree.tree_id,
+            &mut self.conn,
+            self.file_id,
+            self.generation,
+            self.session_id,
+        )
+        .await;
+        self.done = true;
+        result
     }
 
     /// Get the next wire-level chunk from the pending buffer.
@@ -1165,13 +1263,17 @@ impl FileWriter {
 
         let c = self.conn.clone();
         let tree_id = self.tree.tree_id;
+        let generation = self.generation;
+        let session_id = self.session_id;
         self.in_flight.push(Box::pin(async move {
             (
-                c.execute_with_credits(
+                c.execute_with_credits_bound(
                     Command::Write,
                     &req,
                     Some(tree_id),
                     crate::types::CreditCharge(credit_charge),
+                    generation,
+                    session_id,
                 )
                 .await,
                 expected_count,
@@ -1194,8 +1296,7 @@ impl FileWriter {
             // Drain remaining in-flight (best-effort), then close handle.
             while self.in_flight.next().await.is_some() {}
             // Best-effort close.
-            let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
-            self.done = true;
+            let _ = self.close_current().await;
             return Err(Error::Protocol {
                 status: frame.header.status,
                 command: Command::Write,
@@ -1206,8 +1307,7 @@ impl FileWriter {
         let resp = WriteResponse::unpack(&mut cursor)?;
         if resp.count != expected_count {
             while self.in_flight.next().await.is_some() {}
-            let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
-            self.done = true;
+            let _ = self.close_current().await;
             return Err(Error::invalid_data(format!(
                 "SMB WRITE confirmed {} of {} requested bytes",
                 resp.count, expected_count
@@ -1282,7 +1382,7 @@ impl FileWriter {
 
 impl Drop for FileWriter {
     fn drop(&mut self) {
-        if !self.done {
+        if !self.done && self.is_current() {
             debug!(
                 "stream: FileWriter dropped without finish(), file handle may leak \
                  (bytes_written={})",
@@ -1296,8 +1396,9 @@ impl Drop for FileWriter {
 mod tests {
     use super::*;
     use crate::client::test_helpers::{
-        build_close_error_response, build_close_response, build_create_error_response,
-        build_create_response, build_flush_response, build_read_error_response,
+        build_close_error_response, build_close_response, build_compound_response_frame,
+        build_create_error_response, build_create_response, build_flush_response,
+        build_query_info_error_response, build_query_info_response, build_read_error_response,
         build_read_response, build_write_error_response, build_write_response, setup_connection,
     };
     use crate::msg::create::{CreateDisposition, CreateRequest};
@@ -1322,6 +1423,26 @@ mod tests {
             persistent: 0xAA,
             volatile: 0xBB,
         }
+    }
+
+    fn test_identity() -> FileIdentity {
+        FileIdentity {
+            volume_serial: 0xAABB_CCDD,
+            index_number: 0x1122_3344_5566_7788,
+        }
+    }
+
+    fn build_existing_open_response(file_id: FileId, size: u64, identity: FileIdentity) -> Vec<u8> {
+        let index = build_query_info_response(identity.index_number.to_le_bytes().to_vec());
+        let mut volume = vec![0u8; 8];
+        volume.extend_from_slice(&identity.volume_serial.to_le_bytes());
+        volume.extend_from_slice(&0u32.to_le_bytes());
+        volume.extend_from_slice(&[0, 0]);
+        build_compound_response_frame(&[
+            build_create_response(file_id, size),
+            index,
+            build_query_info_response(volume),
+        ])
     }
 
     fn build_flush_error_response(status: NtStatus) -> Vec<u8> {
@@ -1399,12 +1520,16 @@ mod tests {
         use crate::msg::header::Header;
 
         let mock = Arc::new(MockTransport::new());
-        mock.queue_response(build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND));
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+        ]));
         let conn = setup_connection(&mock);
         let tree = test_tree();
 
         let error = match tree
-            .open_existing_file_writer_at(conn, "missing.part", 4096)
+            .open_existing_file_writer_at(conn, "missing.part", 4096, test_identity())
             .await
         {
             Ok(_) => panic!("existing-only resume created a missing file"),
@@ -1416,6 +1541,89 @@ mod tests {
         let mut cursor = ReadCursor::new(&sent[0][Header::SIZE..]);
         let create = CreateRequest::unpack(&mut cursor).unwrap();
         assert_eq!(create.create_disposition, CreateDisposition::FileOpen);
+    }
+
+    #[tokio::test]
+    async fn existing_file_writer_at_rejects_a_replaced_file() {
+        let mock = Arc::new(MockTransport::new());
+        let different = FileIdentity {
+            index_number: 99,
+            ..test_identity()
+        };
+        mock.queue_responses(vec![
+            build_existing_open_response(test_file_id(), 8192, different),
+            build_close_response(),
+        ]);
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let error = match tree
+            .open_existing_file_writer_at(conn, "checkpoint.part", 4096, test_identity())
+            .await
+        {
+            Ok(_) => panic!("a replacement file must never be resumed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
+        assert_eq!(mock.sent_count(), 2, "the rejected handle must be closed");
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn existing_file_writer_at_resumes_the_verified_handle() {
+        use crate::msg::header::Header;
+
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_responses(vec![
+            build_existing_open_response(test_file_id(), 4096, test_identity()),
+            build_write_response(3),
+            build_flush_response(),
+            build_close_response(),
+        ]);
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+        let mut writer = tree
+            .open_existing_file_writer_at(conn, "checkpoint.part", 4096, test_identity())
+            .await
+            .unwrap();
+
+        writer.write_chunk(b"new").await.unwrap();
+        assert_eq!(writer.finish().await.unwrap(), 3);
+
+        let sent = mock.sent_messages();
+        let write = sent
+            .iter()
+            .find_map(|bytes| {
+                let mut cursor = ReadCursor::new(&bytes[Header::SIZE..]);
+                WriteRequest::unpack(&mut cursor)
+                    .ok()
+                    .filter(|request| !request.data.is_empty())
+            })
+            .unwrap();
+        assert_eq!(write.offset, 4096);
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn existing_file_writer_at_rejects_a_truncated_file() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_responses(vec![
+            build_existing_open_response(test_file_id(), 1024, test_identity()),
+            build_close_response(),
+        ]);
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+
+        let error = match tree
+            .open_existing_file_writer_at(conn, "checkpoint.part", 4096, test_identity())
+            .await
+        {
+            Ok(_) => panic!("a truncated file must never be resumed past EOF"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
+        assert_eq!(mock.sent_count(), 2, "the rejected handle must be closed");
+        mock.assert_fully_consumed();
     }
 
     #[tokio::test]
@@ -1442,6 +1650,22 @@ mod tests {
 
         // CREATE + WRITE + FLUSH + WRITE + FLUSH + final FLUSH + one CLOSE.
         assert_eq!(mock.sent_count(), 7);
+    }
+
+    #[tokio::test]
+    async fn file_writer_never_reuses_a_file_id_after_session_change() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(test_file_id(), 0));
+        let conn = setup_connection(&mock);
+        let mut shared = conn.clone();
+        let tree = test_tree();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
+
+        shared.set_session_id(SessionId(0xCAFE));
+        let error = writer.write_chunk(b"must not be sent").await.unwrap_err();
+        assert!(matches!(error, Error::Disconnected));
+        assert_eq!(mock.sent_count(), 1);
+        mock.assert_fully_consumed();
     }
 
     #[tokio::test]

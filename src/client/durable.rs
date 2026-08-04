@@ -464,30 +464,50 @@ impl Tree {
         conn: &mut Connection,
         create_req: &CreateRequest,
     ) -> Result<(Frame, Option<FileIdentity>)> {
+        let generation = conn.generation();
+        let session_id = conn.session_id();
+        self.create_and_identify_bound(conn, create_req, generation, session_id)
+            .await
+    }
+
+    pub(crate) async fn create_and_identify_bound(
+        &self,
+        conn: &mut Connection,
+        create_req: &CreateRequest,
+        generation: u64,
+        session_id: crate::types::SessionId,
+    ) -> Result<(Frame, Option<FileIdentity>)> {
         let index_req = FileIdentity::index_query();
         let volume_req = FileIdentity::volume_query();
         let results = conn
-            .execute_compound(&[
-                CompoundOp {
-                    command: Command::Create,
-                    body: create_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::QueryInfo,
-                    body: &index_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::QueryInfo,
-                    body: &volume_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-            ])
+            .execute_compound_bound(
+                &[
+                    CompoundOp {
+                        command: Command::Create,
+                        body: create_req,
+                        tree_id: Some(self.tree_id),
+                        credit_charge: CreditCharge(1),
+                    },
+                    CompoundOp {
+                        command: Command::QueryInfo,
+                        body: &index_req,
+                        tree_id: Some(self.tree_id),
+                        credit_charge: CreditCharge(1),
+                    },
+                    CompoundOp {
+                        command: Command::QueryInfo,
+                        body: &volume_req,
+                        tree_id: Some(self.tree_id),
+                        credit_charge: CreditCharge(1),
+                    },
+                ],
+                generation,
+                session_id,
+            )
             .await?;
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
         let frames: Vec<Option<Frame>> = results.into_iter().map(|r| r.ok()).collect();
         let create = frames
             .first()

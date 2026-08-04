@@ -59,7 +59,7 @@ use crate::client::dfs::DfsResolver;
 use crate::error::{ErrorKind, Result};
 use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
-use crate::types::FileId;
+use crate::types::{FileId, SessionId};
 use crate::Error;
 
 /// Configuration for an SMB client connection.
@@ -250,6 +250,13 @@ pub(crate) struct ConnectionEntry {
     pub session: Session,
 }
 
+/// A DFS tree-connect is valid only for the session that allocated its ID.
+struct RoutedTreeEntry {
+    tree: Tree,
+    generation: u64,
+    session_id: SessionId,
+}
+
 /// High-level SMB2 client with reconnection support.
 ///
 /// Wraps a [`Connection`] + [`Session`] and provides methods for connecting
@@ -274,7 +281,7 @@ pub struct SmbClient {
     /// A routed stream owns a file handle, not the tree-connect itself. Keeping
     /// one tree per target share here avoids leaking a new tree ID per open and
     /// lets concurrent handles share the same session-scoped route.
-    routed_trees: HashMap<(String, String), Tree>,
+    routed_trees: HashMap<(String, String), RoutedTreeEntry>,
     /// DFS referral resolver with TTL-based cache.
     dfs_resolver: DfsResolver,
     /// Client-level counter: how many times `reconnect()` ran. Survives
@@ -649,10 +656,7 @@ impl SmbClient {
                 Ok(new_tree) => {
                     // Back into caller-path form: the retry goes through the
                     // ordinary `Tree` methods, which encode what they're given.
-                    return Ok((
-                        new_tree,
-                        crate::name::decode_path(&resolved.remaining_path),
-                    ));
+                    return Ok((new_tree, crate::name::decode_path(&resolved.remaining_path)));
                 }
                 Err(e) => {
                     debug!(
@@ -683,11 +687,28 @@ impl SmbClient {
     /// Ensure a connection exists in the pool for the given server address.
     async fn ensure_connection(&mut self, target_addr: &str) -> Result<()> {
         if target_addr == self.primary_server {
-            return Ok(()); // Already have primary connection.
+            if self.conn.is_disconnected() {
+                self.conn.reconnect_if_needed().await?;
+                self.refresh_session();
+                self.routed_trees
+                    .retain(|(server, _), _| server != target_addr);
+            }
+            return Ok(());
         }
-        if self.extra_connections.contains_key(target_addr) {
-            return Ok(()); // Already in pool.
+        if self
+            .extra_connections
+            .get(target_addr)
+            .is_some_and(|entry| !entry.conn.is_disconnected())
+        {
+            return Ok(());
         }
+
+        // Extra DFS connections do not carry the primary connection's
+        // reviver. A dead one must be replaced, and every TreeId it allocated
+        // must leave with it.
+        self.extra_connections.remove(target_addr);
+        self.routed_trees
+            .retain(|(server, _), _| server != target_addr);
 
         // Create new connection to target.
         let mut conn = Connection::connect(target_addr, self.config.timeout).await?;
@@ -711,9 +732,32 @@ impl SmbClient {
     /// Ensure a tree-connect exists for the given server and share.
     async fn ensure_tree(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
         let key = (target_addr.to_string(), share.to_string());
-        if let Some(tree) = self.routed_trees.get(&key) {
-            return Ok(tree.clone());
+        let (generation, session_id, disconnected) = if target_addr == self.primary_server {
+            (
+                self.conn.generation(),
+                self.conn.session_id(),
+                self.conn.is_disconnected(),
+            )
+        } else {
+            let entry = self
+                .extra_connections
+                .get(target_addr)
+                .ok_or_else(|| Error::invalid_data("DFS: no connection for target"))?;
+            (
+                entry.conn.generation(),
+                entry.conn.session_id(),
+                entry.conn.is_disconnected(),
+            )
+        };
+        if disconnected {
+            return Err(Error::Disconnected);
         }
+        if let Some(cached) = self.routed_trees.get(&key) {
+            if cached.generation == generation && cached.session_id == session_id {
+                return Ok(cached.tree.clone());
+            }
+        }
+        self.routed_trees.remove(&key);
 
         let conn = if target_addr == self.primary_server {
             &mut self.conn
@@ -730,7 +774,17 @@ impl SmbClient {
         // can distinguish targets that share the same hostname but
         // use different ports (for example, Docker port-mapped containers).
         tree.server = target_addr.to_string();
-        self.routed_trees.insert(key, tree.clone());
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
+        self.routed_trees.insert(
+            key,
+            RoutedTreeEntry {
+                tree: tree.clone(),
+                generation,
+                session_id,
+            },
+        );
         Ok(tree)
     }
 
@@ -768,6 +822,8 @@ impl SmbClient {
         }
         self.conn.reconnect_if_needed().await?;
         self.refresh_session();
+        self.routed_trees
+            .retain(|(server, _), _| server != &self.primary_server);
         let share = tree.share_name.clone();
         let fresh = self.connect_share(&share).await?;
         // In place, exactly as the DFS redirect does: the caller keeps using
@@ -1498,19 +1554,22 @@ impl SmbClient {
 
     /// Open an existing file for positioned streaming writes.
     ///
-    /// The CREATE uses `FileOpen`, so this never creates a missing path. Use
-    /// it after validating a durable checkpoint whose file must still exist.
+    /// The CREATE uses `FileOpen`, so this never creates a missing path. The
+    /// expected identity and current length are verified on that exact open
+    /// handle before any write is allowed.
     pub async fn open_existing_file_writer_at(
         &self,
         tree: &Tree,
         path: &str,
         offset: u64,
+        expected_identity: FileIdentity,
     ) -> Result<stream::FileWriter> {
         stream::open_existing_file_writer_at(
             std::sync::Arc::new(tree.clone()),
             self.connection_for_tree_ref(tree).clone(),
             path,
             offset,
+            expected_identity,
         )
         .await
     }
@@ -1524,8 +1583,11 @@ impl SmbClient {
         tree: &Tree,
         path: &str,
         offset: u64,
+        expected_identity: FileIdentity,
     ) -> Result<stream::FileWriter> {
-        let result = self.open_existing_file_writer_at(tree, path, offset).await;
+        let result = self
+            .open_existing_file_writer_at(tree, path, offset, expected_identity)
+            .await;
         match result {
             Err(error) if self.should_retry_dfs(&error) => {
                 let (target, remaining_path) = self.resolve_dfs_redirect(tree, path).await?;
@@ -1535,6 +1597,7 @@ impl SmbClient {
                     conn,
                     &remaining_path,
                     offset,
+                    expected_identity,
                 )
                 .await
             }
@@ -1748,8 +1811,9 @@ impl SmbClient {
             let conn = self.connection_for_tree(tree);
             tree.disconnect(conn).await
         };
-        self.routed_trees
-            .retain(|_, cached| cached.server != tree.server || cached.tree_id != tree.tree_id);
+        self.routed_trees.retain(|_, cached| {
+            cached.tree.server != tree.server || cached.tree.tree_id != tree.tree_id
+        });
         result
     }
 }
@@ -2100,6 +2164,44 @@ mod tests {
         let tree = client.connect_share("TestShare").await.unwrap();
         assert_eq!(tree.tree_id, TreeId(42));
         assert_eq!(tree.share_name, "TestShare");
+    }
+
+    #[tokio::test]
+    async fn ensure_tree_never_reuses_a_tree_id_from_another_session() {
+        let mock = Arc::new(MockTransport::new());
+        let old_session = SessionId(0x1111);
+        let mut client = make_mock_client(&mock, old_session).await;
+        let target = client.primary_server.clone();
+        let key = (target.clone(), "data".to_string());
+        client.routed_trees.insert(
+            key,
+            RoutedTreeEntry {
+                tree: Tree {
+                    tree_id: TreeId(7),
+                    share_name: "data".to_string(),
+                    server: target.clone(),
+                    is_dfs: false,
+                    encrypt_data: false,
+                },
+                generation: client.conn.generation(),
+                session_id: old_session,
+            },
+        );
+
+        client.conn.set_session_id(SessionId(0x2222));
+        mock.queue_response(crate::client::test_helpers::build_tree_connect_response(
+            TreeId(8),
+            ShareType::Disk,
+        ));
+        let sent_before = mock.sent_count();
+
+        let tree = client.ensure_tree(&target, "data").await.unwrap();
+        assert_eq!(tree.tree_id, TreeId(8));
+        assert_eq!(
+            mock.sent_count(),
+            sent_before + 1,
+            "the replacement session must issue a fresh TREE_CONNECT"
+        );
     }
 
     /// A reviver that answers each dial with a fresh mock transport, already

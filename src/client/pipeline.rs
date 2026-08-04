@@ -309,8 +309,8 @@ mod tests {
         buf
     }
 
-    /// Build a single FileIdBothDirectoryInformation entry.
-    fn build_file_id_both_dir_info(
+    /// Build a single FileIdFullDirectoryInformation entry.
+    fn build_file_id_full_dir_info(
         name: &str,
         size: u64,
         is_directory: bool,
@@ -332,10 +332,7 @@ mod tests {
         buf.extend_from_slice(&attrs.to_le_bytes());
         buf.extend_from_slice(&(name_bytes_len as u32).to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // EaSize
-        buf.push(0); // ShortNameLength
-        buf.push(0); // Reserved
-        buf.extend_from_slice(&[0u8; 24]); // ShortName
-        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved
         buf.extend_from_slice(&1u64.to_le_bytes()); // FileId
         for &u in &name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());
@@ -438,7 +435,7 @@ mod tests {
 
         // Op 3: ListDirectory -- CREATE + QUERY_DIR + QUERY_DIR(NO_MORE) + CLOSE
         mock.queue_response(build_create_response_directory(file_id));
-        let entry = build_file_id_both_dir_info("test.txt", 100, false, 0);
+        let entry = build_file_id_full_dir_info("test.txt", 100, false, 0);
         mock.queue_response(build_query_directory_response(NtStatus::SUCCESS, entry));
         mock.queue_response(build_query_directory_response(
             NtStatus::NO_MORE_FILES,

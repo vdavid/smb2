@@ -205,6 +205,38 @@ enum QueryStepOutcome {
     },
     /// The server returned STATUS_NO_MORE_FILES, ending the scan.
     NoMoreFiles { bytes: usize },
+    /// The preferred compact information class is unavailable. Retry the same
+    /// scan with the broadly supported class that omits stable file IDs.
+    UnsupportedInformationClass { bytes: usize },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoryInfoLayout {
+    FileIdFull,
+    FileBoth,
+}
+
+impl DirectoryInfoLayout {
+    fn information_class(self) -> FileInformationClass {
+        match self {
+            Self::FileIdFull => FileInformationClass::FileIdFullDirectoryInformation,
+            Self::FileBoth => FileInformationClass::FileBothDirectoryInformation,
+        }
+    }
+
+    fn fixed_len(self) -> usize {
+        match self {
+            Self::FileIdFull => 80,
+            Self::FileBoth => 94,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::FileIdFull => "FileIdFullDirectoryInformation",
+            Self::FileBoth => "FileBothDirectoryInformation",
+        }
+    }
 }
 
 type BoxedDirectoryQuery = Pin<Box<dyn Future<Output = Result<QueryStepOutcome>> + Send + 'static>>;
@@ -262,6 +294,8 @@ pub struct FileInfo {
 pub struct MutationHandle {
     tree: Arc<Tree>,
     conn: Connection,
+    generation: u64,
+    session_id: SessionId,
     file_id: FileId,
     info: FileInfo,
     closed: bool,
@@ -274,12 +308,45 @@ impl MutationHandle {
         &self.info
     }
 
+    fn is_current(&self) -> bool {
+        self.conn.generation() == self.generation && self.conn.session_id() == self.session_id
+    }
+
+    fn ensure_current(&mut self) -> Result<()> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            // Session teardown already released the old handle. Mark it closed
+            // locally so Drop does not report a leak that no longer exists.
+            self.closed = true;
+            Err(Error::Disconnected)
+        }
+    }
+
+    async fn close_current(&mut self) -> Result<()> {
+        if !self.is_current() {
+            self.closed = true;
+            return Ok(());
+        }
+        let result = Tree::close_handle_bound(
+            self.tree.tree_id,
+            &mut self.conn,
+            self.file_id,
+            self.generation,
+            self.session_id,
+        )
+        .await;
+        self.closed = true;
+        result
+    }
+
     /// Atomically rename this open source handle.
     ///
     /// Replacement is encoded directly in `FileRenameInformation`; no target
     /// deletion is performed. A failed SET_INFO leaves the handle open only
     /// long enough for a best-effort CLOSE before the error is returned.
     pub async fn rename(mut self, destination: &str, options: RenameOptions) -> Result<()> {
+        self.ensure_current()?;
         let request = SetInfoRequest {
             info_type: InfoType::File,
             file_info_class: FILE_RENAME_INFORMATION,
@@ -292,16 +359,21 @@ impl MutationHandle {
         };
         let frame = self
             .conn
-            .execute(Command::SetInfo, &request, Some(self.tree.tree_id))
+            .execute_bound(
+                Command::SetInfo,
+                &request,
+                Some(self.tree.tree_id),
+                self.generation,
+                self.session_id,
+            )
             .await;
         match frame {
             Ok(frame) if frame.header.status == NtStatus::SUCCESS => {
                 // The rename committed in SET_INFO. CLOSE failure cannot undo
                 // it and is therefore non-fatal, matching Tree::rename.
-                if let Err(error) = self.tree.close_handle(&mut self.conn, self.file_id).await {
+                if let Err(error) = self.close_current().await {
                     debug!("tree: mutation-handle CLOSE after rename failed: {error}");
                 }
-                self.closed = true;
                 Ok(())
             }
             Ok(frame) => {
@@ -309,13 +381,11 @@ impl MutationHandle {
                     status: frame.header.status,
                     command: Command::SetInfo,
                 };
-                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
-                self.closed = true;
+                let _ = self.close_current().await;
                 Err(error)
             }
             Err(error) => {
-                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
-                self.closed = true;
+                let _ = self.close_current().await;
                 Err(error)
             }
         }
@@ -326,6 +396,7 @@ impl MutationHandle {
     /// Directories must be empty. The returned result includes CLOSE because
     /// delete-pending takes final effect when the handle closes.
     pub async fn delete(mut self) -> Result<()> {
+        self.ensure_current()?;
         let request = SetInfoRequest {
             info_type: InfoType::File,
             file_info_class: FILE_DISPOSITION_INFORMATION,
@@ -335,26 +406,26 @@ impl MutationHandle {
         };
         let frame = self
             .conn
-            .execute(Command::SetInfo, &request, Some(self.tree.tree_id))
+            .execute_bound(
+                Command::SetInfo,
+                &request,
+                Some(self.tree.tree_id),
+                self.generation,
+                self.session_id,
+            )
             .await;
         match frame {
-            Ok(frame) if frame.header.status == NtStatus::SUCCESS => {
-                let result = self.tree.close_handle(&mut self.conn, self.file_id).await;
-                self.closed = true;
-                result
-            }
+            Ok(frame) if frame.header.status == NtStatus::SUCCESS => self.close_current().await,
             Ok(frame) => {
                 let error = Error::Protocol {
                     status: frame.header.status,
                     command: Command::SetInfo,
                 };
-                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
-                self.closed = true;
+                let _ = self.close_current().await;
                 Err(error)
             }
             Err(error) => {
-                let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
-                self.closed = true;
+                let _ = self.close_current().await;
                 Err(error)
             }
         }
@@ -362,15 +433,13 @@ impl MutationHandle {
 
     /// Close without mutating the entry.
     pub async fn close(mut self) -> Result<()> {
-        let result = self.tree.close_handle(&mut self.conn, self.file_id).await;
-        self.closed = true;
-        result
+        self.close_current().await
     }
 }
 
 impl Drop for MutationHandle {
     fn drop(&mut self) {
-        if !self.closed {
+        if !self.closed && self.is_current() {
             debug!("tree: MutationHandle dropped without rename(), delete(), or close()")
         }
     }
@@ -452,6 +521,7 @@ pub struct DirectoryReader {
     session_id: SessionId,
     file_id: FileId,
     output_buffer_length: u32,
+    layout: DirectoryInfoLayout,
     state: DirectoryReaderState,
 }
 
@@ -494,6 +564,13 @@ impl DirectoryReader {
                     }
                     Ok(QueryStepOutcome::NoMoreFiles { .. }) => {
                         self.begin_close(DirectoryReaderAfterClose::Eof);
+                    }
+                    Ok(QueryStepOutcome::UnsupportedInformationClass { .. }) => {
+                        debug!(
+                            "tree: server declined FileIdFullDirectoryInformation, retrying with FileBothDirectoryInformation"
+                        );
+                        self.layout = DirectoryInfoLayout::FileBoth;
+                        self.state = DirectoryReaderState::Ready { restart: true };
                     }
                     Err(error) => {
                         // Preserve the query failure, matching `list_directory`'s
@@ -553,6 +630,7 @@ impl DirectoryReader {
         let session_id = self.session_id;
         let file_id = self.file_id;
         let output_buffer_length = self.output_buffer_length;
+        let layout = self.layout;
         self.state = DirectoryReaderState::Querying(Box::pin(async move {
             if conn.generation() != generation || conn.session_id() != session_id {
                 return Err(Error::Disconnected);
@@ -563,6 +641,9 @@ impl DirectoryReader {
                 file_id,
                 restart,
                 output_buffer_length,
+                layout,
+                generation,
+                session_id,
             )
             .await;
             if conn.generation() != generation || conn.session_id() != session_id {
@@ -583,7 +664,9 @@ impl DirectoryReader {
                 if conn.generation() != generation || conn.session_id() != session_id {
                     return Ok(());
                 }
-                let result = Tree::close_handle_for_tree(tree_id, &mut conn, file_id).await;
+                let result =
+                    Tree::close_handle_bound(tree_id, &mut conn, file_id, generation, session_id)
+                        .await;
                 if conn.generation() != generation || conn.session_id() != session_id {
                     return Ok(());
                 }
@@ -608,7 +691,10 @@ impl DirectoryReader {
 
 impl Drop for DirectoryReader {
     fn drop(&mut self) {
-        if !matches!(&self.state, DirectoryReaderState::Done) {
+        if !matches!(&self.state, DirectoryReaderState::Done)
+            && self.conn.generation() == self.generation
+            && self.conn.session_id() == self.session_id
+        {
             debug!(
                 "tree: DirectoryReader dropped without close(), directory handle may leak until \
                  session teardown"
@@ -625,13 +711,17 @@ impl Tree {
     pub async fn connect(conn: &mut Connection, share_name: &str) -> Result<Tree> {
         let server = conn.server_name().to_string();
         let unc_path = format!(r"\\{}\{}", server, share_name);
+        let generation = conn.generation();
+        let session_id = conn.session_id();
 
         let req = TreeConnectRequest {
             flags: TreeConnectRequestFlags::default(),
             path: unc_path,
         };
 
-        let frame = conn.execute(Command::TreeConnect, &req, None).await?;
+        let frame = conn
+            .execute_bound(Command::TreeConnect, &req, None, generation, session_id)
+            .await?;
 
         if frame.header.command != Command::TreeConnect {
             return Err(Error::invalid_data(format!(
@@ -722,7 +812,9 @@ impl Tree {
         let generation = conn.generation();
         let session_id = conn.session_id();
         let output_buffer_length = Self::default_query_buffer_len(&conn);
-        let open_result = self.open_directory(&mut conn, &normalized).await;
+        let open_result = self
+            .open_directory_bound(&mut conn, &normalized, generation, session_id)
+            .await;
         if conn.generation() != generation || conn.session_id() != session_id {
             return Err(Error::Disconnected);
         }
@@ -735,6 +827,7 @@ impl Tree {
             session_id,
             file_id,
             output_buffer_length,
+            layout: DirectoryInfoLayout::FileIdFull,
             state: DirectoryReaderState::Ready { restart: true },
         })
     }
@@ -781,18 +874,34 @@ impl Tree {
         path: &str,
         query_buffer_len: Option<u32>,
     ) -> Result<(Vec<DirectoryEntry>, ListingTrace)> {
+        let normalized = self.format_path(path);
         let buffer_len = query_buffer_len.unwrap_or_else(|| Self::default_query_buffer_len(conn));
+        let generation = conn.generation();
+        let session_id = conn.session_id();
 
         let create_start = Instant::now();
-        let file_id = self.open_directory(conn, path).await?;
+        let file_id = self
+            .open_directory_bound(conn, &normalized, generation, session_id)
+            .await?;
         let create = create_start.elapsed();
 
         let mut queries = Vec::new();
         let mut all_entries = Vec::new();
         let mut restart = true;
+        let mut layout = DirectoryInfoLayout::FileIdFull;
         let query_result = loop {
             let step_start = Instant::now();
-            match Self::query_directory_step(self.tree_id, conn, file_id, restart, buffer_len).await
+            match Self::query_directory_step(
+                self.tree_id,
+                conn,
+                file_id,
+                restart,
+                buffer_len,
+                layout,
+                generation,
+                session_id,
+            )
+            .await
             {
                 Ok(QueryStepOutcome::Entries { entries, bytes }) => {
                     queries.push(QueryStep {
@@ -812,6 +921,17 @@ impl Tree {
                     });
                     break Ok(());
                 }
+                Ok(QueryStepOutcome::UnsupportedInformationClass { bytes }) => {
+                    queries.push(QueryStep {
+                        elapsed: step_start.elapsed(),
+                        entries: 0,
+                        bytes,
+                        no_more_files: false,
+                    });
+                    layout = DirectoryInfoLayout::FileBoth;
+                    restart = true;
+                    continue;
+                }
                 Err(e) => break Err(e),
             }
             restart = false;
@@ -819,7 +939,8 @@ impl Tree {
 
         // Close the handle regardless of query result, mirroring `list_directory`.
         let close_start = Instant::now();
-        let close_result = self.close_handle(conn, file_id).await;
+        let close_result =
+            Self::close_handle_bound(self.tree_id, conn, file_id, generation, session_id).await;
         let close = close_start.elapsed();
 
         query_result?;
@@ -1126,6 +1247,8 @@ impl Tree {
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
         let normalized = self.format_path(path);
         trace!("tree: stat (compound) path={}", normalized);
+        let generation = conn.generation();
+        let session_id = conn.session_id();
 
         // BUILD CREATE request for reading attributes.
         let create_req = CreateRequest {
@@ -1219,7 +1342,14 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
+        let responses = all_or_first_err(
+            conn.execute_compound_bound(&ops, generation, session_id)
+                .await?,
+            ops.len(),
+        )?;
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
 
         let create_header = &responses[0].header;
         let create_body = &responses[0].body;
@@ -1239,15 +1369,28 @@ impl Tree {
             });
         }
 
-        // Check first QUERY_INFO (basic). If it failed, issue standalone CLOSE.
-        if !basic_header.status.is_success_or_partial() {
-            let mut cursor = ReadCursor::new(create_body);
-            let create_resp = CreateResponse::unpack(&mut cursor)?;
+        let create_resp = CreateResponse::unpack(&mut ReadCursor::new(create_body))?;
+        // A failed optional identity query can cascade through the related
+        // compound and make CLOSE fail with the same status. Release the
+        // successfully created handle explicitly before parsing/returning any
+        // metadata so every later error path is leak-free.
+        if close_header.status != NtStatus::SUCCESS {
             warn!(
-                "tree: compound QUERY_INFO (basic) failed ({:?}), issuing standalone CLOSE",
-                basic_header.status
+                "tree: compound CLOSE returned {:?}, issuing standalone CLOSE",
+                close_header.status
             );
-            let _ = self.close_handle(conn, create_resp.file_id).await;
+            let _ = Self::close_handle_bound(
+                self.tree_id,
+                conn,
+                create_resp.file_id,
+                generation,
+                session_id,
+            )
+            .await;
+        }
+
+        // Check first QUERY_INFO (basic).
+        if !basic_header.status.is_success_or_partial() {
             return Err(Error::Protocol {
                 status: basic_header.status,
                 command: Command::QueryInfo,
@@ -1275,15 +1418,8 @@ impl Tree {
         let changed = FileTime(u64::from_le_bytes(basic_buf[24..32].try_into().unwrap()));
         let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
 
-        // Check second QUERY_INFO (standard). If it failed, issue standalone CLOSE.
+        // Check second QUERY_INFO (standard).
         if !std_header.status.is_success_or_partial() {
-            let mut cursor = ReadCursor::new(create_body);
-            let create_resp = CreateResponse::unpack(&mut cursor)?;
-            warn!(
-                "tree: compound QUERY_INFO (standard) failed ({:?}), issuing standalone CLOSE",
-                std_header.status
-            );
-            let _ = self.close_handle(conn, create_resp.file_id).await;
             return Err(Error::Protocol {
                 status: std_header.status,
                 command: Command::QueryInfo,
@@ -1313,14 +1449,6 @@ impl Tree {
 
         let is_directory =
             is_directory_byte != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-        // Check CLOSE response (non-fatal, we already have the data).
-        if close_header.status != NtStatus::SUCCESS {
-            debug!(
-                "tree: compound CLOSE returned {:?} (non-fatal, stat data already read)",
-                close_header.status,
-            );
-        }
 
         trace!(
             "tree: stat done, size={}, is_dir={}",
@@ -2265,10 +2393,16 @@ impl Tree {
         path: &str,
     ) -> Result<MutationHandle> {
         let normalized = self.format_path(path);
-        let (file_id, info) = self.open_file_for_mutation(&mut conn, &normalized).await?;
+        let generation = conn.generation();
+        let session_id = conn.session_id();
+        let (file_id, info) = self
+            .open_file_for_mutation(&mut conn, &normalized, generation, session_id)
+            .await?;
         Ok(MutationHandle {
             tree: Arc::clone(self),
             conn,
+            generation,
+            session_id,
             file_id,
             info,
             closed: false,
@@ -2335,15 +2469,24 @@ impl Tree {
     /// Open an existing file for positioned streaming writes.
     ///
     /// Unlike [`create_file_writer_at`](Self::create_file_writer_at), this
-    /// never creates a missing file. It is the safe resume primitive when the
-    /// caller has already validated a durable remote checkpoint.
+    /// never creates a missing file. The expected identity and minimum length
+    /// are checked on the retained write handle, so path replacement and
+    /// truncation between checkpoint validation and open fail closed.
     pub async fn open_existing_file_writer_at(
         self: &Arc<Self>,
         conn: Connection,
         path: &str,
         offset: u64,
+        expected_identity: FileIdentity,
     ) -> Result<super::stream::FileWriter> {
-        super::stream::open_existing_file_writer_at(Arc::clone(self), conn, path, offset).await
+        super::stream::open_existing_file_writer_at(
+            Arc::clone(self),
+            conn,
+            path,
+            offset,
+            expected_identity,
+        )
+        .await
     }
 
     /// Create a directory.
@@ -2523,6 +2666,19 @@ impl Tree {
     /// Open a directory handle.
     async fn open_directory(&self, conn: &mut Connection, path: &str) -> Result<FileId> {
         let path = self.format_path(path);
+        let generation = conn.generation();
+        let session_id = conn.session_id();
+        self.open_directory_bound(conn, &path, generation, session_id)
+            .await
+    }
+
+    async fn open_directory_bound(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<FileId> {
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2539,12 +2695,18 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: FILE_DIRECTORY_FILE,
-            name: path,
+            name: path.to_string(),
             create_contexts: vec![],
         };
 
         let frame = conn
-            .execute(Command::Create, &req, Some(self.tree_id))
+            .execute_bound(
+                Command::Create,
+                &req,
+                Some(self.tree_id),
+                generation,
+                session_id,
+            )
             .await?;
 
         if frame.header.status != NtStatus::SUCCESS {
@@ -2556,6 +2718,9 @@ impl Tree {
 
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
         Ok(resp.file_id)
     }
 
@@ -2622,6 +2787,8 @@ impl Tree {
         &self,
         conn: &mut Connection,
         path: &str,
+        generation: u64,
+        session_id: SessionId,
     ) -> Result<(FileId, FileInfo)> {
         let request = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2643,7 +2810,13 @@ impl Tree {
             create_contexts: vec![],
         };
         let frame = conn
-            .execute(Command::Create, &request, Some(self.tree_id))
+            .execute_bound(
+                Command::Create,
+                &request,
+                Some(self.tree_id),
+                generation,
+                session_id,
+            )
             .await?;
         if frame.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
@@ -2652,6 +2825,9 @@ impl Tree {
             });
         }
         let response = CreateResponse::unpack(&mut ReadCursor::new(&frame.body))?;
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
 
         let mut index_request = FileIdentity::index_query();
         index_request.file_id = response.file_id;
@@ -2671,19 +2847,39 @@ impl Tree {
                 credit_charge: CreditCharge(1),
             },
         ];
-        let frames = match conn.execute_compound(&operations).await {
-            Ok(frames) => match all_or_first_err(frames) {
+        let frames = match conn
+            .execute_compound_bound(&operations, generation, session_id)
+            .await
+        {
+            Ok(frames) => match all_or_first_err(frames, operations.len()) {
                 Ok(frames) => frames,
                 Err(error) => {
-                    let _ = self.close_handle(conn, response.file_id).await;
+                    let _ = Self::close_handle_bound(
+                        self.tree_id,
+                        conn,
+                        response.file_id,
+                        generation,
+                        session_id,
+                    )
+                    .await;
                     return Err(error);
                 }
             },
             Err(error) => {
-                let _ = self.close_handle(conn, response.file_id).await;
+                let _ = Self::close_handle_bound(
+                    self.tree_id,
+                    conn,
+                    response.file_id,
+                    generation,
+                    session_id,
+                )
+                .await;
                 return Err(error);
             }
         };
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
         let identity = FileIdentity::from_frames(frames.first(), frames.get(1));
         let is_directory = response.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
         Ok((
@@ -2709,22 +2905,41 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<FileId> {
-        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOverwriteIf)
+        let generation = conn.generation();
+        let session_id = conn.session_id();
+        self.open_file_for_write_bound(conn, path, generation, session_id)
             .await
+    }
+
+    pub(crate) async fn open_file_for_write_bound(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<FileId> {
+        self.open_file_for_write_with_disposition(
+            conn,
+            path,
+            CreateDisposition::FileOverwriteIf,
+            generation,
+            session_id,
+        )
+        .await
     }
 
     /// Open a file for writing using a specific `CreateDisposition`.
     ///
-    /// Shared body of [`open_file_for_write`](Self::open_file_for_write)
-    /// (`FileOverwriteIf`) and
-    /// [`open_file_for_exclusive_create`](Self::open_file_for_exclusive_create)
-    /// (`FileCreate`). Held private so the disposition stays a strict
-    /// allow-list inside the crate.
+    /// Shared body for the overwrite, exclusive-create, and positioned writer
+    /// opens. Held private so the disposition stays a strict allow-list inside
+    /// the crate.
     async fn open_file_for_write_with_disposition(
         &self,
         conn: &mut Connection,
         path: &str,
         create_disposition: CreateDisposition,
+        generation: u64,
+        session_id: SessionId,
     ) -> Result<FileId> {
         let path = self.format_path(path);
         let req = CreateRequest {
@@ -2744,7 +2959,13 @@ impl Tree {
         };
 
         let frame = conn
-            .execute(Command::Create, &req, Some(self.tree_id))
+            .execute_bound(
+                Command::Create,
+                &req,
+                Some(self.tree_id),
+                generation,
+                session_id,
+            )
             .await?;
 
         if frame.header.status != NtStatus::SUCCESS {
@@ -2756,6 +2977,9 @@ impl Tree {
 
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
+        if conn.generation() != generation || conn.session_id() != session_id {
+            return Err(Error::Disconnected);
+        }
         Ok(resp.file_id)
     }
 
@@ -2770,13 +2994,21 @@ impl Tree {
     ///
     /// Pairs with [`open_file_for_write`](Self::open_file_for_write), which
     /// uses `FileOverwriteIf` (truncating).
-    pub(crate) async fn open_file_for_exclusive_create(
+    pub(crate) async fn open_file_for_exclusive_create_bound(
         &self,
         conn: &mut Connection,
         path: &str,
+        generation: u64,
+        session_id: SessionId,
     ) -> Result<FileId> {
-        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileCreate)
-            .await
+        self.open_file_for_write_with_disposition(
+            conn,
+            path,
+            CreateDisposition::FileCreate,
+            generation,
+            session_id,
+        )
+        .await
     }
 
     /// Open an existing file (or create it if absent) for writing *without*
@@ -2788,27 +3020,57 @@ impl Tree {
     /// at an arbitrary offset over or past it. Used by the positioned
     /// [`FileWriter`](crate::client::stream::FileWriter) built via
     /// [`create_file_writer_at`](Self::create_file_writer_at).
-    pub(crate) async fn open_file_for_write_at(
+    pub(crate) async fn open_file_for_write_at_bound(
         &self,
         conn: &mut Connection,
         path: &str,
+        generation: u64,
+        session_id: SessionId,
     ) -> Result<FileId> {
-        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOpenIf)
-            .await
+        self.open_file_for_write_with_disposition(
+            conn,
+            path,
+            CreateDisposition::FileOpenIf,
+            generation,
+            session_id,
+        )
+        .await
     }
 
     /// Open an existing file for positioned writes without truncating it.
     ///
-    /// Uses `FileOpen`, so a path that disappeared after a caller validated
-    /// its checkpoint fails with `STATUS_OBJECT_NAME_NOT_FOUND` instead of
-    /// silently creating a sparse replacement.
+    /// Uses `FileOpen` and queries identity on the related handle. The caller
+    /// compares the returned identity and CREATE length before constructing a
+    /// writer, so missing, replaced, and truncated checkpoints fail closed.
     pub(crate) async fn open_existing_file_for_write_at(
         &self,
         conn: &mut Connection,
         path: &str,
-    ) -> Result<FileId> {
-        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOpen)
-            .await
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<(FileId, u64, Option<FileIdentity>)> {
+        let path = self.format_path(path);
+        let request = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_WRITE_DATA
+                    | FileAccessMask::FILE_WRITE_ATTRIBUTES
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0x80,
+            share_access: ShareAccess(0),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_NON_DIRECTORY_FILE,
+            name: path,
+            create_contexts: vec![],
+        };
+        let (frame, identity) = self
+            .create_and_identify_bound(conn, &request, generation, session_id)
+            .await?;
+        let response = CreateResponse::unpack(&mut ReadCursor::new(&frame.body))?;
+        Ok((response.file_id, response.end_of_file, identity))
     }
 
     /// Open (or create) a file with combined read+write access, **without**
@@ -2916,9 +3178,12 @@ impl Tree {
         file_id: FileId,
         restart: bool,
         output_buffer_length: u32,
+        layout: DirectoryInfoLayout,
+        generation: u64,
+        session_id: SessionId,
     ) -> Result<QueryStepOutcome> {
         let req = QueryDirectoryRequest {
-            file_information_class: FileInformationClass::FileIdBothDirectoryInformation,
+            file_information_class: layout.information_class(),
             flags: QueryDirectoryFlags(if restart {
                 QueryDirectoryFlags::RESTART_SCANS
             } else {
@@ -2933,11 +3198,29 @@ impl Tree {
             CreditCharge((output_buffer_length as u64).div_ceil(65536).max(1) as u16);
 
         let frame = conn
-            .execute_with_credits(Command::QueryDirectory, &req, Some(tree_id), credit_charge)
+            .execute_with_credits_bound(
+                Command::QueryDirectory,
+                &req,
+                Some(tree_id),
+                credit_charge,
+                generation,
+                session_id,
+            )
             .await?;
 
         if frame.header.status == NtStatus::NO_MORE_FILES {
             return Ok(QueryStepOutcome::NoMoreFiles {
+                bytes: frame.body.len(),
+            });
+        }
+
+        if layout == DirectoryInfoLayout::FileIdFull
+            && matches!(
+                frame.header.status,
+                NtStatus::NOT_SUPPORTED | NtStatus::INVALID_INFO_CLASS
+            )
+        {
+            return Ok(QueryStepOutcome::UnsupportedInformationClass {
                 bytes: frame.body.len(),
             });
         }
@@ -2953,8 +3236,7 @@ impl Tree {
         let resp = QueryDirectoryResponse::unpack(&mut cursor)?;
         let bytes = resp.output_buffer.len();
 
-        // Parse FileIdBothDirectoryInformation entries from the output buffer.
-        let entries = parse_file_id_both_directory_info(&resp.output_buffer)?;
+        let entries = parse_directory_info(&resp.output_buffer, layout)?;
         for e in &entries {
             trace!(
                 "tree: dir_entry name={}, size={}, is_dir={}",
@@ -3618,6 +3900,54 @@ impl Tree {
         Ok(())
     }
 
+    pub(crate) async fn close_handle_bound(
+        tree_id: TreeId,
+        conn: &mut Connection,
+        file_id: FileId,
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<()> {
+        conn.forget_oplock(file_id);
+        let req = CloseRequest { flags: 0, file_id };
+        let frame = conn
+            .execute_bound(Command::Close, &req, Some(tree_id), generation, session_id)
+            .await?;
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::Close,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn flush_handle_bound(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<()> {
+        debug!("tree: flushing session-bound file handle");
+        let req = FlushRequest { file_id };
+        let frame = conn
+            .execute_bound(
+                Command::Flush,
+                &req,
+                Some(self.tree_id),
+                generation,
+                session_id,
+            )
+            .await?;
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::Flush,
+            });
+        }
+        Ok(())
+    }
+
     /// Write data to a file in chunks.
     ///
     /// Kept for potential future use by callers that need per-chunk control
@@ -3694,35 +4024,19 @@ fn normalize_path(path: &str) -> String {
     crate::name::encode_path(path)
 }
 
-/// Parse `FileIdBothDirectoryInformation` entries from raw bytes.
-///
-/// Each entry has:
-/// - NextEntryOffset (4 bytes)
-/// - FileIndex (4 bytes)
-/// - CreationTime (8 bytes)
-/// - LastAccessTime (8 bytes)
-/// - LastWriteTime (8 bytes)
-/// - ChangeTime (8 bytes)
-/// - EndOfFile (8 bytes)
-/// - AllocationSize (8 bytes)
-/// - FileAttributes (4 bytes)
-/// - FileNameLength (4 bytes)
-/// - EaSize (4 bytes)
-/// - ShortNameLength (1 byte)
-/// - Reserved (1 byte)
-/// - ShortName (24 bytes)
-/// - Reserved2 (2 bytes)
-/// - FileId (8 bytes)
-/// - FileName (variable, FileNameLength bytes)
-fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
+/// Parse either the compact ID-bearing directory layout or its compatibility
+/// fallback. Their first 68 bytes are identical; only the fixed suffix differs.
+fn parse_directory_info(data: &[u8], layout: DirectoryInfoLayout) -> Result<Vec<DirectoryEntry>> {
     let mut entries = Vec::new();
     let mut offset = 0usize;
+    let fixed_len = layout.fixed_len();
+    let layout_name = layout.name();
 
     while offset < data.len() {
         let remaining = data.len() - offset;
-        if remaining < 104 {
+        if remaining < fixed_len {
             return Err(Error::invalid_data(format!(
-                "FileIdBothDirectoryInformation fixed record is truncated at byte {offset}"
+                "{layout_name} fixed record is truncated at byte {offset}"
             )));
         }
 
@@ -3734,12 +4048,12 @@ fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>>
         let record_len = if next_entry_offset == 0 {
             remaining
         } else {
-            if next_entry_offset < 104
+            if next_entry_offset < fixed_len
                 || next_entry_offset > remaining
                 || next_entry_offset % 8 != 0
             {
                 return Err(Error::invalid_data(format!(
-                    "invalid FileIdBothDirectoryInformation NextEntryOffset {next_entry_offset} at byte {offset}"
+                    "invalid {layout_name} NextEntryOffset {next_entry_offset} at byte {offset}"
                 )));
             }
             next_entry_offset
@@ -3760,24 +4074,28 @@ fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>>
         let file_attributes = cursor.read_u32_le()?;
         let file_name_length = cursor.read_u32_le()? as usize;
         let _ea_size = cursor.read_u32_le()?;
-        let short_name_length = cursor.read_u8()? as usize;
-        if short_name_length > 24 || short_name_length % 2 != 0 {
-            return Err(Error::invalid_data(format!(
-                "invalid FileIdBothDirectoryInformation ShortNameLength {short_name_length} at byte {offset}"
-            )));
-        }
-        let _reserved = cursor.read_u8()?;
-        // ShortName: 24 bytes (fixed, null-padded).
-        cursor.skip(24)?;
-        // Reserved2 + stable 64-bit FileId.
-        cursor.skip(2)?;
-        let file_index = cursor.read_u64_le()?;
-        // FileName: FileNameLength bytes in UTF-16LE. A single component, so
-        // it decodes with `decode_name`, not `decode_path`: a `\` that comes
-        // back here is a character in the name (see `crate::name`).
+        let file_index = match layout {
+            DirectoryInfoLayout::FileIdFull => {
+                cursor.skip(4)?; // Reserved
+                let id = cursor.read_u64_le()?;
+                (id != 0).then_some(id)
+            }
+            DirectoryInfoLayout::FileBoth => {
+                let short_name_length = cursor.read_u8()? as usize;
+                if short_name_length > 24 || short_name_length % 2 != 0 {
+                    return Err(Error::invalid_data(format!(
+                        "invalid FileBothDirectoryInformation ShortNameLength {short_name_length} at byte {offset}"
+                    )));
+                }
+                cursor.skip(1)?; // Reserved
+                cursor.skip(24)?; // ShortName
+                None
+            }
+        };
+        // FileName is one component, so decode it as a name rather than a path.
         if file_name_length % 2 != 0 || file_name_length > cursor.remaining() {
             return Err(Error::invalid_data(format!(
-                "invalid FileIdBothDirectoryInformation FileNameLength {file_name_length} at byte {offset}"
+                "invalid {layout_name} FileNameLength {file_name_length} at byte {offset}"
             )));
         }
         let name = if file_name_length > 0 {
@@ -3795,7 +4113,7 @@ fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>>
             created: creation_time,
             modified: last_write_time,
             changed: change_time,
-            file_index: (file_index != 0).then_some(file_index),
+            file_index,
         });
 
         if next_entry_offset == 0 {
@@ -3803,7 +4121,7 @@ fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>>
         }
         offset = offset
             .checked_add(next_entry_offset)
-            .ok_or_else(|| Error::invalid_data("FileIdBothDirectoryInformation offset overflow"))?;
+            .ok_or_else(|| Error::invalid_data(format!("{layout_name} offset overflow")))?;
     }
 
     Ok(entries)
@@ -3814,8 +4132,9 @@ mod tests {
     use super::*;
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
-        build_close_response, build_create_error_response, build_create_response,
-        build_query_info_error_response, build_tree_connect_response, setup_connection,
+        build_close_error_response, build_close_response, build_create_error_response,
+        build_create_response, build_query_info_error_response, build_tree_connect_response,
+        setup_connection,
     };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
@@ -3841,8 +4160,7 @@ mod tests {
         h.credits = 32;
         h.status = status;
 
-        if status == NtStatus::NO_MORE_FILES {
-            // Error response body for NO_MORE_FILES.
+        if status != NtStatus::SUCCESS {
             use crate::msg::header::ErrorResponse;
             let body = ErrorResponse {
                 error_context_count: 0,
@@ -3898,14 +4216,14 @@ mod tests {
         pack_message(&h, &body)
     }
 
-    /// Build a single FileIdBothDirectoryInformation entry.
-    fn build_file_id_both_dir_info(
+    /// Build a single FileIdFullDirectoryInformation entry.
+    fn build_file_id_full_dir_info(
         name: &str,
         size: u64,
         is_directory: bool,
         next_offset: u32,
     ) -> Vec<u8> {
-        build_file_id_both_dir_info_with_index(
+        build_file_id_full_dir_info_with_index(
             name,
             size,
             is_directory,
@@ -3914,7 +4232,7 @@ mod tests {
         )
     }
 
-    fn build_file_id_both_dir_info_with_index(
+    fn build_file_id_full_dir_info_with_index(
         name: &str,
         size: u64,
         is_directory: bool,
@@ -3952,20 +4270,27 @@ mod tests {
         buf.extend_from_slice(&(name_bytes_len as u32).to_le_bytes());
         // EaSize (4)
         buf.extend_from_slice(&0u32.to_le_bytes());
-        // ShortNameLength (1)
-        buf.push(0);
-        // Reserved (1)
-        buf.push(0);
-        // ShortName (24 bytes, zero-padded)
-        buf.extend_from_slice(&[0u8; 24]);
-        // Reserved2 (2) + FileId (8)
-        buf.extend_from_slice(&0u16.to_le_bytes());
+        // Reserved (4) + FileId (8)
+        buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&file_index.to_le_bytes());
         // FileName (variable)
         for &u in &name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());
         }
 
+        buf
+    }
+
+    fn build_file_both_dir_info(
+        name: &str,
+        size: u64,
+        is_directory: bool,
+        next_offset: u32,
+    ) -> Vec<u8> {
+        let full = build_file_id_full_dir_info(name, size, is_directory, next_offset);
+        let mut buf = full[..68].to_vec();
+        buf.extend_from_slice(&[0u8; 26]); // ShortNameLength, Reserved, ShortName
+        buf.extend_from_slice(&full[80..]);
         buf
     }
 
@@ -4007,12 +4332,12 @@ mod tests {
         };
 
         // Build two directory entries.
-        let entry1 = build_file_id_both_dir_info("file1.txt", 1024, false, 0);
+        let entry1 = build_file_id_full_dir_info("file1.txt", 1024, false, 0);
         let total_entry_len = entry1.len().next_multiple_of(8);
         let mut entry1_with_next =
-            build_file_id_both_dir_info("file1.txt", 1024, false, total_entry_len as u32);
+            build_file_id_full_dir_info("file1.txt", 1024, false, total_entry_len as u32);
         entry1_with_next.resize(total_entry_len, 0);
-        let entry2 = build_file_id_both_dir_info("subdir", 0, true, 0);
+        let entry2 = build_file_id_full_dir_info("subdir", 0, true, 0);
 
         let mut entries_data = entry1_with_next;
         entries_data.extend_from_slice(&entry2);
@@ -4052,8 +4377,57 @@ mod tests {
         let request = QueryDirectoryRequest::unpack(&mut cursor).unwrap();
         assert_eq!(
             request.file_information_class,
-            FileInformationClass::FileIdBothDirectoryInformation
+            FileInformationClass::FileIdFullDirectoryInformation
         );
+    }
+
+    #[tokio::test]
+    async fn list_directory_falls_back_when_file_id_full_is_unsupported() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x1111,
+            volatile: 0x2222,
+        };
+        mock.queue_responses(vec![
+            build_create_response(file_id, 0),
+            build_query_directory_response(NtStatus::NOT_SUPPORTED, vec![]),
+            build_query_directory_response(
+                NtStatus::SUCCESS,
+                build_file_both_dir_info("compatible.txt", 7, false, 0),
+            ),
+            build_query_directory_response(NtStatus::NO_MORE_FILES, vec![]),
+            build_close_response(),
+        ]);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let entries = tree.list_directory(&mut conn, "somedir").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "compatible.txt");
+        assert_eq!(entries[0].file_index, None);
+
+        for (request_index, expected_class) in [
+            FileInformationClass::FileIdFullDirectoryInformation,
+            FileInformationClass::FileBothDirectoryInformation,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sent = mock.sent_message(request_index + 1).unwrap();
+            let mut cursor = ReadCursor::new(&sent);
+            let _header = Header::unpack(&mut cursor).unwrap();
+            let request = QueryDirectoryRequest::unpack(&mut cursor).unwrap();
+            assert_eq!(request.file_information_class, expected_class);
+            assert_ne!(request.flags.0 & QueryDirectoryFlags::RESTART_SCANS, 0);
+        }
+        mock.assert_fully_consumed();
     }
 
     #[tokio::test]
@@ -4067,11 +4441,11 @@ mod tests {
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_id_both_dir_info("first.txt", 10, false, 0),
+            build_file_id_full_dir_info("first.txt", 10, false, 0),
         ));
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_id_both_dir_info("second.txt", 20, false, 0),
+            build_file_id_full_dir_info("second.txt", 20, false, 0),
         ));
         mock.queue_response(build_query_directory_response(
             NtStatus::NO_MORE_FILES,
@@ -4188,7 +4562,7 @@ mod tests {
         mock.queue_response(build_create_response(file_id, 0));
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_id_both_dir_info("first.txt", 10, false, 0),
+            build_file_id_full_dir_info("first.txt", 10, false, 0),
         ));
 
         let conn = setup_connection(&mock);
@@ -4218,7 +4592,7 @@ mod tests {
 
         mock.queue_response(build_query_directory_response(
             NtStatus::SUCCESS,
-            build_file_id_both_dir_info("preserved.txt", 20, false, 0),
+            build_file_id_full_dir_info("preserved.txt", 20, false, 0),
         ));
         wait_for_mock_counts(&mock, 3, 3).await;
 
@@ -4314,7 +4688,7 @@ mod tests {
         mock.queue_responses(vec![
             build_query_directory_response(
                 NtStatus::SUCCESS,
-                build_file_id_both_dir_info("discarded.txt", 10, false, 0),
+                build_file_id_full_dir_info("discarded.txt", 10, false, 0),
             ),
             build_close_response(),
         ]);
@@ -4403,12 +4777,12 @@ mod tests {
             volatile: 0x2222,
         };
 
-        let entry1 = build_file_id_both_dir_info("file1.txt", 1024, false, 0);
+        let entry1 = build_file_id_full_dir_info("file1.txt", 1024, false, 0);
         let entry1_len = entry1.len().next_multiple_of(8);
         let mut entry1_with_next =
-            build_file_id_both_dir_info("file1.txt", 1024, false, entry1_len as u32);
+            build_file_id_full_dir_info("file1.txt", 1024, false, entry1_len as u32);
         entry1_with_next.resize(entry1_len, 0);
-        let entry2 = build_file_id_both_dir_info("subdir", 0, true, 0);
+        let entry2 = build_file_id_full_dir_info("subdir", 0, true, 0);
         let mut entries_data = entry1_with_next;
         entries_data.extend_from_slice(&entry2);
         let payload_len = entries_data.len();
@@ -4563,7 +4937,7 @@ mod tests {
     #[tokio::test]
     async fn directory_listings_decode_private_use_area_names() {
         let data = build_file_both_dir_info("a\u{F025}b", 7, false, 0);
-        let entries = parse_file_both_directory_info(&data).unwrap();
+        let entries = parse_directory_info(&data, DirectoryInfoLayout::FileBoth).unwrap();
         assert_eq!(entries[0].name, "a?b");
     }
 
@@ -4616,9 +4990,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_file_id_both_dir_info_single_entry() {
-        let data = build_file_id_both_dir_info("test.txt", 42, false, 0);
-        let entries = parse_file_id_both_directory_info(&data).unwrap();
+    async fn parse_file_id_full_dir_info_single_entry() {
+        let data = build_file_id_full_dir_info("test.txt", 42, false, 0);
+        let entries = parse_directory_info(&data, DirectoryInfoLayout::FileIdFull).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.txt");
         assert_eq!(entries[0].size, 42);
@@ -4628,36 +5002,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_file_id_both_dir_info_ignores_zero_file_id() {
-        let data = build_file_id_both_dir_info_with_index("unstable.txt", 42, false, 0, 0);
-        let entries = parse_file_id_both_directory_info(&data).unwrap();
+    fn parse_file_id_full_dir_info_ignores_zero_file_id() {
+        let data = build_file_id_full_dir_info_with_index("unstable.txt", 42, false, 0, 0);
+        let entries = parse_directory_info(&data, DirectoryInfoLayout::FileIdFull).unwrap();
         assert_eq!(entries[0].file_index, None);
     }
 
     #[test]
-    fn parse_file_id_both_dir_info_rejects_truncated_record() {
-        let error = parse_file_id_both_directory_info(&[0u8; 103]).unwrap_err();
+    fn parse_file_both_dir_info_has_no_stable_file_id() {
+        let data = build_file_both_dir_info("compatible.txt", 42, false, 0);
+        let entries = parse_directory_info(&data, DirectoryInfoLayout::FileBoth).unwrap();
+        assert_eq!(entries[0].name, "compatible.txt");
+        assert_eq!(entries[0].file_index, None);
+    }
+
+    #[test]
+    fn parse_file_id_full_dir_info_rejects_truncated_record() {
+        let error = parse_directory_info(&[0u8; 79], DirectoryInfoLayout::FileIdFull).unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
     }
 
     #[test]
-    fn parse_file_id_both_dir_info_rejects_bad_next_offset() {
-        let mut data = build_file_id_both_dir_info("bad.txt", 42, false, 0);
-        data[0..4].copy_from_slice(&105u32.to_le_bytes());
-        let error = parse_file_id_both_directory_info(&data).unwrap_err();
+    fn parse_file_id_full_dir_info_rejects_bad_next_offset() {
+        let mut data = build_file_id_full_dir_info("bad.txt", 42, false, 0);
+        data[0..4].copy_from_slice(&81u32.to_le_bytes());
+        let error = parse_directory_info(&data, DirectoryInfoLayout::FileIdFull).unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
     }
 
     #[test]
-    fn parse_file_id_both_dir_info_rejects_name_crossing_record() {
-        let mut first = build_file_id_both_dir_info("first.txt", 42, false, 0);
+    fn parse_file_id_full_dir_info_rejects_name_crossing_record() {
+        let mut first = build_file_id_full_dir_info("first.txt", 42, false, 0);
         let record_len = first.len().next_multiple_of(8);
         first.resize(record_len, 0);
         first[0..4].copy_from_slice(&(record_len as u32).to_le_bytes());
         first[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
-        first.extend_from_slice(&build_file_id_both_dir_info("second.txt", 1, false, 0));
+        first.extend_from_slice(&build_file_id_full_dir_info("second.txt", 1, false, 0));
 
-        let error = parse_file_id_both_directory_info(&first).unwrap_err();
+        let error = parse_directory_info(&first, DirectoryInfoLayout::FileIdFull).unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::InvalidData);
     }
 
@@ -5031,9 +5413,10 @@ mod tests {
             build_query_info_response(build_file_standard_info(4096, 2048, 1, false, false)),
             build_query_info_error_response(NtStatus::NOT_SUPPORTED),
             build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-            build_close_response(),
+            build_close_error_response(NtStatus::NOT_SUPPORTED),
         ];
         mock.queue_response(build_compound_response_frame(&responses));
+        mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -5047,6 +5430,11 @@ mod tests {
         let info = tree.stat(&mut conn, "doc.txt").await.unwrap();
         assert_eq!(info.identity, None);
         assert_eq!(info.changed, FileTime(4));
+        assert_eq!(
+            mock.sent_count(),
+            2,
+            "cascaded CLOSE failure must be cleaned up"
+        );
     }
 
     #[tokio::test]
@@ -5226,6 +5614,40 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().size, 2048);
         assert_eq!(results[2].as_ref().unwrap().size, 3072);
         assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn stat_files_cleans_up_a_close_cascaded_from_optional_identity() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 7,
+            volatile: 8,
+        };
+        mock.queue_responses(vec![
+            build_compound_response_frame(&[
+                build_create_response(file_id, 0),
+                build_query_info_response(build_file_basic_info(1, 2, 3, 4, 0x20)),
+                build_query_info_response(build_file_standard_info(4096, 2048, 1, false, false)),
+                build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+                build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+                build_close_error_response(NtStatus::NOT_SUPPORTED),
+            ]),
+            build_close_response(),
+        ]);
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+        let results = tree.stat_files(&mut conn, &["doc.txt"]).await;
+
+        assert_eq!(results[0].as_ref().unwrap().identity, None);
+        assert_eq!(mock.sent_count(), 2);
+        mock.assert_fully_consumed();
     }
 
     #[tokio::test]
@@ -5514,6 +5936,41 @@ mod tests {
         assert_eq!(request.file_info_class, FILE_DISPOSITION_INFORMATION);
         assert_eq!(request.buffer, vec![1]);
         assert_eq!(mock.sent_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn mutation_handle_never_reuses_ids_after_session_change() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x51,
+            volatile: 0x52,
+        };
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_compound_response_frame(&[
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+        ]));
+
+        let conn = setup_connection(&mock);
+        let mut shared = conn.clone();
+        let tree = Arc::new(Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        });
+        let handle = tree.open_mutation_handle(conn, "old.txt").await.unwrap();
+        shared.set_session_id(SessionId(0xCAFE));
+
+        let error = handle.delete().await.unwrap_err();
+        assert!(matches!(error, Error::Disconnected));
+        assert_eq!(
+            mock.sent_count(),
+            2,
+            "stale SetInfo and Close must stay off the replacement session"
+        );
+        mock.assert_fully_consumed();
     }
 
     #[tokio::test]
@@ -5893,7 +6350,9 @@ mod tests {
             encrypt_data: false,
         };
 
-        tree.open_file_for_exclusive_create(&mut conn, "new.bin")
+        let generation = conn.generation();
+        let session_id = conn.session_id();
+        tree.open_file_for_exclusive_create_bound(&mut conn, "new.bin", generation, session_id)
             .await
             .unwrap();
 
@@ -5926,8 +6385,10 @@ mod tests {
             encrypt_data: false,
         };
 
+        let generation = conn.generation();
+        let session_id = conn.session_id();
         let err = tree
-            .open_file_for_exclusive_create(&mut conn, "existing.bin")
+            .open_file_for_exclusive_create_bound(&mut conn, "existing.bin", generation, session_id)
             .await
             .expect_err("exclusive-create on an existing file must error");
         assert_eq!(

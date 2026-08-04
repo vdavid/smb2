@@ -856,9 +856,15 @@ async fn guest_writer_checkpoints_resume_at_an_absolute_existing_offset() {
     writer.write_chunk(b"prefix").await.expect("write suffix");
     assert_eq!(writer.flush_checkpoint().await.unwrap(), 14);
     assert_eq!(writer.finish().await.unwrap(), 14);
+    let identity = client
+        .stat(&mut tree, path)
+        .await
+        .expect("stat checkpoint")
+        .identity
+        .expect("server exposes stable file identity");
 
     let mut resumed = client
-        .open_existing_file_writer_at(&tree, path, 14)
+        .open_existing_file_writer_at(&tree, path, 14, identity)
         .await
         .expect("resume existing checkpoint");
     resumed
@@ -873,7 +879,7 @@ async fn guest_writer_checkpoints_resume_at_an_absolute_existing_offset() {
     );
 
     let error = match client
-        .open_existing_file_writer_at(&tree, missing, 4096)
+        .open_existing_file_writer_at(&tree, missing, 4096, identity)
         .await
     {
         Ok(_) => panic!("existing-only resume created a missing checkpoint"),
