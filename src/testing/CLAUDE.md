@@ -24,6 +24,8 @@ The consumer Docker files (compose, Dockerfiles, smb.conf, scripts) are embedded
 
 15 containers on ports 10480-10494. Each port has an env-var override (`SMB_CONSUMER_*_PORT`). The `port()` function checks the env var, falls back to the hardcoded default.
 
+All of them publish to **127.0.0.1 only**, via a `${SMB_BIND_ADDR:-127.0.0.1}` prefix on each `ports:` entry. Docker's default is `0.0.0.0`, which would put 15 unauthenticated Samba servers on the LAN and tailnet of whoever runs the tests. Set `SMB_BIND_ADDR=0.0.0.0` when the client isn't on the host: another machine, or a NAT'd VM (a guest VM reaches the host via a gateway IP, so loopback binding is invisible to it).
+
 ## Profiles
 
 - **Minimal**: guest + auth only (2 containers, fast startup).

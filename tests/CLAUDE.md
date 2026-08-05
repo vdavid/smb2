@@ -146,6 +146,8 @@ cd test-infra && docker compose up -d
 # Containers available at localhost:10480-10494
 ```
 
+Both harnesses bind their ports to **127.0.0.1 only** (`${SMB_BIND_ADDR:-127.0.0.1}` in the compose files), so the fixtures aren't exposed to the LAN or tailnet. Set `SMB_BIND_ADDR=0.0.0.0` if the SMB client runs somewhere other than the Docker host.
+
 ## How to run
 
 | Command | What it runs | Needs |

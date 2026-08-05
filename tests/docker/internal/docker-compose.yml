@@ -1,45 +1,52 @@
+# Every port publishes to 127.0.0.1, not 0.0.0.0. Without the `${SMB_BIND_ADDR}` prefix, Docker binds
+# all interfaces, putting 14 Samba servers (guest shares included) on the LAN and tailnet of whoever
+# runs the tests. The fixtures hold no real data, but an unauthenticated smbd reachable from the local
+# network is surface nobody asked for.
+#
+# Set SMB_BIND_ADDR=0.0.0.0 to reach the fixtures from another machine or a NAT'd VM (a guest VM hits
+# the host through a gateway IP, not loopback, so localhost binding is invisible to it).
 services:
   smb-guest:
     build:
       context: smb-guest
     ports:
-      - "10445:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10445:445"
 
   smb-auth:
     build:
       context: smb-auth
     ports:
-      - "10446:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10446:445"
 
   smb-signing:
     build:
       context: smb-signing
     ports:
-      - "10447:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10447:445"
 
   smb-readonly:
     build:
       context: smb-readonly
     ports:
-      - "10448:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10448:445"
 
   smb-ancient:
     build:
       context: smb-ancient
     ports:
-      - "10449:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10449:445"
 
   smb-flaky:
     build:
       context: smb-flaky
     ports:
-      - "10450:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10450:445"
 
   smb-slow:
     build:
       context: smb-slow
     ports:
-      - "10451:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10451:445"
     cap_add:
       - NET_ADMIN
 
@@ -47,40 +54,40 @@ services:
     build:
       context: smb-encryption
     ports:
-      - "10452:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10452:445"
 
   smb-encryption-aes128:
     build:
       context: smb-encryption-aes128
     ports:
-      - "10455:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10455:445"
 
   smb-50shares:
     build:
       context: smb-50shares
     ports:
-      - "10453:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10453:445"
 
   smb-manyshares:
     build:
       context: smb-manyshares
     ports:
-      - "10458:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10458:445"
 
   smb-maxreadsize:
     build:
       context: smb-maxreadsize
     ports:
-      - "10454:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10454:445"
 
   smb-dfs-root:
     build:
       context: smb-dfs-root
     ports:
-      - "10456:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10456:445"
 
   smb-dfs-target:
     build:
       context: smb-dfs-target
     ports:
-      - "10457:445"
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10457:445"
