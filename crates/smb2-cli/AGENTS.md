@@ -1,6 +1,8 @@
 # smb2-cli
 
-A command-line SMB2/3 client built on the [smb2](https://github.com/vdavid/smb2) crate, in `../smb2` as a path dependency. The binary is named `smb2`; the package is `smb2-cli`.
+A command-line SMB2/3 client built on the [smb2](https://github.com/vdavid/smb2) crate, pulled from crates.io. The binary is named `smb2`; the package is `smb2-cli`.
+
+Don't turn `smb2` into a path or git dependency: a path dep breaks this build whenever David bumps the version in `../smb2`, and a git dep tracking the default branch breaks even more often. To try an unreleased change, use a temporary `[patch.crates-io]` entry and take it out before committing.
 
 ## Layout
 
