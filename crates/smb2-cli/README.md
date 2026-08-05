@@ -26,7 +26,7 @@ Every command also prints JSON, which makes it pleasant to drive from a script o
 ## Install
 
 ```sh
-cargo install --git https://github.com/vdavid/smb2-cli
+cargo install smb2-cli
 ```
 
 The binary is called `smb2`.
