@@ -9,6 +9,16 @@ repository = "https://github.com/vdavid/smb2-cli"
 keywords = ["smb", "smb2", "smb3", "cifs", "cli"]
 categories = ["command-line-utilities", "network-programming", "filesystem"]
 readme = "README.md"
+exclude = [
+    # Agent tooling, not library source: these are house style for contributors
+    # here, not something a consumer installing the binary wants.
+    "AGENTS.md",
+    # Root-anchored: this one is only an `@AGENTS.md` import, and `AGENTS.md`
+    # is excluded above, so shipping it would publish a pointer to a file
+    # that isn't in the package.
+    "/CLAUDE.md",
+    ".claude/",
+]
 
 [[bin]]
 name = "smb2"
