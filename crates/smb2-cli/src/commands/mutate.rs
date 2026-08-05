@@ -86,9 +86,23 @@ pub async fn mkdir(
         }
         .print("created", true);
     }
-    let jobs = paths.iter().cloned().map(Job::CreateDirectory).collect();
-    // Parents have to exist before their children, so `-p` runs single-file.
-    let concurrency = if parents { 1 } else { concurrency };
+    // With `-p`, a directory that already exists is fine, and parents have to
+    // exist before their children, so it runs one at a time.
+    let (jobs, concurrency): (Vec<Job>, usize) = if parents {
+        (
+            paths
+                .iter()
+                .cloned()
+                .map(Job::CreateDirectoryIfMissing)
+                .collect(),
+            1,
+        )
+    } else {
+        (
+            paths.iter().cloned().map(Job::CreateDirectory).collect(),
+            concurrency,
+        )
+    };
     run_jobs(&base, credentials, concurrency, paths, jobs, false)
         .await?
         .print("Created", false)

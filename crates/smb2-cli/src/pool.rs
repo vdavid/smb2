@@ -7,6 +7,7 @@
 //! the caller's order at the end.
 
 use anyhow::{Context, Result};
+use smb2::types::status::NtStatus;
 use smb2::{FileInfo, SmbClient, Tree};
 
 use crate::auth::Credentials;
@@ -16,10 +17,16 @@ use crate::target::Target;
 #[derive(Debug, Clone)]
 pub enum Job {
     Stat(String),
-    Rename { from: String, to: String },
+    Rename {
+        from: String,
+        to: String,
+    },
     DeleteFile(String),
     DeleteDirectory(String),
     CreateDirectory(String),
+    /// Create a directory, treating "it's already there" as success, which is
+    /// what `mkdir -p` means.
+    CreateDirectoryIfMissing(String),
 }
 
 /// What a job produced.
@@ -140,6 +147,10 @@ async fn execute(client: &mut SmbClient, tree: &mut Tree, job: &Job) -> Outcome 
         Job::DeleteFile(path) => report(client.delete_file(tree, path).await),
         Job::DeleteDirectory(path) => report(client.delete_directory(tree, path).await),
         Job::CreateDirectory(path) => report(client.create_directory(tree, path).await),
+        Job::CreateDirectoryIfMissing(path) => match client.create_directory(tree, path).await {
+            Err(error) if error.status() == Some(NtStatus::OBJECT_NAME_COLLISION) => Outcome::Done,
+            other => report(other),
+        },
     }
 }
 
