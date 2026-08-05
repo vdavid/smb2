@@ -2415,3 +2415,70 @@ async fn nas_answers_the_echo_keepalive_probe() {
     let _ = tree.delete_directory(&mut conn, watched).await;
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
+
+#[tokio::test]
+#[ignore]
+async fn nas_stores_an_illegal_name_the_way_macos_does() {
+    let _ = env_logger::try_init();
+
+    // The end-to-end check against real NAS firmware, with the name that
+    // started this: a QNAP Samba share answered STATUS_OBJECT_NAME_INVALID
+    // for it before the private-use mapping existed. Both `?` and `"` are
+    // wildcards in SMB2's name syntax, so nothing about the retry could help.
+    let names = [
+        "\"how_are_you_feeling?\"_emojis.json",
+        "every\"*:<>?\\|char",
+        "trailing space ",
+        "trailing period.",
+    ];
+    let dir = "_test/smb2-illegal-names";
+
+    let mut client = connect_client_to_nas().await;
+    let mut tree = client.connect_share("naspi").await.expect("connect_share");
+
+    for name in names {
+        client
+            .delete_file(&mut tree, &format!("{dir}/{name}"))
+            .await
+            .ok();
+    }
+    client.delete_directory(&mut tree, dir).await.ok();
+    client
+        .create_directory(&mut tree, dir)
+        .await
+        .expect("create the test directory");
+
+    for name in names {
+        let path = format!("{dir}/{name}");
+        let payload = format!("content for {name}").into_bytes();
+        client
+            .write_file(&mut tree, &path, &payload)
+            .await
+            .unwrap_or_else(|e| panic!("write {name:?}: {e}"));
+        let read_back = client
+            .read_file(&mut tree, &path)
+            .await
+            .unwrap_or_else(|e| panic!("read {name:?}: {e}"));
+        assert_eq!(read_back, payload, "content differs for {name:?}");
+    }
+
+    let entries = client
+        .list_directory(&mut tree, dir)
+        .await
+        .expect("list the test directory");
+    let listed: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    for name in names {
+        assert!(listed.contains(&name), "missing {name:?} in {listed:?}");
+    }
+
+    for name in names {
+        client
+            .delete_file(&mut tree, &format!("{dir}/{name}"))
+            .await
+            .unwrap_or_else(|e| panic!("delete {name:?}: {e}"));
+    }
+    client
+        .delete_directory(&mut tree, dir)
+        .await
+        .expect("cleanup the test directory");
+}

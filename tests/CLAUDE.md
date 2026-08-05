@@ -43,7 +43,7 @@ cargo test --test integration -- --ignored --nocapture
   `docs/notes/samba-4.9-compound-write-crash.md`.
 - `SMB2_TEST_NAS_PASSWORD` env var (from `.env` file or shell). See `.env.example`.
 
-**What they cover:** Connect, negotiate, auth (NTLM + guest), tree connect, list directory, read/write/delete file, stat, create/delete directory, compound read/write, pipelined I/O, streaming download/upload with progress, reconnect, share enumeration, file watching, disk space, rename. Also a micro-benchmark comparing smb2 vs native macOS SMB.
+**What they cover:** Connect, negotiate, auth (NTLM + guest), tree connect, list directory, read/write/delete file, stat, create/delete directory, compound read/write, pipelined I/O, streaming download/upload with progress, reconnect, share enumeration, file watching, disk space, rename, and filenames carrying characters SMB2 forbids (`nas_stores_an_illegal_name_the_way_macos_does`, against real QNAP firmware rather than a container). Also a micro-benchmark comparing smb2 vs native macOS SMB.
 
 These are secondary validation — the primary safety net is the unit tests and (soon) Docker tests. Contributors without NAS hardware can skip these.
 
