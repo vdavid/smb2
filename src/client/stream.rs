@@ -738,9 +738,8 @@ pub struct FileWriter {
     max_write_size: u32,
     /// Next write offset in the file.
     offset: u64,
-    /// In-flight WRITE futures. `FuturesUnordered::len()` gives the same
-    /// "how many responses are pending" count the old `in_flight: usize`
-    /// field tracked pre-Phase-3.
+    /// In-flight WRITE futures. `FuturesUnordered::len()` is the count of
+    /// responses still pending.
     in_flight: futures_util::stream::FuturesUnordered<BoxedWriteFut>,
     /// Confirmed bytes (from WRITE responses).
     total_written: u64,

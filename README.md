@@ -26,7 +26,7 @@ we have more control to reach even better speeds.
 - Connect to SMB2/3 shares using NTLM or Kerberos authentication
 - List directories, read files, write files, delete, rename, stat, create directories
 - Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds, compound delete/rename/stat)
-- Batch operations (delete, rename, stat multiple files -- all requests sent before waiting for responses)
+- Batch helpers for deleting, renaming, and stat-ing many files in one call
 - Pipelined I/O with sliding window for large file transfers
 - SMB 2.x (HMAC-SHA256) and 3.x (AES-CMAC, AES-GMAC) signing, and encryption (AES-128/256-CCM/GCM)
 - LZ4 compression
@@ -94,7 +94,7 @@ async fn main() -> Result<(), smb2::Error> {
 
 ## Pipeline API
 
-The pipeline is the core feature. It lets you batch multiple operations and execute them together:
+The pipeline runs a mixed list of operations through one call and hands back one result per operation. It is a convenience over calling the methods one at a time: operations run in order and do not overlap on the wire. For real concurrency, run operations on several connections at once.
 
 ```rust
 use smb2::{Pipeline, Op, OpResult};
@@ -289,7 +289,7 @@ For when you want to do one thing and get the result:
 - `client.read_file(&mut share, path)`: Download a file
 - `client.write_file(&mut share, path, data)`: Upload a file
 - `client.delete_file(&mut share, path)`: Delete a file
-- `client.delete_files(&mut share, &paths)`: Batch delete (all requests sent before waiting)
+- `client.delete_files(&mut share, &paths)`: Delete many files, one result each
 - `client.stat(&mut share, path)`: Get file metadata
 - `client.stat_files(&mut share, &paths)`: Batch stat
 - `client.rename(&mut share, from, to)`: Rename a file

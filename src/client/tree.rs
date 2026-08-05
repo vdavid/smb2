@@ -661,12 +661,14 @@ impl Tree {
             .await
     }
 
-    /// Delete multiple files using batch compound requests.
+    /// Delete multiple files, one compound request each.
     ///
-    /// Sends all compound (CREATE+CLOSE) requests before waiting for any
-    /// responses, minimizing total round-trips. Returns results in the same
-    /// order as the input paths. Each file's result is independent -- one
-    /// failure does not affect the others.
+    /// Returns results in the same order as the input paths. Each file's
+    /// result is independent: one failure does not affect the others.
+    ///
+    /// Each delete costs one round trip and they do not overlap, so this
+    /// saves the per-call setup rather than the wire time. To overlap server
+    /// work, run `delete_file` on several connections concurrently.
     pub async fn delete_files(&self, conn: &mut Connection, paths: &[&str]) -> Vec<Result<()>> {
         if paths.is_empty() {
             return vec![];
@@ -971,11 +973,15 @@ impl Tree {
         })
     }
 
-    /// Stat multiple files using batch compound requests.
+    /// Stat multiple files, one compound request each.
     ///
-    /// Sends all compound (CREATE+QUERY_INFO+QUERY_INFO+CLOSE) requests before
-    /// waiting for any responses. Returns results in the same order as the
-    /// input paths.
+    /// Returns results in the same order as the input paths. Each path's
+    /// result is independent: one failure does not affect the others.
+    ///
+    /// Each stat costs one round trip and they do not overlap, so this saves
+    /// the per-call setup rather than the wire time. To overlap server work,
+    /// run `stat` on several connections concurrently. To describe a whole
+    /// directory, `list_directory` is far cheaper than a stat per entry.
     pub async fn stat_files(&self, conn: &mut Connection, paths: &[&str]) -> Vec<Result<FileInfo>> {
         if paths.is_empty() {
             return vec![];
@@ -1456,10 +1462,14 @@ impl Tree {
         Ok(())
     }
 
-    /// Rename multiple files using batch compound requests.
+    /// Rename multiple files, one compound request each.
     ///
-    /// Sends all compound (CREATE+SET_INFO+CLOSE) requests before waiting for
-    /// any responses. Returns results in the same order as the input pairs.
+    /// Returns results in the same order as the input pairs. Each rename's
+    /// result is independent: one failure does not affect the others.
+    ///
+    /// Each rename costs one round trip and they do not overlap, so this
+    /// saves the per-call setup rather than the wire time. To overlap server
+    /// work, run `rename` on several connections concurrently.
     pub async fn rename_files(
         &self,
         conn: &mut Connection,
@@ -2288,10 +2298,19 @@ impl Tree {
 
     // ── Private helpers ──────────────────────────────────────────────
 
-    /// Compound CREATE (DELETE_ON_CLOSE) + CLOSE in a single round-trip.
+    /// Compound CREATE + SET_INFO (FileDispositionInformation) + CLOSE in a
+    /// single round-trip.
     ///
     /// `type_option` selects file vs directory (`FILE_NON_DIRECTORY_FILE`
     /// or `FILE_DIRECTORY_FILE`). `kind` is used only for log messages.
+    ///
+    /// Don't switch this back to `FILE_DELETE_ON_CLOSE`. Samba accepts a
+    /// delete-on-close CREATE against a non-empty directory, answers both
+    /// CREATE and CLOSE with `STATUS_SUCCESS`, and then doesn't delete
+    /// anything — so the caller is told a delete happened that never did.
+    /// Setting the disposition explicitly makes the server validate while it
+    /// still has somewhere to put the error, and it comes back as
+    /// `STATUS_DIRECTORY_NOT_EMPTY`.
     async fn delete_compound(
         &self,
         conn: &mut Connection,

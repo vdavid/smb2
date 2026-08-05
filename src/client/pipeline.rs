@@ -1,12 +1,11 @@
-//! Unified operation pipeline for concurrent SMB2 operations.
+//! Running a heterogeneous list of SMB2 operations through one call.
 //!
-//! The [`Pipeline`] sends multiple SMB2 requests without waiting for each
-//! response, filling the credit window. Results are collected and returned
-//! once all operations complete.
-//!
-//! This is a first-iteration pipeline that executes a batch of operations.
-//! Future iterations will add a channel-based streaming interface, compound
-//! request construction, and chunk-level interleaving for large files.
+//! [`Pipeline`] takes a mixed batch of reads, writes, deletes, listings, and
+//! stats, runs them in order, and hands back one result per operation. It is
+//! a convenience over calling [`Tree`] methods one at a time, not a
+//! throughput feature: operations do not overlap on the wire, so it neither
+//! fills the credit window nor saves round trips. To overlap server work,
+//! run operations on several connections concurrently.
 
 use log::trace;
 
@@ -73,12 +72,11 @@ pub enum OpResult {
     },
 }
 
-/// A pipeline for executing multiple SMB operations as a batch.
+/// Runs a list of SMB operations in order and collects their results.
 ///
-/// The pipeline executes operations sequentially in this first iteration.
-/// Each multi-step operation (for example, read = CREATE + READ + CLOSE) runs
-/// to completion before the next operation starts. Future iterations will
-/// interleave steps from different operations to fill the credit window.
+/// Each operation runs to completion before the next one starts, including
+/// its internal steps (a read is CREATE + READ + CLOSE). Nothing here
+/// interleaves work from different operations.
 pub struct Pipeline<'a> {
     conn: &'a mut Connection,
     tree: &'a Tree,

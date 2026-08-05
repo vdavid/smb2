@@ -876,10 +876,13 @@ impl SmbClient {
         }
     }
 
-    /// Delete multiple files on the given share in a single batch.
+    /// Delete multiple files on the given share.
     ///
-    /// Sends all requests before waiting for responses, minimizing
-    /// round-trips. Returns results in the same order as the input paths.
+    /// Returns results in the same order as the input paths.
+    ///
+    /// Each item costs one round trip and they do not overlap, so this saves
+    /// the per-call setup rather than the wire time. To overlap server work,
+    /// run the single-item call on several connections concurrently.
     ///
     /// Note: DFS retry is not applied to batch operations. If the share
     /// is a DFS target, perform a single-file operation first to trigger
@@ -910,10 +913,14 @@ impl SmbClient {
         }
     }
 
-    /// Stat multiple files on the given share in a single batch.
+    /// Stat multiple files on the given share.
     ///
-    /// Sends all requests before waiting for responses, minimizing
-    /// round-trips. Returns results in the same order as the input paths.
+    /// Returns results in the same order as the input paths. To describe a
+    /// whole directory, `list_directory` is far cheaper than a stat per entry.
+    ///
+    /// Each item costs one round trip and they do not overlap, so this saves
+    /// the per-call setup rather than the wire time. To overlap server work,
+    /// run the single-item call on several connections concurrently.
     ///
     /// Note: DFS retry is not applied to batch operations. If the share
     /// is a DFS target, perform a single-file operation first to trigger
@@ -939,10 +946,13 @@ impl SmbClient {
         }
     }
 
-    /// Rename multiple files on the given share in a single batch.
+    /// Rename multiple files on the given share.
     ///
-    /// Sends all requests before waiting for responses, minimizing
-    /// round-trips. Returns results in the same order as the input pairs.
+    /// Returns results in the same order as the input pairs.
+    ///
+    /// Each item costs one round trip and they do not overlap, so this saves
+    /// the per-call setup rather than the wire time. To overlap server work,
+    /// run the single-item call on several connections concurrently.
     ///
     /// Note: DFS retry is not applied to batch operations. If the share
     /// is a DFS target, perform a single-file operation first to trigger

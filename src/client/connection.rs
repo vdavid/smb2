@@ -3096,7 +3096,7 @@ impl Connection {
     ) -> Result<LongPollOutcome> {
         let msg_id = guard.msg_id();
         // Nothing to wake up for: no death bound and no refresh means the wait
-        // is exactly as unbounded as the crate used to make it.
+        // is unbounded.
         let Some(shortest) = [budget, refresh].into_iter().flatten().min() else {
             return guard.recv().await.map(LongPollOutcome::Answered);
         };
