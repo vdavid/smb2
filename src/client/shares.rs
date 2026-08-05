@@ -4,7 +4,7 @@
 //! opening the srvsvc named pipe, and performing the NetShareEnumAll RPC
 //! exchange.
 
-use log::{debug, info};
+use log::{debug, info, trace};
 
 use crate::client::connection::Connection;
 use crate::error::Result;
@@ -113,18 +113,18 @@ async fn rpc_bind_and_request(
     // 3. Write RPC BIND
     let bind_data = rpc::build_srvsvc_bind(1);
     write_pipe(conn, tree_id, file_id, &bind_data).await?;
-    debug!("shares: sent RPC BIND ({} bytes)", bind_data.len());
+    trace!("shares: sent RPC BIND ({} bytes)", bind_data.len());
 
     // 4. Read RPC BIND_ACK
     let bind_ack_data = read_pipe_message(conn, tree_id, file_id).await?;
     rpc::parse_bind_ack(&bind_ack_data)?;
-    debug!("shares: received BIND_ACK, context accepted");
+    trace!("shares: received BIND_ACK, context accepted");
 
     // 5. Write RPC REQUEST (NetShareEnumAll)
     let server_name = format!(r"\\{}", conn.server_name());
     let request_data = srvsvc::build_net_share_enum_all(2, &server_name);
     write_pipe(conn, tree_id, file_id, &request_data).await?;
-    debug!(
+    trace!(
         "shares: sent NetShareEnumAll request ({} bytes)",
         request_data.len()
     );
@@ -180,7 +180,7 @@ async fn open_srvsvc_pipe(conn: &mut Connection, tree_id: TreeId) -> Result<File
 
     let mut cursor = ReadCursor::new(&frame.body);
     let resp = CreateResponse::unpack(&mut cursor)?;
-    debug!("shares: opened srvsvc pipe, file_id={:?}", resp.file_id);
+    trace!("shares: opened srvsvc pipe, file_id={:?}", resp.file_id);
     Ok(resp.file_id)
 }
 
@@ -215,7 +215,7 @@ async fn write_pipe(
 
     let mut cursor = ReadCursor::new(&frame.body);
     let resp = WriteResponse::unpack(&mut cursor)?;
-    debug!("shares: wrote {} bytes to pipe", resp.count);
+    trace!("shares: wrote {} bytes to pipe", resp.count);
     Ok(())
 }
 
@@ -275,7 +275,7 @@ async fn read_pipe_message(
         }
     }
 
-    debug!("shares: read {} bytes from pipe", message.len());
+    trace!("shares: read {} bytes from pipe", message.len());
     Ok(message)
 }
 

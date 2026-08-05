@@ -14,7 +14,7 @@
 //! an unbounded `oneshot` await; using one here is what left a watcher on a
 //! silent-but-open session waiting forever.
 
-use log::debug;
+use log::{debug, trace};
 
 use crate::client::connection::{Connection, LongPollOutcome, WaiterGuard};
 use crate::client::tree::Tree;
@@ -241,7 +241,15 @@ impl Watcher {
         let resp = ChangeNotifyResponse::unpack(&mut cursor)?;
 
         let events = parse_notify_information(&resp.output_data)?;
-        debug!("watcher: received {} change event(s)", events.len());
+        // An empty response is plumbing: a subscription handed over during a
+        // refresh answers with nothing to report, and on an idle directory
+        // that's most of them. Events are the signal, so only those get a
+        // line a consumer sees at `debug`.
+        if events.is_empty() {
+            trace!("watcher: a subscription answered with no change events");
+        } else {
+            debug!("watcher: received {} change event(s)", events.len());
+        }
         Ok(events)
     }
 

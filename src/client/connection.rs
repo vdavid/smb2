@@ -2403,7 +2403,7 @@ impl Connection {
                     match self.inner.send_and_count(&framed, command).await {
                         Ok(()) => {
                             reservation.commit();
-                            debug!(
+                            trace!(
                                 "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, compressed {}->{} bytes",
                                 command, msg_id.0, charge, tree_id, should_sign,
                                 msg_bytes.len(), framed.len()
@@ -2421,7 +2421,7 @@ impl Connection {
         self.inner.send_and_count(&wire_bytes, command).await?;
         reservation.commit();
         self.inner.mark_sent(&[msg_id]);
-        debug!(
+        trace!(
             "dispatch: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
         );
@@ -2751,9 +2751,10 @@ impl Connection {
             self.inner
                 .send_and_count(&encrypted, Command::Cancel)
                 .await?;
-            debug!(
+            trace!(
                 "send_cancel: msg_id={}, async_id={:?}, encrypted",
-                original_msg_id.0, async_id
+                original_msg_id.0,
+                async_id
             );
         } else {
             if should_sign {
@@ -2770,9 +2771,11 @@ impl Connection {
             self.inner
                 .send_and_count(&msg_bytes, Command::Cancel)
                 .await?;
-            debug!(
+            trace!(
                 "send_cancel: msg_id={}, async_id={:?}, signed={}",
-                original_msg_id.0, async_id, should_sign
+                original_msg_id.0,
+                async_id,
+                should_sign
             );
         }
         Ok(())
@@ -4170,9 +4173,10 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
                 waiter.async_id = Some(async_id);
             }
         }
-        debug!(
+        trace!(
             "recv: STATUS_PENDING (interim), cmd={:?}, msg_id={}",
-            header.command, header.message_id.0
+            header.command,
+            header.message_id.0
         );
         return Ok(SubFrameAction::Skip);
     }

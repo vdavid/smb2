@@ -48,7 +48,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use log::{debug, info};
+use log::debug;
 
 use crate::client::dfs::DfsResolver;
 use crate::error::{ErrorKind, Result};
@@ -220,7 +220,7 @@ impl SmbClient {
     ///
     /// Performs TCP connect, negotiate, and session setup in one call.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
-        info!("smb_client: connecting to {}", config.addr);
+        debug!("smb_client: connecting to {}", config.addr);
 
         let mut conn = Connection::connect(&config.addr, config.timeout).await?;
         conn.set_compression_requested(config.compression);
@@ -234,7 +234,7 @@ impl SmbClient {
         )
         .await?;
 
-        info!(
+        debug!(
             "smb_client: connected and authenticated, session_id={}, compression={}",
             session.session_id,
             conn.compression_enabled()
@@ -345,7 +345,7 @@ impl SmbClient {
     /// connection is left unambiguously dead and the error is
     /// [`Error::ReconnectFailed`].
     pub async fn reconnect(&mut self) -> Result<()> {
-        info!("smb_client: reconnecting to {}", self.config.addr);
+        debug!("smb_client: reconnecting to {}", self.config.addr);
         self.reconnects.fetch_add(1, Ordering::Relaxed);
 
         // An explicit reconnect works even when `auto_reconnect` is off: the
@@ -367,7 +367,7 @@ impl SmbClient {
         self.primary_server = self.config.addr.clone();
         self.extra_connections.clear();
 
-        info!(
+        debug!(
             "smb_client: reconnected, new session_id={}",
             self.session.session_id
         );

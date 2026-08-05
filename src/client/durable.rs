@@ -304,7 +304,7 @@ impl Tree {
         // moment, when the honest answer was available right here.
         let durable = match (grant, identity) {
             (Some(grant), Some(identity)) => {
-                info!(
+                debug!(
                     "durable: {} opened with a durable handle, server holds it {} ms{}",
                     path,
                     grant.timeout_ms,

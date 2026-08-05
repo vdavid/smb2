@@ -420,9 +420,10 @@ impl Tree {
     pub async fn read_file_compound(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
         let normalized = self.format_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
-        debug!(
+        trace!(
             "tree: read_file_compound path={}, max_read={}",
-            normalized, max_read
+            normalized,
+            max_read
         );
 
         // Build CREATE request (same params as open_file).
@@ -561,7 +562,7 @@ impl Tree {
             );
         }
 
-        debug!("tree: read_file_compound done, read {} bytes", data.len());
+        trace!("tree: read_file_compound done, read {} bytes", data.len());
         Ok(data)
     }
 
@@ -584,9 +585,10 @@ impl Tree {
 
     /// Disconnect from the share.
     pub async fn disconnect(&self, conn: &mut Connection) -> Result<()> {
-        debug!(
+        trace!(
             "tree: disconnecting share={}, tree_id={}",
-            self.share_name, self.tree_id
+            self.share_name,
+            self.tree_id
         );
         let body = TreeDisconnectRequest;
         let frame = conn
@@ -750,7 +752,7 @@ impl Tree {
                     command: Command::Close,
                 }));
             } else {
-                info!("tree: batch deleted file={}", path);
+                debug!("tree: batch deleted file={}", path);
                 results.push(Ok(()));
             }
         }
@@ -778,7 +780,7 @@ impl Tree {
     /// QUERY_INFO (FileStandardInformation) + CLOSE as a single compound message.
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
         let normalized = self.format_path(path);
-        debug!("tree: stat (compound) path={}", normalized);
+        trace!("tree: stat (compound) path={}", normalized);
 
         // BUILD CREATE request for reading attributes.
         let create_req = CreateRequest {
@@ -955,9 +957,10 @@ impl Tree {
             );
         }
 
-        debug!(
+        trace!(
             "tree: stat done, size={}, is_dir={}",
-            end_of_file, is_directory
+            end_of_file,
+            is_directory
         );
         Ok(FileInfo {
             size: end_of_file,
@@ -1069,7 +1072,7 @@ impl Tree {
             };
             let parsed = self.parse_stat_batch_response(&responses, &mut cleanup_handles);
             if parsed.is_ok() {
-                debug!("tree: batch stat done for file={}", path);
+                trace!("tree: batch stat done for file={}", path);
             }
             results.push(parsed);
         }
@@ -1198,7 +1201,7 @@ impl Tree {
     /// Returns total capacity, free space, and allocation unit sizes.
     /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
     pub async fn fs_info(&self, conn: &mut Connection) -> Result<FsInfo> {
-        debug!("tree: fs_info on share={}", self.share_name);
+        trace!("tree: fs_info on share={}", self.share_name);
 
         // Build CREATE request to open the root directory of the share.
         let create_req = CreateRequest {
@@ -1324,9 +1327,11 @@ impl Tree {
             );
         }
 
-        debug!(
+        trace!(
             "tree: fs_info done, total={}, free={}, total_free={}",
-            total_bytes, free_bytes, total_free_bytes
+            total_bytes,
+            free_bytes,
+            total_free_bytes
         );
         Ok(FsInfo {
             total_bytes,
@@ -1344,9 +1349,10 @@ impl Tree {
     pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
         let from_normalized = self.format_path(from);
         let to_normalized = normalize_path(to);
-        debug!(
+        trace!(
             "tree: rename (compound) from={} to={}",
-            from_normalized, to_normalized
+            from_normalized,
+            to_normalized
         );
 
         // Build CREATE request with DELETE access (required for rename).
@@ -1443,7 +1449,7 @@ impl Tree {
             );
         }
 
-        info!(
+        debug!(
             "tree: renamed from={} to={}",
             from_normalized, to_normalized
         );
@@ -1560,7 +1566,7 @@ impl Tree {
                         close_header.status,
                     );
                 }
-                info!("tree: batch renamed from={} to={}", from, to);
+                debug!("tree: batch renamed from={} to={}", from, to);
                 results.push(Ok(()));
             }
         }
@@ -1594,7 +1600,7 @@ impl Tree {
         data: &[u8],
     ) -> Result<u64> {
         let normalized = self.format_path(path);
-        debug!(
+        trace!(
             "tree: write_file_compound path={}, len={}",
             normalized,
             data.len()
@@ -1773,7 +1779,7 @@ impl Tree {
         let (file_id, file_size) = self.open_file(conn, &normalized).await?;
 
         if file_size == 0 {
-            debug!(
+            trace!(
                 "tree: read_file_pipelined path={}, size=0 (empty file)",
                 normalized
             );
@@ -1799,7 +1805,7 @@ impl Tree {
         };
         let credit_charge = chunk_size.div_ceil(65536) as u16;
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
-        debug!(
+        trace!(
             "tree: read_file_pipelined path={}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
             normalized, file_size, chunk_size, credit_charge, total_chunks, conn.credits()
         );
@@ -1858,7 +1864,7 @@ impl Tree {
         let (file_id, file_size) = self.open_file(conn, &normalized).await?;
 
         if file_size == 0 {
-            debug!(
+            trace!(
                 "tree: read_file_pipelined_with_progress path={}, size=0 (empty file)",
                 normalized
             );
@@ -1879,7 +1885,7 @@ impl Tree {
         };
         let credit_charge = chunk_size.div_ceil(65536) as u16;
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
-        debug!(
+        trace!(
             "tree: read_file_pipelined_with_progress path={}, size={}, chunk_size={}, total_chunks={}",
             normalized, file_size, chunk_size, total_chunks
         );
@@ -1964,7 +1970,7 @@ impl Tree {
         let normalized = self.format_path(path);
 
         if data.is_empty() {
-            debug!(
+            trace!(
                 "tree: write_file_pipelined path={}, len=0 (empty write)",
                 normalized
             );
@@ -2010,7 +2016,7 @@ impl Tree {
         let chunk_size = max_write;
         let credit_charge = chunk_size.div_ceil(65536) as u16;
         let total_chunks = data.len().div_ceil(chunk_size as usize);
-        debug!(
+        trace!(
             "tree: write_file_pipelined path={}, len={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
             normalized, data.len(), chunk_size, credit_charge, total_chunks, conn.credits()
         );
@@ -2113,7 +2119,7 @@ impl Tree {
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
         let normalized = self.format_path(path);
-        debug!("tree: write_file_streamed path={}", normalized);
+        trace!("tree: write_file_streamed path={}", normalized);
 
         // Open (or create) the file for writing.
         let file_id = self.open_file_for_write(conn, &normalized).await?;
@@ -2230,7 +2236,7 @@ impl Tree {
     /// option, then immediately closes the handle.
     pub async fn create_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
         let normalized = self.format_path(path);
-        debug!("tree: create_directory path={}", normalized);
+        trace!("tree: create_directory path={}", normalized);
 
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2267,7 +2273,7 @@ impl Tree {
 
         // Close the handle immediately.
         self.close_handle(conn, file_id).await?;
-        info!("tree: created directory={}", normalized);
+        debug!("tree: created directory={}", normalized);
         Ok(())
     }
 
@@ -2294,7 +2300,7 @@ impl Tree {
         kind: &str,
     ) -> Result<()> {
         let normalized = self.format_path(path);
-        debug!("tree: delete_{} (compound) path={}", kind, normalized);
+        trace!("tree: delete_{} (compound) path={}", kind, normalized);
 
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2364,7 +2370,7 @@ impl Tree {
             });
         }
 
-        info!("tree: deleted {}={}", kind, normalized);
+        debug!("tree: deleted {}={}", kind, normalized);
         Ok(())
     }
 
@@ -2830,7 +2836,7 @@ impl Tree {
         // under-send.
         let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
 
-        debug!(
+        trace!(
             "tree: pipeline read sliding window: initial_window={}, total_chunks={}, credits={}",
             initial_window,
             total_chunks,
@@ -3063,7 +3069,7 @@ impl Tree {
         // under-send.
         let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
 
-        debug!(
+        trace!(
             "tree: pipeline write sliding window: initial_window={}, total_chunks={}, credits={}",
             initial_window,
             total_chunks,
@@ -3343,7 +3349,7 @@ impl Tree {
     /// Sends an SMB2 FLUSH request and waits for the server to confirm
     /// that all cached data has been written to persistent storage.
     pub(crate) async fn flush_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
-        debug!("tree: flushing file handle");
+        trace!("tree: flushing file handle");
         let req = FlushRequest { file_id };
 
         let frame = conn

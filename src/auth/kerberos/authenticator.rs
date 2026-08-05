@@ -393,7 +393,7 @@ impl KerberosAuthenticator {
 
         // Update etype from what the KDC actually chose.
         self.etype = etype_from_i32(as_rep.enc_part.etype)?;
-        debug!(
+        trace!(
             "kerberos: AS-REP etype={}, kvno={:?}, cipher_len={}, crealm={}, cname={:?}",
             as_rep.enc_part.etype,
             as_rep.enc_part.kvno,
@@ -405,7 +405,7 @@ impl KerberosAuthenticator {
         // Derive the user's long-term key (may have been derived already,
         // but etype might have changed based on the KDC response).
         let user_key = self.derive_user_key();
-        debug!(
+        trace!(
             "kerberos: user_key len={}, etype={:?}, salt={}{}, key_prefix={:02x?}",
             user_key.len(),
             self.etype,
@@ -505,7 +505,7 @@ impl KerberosAuthenticator {
             Some((&body_checksum, checksum_type)),
         );
 
-        debug!(
+        trace!(
             "kerberos: TGS authenticator plain ({} bytes), session key prefix={:02x?}",
             authenticator_plain.len(),
             &as_session_key[..as_session_key.len().min(8)]
@@ -543,15 +543,16 @@ impl KerberosAuthenticator {
 
         // Parse TGS-REP (APPLICATION [13] = 0x6d).
         let tgs_rep = parse_kdc_rep(&response)?;
-        debug!(
+        trace!(
             "kerberos: TGS-REP ticket etype={}, kvno={:?}, cipher_len={}",
             tgs_rep.ticket.enc_part.etype,
             tgs_rep.ticket.enc_part.kvno,
             tgs_rep.ticket.enc_part.cipher.len()
         );
-        debug!(
+        trace!(
             "kerberos: TGS-REP enc-part etype={}, kvno={:?}",
-            tgs_rep.enc_part.etype, tgs_rep.enc_part.kvno
+            tgs_rep.enc_part.etype,
+            tgs_rep.enc_part.kvno
         );
         if tgs_rep.msg_type != 13 {
             return Err(Error::invalid_data(format!(
@@ -589,7 +590,7 @@ impl KerberosAuthenticator {
         );
 
         // Log ticket raw bytes info.
-        debug!(
+        trace!(
             "kerberos: service ticket has raw_bytes={}, raw_len={:?}",
             tgs_rep.ticket.raw_bytes.is_some(),
             tgs_rep.ticket.raw_bytes.as_ref().map(|b| b.len())
@@ -770,14 +771,14 @@ impl KerberosAuthenticator {
                 let enc_part = parse_enc_ap_rep_part(&plain)?;
 
                 if let Some(server_subkey) = enc_part.subkey {
-                    debug!(
+                    trace!(
                         "kerberos: AP-REP server subkey, etype={}, len={}",
                         server_subkey.keytype,
                         server_subkey.keyvalue.len()
                     );
                     self.session_key = Some(server_subkey.keyvalue);
                 } else {
-                    debug!("kerberos: AP-REP has no server subkey");
+                    trace!("kerberos: AP-REP has no server subkey");
                 }
             }
             [0x03, 0x00] => {

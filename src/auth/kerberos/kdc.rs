@@ -66,7 +66,7 @@ fn resolve_address(address: &str) -> String {
 /// TCP framing: 4-byte big-endian length prefix, then DER bytes.
 pub async fn send_to_kdc(config: &KdcConfig, message: &[u8]) -> Result<Vec<u8>> {
     let addr = resolve_address(&config.address);
-    debug!("kdc: sending {} bytes to {}", message.len(), addr);
+    trace!("kdc: sending {} bytes to {}", message.len(), addr);
 
     // Try UDP first.
     match send_udp(&addr, message, config.timeout).await {

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use log::debug;
+use log::{debug, trace};
 
 use crate::client::connection::Connection;
 use crate::error::Result;
@@ -108,7 +108,7 @@ async fn send_dfs_ioctl(
     referral_req.pack(&mut req_cursor);
     let input_data = req_cursor.into_inner();
 
-    debug!(
+    trace!(
         "dfs: sending FSCTL_DFS_GET_REFERRALS for {:?} ({} bytes input)",
         path,
         input_data.len()
@@ -139,7 +139,7 @@ async fn send_dfs_ioctl(
     let mut cursor = ReadCursor::new(&frame.body);
     let ioctl_resp = IoctlResponse::unpack(&mut cursor)?;
 
-    debug!(
+    trace!(
         "dfs: received IOCTL response ({} bytes output)",
         ioctl_resp.output_data.len()
     );
@@ -272,7 +272,7 @@ impl DfsResolver {
         // 1. Check cache (longest prefix match)
         if let Some(resolved) = self.resolve_from_cache(unc_path) {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
-            debug!("dfs: cache hit for {:?}", unc_path);
+            trace!("dfs: cache hit for {:?}", unc_path);
             return Ok(resolved);
         }
 

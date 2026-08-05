@@ -369,15 +369,39 @@ SMB2_PASS=secret cargo run --example diagnostics --features serde -- --json
 The crate uses `log` (a facade) for structured logging. The application picks the backend (for example, `env_logger`,
 `tracing`).
 
+**The volume rule (read this before adding any log line):** no site at `debug` or above may fire at a rate
+proportional to the number of frames on the wire. A consumer runs its own code at `debug`, and a library that spends
+that budget on protocol plumbing makes `debug` useless for the person who owns the application. If a line's rate
+tracks request volume, it belongs at `trace`, where anyone who wants a packet-by-packet trace can turn it on.
+
+Two follow-on rules fall out of it:
+
+- **One `debug` line per consumer-visible operation, not two.** Where a code path logs both "starting X" and "X done",
+  the "starting" line is `trace` and the "done" line (the one carrying the result: bytes, count, throughput) is
+  `debug`. Reaching for both at `debug` doubles the volume and adds nothing.
+- **`info` gets one line per protocol milestone, and nothing else.** Never announce an intent that the very next line
+  confirms, and never log a per-file operation at `info`: a consumer deleting 5,000 files would get 5,000 `info` lines.
+
 **Log levels:**
 
-| Level   | Use for                                   | Examples                                                                                                                    |
-|---------|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| `info`  | Major lifecycle events users care about   | Connected, negotiated dialect, session established, tree connected/disconnected                                             |
-| `debug` | Protocol details useful for debugging     | Negotiate params, session setup rounds, signing activation, credit changes, per-operation mutations (rename/delete/write), routing errors and orphan frames |
-| `trace` | Very verbose, per-frame / byte-level      | Per-frame request/response plumbing (per-message signing, `execute`/`execute_compound` dispatch, success routing, per-listing directory ops), raw message sizes, signature bytes (first 4), nonce values, preauth hash updates, TCP framing, individual directory entries |
-| `warn`  | Unexpected but recoverable                | Signature verification skipped, credit starvation, retryable errors                                                         |
-| `error` | Should not happen during normal operation | Protocol violations, decryption/signature failures, connection drops                                                        |
+- `info`: connection and session milestones only. Connected, negotiated dialect, session established, tree
+  connected/disconnected, reconnect succeeded, durable handle reclaimed. There are ~11 `info` sites in the whole crate,
+  and four of them fire per connect. Keep it that way.
+- `debug`: what changed the connection's capabilities (negotiate params, signing/encryption activation, credit
+  starvation and recovery), the mutations a consumer asked for (write, rename, delete, mkdir), one summary per
+  multi-round-trip transfer (bytes and MB/s), and anomalies (orphan frames, non-fatal compound sub-request failures,
+  handles that may leak, long-poll refreshes).
+- `trace`: everything that happens once per request or per response. Dispatch, interim `STATUS_PENDING` responses,
+  cancels, per-message signing, success routing, TCP framing. Also the read path (`stat`, `fs_info`, single-round-trip
+  reads, opening a handle), because reads change nothing and are what a polling consumer does constantly, plus
+  byte-level detail: raw message sizes, signature bytes (first four), nonce values, preauth hash updates, individual
+  directory entries, Kerberos and NTLM key and ciphertext lengths.
+- `warn`: unexpected but recoverable. Signature verification skipped, credit starvation, retryable errors.
+- `error`: shouldn't happen during normal operation. Protocol violations, decryption and signature failures,
+  connection drops.
+
+An idle connection is the test case that matters: keepalive `ECHO`s and long-polling `CHANGE_NOTIFY`s must produce
+nothing at `debug` when they're working.
 
 **How to enable:**
 

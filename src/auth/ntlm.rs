@@ -7,7 +7,7 @@
 //!
 //! Only NTLMv2 is supported. NTLMv1 is insecure and not implemented.
 
-use log::{debug, trace};
+use log::trace;
 
 use crate::Error;
 use digest::{Digest, KeyInit};
@@ -160,7 +160,7 @@ impl NtlmAuthenticator {
         // WorkstationFields: Len(2) + MaxLen(2) + Offset(4) = all zeros
         buf.extend_from_slice(&[0u8; 8]);
 
-        debug!("ntlm: negotiate message built, len={}", buf.len());
+        trace!("ntlm: negotiate message built, len={}", buf.len());
         self.negotiate_bytes = Some(buf.clone());
         buf
     }
@@ -170,7 +170,7 @@ impl NtlmAuthenticator {
     ///
     /// Returns the raw bytes for the next SESSION_SETUP.
     pub fn authenticate(&mut self, challenge_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-        debug!("ntlm: processing challenge, len={}", challenge_bytes.len());
+        trace!("ntlm: processing challenge, len={}", challenge_bytes.len());
         self.challenge_bytes = Some(challenge_bytes.to_vec());
 
         // Parse the CHALLENGE_MESSAGE
@@ -288,7 +288,7 @@ impl NtlmAuthenticator {
         };
 
         self.session_key = Some(exported_session_key);
-        debug!(
+        trace!(
             "ntlm: authenticate message built, len={}, mic={}",
             final_msg.len(),
             has_timestamp

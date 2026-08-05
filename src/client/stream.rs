@@ -10,7 +10,7 @@
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use log::debug;
+use log::{debug, trace};
 
 use crate::client::connection::Connection;
 use crate::client::tree::Tree;
@@ -357,7 +357,7 @@ pub async fn open_file_reader(
     path: &str,
 ) -> Result<FileReader> {
     let normalized = tree.format_path(path);
-    debug!("stream: open_file_reader path={}", normalized);
+    trace!("stream: open_file_reader path={}", normalized);
 
     let (file_id, file_size) = tree.open_file(&mut conn, &normalized).await?;
     let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
@@ -775,7 +775,7 @@ pub async fn open_file_writer(
     path: &str,
 ) -> Result<FileWriter> {
     let normalized = tree.format_path(path);
-    debug!("stream: open_file_writer path={}", normalized);
+    trace!("stream: open_file_writer path={}", normalized);
 
     let file_id = tree.open_file_for_write(&mut conn, &normalized).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -796,7 +796,7 @@ pub async fn open_file_writer_exclusive(
     path: &str,
 ) -> Result<FileWriter> {
     let normalized = tree.format_path(path);
-    debug!("stream: open_file_writer_exclusive path={}", normalized);
+    trace!("stream: open_file_writer_exclusive path={}", normalized);
 
     let file_id = tree
         .open_file_for_exclusive_create(&mut conn, &normalized)
@@ -838,9 +838,10 @@ pub async fn open_file_writer_at(
     offset: u64,
 ) -> Result<FileWriter> {
     let normalized = tree.format_path(path);
-    debug!(
+    trace!(
         "stream: open_file_writer_at path={} offset={}",
-        normalized, offset
+        normalized,
+        offset
     );
 
     let file_id = tree.open_file_for_write_at(&mut conn, &normalized).await?;

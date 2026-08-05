@@ -5,6 +5,21 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] - 2026-08-05
+
+### Changed
+
+- **`DEBUG` belongs to the application again: an idle connection now logs essentially nothing.** The crate emitted one `DEBUG` line per SMB request, so a consumer that turned on `smb2=debug` to debug its own code got the crate's packet trace instead. Measured over one representative hour on a single NAS with about 12 short-lived connections, mostly idle background watching: 2,150 lines, of which 1,008 were keepalive `ECHO` dispatches, 666 were long-polling `CHANGE_NOTIFY` dispatches, and 255 were interim `STATUS_PENDING` responses. Nothing was happening. The same hour now produces well under 150 lines, and the volume no longer scales with frames on the wire, so a bulk copy or a deep tree walk stops flooding the consumer's log file too.
+  - **Per-request and per-response plumbing moved to `TRACE`**, which is where the crate's own convention already put it: `dispatch`, interim `STATUS_PENDING` responses, `send_cancel`, the `pipeline:` operation entries, `stream:` handle opens, the `shares:` and `dfs:` RPC frame steps, and the Kerberos and NTLM key and ciphertext lengths. Turn on `RUST_LOG=smb2=trace` for a packet-by-packet trace; nothing is gone.
+  - **The read path moved to `TRACE` as well**: `stat`, `fs_info`, single-round-trip reads, and opening a handle. Reads change nothing and are exactly what a polling consumer does constantly. Mutations stay at `DEBUG`, one line each, and so does one summary line per multi-round-trip transfer with its byte count and MB/s.
+  - **A watch that has nothing to report says so at `TRACE`.** An empty `CHANGE_NOTIFY` response is a refresh handover, not an event; on an idle directory that was most of them. Actual events still log at `DEBUG`.
+  - **`INFO` is back to protocol milestones only.** Per-file mutations (`tree: created directory`, `tree: deleted`, `tree: renamed`, both batch variants, and `durable: opened with a durable handle`) were logging at `INFO`, so deleting 5,000 files produced 5,000 `INFO` lines; they're `DEBUG` now. The `smb_client:` connect and reconnect lines duplicated the `connection:`, `session:`, and `reconnect:` lines that follow them, so a single connect announced itself six times at `INFO` and now does it four: connected, negotiated dialect, session established, tree connected.
+
+### Notes
+
+- **The rule is written down now**, in `AGENTS.md`: no site at `DEBUG` or above may fire at a rate proportional to the number of frames on the wire, one `DEBUG` line per consumer-visible operation rather than a start/done pair, and `INFO` gets one line per protocol milestone and nothing else. An idle connection is the test case: keepalives and long polls must produce nothing at `DEBUG` when they're working. Without the rule stated, this drifts back.
+- **Log levels aren't API, so this is a patch.** No signature, type, or wire behavior changed. If you grep your logs for specific smb2 lines, the ones that moved are listed above; the message text is unchanged in every case except the empty-watch line, and everything still exists at some level.
+
 ## [0.17.0] - 2026-08-03
 
 ### Fixed
