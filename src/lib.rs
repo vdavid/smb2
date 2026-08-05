@@ -38,6 +38,10 @@
 //!   This is what most users need.
 //! - [`error`] -- Error types and NTSTATUS mapping.
 //! - [`msg`] -- Wire format message structs (advanced/internal use).
+//! - [`name`] -- The private-use-area mapping that lets a name carrying `?`,
+//!   `*`, `"` or another SMB2-illegal character exist on a share at all. Runs
+//!   on every path automatically; the functions are public for a consumer that
+//!   wants to see the literal wire form.
 //! - [`pack`] -- Binary serialization primitives (advanced/internal use).
 //! - [`transport`] -- Transport trait and TCP implementation (advanced/internal use).
 //! - [`crypto`] -- Signing and encryption (advanced/internal use).
@@ -50,6 +54,7 @@ pub mod client;
 pub mod crypto;
 pub mod error;
 pub mod msg;
+pub mod name;
 pub mod pack;
 pub mod rpc;
 #[cfg(feature = "testing")]
@@ -64,6 +69,9 @@ pub mod fuzzing;
 
 // Error types
 pub use error::{Error, ErrorKind, Result};
+
+/// Filename mapping for characters SMB2 does not allow on the wire.
+pub use name::{decode_name, decode_path, encode_name, encode_path};
 
 // High-level client
 pub use client::{connect, ClientConfig, SmbClient};

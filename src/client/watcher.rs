@@ -94,7 +94,13 @@ impl std::fmt::Display for FileNotifyAction {
 pub struct FileNotifyEvent {
     /// What kind of change occurred.
     pub action: FileNotifyAction,
-    /// The relative file name within the watched directory.
+    /// The changed path, relative to the watched directory.
+    ///
+    /// A recursive watch reports something below the directory it was armed
+    /// on, so this can carry separators. They are `/`, and each component has
+    /// been mapped back out of the private-use area (see [`crate::name`]), so
+    /// the value goes straight into any [`Tree`](crate::Tree) method after
+    /// being joined onto the watched directory's path.
     pub filename: String,
 }
 
@@ -415,8 +421,10 @@ fn parse_notify_information(data: &[u8]) -> Result<Vec<FileNotifyEvent>> {
 
         let filename_bytes = &data[filename_start..filename_end];
 
-        // Decode UTF-16LE filename.
-        let filename = decode_utf16le(filename_bytes)?;
+        // A recursive watch reports a path, not a bare name, so this decodes
+        // per component and hands back `/` separators like every other path
+        // the caller deals with.
+        let filename = crate::name::decode_path(&decode_utf16le(filename_bytes)?);
         let action = FileNotifyAction::from_u32(action_raw)?;
 
         events.push(FileNotifyEvent { action, filename });

@@ -356,10 +356,9 @@ pub async fn open_file_reader(
     mut conn: Connection,
     path: &str,
 ) -> Result<FileReader> {
-    let normalized = tree.format_path(path);
-    trace!("stream: open_file_reader path={}", normalized);
+    trace!("stream: open_file_reader path={}", path);
 
-    let (file_id, file_size) = tree.open_file(&mut conn, &normalized).await?;
+    let (file_id, file_size) = tree.open_file(&mut conn, path).await?;
     let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
     Ok(FileReader::new(tree, conn, file_id, file_size, max_read))
@@ -773,10 +772,9 @@ pub async fn open_file_writer(
     mut conn: Connection,
     path: &str,
 ) -> Result<FileWriter> {
-    let normalized = tree.format_path(path);
-    trace!("stream: open_file_writer path={}", normalized);
+    trace!("stream: open_file_writer path={}", path);
 
-    let file_id = tree.open_file_for_write(&mut conn, &normalized).await?;
+    let file_id = tree.open_file_for_write(&mut conn, path).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
     Ok(FileWriter::new(tree, conn, file_id, max_write))
@@ -794,12 +792,9 @@ pub async fn open_file_writer_exclusive(
     mut conn: Connection,
     path: &str,
 ) -> Result<FileWriter> {
-    let normalized = tree.format_path(path);
-    trace!("stream: open_file_writer_exclusive path={}", normalized);
+    trace!("stream: open_file_writer_exclusive path={}", path);
 
-    let file_id = tree
-        .open_file_for_exclusive_create(&mut conn, &normalized)
-        .await?;
+    let file_id = tree.open_file_for_exclusive_create(&mut conn, path).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
     Ok(FileWriter::new(tree, conn, file_id, max_write))
@@ -836,14 +831,13 @@ pub async fn open_file_writer_at(
     path: &str,
     offset: u64,
 ) -> Result<FileWriter> {
-    let normalized = tree.format_path(path);
     trace!(
         "stream: open_file_writer_at path={} offset={}",
-        normalized,
+        path,
         offset
     );
 
-    let file_id = tree.open_file_for_write_at(&mut conn, &normalized).await?;
+    let file_id = tree.open_file_for_write_at(&mut conn, path).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
     let mut writer = FileWriter::new(tree, conn, file_id, max_write);

@@ -321,14 +321,13 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
-        let normalized = self.format_path(path);
         // TRACE, not DEBUG: a recursive scan calls list_directory once per directory
         // (millions of times on a large share), so at DEBUG it dominates a consumer's
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
-        trace!("tree: list_directory path={}", normalized);
+        trace!("tree: list_directory path={}", path);
 
         // Open the directory.
-        let file_id = self.open_directory(conn, &normalized).await?;
+        let file_id = self.open_directory(conn, path).await?;
 
         // Query directory entries.
         let result = self.query_directory_loop(conn, file_id).await;
@@ -361,11 +360,10 @@ impl Tree {
         path: &str,
         query_buffer_len: Option<u32>,
     ) -> Result<(Vec<DirectoryEntry>, ListingTrace)> {
-        let normalized = self.format_path(path);
         let buffer_len = query_buffer_len.unwrap_or_else(|| Self::default_query_buffer_len(conn));
 
         let create_start = Instant::now();
-        let file_id = self.open_directory(conn, &normalized).await?;
+        let file_id = self.open_directory(conn, path).await?;
         let create = create_start.elapsed();
 
         let mut queries = Vec::new();
@@ -642,16 +640,15 @@ impl Tree {
         path: &str,
         recursive: bool,
     ) -> Result<crate::client::watcher::Watcher> {
-        let normalized = self.format_path(path);
         debug!(
             "tree: watch path={}, recursive={}, tree_id={}",
-            normalized, recursive, self.tree_id
+            path, recursive, self.tree_id
         );
 
         // Open the directory with FILE_LIST_DIRECTORY access (same as
         // FILE_READ_DATA = 0x0001). We need the handle to stay open for
         // the lifetime of the watcher.
-        let file_id = self.open_directory(conn, &normalized).await?;
+        let file_id = self.open_directory(conn, path).await?;
 
         // Hand the watcher an owned Tree clone and an owned Connection
         // clone so it can pipeline CHANGE_NOTIFY requests independently
@@ -1404,15 +1401,13 @@ impl Tree {
     /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
     /// The window is capped at 32 in-flight requests (2 MB).
     pub async fn read_file_pipelined(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
-        let normalized = self.format_path(path);
-
         // Open the file.
-        let (file_id, file_size) = self.open_file(conn, &normalized).await?;
+        let (file_id, file_size) = self.open_file(conn, path).await?;
 
         if file_size == 0 {
             trace!(
                 "tree: read_file_pipelined path={}, size=0 (empty file)",
-                normalized
+                path
             );
             self.close_handle(conn, file_id).await?;
             return Ok(Vec::new());
@@ -1438,7 +1433,7 @@ impl Tree {
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
             "tree: read_file_pipelined path={}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
-            normalized, file_size, chunk_size, credit_charge, total_chunks, conn.credits()
+            path, file_size, chunk_size, credit_charge, total_chunks, conn.credits()
         );
 
         let start = std::time::Instant::now();
@@ -1490,14 +1485,12 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
-        let normalized = self.format_path(path);
-
-        let (file_id, file_size) = self.open_file(conn, &normalized).await?;
+        let (file_id, file_size) = self.open_file(conn, path).await?;
 
         if file_size == 0 {
             trace!(
                 "tree: read_file_pipelined_with_progress path={}, size=0 (empty file)",
-                normalized
+                path
             );
             self.close_handle(conn, file_id).await?;
             let _ = on_progress(Progress {
@@ -1518,7 +1511,7 @@ impl Tree {
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
             "tree: read_file_pipelined_with_progress path={}, size={}, chunk_size={}, total_chunks={}",
-            normalized, file_size, chunk_size, total_chunks
+            path, file_size, chunk_size, total_chunks
         );
 
         let result = self
@@ -1575,9 +1568,7 @@ impl Tree {
         conn: &'a mut Connection,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let normalized = path.replace('/', "\\");
-        let normalized = normalized.trim_start_matches('\\');
-        let (file_id, file_size) = self.open_file(conn, normalized).await?;
+        let (file_id, file_size) = self.open_file(conn, path).await?;
         let chunk_size = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         Ok(FileDownload::new(
             self, conn, file_id, file_size, chunk_size,
@@ -1749,11 +1740,10 @@ impl Tree {
     where
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
-        let normalized = self.format_path(path);
-        trace!("tree: write_file_streamed path={}", normalized);
+        trace!("tree: write_file_streamed path={}", path);
 
         // Open (or create) the file for writing.
-        let file_id = self.open_file_for_write(conn, &normalized).await?;
+        let file_id = self.open_file_for_write(conn, path).await?;
 
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
@@ -2037,6 +2027,7 @@ impl Tree {
 
     /// Open a directory handle.
     async fn open_directory(&self, conn: &mut Connection, path: &str) -> Result<FileId> {
+        let path = self.format_path(path);
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2053,7 +2044,7 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: FILE_DIRECTORY_FILE,
-            name: path.to_string(),
+            name: path,
             create_contexts: vec![],
         };
 
@@ -2093,6 +2084,7 @@ impl Tree {
     /// drop, or by calling the internal close path). Leaking the handle
     /// wastes server resources.
     pub async fn open_file(&self, conn: &mut Connection, path: &str) -> Result<(FileId, u64)> {
+        let path = self.format_path(path);
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2109,7 +2101,7 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: 0,
-            name: path.to_string(),
+            name: path,
             create_contexts: vec![],
         };
 
@@ -2155,6 +2147,7 @@ impl Tree {
         path: &str,
         create_disposition: CreateDisposition,
     ) -> Result<FileId> {
+        let path = self.format_path(path);
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2167,7 +2160,7 @@ impl Tree {
             share_access: ShareAccess(0),
             create_disposition,
             create_options: FILE_NON_DIRECTORY_FILE,
-            name: path.to_string(),
+            name: path,
             create_contexts: vec![],
         };
 
@@ -2265,6 +2258,7 @@ impl Tree {
         path: &str,
         create_disposition: CreateDisposition,
     ) -> Result<(FileId, u64)> {
+        let path = self.format_path(path);
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2283,7 +2277,7 @@ impl Tree {
             ),
             create_disposition,
             create_options: FILE_NON_DIRECTORY_FILE,
-            name: path.to_string(),
+            name: path,
             create_contexts: vec![],
         };
 
@@ -3121,10 +3115,13 @@ fn build_rename_info_buffer(new_name: &str) -> Vec<u8> {
     buf
 }
 
-/// Normalize a file path: convert `/` to `\` and strip leading `\`.
+/// Turn a caller's path into the wire path SMB2 wants.
+///
+/// `/` is the separator, `\` is a name character, and any character SMB2
+/// refuses is mapped into the private-use area per component. See
+/// [`crate::name`] for the table and why the mapping is unconditional.
 fn normalize_path(path: &str) -> String {
-    let p = path.replace('/', "\\");
-    p.trim_start_matches('\\').to_string()
+    crate::name::encode_path(path)
 }
 
 /// Parse `FileBothDirectoryInformation` entries from raw bytes.
@@ -3173,9 +3170,11 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
         let _reserved = cursor.read_u8()?;
         // ShortName: 24 bytes (fixed, null-padded).
         cursor.skip(24)?;
-        // FileName: FileNameLength bytes in UTF-16LE.
+        // FileName: FileNameLength bytes in UTF-16LE. A single component, so
+        // it decodes with `decode_name`, not `decode_path`: a `\` that comes
+        // back here is a character in the name (see `crate::name`).
         let name = if file_name_length > 0 {
-            cursor.read_utf16_le(file_name_length)?
+            crate::name::decode_name(&cursor.read_utf16_le(file_name_length)?).into_owned()
         } else {
             String::new()
         };
@@ -3544,8 +3543,33 @@ mod tests {
     async fn normalize_path_converts_slashes() {
         assert_eq!(normalize_path("foo/bar/baz"), "foo\\bar\\baz");
         assert_eq!(normalize_path("/leading/slash"), "leading\\slash");
-        assert_eq!(normalize_path("\\leading\\backslash"), "leading\\backslash");
         assert_eq!(normalize_path("no_change"), "no_change");
+        // A `\` is a name character now, not a second separator.
+        assert_eq!(
+            normalize_path("\\leading\\backslash"),
+            "\u{F026}leading\u{F026}backslash"
+        );
+    }
+
+    #[tokio::test]
+    async fn illegal_characters_are_mapped_into_the_private_use_area() {
+        // The exact name that a QNAP Samba share rejected with
+        // STATUS_OBJECT_NAME_INVALID before the mapping existed.
+        assert_eq!(
+            normalize_path("dir/\"how_are_you_feeling?\"_emojis.json"),
+            "dir\\\u{F020}how_are_you_feeling\u{F025}\u{F020}_emojis.json"
+        );
+        // A backslash inside a name is a name character, not a separator.
+        assert_eq!(normalize_path("a\\b"), "a\u{F026}b");
+        // The trailing rule applies per component, to the last character only.
+        assert_eq!(normalize_path("dir /file. "), "dir\u{F028}\\file.\u{F028}");
+    }
+
+    #[tokio::test]
+    async fn directory_listings_decode_private_use_area_names() {
+        let data = build_file_both_dir_info("a\u{F025}b", 7, false, 0);
+        let entries = parse_file_both_directory_info(&data).unwrap();
+        assert_eq!(entries[0].name, "a?b");
     }
 
     #[tokio::test]

@@ -520,7 +520,10 @@ impl SmbClient {
             .unwrap_or(&tree.server)
             .to_string();
         let share = tree.share_name.clone();
-        let normalized = original_path.replace('/', "\\");
+        // Encoded, not just slash-flipped: the referral lookup and the CREATE
+        // that follows have to agree on where a component ends, and a `\` that
+        // came from a *name* is U+F026 in both (`crate::name`).
+        let normalized = crate::name::encode_path(original_path);
         let unc_path = format!("\\\\{}\\{}\\{}", hostname, share, normalized);
 
         debug!("dfs: resolving {}", unc_path);
@@ -565,7 +568,9 @@ impl SmbClient {
                 Ok(new_tree) => {
                     // Update the caller's tree in-place.
                     *tree = new_tree;
-                    return Ok(resolved.remaining_path.clone());
+                    // Back into caller-path form: the retry goes through the
+                    // ordinary `Tree` methods, which encode what they're given.
+                    return Ok(crate::name::decode_path(&resolved.remaining_path));
                 }
                 Err(e) => {
                     debug!(
@@ -1071,9 +1076,6 @@ impl SmbClient {
         path: &str,
         data: &'a [u8],
     ) -> Result<stream::FileUpload<'a>> {
-        let normalized = path.replace('/', "\\");
-        let normalized = normalized.trim_start_matches('\\');
-
         let max_write = self
             .conn
             .params()
@@ -1082,8 +1084,7 @@ impl SmbClient {
 
         if data.len() <= max_write {
             // Small file: write everything via compound in one round-trip.
-            tree.write_file_compound(&mut self.conn, normalized, data)
-                .await?;
+            tree.write_file_compound(&mut self.conn, path, data).await?;
             Ok(stream::FileUpload::new_done(
                 tree,
                 &mut self.conn,
@@ -1091,7 +1092,7 @@ impl SmbClient {
             ))
         } else {
             // Large file: open the file, let the caller drive chunks.
-            let file_id = tree.open_file_for_write(&mut self.conn, normalized).await?;
+            let file_id = tree.open_file_for_write(&mut self.conn, path).await?;
             let chunk_size = max_write as u32;
             Ok(stream::FileUpload::new(
                 tree,
@@ -1232,9 +1233,6 @@ impl SmbClient {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
-        let normalized = path.replace('/', "\\");
-        let normalized = normalized.trim_start_matches('\\');
-
         // Open the file for writing.
         let req = crate::msg::create::CreateRequest {
             requested_oplock_level: crate::types::OplockLevel::None,
@@ -1248,7 +1246,7 @@ impl SmbClient {
             share_access: crate::msg::create::ShareAccess(0),
             create_disposition: crate::msg::create::CreateDisposition::FileOverwriteIf,
             create_options: 0x0000_0040, // FILE_NON_DIRECTORY_FILE
-            name: normalized.to_string(),
+            name: tree.format_path(path),
             create_contexts: vec![],
         };
 

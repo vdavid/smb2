@@ -495,19 +495,17 @@ impl Tree {
         dest_offset: u64,
         length: Option<u64>,
     ) -> Result<u64> {
-        let src_norm = self.format_path(source_path);
-        let dst_norm = self.format_path(dest_path);
         debug!(
             "copy: server-side copy {} -> {} (truncate_dest={})",
-            src_norm, dst_norm, truncate_dest
+            source_path, dest_path, truncate_dest
         );
 
-        let (src_id, src_size) = self.open_file(conn, &src_norm).await?;
+        let (src_id, src_size) = self.open_file(conn, source_path).await?;
 
         let dst_open = if truncate_dest {
-            self.open_readwrite_overwrite(conn, &dst_norm).await
+            self.open_readwrite_overwrite(conn, dest_path).await
         } else {
-            self.open_file_readwrite(conn, &dst_norm).await
+            self.open_file_readwrite(conn, dest_path).await
         };
         let dst_id = match dst_open {
             Ok((id, _)) => id,
