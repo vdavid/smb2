@@ -220,7 +220,7 @@ before closing the file handle.
 
 ### Server-side copy
 
-When source and destination live on the same share, the server can copy the bytes between its own files directly — the
+When source and destination live on the same share, the server can copy the bytes between its own files directly. The
 data never crosses the wire, so even a multi-gigabyte copy finishes in moments. Not every server supports it (older
 Samba builds, some NAS firmware), so branch on `ErrorKind::Unsupported` to fall back to a read-then-write copy:
 
