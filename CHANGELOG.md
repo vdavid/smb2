@@ -7,6 +7,14 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.18.0] - 2026-08-05
 
+### Breaking
+
+- **`\` in a path is a name character now, not a second separator.** It has to be: an SMB2 name cannot contain a literal backslash, so carrying one means mapping it to U+F026 (see *Fixed* below), and one string cannot mean both separator and character. `/` is the separator. A caller passing `"dir\file.txt"` used to reach `dir\file.txt` and now asks for a single file whose name contains a backslash. **This is the one thing to check when upgrading**: search your call sites for `\`-separated paths and switch them to `/`. It fails loudly rather than quietly on reads -- a depth-50 navigation test in this repo caught it with `STATUS_OBJECT_NAME_INVALID` -- but a `write_file` with a `\`-separated path will create an oddly named file rather than erroring.
+
+- **`FileNotifyEvent::filename` reports `/` separators and decoded names.** It used to carry the server's raw `\`-separated form, so a recursive watch's path can now be joined onto the watched directory's path and handed straight to any `Tree` method. Code that split it on `\` needs to split on `/`.
+
+- **`delete_directory` returns an error for a non-empty directory instead of reporting success.** It used `FILE_DELETE_ON_CLOSE`, and against Samba a delete-on-close CREATE on a non-empty directory answers `STATUS_SUCCESS` for both CREATE and CLOSE and then deletes nothing -- so the crate logged "deleted directory" and returned `Ok(())` while the directory was still there. A consumer clearing 4,883 directories was told every one of them worked; none had. The compound is now CREATE + SET_INFO (`FileDispositionInformation`) + CLOSE, still one round trip, and the server validates while it still has somewhere to put the error. Code that relied on the old `Ok(())` now sees `STATUS_DIRECTORY_NOT_EMPTY`, which is the truth it was missing. Verified against the Docker fixtures and a live Samba 4 on Debian trixie.
+
 ### Fixed
 
 - **A file whose name carries `?`, `*`, `"`, `:`, `<`, `>`, `\`, `|`, or a trailing space or period can now be written to a share at all.** SMB2 borrows its name syntax from Windows, so those eight characters are wildcards or separators in the protocol's own grammar and are illegal in a name, along with the control characters and a trailing space or period. The crate put such a name on the wire verbatim and the server answered `STATUS_OBJECT_NAME_INVALID` (0xC0000033), which no amount of retrying could fix. A real QNAP Samba share refused `"how_are_you_feeling?"_emojis.json` this way.
@@ -18,6 +26,8 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **`Tree::download`, `SmbClient::upload`, and `SmbClient::write_file_streamed_with_progress` never applied the `server\share\` prefix a DFS share needs.** Each carried its own copy of the old path normalization instead of going through `Tree::format_path`, so all three would have opened the wrong path on a DFS tree (and none would have got the new mapping either). `SmbClient::upload` also normalized and then handed the result to `write_file_compound`, which normalizes again -- harmless while normalizing was idempotent, corrupting once a mapping exists. The public `Tree::open_file`, `open_file_for_write`, `open_file_for_exclusive_create`, and `open_file_readwrite` never normalized at all, so a consumer calling them directly put a raw `/` on the wire. Every method that accepts a caller path now formats it at its own boundary, and nothing passes a formatted path to another method.
 
+- **A server that answered a compound chain with fewer frames than it had sub-requests was a panic waiting to happen.** `all_or_first_err` now takes the expected frame count and errors on a mismatch; every caller indexes fixed positions (`responses[2]`) right after it returns.
+
 ### Added
 
 - **`ErrorKind::InvalidName`**, and `NtStatus::OBJECT_NAME_INVALID` to go with it. The status was missing from the table, so it rendered as bare hex in every log line and classified as `ErrorKind::Other`. The old doc comment said it fell through "because no consumer needs to branch on it", which is no longer true: a file manager that just failed a copy wants to distinguish a name this server cannot store (rename and retry) from a generic protocol error (don't). Rarer now that the mapping handles the characters SMB2 forbids outright, but still reachable -- a reserved Windows device name, a name past the server's length limit, a character the server's filesystem cannot hold. `ErrorKind` is `#[non_exhaustive]`, so this is not a breaking change.
@@ -28,11 +38,15 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **`fuzz_name_round_trip`**, the first target in `fuzz/` that asserts a property rather than "does not panic": `decode(encode(name)) == name` over arbitrary UTF-8, plus "nothing SMB2 rejects survives an encode". 2,375,202 executions found nothing.
 
+- **`NtStatus::DIRECTORY_NOT_EMPTY`**, so it prints as a name rather than `0xC0000101`.
+
 ### Changed
 
-- ⚠️ **`\` in a path is a name character now, not a second separator.** It has to be: mapping it to U+F026 is the only way a file named `a\b` can be opened at all, and one string cannot mean both. `/` is the separator; a caller passing `"dir\file.txt"` used to reach `dir\file.txt` and now asks for a single file whose name contains a backslash. **This is the one thing to check when upgrading.** It fails loudly rather than quietly -- a depth-50 navigation test in this repo caught it with `STATUS_OBJECT_NAME_INVALID` -- but a `write_file` with a `\`-separated path will create an oddly named file rather than erroring.
+- **`delete_files`, `rename_files`, and `stat_files` are loops over the single-item methods**, not three hand-inlined copies of the same compound. No API change and no behavior change beyond the `delete_directory` fix above; ~500 lines go away, and the next fix of that shape lands in one place instead of two.
 
-- ⚠️ **`FileNotifyEvent::filename` now reports `/` separators** and decoded names, so it can be joined onto the watched directory's path and handed straight to any `Tree` method. It used to carry the server's raw `\`-separated form.
+- **The Docker test fixtures publish on `127.0.0.1`, not `0.0.0.0`.** Both harnesses used Docker's default, so running the tests put 29 unauthenticated Samba servers (guest shares included, one writable) on the LAN and tailnet of whoever ran them, for as long as the containers lived. `SMB_BIND_ADDR=0.0.0.0` is the escape hatch for an SMB client that isn't on the Docker host, notably a NAT'd VM reaching the host by gateway IP. ⚠️ **Consumers vendoring the fixtures have to change it at the source and re-vendor**: Compose *concatenates* `ports` across override files rather than replacing them, so an override collides on the host port instead of rebinding it.
+
+- **The batch and pipeline docs stopped promising overlap the crate doesn't do.** `delete_files`, `stat_files`, and `rename_files` (on both `SmbClient` and `Tree`) claimed to send every request before waiting for responses; they issue one round trip per item and wait for each. `Pipeline`'s module doc advertised filling the credit window while its own struct doc said it runs sequentially. Corrected everywhere including `README.md`, with what these APIs are actually for: they save the per-call setup, not wire time, and real overlap comes from several connections.
 
 ### Notes
 
