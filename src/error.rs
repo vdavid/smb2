@@ -396,6 +396,20 @@ pub enum ErrorKind {
     /// For example, a callback error in `write_file_streamed` produces `Io`,
     /// but the connection is still in a clean state.
     Io,
+    /// The name is not usable on this server, whatever it is asked to do.
+    ///
+    /// Distinct from [`NotFound`](Self::NotFound): the file may or may not
+    /// exist, and the server never got far enough to find out, so retrying the
+    /// same name can only fail again. A consumer's useful response is to
+    /// change the name, or tell the person that this one will not work here.
+    ///
+    /// The characters SMB2 forbids outright -- `"`, `*`, `:`, `<`, `>`, `?`,
+    /// `\`, `|`, the control characters, and a trailing space or period -- are
+    /// mapped out of the way automatically (see [`crate::name`]), so this is
+    /// what is left over: a reserved Windows device name (`CON`, `NUL`,
+    /// `LPT1`), a name past the server's own length limit, or a character its
+    /// filesystem cannot store. Maps from `STATUS_OBJECT_NAME_INVALID`.
+    InvalidName,
     /// The server does not support the requested operation.
     ///
     /// Returned when the server rejects an operation it does not implement --
@@ -409,10 +423,11 @@ pub enum ErrorKind {
     ///
     /// Use [`Error::status()`] to get the raw NTSTATUS code. Some defined
     /// `NtStatus` codes deliberately fall through here today
-    /// (`OBJECT_NAME_INVALID`, `DELETE_PENDING`, `INSUFFICIENT_RESOURCES`,
-    /// `INSUFF_SERVER_RESOURCES`, and similar) — they don't yet have a
-    /// dedicated `ErrorKind` because no consumer needs to branch on them.
-    /// Promoting one to its own variant is non-breaking.
+    /// (`DELETE_PENDING`, `INSUFFICIENT_RESOURCES`, `INSUFF_SERVER_RESOURCES`,
+    /// and similar) — they don't yet have a dedicated `ErrorKind` because no
+    /// consumer needs to branch on them. Promoting one to its own variant is
+    /// non-breaking, which is how `OBJECT_NAME_INVALID` became
+    /// [`InvalidName`](Self::InvalidName).
     Other,
 }
 
@@ -476,6 +491,10 @@ fn classify_status(status: NtStatus) -> ErrorKind {
             // SigningRequired when signing_required is true.
             ErrorKind::AccessDenied
         }
+
+        // The name can't be used at all, which is not the same as not finding
+        // what it points at: the server never looked.
+        NtStatus::OBJECT_NAME_INVALID => ErrorKind::InvalidName,
 
         // Not found
         NtStatus::NO_SUCH_FILE
@@ -552,6 +571,8 @@ mod tests {
         (NtStatus::BAD_NETWORK_NAME, ErrorKind::NotFound),
         // Already exists
         (NtStatus::OBJECT_NAME_COLLISION, ErrorKind::AlreadyExists),
+        // Unusable name
+        (NtStatus::OBJECT_NAME_INVALID, ErrorKind::InvalidName),
         // Wrong file type
         (NtStatus::FILE_IS_A_DIRECTORY, ErrorKind::IsADirectory),
         (NtStatus::NOT_A_DIRECTORY, ErrorKind::NotADirectory),

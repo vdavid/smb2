@@ -101,6 +101,15 @@ nt_status_codes! {
     /// The buffer is too small to contain the entry.
     BUFFER_TOO_SMALL = 0xC000_0023, "STATUS_BUFFER_TOO_SMALL";
 
+    /// The object name is not valid on this server.
+    ///
+    /// Not "no such file": the name itself is unusable, so retrying it
+    /// verbatim can only fail again. The usual cause is a character SMB2
+    /// forbids, which [`crate::name`] maps away before it reaches the wire;
+    /// what is left is a name that is invalid for a reason the mapping does
+    /// not cover, such as a reserved Windows device name.
+    OBJECT_NAME_INVALID = 0xC000_0033, "STATUS_OBJECT_NAME_INVALID";
+
     /// The object name is not found.
     OBJECT_NAME_NOT_FOUND = 0xC000_0034, "STATUS_OBJECT_NAME_NOT_FOUND";
 
@@ -370,6 +379,17 @@ mod tests {
     }
 
     #[test]
+    fn the_status_for_an_unusable_name_renders_by_name() {
+        // What a QNAP Samba share answered a CREATE carrying a raw `?`
+        // (2026-08-05). Rendering it as raw hex told nobody anything.
+        assert_eq!(NtStatus(0xC000_0033), NtStatus::OBJECT_NAME_INVALID);
+        assert_eq!(
+            NtStatus::OBJECT_NAME_INVALID.to_string(),
+            "STATUS_OBJECT_NAME_INVALID"
+        );
+    }
+
+    #[test]
     fn all_error_codes_have_error_severity() {
         let errors = [
             NtStatus::UNSUCCESSFUL,
@@ -380,6 +400,7 @@ mod tests {
             NtStatus::END_OF_FILE,
             NtStatus::ACCESS_DENIED,
             NtStatus::BUFFER_TOO_SMALL,
+            NtStatus::OBJECT_NAME_INVALID,
             NtStatus::OBJECT_NAME_NOT_FOUND,
             NtStatus::OBJECT_NAME_COLLISION,
             NtStatus::OBJECT_PATH_NOT_FOUND,
