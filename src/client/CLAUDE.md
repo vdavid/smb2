@@ -119,6 +119,16 @@ Full rationale in `connection.rs` on `KEEPALIVE_AFTER` and `Connection::echo_pro
 - **Getting the probe onto the wire is the send deadline's business**, not the keepalive's, so `echo_probe` puts no timeout around the dispatch. A stuck socket already has an owner that tears the connection down; blaming the server for it is the misdiagnosis `sent_at` exists to prevent.
 - ❌ **Don't coarsen the loop's tick while idle.** The sleep is chosen before the check, so a long idle interval delays the round that would notice a `set_keepalive` change too. That cost 5 s of setter lag for one timer per second.
 
+## Paths and the names SMB2 won't carry
+
+Table, rationale, and the empirical evidence: `src/name.rs` module docs. What matters at this layer:
+
+- **`Tree::format_path` is the one outbound encode point**, and every method taking a caller path calls it at its own boundary. ❌ Nothing may hand an already-formatted path to another method: a second pass turns the wire path's `\` separators into U+F026 name characters and prepends the DFS prefix twice. The four `open_*` helpers format their own argument, which is what makes double-encoding unreachable rather than merely avoided.
+- **Decoding has to cover every site a name arrives at, or the two halves disagree** and a listing hands back names that nothing can open. Today: `parse_file_both_directory_info` (`tree.rs`, single components → `decode_name`) and `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`). ❌ Adding an info class that carries a name means adding a decode there too.
+- **What is deliberately NOT mapped**: share names, tree-connect paths, the `srvsvc` pipe name, DFS referral *server* and *share* fields, and the `*` search pattern in QUERY_DIRECTORY. Those aren't file names, and the wildcard is meant to be a wildcard.
+- **`/` is the only separator a caller can write.** A `\` is a name character (U+F026). `Tree::rename`'s target, `SmbClient::upload`, `Tree::download`, and the DFS remaining-path all go through the same codec so one convention holds end to end.
+- **DFS referral paths are encoded too** (`SmbClient::handle_dfs_redirect`), because the lookup and the CREATE that follows have to agree on where a component ends; the remaining path comes back through `decode_path` into caller form.
+
 ## Compound requests
 
 `Connection::execute_compound(&[CompoundOp])` packs multiple operations into a single transport frame. Each sub-request is 8-byte aligned, linked via `NextCommand`. Subsequent related operations use `FileId::SENTINEL` (the server substitutes the real handle from the first CREATE).

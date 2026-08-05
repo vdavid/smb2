@@ -37,6 +37,45 @@ we have more control to reach even better speeds.
 - DFS path resolution (standalone DFS with transparent referral follow-through)
 - Reconnection after network failures
 - Auto-flush on writes (data safety for family photos and company docs)
+- Filenames carrying characters SMB2 forbids (`?`, `*`, `"`, `:`, `<`, `>`, `\`, `|`, a trailing space or period),
+  mapped the way macOS does so a file is named the same here and in Finder
+
+## Filenames SMB2 won't carry
+
+SMB2 borrows its name syntax from Windows, so eight ASCII characters are illegal in a file or directory name --
+`"`, `*`, `:`, `<`, `>`, `?`, `\`, and `|` are wildcards or separators in the protocol's own grammar -- along with the
+control characters and a trailing space or period. A server asked to create such a name answers
+`STATUS_OBJECT_NAME_INVALID` and there is nothing to retry.
+
+This crate does what every SMB client carrying POSIX names has done since Services for Macintosh: substitutes each one
+with a code point in the Unicode private-use area at U+F000 on the way out, and substitutes back on the way in. The
+server stores an ordinary legal name and never knows, and **no server-side configuration is involved**.
+
+```rust,no_run
+# async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+// Just works. On the wire the name carries U+F025 where the `?` is, which is
+// byte for byte what macOS Finder writes for the same file.
+client.write_file(share, r#""how are you?".json"#, b"...").await?;
+
+// And comes back the way you wrote it.
+let entries = client.list_directory(share, "").await?;
+assert!(entries.iter().any(|e| e.name == r#""how are you?".json"#));
+# Ok(())
+# }
+```
+
+It is always on and there is no switch: for a name with nothing to map -- almost every name -- encoding is the
+identity, and for a name with something to map, the mapped form is the only form the server accepts. The table and the
+two places the round trip is not exact are documented in the [`name`](https://docs.rs/smb2/latest/smb2/name/) module,
+whose `encode_name` / `decode_name` / `encode_path` / `decode_path` are public if you want the literal wire form.
+
+Two things to know:
+
+- **`/` is the only path separator.** A `\` is an ordinary character in a name and becomes U+F026, which is the only
+  way a file named `a\b` can be opened at all. Write `dir/file.txt`, never `dir\file.txt`.
+- **No Unicode normalization.** macOS smbfs converts decomposed names to NFC before sending because its local
+  filesystem stores NFD; a cross-platform crate has no such local form to convert from, and an NFD name is perfectly
+  legal on the wire. If you want byte-for-byte Finder parity on macOS, normalize to NFC before calling.
 
 ## Limitations
 
@@ -264,7 +303,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.17"
+smb2 = "0.18"
 ```
 
 You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is
@@ -306,6 +345,9 @@ For when you want to do one thing and get the result:
 - `client.credits()`: Current available credits
 - `client.estimated_rtt()`: Round-trip time from negotiate
 - `client.disconnect_share(&share)`: Disconnect from a share
+
+Paths use `/` as their separator and are relative to the share root. A `\` is a character in a name, not a separator
+(see "Filenames SMB2 won't carry" above).
 
 ### Pipeline API
 
