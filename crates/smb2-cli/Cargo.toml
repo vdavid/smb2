@@ -1,0 +1,29 @@
+[package]
+name = "smb2-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Command-line SMB2/3 client: list, stat, move, and delete files on a share without mounting it"
+repository = "https://github.com/vdavid/smb2-cli"
+keywords = ["smb", "smb2", "smb3", "cifs", "cli"]
+categories = ["command-line-utilities", "network-programming", "filesystem"]
+readme = "README.md"
+
+[[bin]]
+name = "smb2"
+path = "src/main.rs"
+
+[dependencies]
+smb2 = { version = "0.17.1", path = "../smb2" }
+anyhow = "1.0.104"
+clap = { version = "4.6.5", features = ["derive", "env"] }
+env_logger = "0.11.11"
+rpassword = "7.5.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-std", "io-util", "sync"] }
+
+[profile.release]
+lto = "thin"
+strip = true
