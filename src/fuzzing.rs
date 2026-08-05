@@ -24,6 +24,8 @@
 //! - [`fuzz_query_info_response_parse`] -- opaque output buffer sharp edge.
 //! - [`fuzz_dfs_referral_response_parse`] -- manual offset arithmetic,
 //!   obvious fuzzing target.
+//! - [`fuzz_name_round_trip`] -- the private-use-area filename mapping. The
+//!   only target here that asserts a property rather than "doesn't panic".
 
 use crate::msg::header::Header;
 use crate::msg::transform::{CompressionTransformHeader, TransformHeader};
@@ -182,4 +184,72 @@ pub fn fuzz_query_info_response_parse(data: &[u8]) {
 pub fn fuzz_dfs_referral_response_parse(data: &[u8]) {
     let mut cursor = ReadCursor::new(data);
     let _ = crate::msg::dfs::RespGetDfsReferral::unpack(&mut cursor);
+}
+
+/// Fuzz the private-use-area name mapping in [`crate::name`].
+///
+/// Unlike every other target here, this one asserts a property rather than
+/// only "does not panic". The round trip is the contract a consumer relies
+/// on -- a listing hands back a name and the next call opens it -- and it is
+/// exactly the kind of contract a hand-written test set can leave a hole in.
+///
+/// Two documented exemptions, both inherent to the scheme and both matching
+/// what macOS does: a name that already carries U+F001–U+F029 is not
+/// round-trip stable, and `encode_path` drops leading separators. Those
+/// inputs still have to encode without panicking and without emitting
+/// anything SMB2 rejects, so they are checked, just not for equality.
+pub fn fuzz_name_round_trip(data: &[u8]) {
+    let Ok(name) = std::str::from_utf8(data) else {
+        return;
+    };
+
+    let encoded_name = crate::name::encode_name(name);
+    assert_wire_safe(&encoded_name, name);
+    let encoded_path = crate::name::encode_path(name);
+    for component in encoded_path.split('\\') {
+        if component != "." && component != ".." {
+            assert_wire_safe(component, name);
+        }
+    }
+
+    // The scheme owns U+F001–U+F029, so a name already holding one stands for
+    // something else after a round trip. Documented, and macOS agrees.
+    if name
+        .chars()
+        .any(|c| (0xF001..=0xF029).contains(&(c as u32)))
+    {
+        return;
+    }
+
+    assert_eq!(
+        crate::name::decode_name(&encoded_name),
+        name,
+        "decode_name did not undo encode_name for {name:?}"
+    );
+
+    // A leading separator is dropped on purpose (SMB2 paths are relative to
+    // the share root), so only paths without one can round-trip.
+    if !name.starts_with('/') {
+        assert_eq!(
+            crate::name::decode_path(&encoded_path),
+            name,
+            "decode_path did not undo encode_path for {name:?}"
+        );
+    }
+}
+
+/// Nothing SMB2 refuses may survive an encode.
+fn assert_wire_safe(encoded: &str, original: &str) {
+    assert!(
+        !encoded.contains(['"', '*', ':', '<', '>', '?', '\\', '|']),
+        "encoding {original:?} left a character SMB2 rejects"
+    );
+    assert!(
+        !encoded.chars().any(|c| ('\u{01}'..='\u{1F}').contains(&c)),
+        "encoding {original:?} left a control character"
+    );
+    assert!(
+        !matches!(encoded.chars().next_back(), Some(' ') | Some('.')),
+        "encoding {original:?} left a trailing space or period"
+    );
 }

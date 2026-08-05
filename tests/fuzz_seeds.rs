@@ -436,6 +436,37 @@ fn generate_fuzz_seeds() {
         &build_dfs_referral_v4(),
     );
 
+    // ── fuzz_name_round_trip ────────────────────────────────────────
+    // Plain UTF-8 names, not wire structures. Seeded with one per character
+    // in the mapping table plus the positional cases, so the fuzzer starts
+    // from names that already exercise every branch.
+    for (name, seed) in [
+        ("plain", "report.pdf"),
+        ("quote", "a\"b"),
+        ("star", "a*b"),
+        ("colon", "a:b"),
+        ("angles", "<a>"),
+        ("question", "who?"),
+        ("backslash", "a\\b"),
+        ("pipe", "a|b"),
+        ("control", "a\u{01}\u{1F}b"),
+        ("trailing_space", "trailing "),
+        ("trailing_period", "trailing."),
+        ("trailing_both", "a. "),
+        ("interior_only", "a . b"),
+        ("path", "dir/sub/leaf.txt"),
+        ("path_illegal", "di?r/le*af "),
+        ("relative", "a/../b"),
+        ("already_pua", "a\u{F025}b"),
+        ("outside_pua", "a\u{F0FF}b"),
+        ("unicode", "\u{65E5}\u{672C}\u{8A9E}?.txt"),
+        ("combining", "cafe\u{301}?"),
+        ("empty", ""),
+        ("real", "\"how_are_you_feeling?\"_emojis.json"),
+    ] {
+        write_seed("fuzz_name_round_trip", name, seed.as_bytes());
+    }
+
     // Report out.
     let root = corpus_root();
     let mut count = 0usize;

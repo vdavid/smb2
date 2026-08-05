@@ -106,3 +106,10 @@ path = "fuzz_targets/fuzz_dfs_referral_response_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_name_round_trip"
+path = "fuzz_targets/fuzz_name_round_trip.rs"
+test = false
+doc = false
+bench = false

@@ -379,7 +379,7 @@ async fn deepnest_navigate_deep() {
     let mut path = String::new();
     for i in 1..=50 {
         if !path.is_empty() {
-            path.push('\\');
+            path.push('/');
         }
         path.push_str(&format!("level_{i:02}"));
     }
@@ -396,7 +396,7 @@ async fn deepnest_navigate_deep() {
     );
 
     // Read the file at the bottom.
-    let file_path = format!("{path}\\file.txt");
+    let file_path = format!("{path}/file.txt");
     let data = client
         .read_file(&mut tree, &file_path)
         .await
@@ -596,5 +596,59 @@ async fn slow_operations_work() {
         .delete_file(&mut tree, test_path)
         .await
         .expect("delete_file");
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn unicode_list_directory_decodes_names_smb2_cannot_carry() {
+    let _ = env_logger::try_init();
+
+    // The fixture stores these as the private-use forms macOS smbfs writes
+    // (see its populate.sh), so a consumer app that gets the plain characters
+    // back here shows the same names Finder does.
+    let mut client = connect_guest(&unicode_addr()).await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let entries = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list_directory");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+    for expected in [
+        "who?.txt",
+        "\"quoted\".txt",
+        "wild*card.txt",
+        "12:30.txt",
+        "<tag>.txt",
+        "back\\slash.txt",
+        "a|b.txt",
+        "trailing space ",
+        "trailing period.",
+        "\"how_are_you_feeling?\"_emojis.json",
+        "we?ird dir",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing {expected:?} in {names:?}"
+        );
+    }
+
+    // Reading one back proves the encode half agrees with the decode half; a
+    // listing alone would look right and then open nothing.
+    let data = client
+        .read_file(&mut tree, "who?.txt")
+        .await
+        .expect("read a file whose name needs mapping");
+    assert_eq!(data, b"question mark\n");
+
+    // The mapping is per path component, so a directory that needs it works
+    // the same way a leaf does.
+    let nested = client
+        .read_file(&mut tree, "we?ird dir/in*ner.txt")
+        .await
+        .expect("read through a directory whose name needs mapping");
+    assert_eq!(nested, b"nested\n");
+
     client.disconnect_share(&tree).await.expect("disconnect");
 }

@@ -218,7 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Arc::clone(&small_body)
             };
-            let path = format!("{}\\file-{:05}.bin", cfg.dir, idx);
+            let path = format!("{}/file-{:05}.bin", cfg.dir, idx);
             let tree = Arc::clone(&tree);
             let conn = conn.clone();
             let progress = Arc::clone(&progress);
@@ -298,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !cfg.keep && failures.is_empty() && done == cfg.files {
         let paths: Vec<String> = (0..cfg.files)
-            .map(|i| format!("{}\\file-{:05}.bin", cfg.dir, i))
+            .map(|i| format!("{}/file-{:05}.bin", cfg.dir, i))
             .collect();
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         let mut c = conn.clone();
