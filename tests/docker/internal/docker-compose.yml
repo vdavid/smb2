@@ -80,6 +80,12 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10454:445"
 
+  smb-weirdnames:
+    build:
+      context: smb-weirdnames
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10459:445"
+
   smb-dfs-root:
     build:
       context: smb-dfs-root

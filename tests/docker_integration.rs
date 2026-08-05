@@ -25,6 +25,7 @@ const SHARES50_ADDR: &str = "127.0.0.1:10453";
 const MANYSHARES_ADDR: &str = "127.0.0.1:10458";
 const MAXREAD_ADDR: &str = "127.0.0.1:10454";
 const ENCRYPTION_AES128_ADDR: &str = "127.0.0.1:10455";
+const WEIRDNAMES_ADDR: &str = "127.0.0.1:10459";
 const DFS_ROOT_ADDR: &str = "127.0.0.1:10456";
 const DFS_TARGET_ADDR: &str = "127.0.0.1:10457";
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -4338,4 +4339,509 @@ async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
          not quietly drop or add encryption"
     );
     client.delete_file(&mut tree, path).await.ok();
+}
+
+// ── Names SMB2 refuses to carry (smb-weirdnames) ─────────────────────
+//
+// The fixture's populate.sh writes its files with octal escapes, so the bytes
+// on disk in the container are exactly the bytes macOS smbfs put on a real
+// Samba share (read back over SSH on a QNAP TS-464, 2026-08-05). Real Finder
+// cannot run in Linux CI, so those pinned bytes are what stands in for it: a
+// listing that comes back with the plain characters proves this crate and
+// Finder agree about what the directory contains.
+
+/// Create an SmbClient connected as guest to smb-weirdnames.
+async fn weirdnames_client() -> SmbClient {
+    SmbClient::connect(ClientConfig {
+        addr: WEIRDNAMES_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
+    })
+    .await
+    .expect("SmbClient::connect to smb-weirdnames failed")
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_listing_decodes_every_character_in_the_table() {
+    let _ = env_logger::try_init();
+
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let entries = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list_directory");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+    for expected in [
+        "q\"uote",
+        "st*ar",
+        "co:lon",
+        "l<t",
+        "g>t",
+        "q?mark",
+        "back\\slash",
+        "pi|pe",
+        "ctrl\u{01}one",
+        "ctrl\u{1F}last",
+        "trailing-space ",
+        "trailing-period.",
+        "?leading",
+        "all\"*:<>?\\|chars",
+        "\"how_are_you_feeling?\"_emojis.json",
+        "su?bdir",
+        "dir-trailing-space ",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing {expected:?} in {names:?}"
+        );
+    }
+
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_listing_maps_the_last_character_only() {
+    let _ = env_logger::try_init();
+
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let entries = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list_directory");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+    // Only the final space or period is substituted, so these come back with
+    // their interior ones intact. Substituting all of them would be an easy
+    // mistake that no single-character test would catch.
+    for expected in [
+        "two-spaces  ",
+        "two-periods..",
+        "period-then-space. ",
+        " leading-space",
+        ".leading-period",
+        "interior period.and space",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing {expected:?} in {names:?}"
+        );
+    }
+
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_listing_leaves_alone_what_is_not_in_the_table() {
+    let _ = env_logger::try_init();
+
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let entries = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list_directory");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+    for expected in [
+        "plain-ascii.txt",
+        "\u{65E5}\u{672C}\u{8A9E}.txt",
+        // Precomposed and decomposed both survive as they were stored: this
+        // crate does no Unicode normalization, deliberately.
+        "caf\u{E9}-nfc",
+        "cafe\u{301}-nfd",
+        "\u{1F4C1}-emoji",
+        // A private-use code point outside U+F001..U+F029 is not ours.
+        "outside-the-table-\u{F02A}",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing {expected:?} in {names:?}"
+        );
+    }
+
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_a_file_can_be_read_by_the_name_the_listing_gave() {
+    let _ = env_logger::try_init();
+
+    // Round-tripping the listing back through a CREATE is the assertion that
+    // matters: a decode with no matching encode would list beautifully and
+    // then fail to open anything.
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+
+    for name in [
+        "q?mark",
+        "all\"*:<>?\\|chars",
+        "\"how_are_you_feeling?\"_emojis.json",
+        "trailing-space ",
+        "trailing-period.",
+        "two-spaces  ",
+        "ctrl\u{01}one",
+    ] {
+        let data = client
+            .read_file(&mut tree, name)
+            .await
+            .unwrap_or_else(|e| panic!("read {name:?}: {e}"));
+        assert!(!data.is_empty(), "{name:?} came back empty");
+
+        let info = client
+            .stat(&mut tree, name)
+            .await
+            .unwrap_or_else(|e| panic!("stat {name:?}: {e}"));
+        assert_eq!(
+            info.size as usize,
+            data.len(),
+            "stat disagrees for {name:?}"
+        );
+    }
+
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_every_component_of_a_path_is_mapped() {
+    let _ = env_logger::try_init();
+
+    // The bug this guards: mapping the path as one string turns its separators
+    // into name characters, and mapping only the leaf leaves the directory
+    // unreachable. Both fail here.
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+
+    let nested = client
+        .read_file(&mut tree, "su?bdir/in*ner.txt")
+        .await
+        .expect("read through a directory whose own name needs mapping");
+    assert_eq!(nested, b"nested content\n");
+
+    // Trailing space on the directory component, backslash in the leaf.
+    let deeper = client
+        .read_file(&mut tree, "dir-trailing-space /le\\af")
+        .await
+        .expect("read through a directory component with a trailing space");
+    assert_eq!(deeper, b"deeper content\n");
+
+    let entries = client
+        .list_directory(&mut tree, "su?bdir")
+        .await
+        .expect("list a directory whose name needs mapping");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"in*ner.txt"), "got {names:?}");
+
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_what_this_crate_writes_is_what_finder_writes() {
+    let _ = env_logger::try_init();
+
+    // The Finder-parity assertion CI can actually make. `collide?me` exists in
+    // the fixture under the on-disk name macOS produces; an exclusive create
+    // for the same caller-facing name collides with it if and only if this
+    // crate encodes to the same bytes. An encoding that differed by one code
+    // point would create a second file and this would pass as `Ok`.
+    let mut client = weirdnames_client().await;
+    let tree = std::sync::Arc::new(client.connect_share("public").await.expect("connect_share"));
+
+    let err = client
+        .create_file_writer_exclusive(&tree, "collide?me")
+        .await
+        .err()
+        .expect("an exclusive create must collide with the pre-seeded name");
+    assert_eq!(
+        err.kind(),
+        smb2::ErrorKind::AlreadyExists,
+        "expected a collision with the private-use name on disk, got {err}"
+    );
+
+    // Same check one layer down, for a name that exercises the trailing rule.
+    let err = client
+        .create_file_writer_exclusive(&tree, "trailing-space ")
+        .await
+        .err()
+        .expect("an exclusive create must collide with the trailing-space name");
+    assert_eq!(err.kind(), smb2::ErrorKind::AlreadyExists, "got {err}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_a_written_file_survives_a_full_round_trip() {
+    let _ = env_logger::try_init();
+
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+
+    // Every character in the table, in leading, interior, and trailing
+    // positions, plus a name that is nothing but substitutions.
+    let names = [
+        "w-\"quote",
+        "w-star*",
+        "*w-lead-star",
+        "w-co:lon",
+        "w-l<t",
+        "w-g>t",
+        "w-q?mark",
+        "w-back\\slash",
+        "w-pi|pe",
+        "w-ctrl\u{01}\u{1F}",
+        "w-trailing-space ",
+        "w-trailing-period.",
+        "w-\"*:<>?\\|",
+        "w-mixed \"a\" ? b\\c. ",
+        "w-\u{1F600}-emoji?",
+        "w-\u{65E5}\u{672C}\u{8A9E}?",
+        "w-cafe\u{301}-nfd?",
+    ];
+
+    for name in names {
+        let path = format!("scratch/{name}");
+        let payload = format!("payload for {name}").into_bytes();
+
+        client
+            .write_file(&mut tree, &path, &payload)
+            .await
+            .unwrap_or_else(|e| panic!("write {name:?}: {e}"));
+
+        let read_back = client
+            .read_file(&mut tree, &path)
+            .await
+            .unwrap_or_else(|e| panic!("read {name:?}: {e}"));
+        assert_eq!(read_back, payload, "content differs for {name:?}");
+    }
+
+    // The listing has to hand back exactly the names that were written, or the
+    // encode and decode halves disagree.
+    let entries = client
+        .list_directory(&mut tree, "scratch")
+        .await
+        .expect("list scratch");
+    let listed: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    for name in names {
+        assert!(listed.contains(&name), "missing {name:?} in {listed:?}");
+    }
+
+    // Rename and delete address the file by the same name, through a different
+    // request shape (SET_INFO carries the target as its own buffer).
+    let renamed = "scratch/w-renamed?to.this ";
+    client
+        .rename(&mut tree, "scratch/w-q?mark", renamed)
+        .await
+        .expect("rename to a name that needs mapping");
+    assert!(client.stat(&mut tree, renamed).await.is_ok());
+    assert_eq!(
+        client
+            .stat(&mut tree, "scratch/w-q?mark")
+            .await
+            .expect_err("the old name must be gone")
+            .kind(),
+        smb2::ErrorKind::NotFound
+    );
+
+    for name in names {
+        let path = if name == "w-q?mark" {
+            renamed.to_string()
+        } else {
+            format!("scratch/{name}")
+        };
+        client
+            .delete_file(&mut tree, &path)
+            .await
+            .unwrap_or_else(|e| panic!("delete {path:?}: {e}"));
+    }
+
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_a_directory_whose_name_needs_mapping_can_be_created() {
+    let _ = env_logger::try_init();
+
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+
+    let dir = "scratch/made?by*smb2 ";
+    let file = "scratch/made?by*smb2 /in|side.txt";
+    client.delete_file(&mut tree, file).await.ok();
+    client.delete_directory(&mut tree, dir).await.ok();
+
+    client
+        .create_directory(&mut tree, dir)
+        .await
+        .expect("create a directory whose name needs mapping");
+    client
+        .write_file(&mut tree, file, b"inside")
+        .await
+        .expect("write into it");
+
+    let entries = client
+        .list_directory(&mut tree, dir)
+        .await
+        .expect("list it back");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"in|side.txt"), "got {names:?}");
+
+    client
+        .delete_file(&mut tree, file)
+        .await
+        .expect("cleanup file");
+    client
+        .delete_directory(&mut tree, dir)
+        .await
+        .expect("cleanup dir");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_a_name_the_mapping_cannot_fix_is_classified_honestly() {
+    let _ = env_logger::try_init();
+
+    // Bypasses the codec on purpose: a raw `?` is what a server answers
+    // STATUS_OBJECT_NAME_INVALID for, and after the mapping the crate has no
+    // ordinary path that produces one. The status still has to classify as
+    // something a consumer can branch on rather than as a generic protocol
+    // error, because a name can be invalid for reasons the table doesn't cover.
+    use smb2::msg::create::{CreateDisposition, CreateRequest, ImpersonationLevel, ShareAccess};
+    use smb2::types::flags::FileAccessMask;
+    use smb2::types::{Command, OplockLevel};
+
+    let mut conn = Connection::connect(WEIRDNAMES_ADDR, TIMEOUT)
+        .await
+        .expect("connect to smb-weirdnames");
+    conn.negotiate().await.expect("negotiate");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("guest session");
+    let tree = Tree::connect(&mut conn, "public")
+        .await
+        .expect("tree connect");
+
+    let req = CreateRequest {
+        requested_oplock_level: OplockLevel::None,
+        impersonation_level: ImpersonationLevel::Impersonation,
+        desired_access: FileAccessMask::new(FileAccessMask::FILE_WRITE_DATA),
+        file_attributes: 0x80,
+        share_access: ShareAccess(0),
+        create_disposition: CreateDisposition::FileCreate,
+        create_options: 0,
+        name: "scratch\\raw?question".to_string(),
+        create_contexts: vec![],
+    };
+    let frame = conn
+        .execute(Command::Create, &req, Some(tree.tree_id))
+        .await
+        .expect("the request itself reaches the server");
+    assert_eq!(
+        frame.header.status,
+        smb2::types::status::NtStatus::OBJECT_NAME_INVALID,
+        "a raw wildcard character must be refused by name, not by hex"
+    );
+
+    let err = smb2::Error::Protocol {
+        status: frame.header.status,
+        command: Command::Create,
+    };
+    assert_eq!(err.kind(), smb2::ErrorKind::InvalidName);
+
+    tree.disconnect(&mut conn).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn weirdnames_a_watch_reports_a_changed_name_the_way_a_listing_does() {
+    let _ = env_logger::try_init();
+
+    // CHANGE_NOTIFY carries names in its own buffer, so it is its own decode
+    // site. An encode/decode asymmetry here would let a watcher report a name
+    // no `Tree` method can then open.
+    //
+    // Its own directory, because the other tests in this file write into
+    // `scratch` concurrently and a watch cannot tell whose event it just got.
+    // The write has to happen while `next_events` is already awaiting: the
+    // first call is what puts the first CHANGE_NOTIFY on the wire.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = "scratch/watch-probe";
+            let name = "watched?file .txt";
+            let path = format!("{dir}/{name}");
+
+            let mut watcher_client = weirdnames_client().await;
+            let mut watcher_share = watcher_client
+                .connect_share("public")
+                .await
+                .expect("connect_share (watcher)");
+            watcher_client
+                .delete_file(&mut watcher_share, &path)
+                .await
+                .ok();
+            watcher_client
+                .delete_directory(&mut watcher_share, dir)
+                .await
+                .ok();
+            watcher_client
+                .create_directory(&mut watcher_share, dir)
+                .await
+                .expect("create the watch directory");
+
+            let mut watcher = watcher_client
+                .watch(&watcher_share, dir, false)
+                .await
+                .expect("watch the probe directory");
+
+            let write_path = path.clone();
+            let writer_task = tokio::task::spawn_local(async move {
+                let mut writer_client = weirdnames_client().await;
+                let mut writer_share = writer_client
+                    .connect_share("public")
+                    .await
+                    .expect("connect_share (writer)");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                writer_client
+                    .write_file(&mut writer_share, &write_path, b"hello")
+                    .await
+                    .expect("write the watched file");
+                (writer_client, writer_share)
+            });
+
+            let events = tokio::time::timeout(Duration::from_secs(10), watcher.next_events())
+                .await
+                .expect("the watch must report within 10s")
+                .expect("next_events");
+            let reported: Vec<&str> = events.iter().map(|e| e.filename.as_str()).collect();
+            assert!(
+                reported.contains(&name),
+                "a watch must report the same name a listing would, got {reported:?}"
+            );
+            watcher.close().await.expect("watcher close");
+
+            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
+            writer_client
+                .delete_file(&mut writer_share, &path)
+                .await
+                .expect("cleanup file");
+            writer_client
+                .delete_directory(&mut writer_share, dir)
+                .await
+                .expect("cleanup dir");
+        })
+        .await;
 }

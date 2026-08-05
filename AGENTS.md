@@ -259,7 +259,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 
 ### Docker test containers
 
-14 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+15 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
@@ -275,6 +275,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 | smb-manyshares        | 10458 | 200 long-comment shares, multi-fragment srvsvc reassembly |
 | smb-maxreadsize       | 10454 | 64 KB max read/write, chunking edge cases     |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
+| smb-weirdnames        | 10459 | Names carrying SMB2-illegal characters, seeded as the exact private-use bytes macOS writes |
 | smb-dfs-root          | 10456 | DFS namespace root with msdfs link            |
 | smb-dfs-target        | 10457 | DFS target server with actual files            |
 
