@@ -14,6 +14,15 @@ use crate::transport::MockTransport;
 use crate::types::flags::{Capabilities, ShareCapabilities, ShareFlags};
 use crate::types::{Command, Dialect, FileId, OplockLevel, SessionId, TreeId};
 
+/// Build a successful SET_INFO response.
+pub(crate) fn build_set_info_response() -> Vec<u8> {
+    use crate::msg::set_info::SetInfoResponse;
+    let mut h = Header::new_request(Command::SetInfo);
+    h.flags.set_response();
+    h.credits = 32;
+    pack_message(&h, &SetInfoResponse)
+}
+
 /// Create a mock-backed connection with standard negotiated params.
 ///
 /// Enables the mock's auto-msg_id-rewrite so canned `build_*_response`

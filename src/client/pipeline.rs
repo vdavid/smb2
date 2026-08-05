@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
-        build_close_response, build_create_response, setup_connection,
+        build_close_response, build_create_response, build_set_info_response, setup_connection,
     };
     use crate::client::tree::Tree;
     use crate::msg::create::{CreateAction, CreateResponse};
@@ -425,10 +425,14 @@ mod tests {
         // Op 1: ReadFile -- compound CREATE + READ + CLOSE
         mock.queue_response(build_compound_read_response(file_id, b"hello".to_vec()));
 
-        // Op 2: Delete -- compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        // Op 2: Delete -- compound CREATE + SET_INFO(disposition) + CLOSE
         let del_create = build_create_response(file_id, 0);
         let del_close = build_close_response();
-        mock.queue_response(build_compound_response_frame(&[del_create, del_close]));
+        mock.queue_response(build_compound_response_frame(&[
+            del_create,
+            build_set_info_response(),
+            del_close,
+        ]));
 
         // Op 3: ListDirectory -- CREATE + QUERY_DIR + QUERY_DIR(NO_MORE) + CLOSE
         mock.queue_response(build_create_response_directory(file_id));
@@ -481,10 +485,11 @@ mod tests {
             volatile: 2,
         };
 
-        // DELETE = compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        // DELETE = compound CREATE + SET_INFO(disposition) + CLOSE
         let create_resp = build_create_response(file_id, 0);
         let close_resp = build_close_response();
-        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        let frame =
+            build_compound_response_frame(&[create_resp, build_set_info_response(), close_resp]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);

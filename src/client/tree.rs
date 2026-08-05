@@ -45,20 +45,32 @@ const MAX_PIPELINE_WINDOW: usize = 32;
 /// Unwrap an `execute_compound` result, propagating the first inner
 /// waiter-level error (session expired, signature verify failure,
 /// connection disconnected mid-await) as the outer `Err`. Returns a
-/// `Vec<Frame>` so callers can index per sub-op.
+/// `Vec<Frame>` of exactly `expected` frames, so callers can index per
+/// sub-op.
 ///
-/// Matches the pre-Phase-3 `receive_compound_expected`'s short-circuit
-/// semantics: any routing-level failure aborts the whole operation
-/// rather than silently handing back a partial response list the
-/// caller would have to inspect one-by-one. Sub-op status codes
-/// (`STATUS_OBJECT_NAME_NOT_FOUND` and friends) are NOT errors here;
-/// they ride in `Frame::header.status` and the caller checks them.
+/// Any routing-level failure aborts the whole operation rather than
+/// silently handing back a partial response list the caller would have to
+/// inspect one-by-one. Sub-op status codes (`STATUS_OBJECT_NAME_NOT_FOUND`
+/// and friends) are NOT errors here; they ride in `Frame::header.status`
+/// and the caller checks them.
+///
+/// The `expected` count is what keeps every caller's `responses[2]` from
+/// being a panic: a server that answers a four-op chain with two frames is
+/// a protocol error, not a reason to take the process down.
 fn all_or_first_err(
     frames: Vec<Result<crate::client::connection::Frame>>,
+    expected: usize,
 ) -> Result<Vec<crate::client::connection::Frame>> {
     let mut out = Vec::with_capacity(frames.len());
     for r in frames {
         out.push(r?);
+    }
+    if out.len() != expected {
+        return Err(Error::invalid_data(format!(
+            "compound response has {} frames, expected {}",
+            out.len(),
+            expected
+        )));
     }
     Ok(out)
 }
@@ -72,9 +84,6 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// Create option: the target must not be a directory.
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
-/// Create option: delete file when all handles are closed.
-const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
-
 /// FileBasicInformation class for QUERY_INFO (MS-FSCC 2.4.7).
 const FILE_BASIC_INFORMATION: u8 = 4;
 
@@ -83,6 +92,9 @@ const FILE_STANDARD_INFORMATION: u8 = 5;
 
 /// FileRenameInformation class for SET_INFO (MS-FSCC 2.4.34.2).
 const FILE_RENAME_INFORMATION: u8 = 10;
+
+/// FileDispositionInformation class for SET_INFO (MS-FSCC 2.4.11).
+const FILE_DISPOSITION_INFORMATION: u8 = 13;
 
 /// FileFsFullSizeInformation class for QUERY_INFO (MS-FSCC 2.5.4).
 const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
@@ -490,7 +502,7 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
 
         let create_header = &responses[0].header;
         let create_body = &responses[0].body;
@@ -676,96 +688,9 @@ impl Tree {
 
         debug!("tree: delete_files batch, count={}", paths.len());
 
-        // Issue one `execute_compound` per path sequentially. Each compound
-        // is still CREATE+CLOSE in a single wire frame, so per-file round
-        // trips stay at 1. Pre-Phase-3 this loop did "phase 1: send all,
-        // phase 2: receive all" to overlap server work — the new API
-        // doesn't expose raw send/receive separately; if that throughput
-        // matters, `execute_compound` can run on cloned connections via
-        // `tokio::spawn` to interleave responses through the receiver
-        // task's per-`MessageId` routing.
         let mut results: Vec<Result<()>> = Vec::with_capacity(paths.len());
-        let mut cleanup_handles: Vec<FileId> = Vec::new();
         for path in paths {
-            let normalized = self.format_path(path);
-            let create_req = CreateRequest {
-                requested_oplock_level: OplockLevel::None,
-                impersonation_level: ImpersonationLevel::Impersonation,
-                desired_access: FileAccessMask::new(
-                    FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
-                ),
-                file_attributes: 0,
-                share_access: ShareAccess(
-                    ShareAccess::FILE_SHARE_READ
-                        | ShareAccess::FILE_SHARE_WRITE
-                        | ShareAccess::FILE_SHARE_DELETE,
-                ),
-                create_disposition: CreateDisposition::FileOpen,
-                create_options: FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE,
-                name: normalized,
-                create_contexts: vec![],
-            };
-            let close_req = CloseRequest {
-                flags: 0,
-                file_id: FileId::SENTINEL,
-            };
-            let ops = [
-                CompoundOp {
-                    command: Command::Create,
-                    body: &create_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::Close,
-                    body: &close_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-            ];
-            let frames = match conn.execute_compound(&ops).await {
-                Ok(v) => v,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
-            let responses = match all_or_first_err(frames) {
-                Ok(v) => v,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
-            let create_header = &responses[0].header;
-            let create_body = &responses[0].body;
-            let close_header = &responses[1].header;
-            if create_header.status != NtStatus::SUCCESS {
-                results.push(Err(Error::Protocol {
-                    status: create_header.status,
-                    command: Command::Create,
-                }));
-            } else if close_header.status != NtStatus::SUCCESS {
-                if let Ok(create_resp) = CreateResponse::unpack(&mut ReadCursor::new(create_body)) {
-                    cleanup_handles.push(create_resp.file_id);
-                }
-                results.push(Err(Error::Protocol {
-                    status: close_header.status,
-                    command: Command::Close,
-                }));
-            } else {
-                debug!("tree: batch deleted file={}", path);
-                results.push(Ok(()));
-            }
-        }
-
-        // Phase 3: Cleanup -- issue standalone CLOSEs for leaked handles.
-        for file_id in &cleanup_handles {
-            warn!(
-                "tree: batch delete cleanup, issuing standalone CLOSE for {:?}",
-                file_id
-            );
-            let _ = self.close_handle(conn, *file_id).await;
+            results.push(self.delete_file(conn, path).await);
         }
 
         debug!(
@@ -858,7 +783,7 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
 
         let create_header = &responses[0].header;
         let create_body = &responses[0].body;
@@ -989,107 +914,9 @@ impl Tree {
 
         debug!("tree: stat_files batch, count={}", paths.len());
 
-        // Issue one `execute_compound` per path sequentially. See
-        // `delete_files` for the same shape and the note on wire-level
-        // pipelining tradeoffs.
         let mut results: Vec<Result<FileInfo>> = Vec::with_capacity(paths.len());
-        let mut cleanup_handles: Vec<FileId> = Vec::new();
-
         for path in paths {
-            let normalized = self.format_path(path);
-            let create_req = CreateRequest {
-                requested_oplock_level: OplockLevel::None,
-                impersonation_level: ImpersonationLevel::Impersonation,
-                desired_access: FileAccessMask::new(
-                    FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
-                ),
-                file_attributes: 0,
-                share_access: ShareAccess(
-                    ShareAccess::FILE_SHARE_READ
-                        | ShareAccess::FILE_SHARE_WRITE
-                        | ShareAccess::FILE_SHARE_DELETE,
-                ),
-                create_disposition: CreateDisposition::FileOpen,
-                create_options: 0,
-                name: normalized,
-                create_contexts: vec![],
-            };
-            let basic_req = QueryInfoRequest {
-                info_type: InfoType::File,
-                file_info_class: FILE_BASIC_INFORMATION,
-                output_buffer_length: 40,
-                additional_information: 0,
-                flags: 0,
-                file_id: FileId::SENTINEL,
-                input_buffer: vec![],
-            };
-            let std_req = QueryInfoRequest {
-                info_type: InfoType::File,
-                file_info_class: FILE_STANDARD_INFORMATION,
-                output_buffer_length: 24,
-                additional_information: 0,
-                flags: 0,
-                file_id: FileId::SENTINEL,
-                input_buffer: vec![],
-            };
-            let close_req = CloseRequest {
-                flags: 0,
-                file_id: FileId::SENTINEL,
-            };
-            let ops = [
-                CompoundOp {
-                    command: Command::Create,
-                    body: &create_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::QueryInfo,
-                    body: &basic_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::QueryInfo,
-                    body: &std_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::Close,
-                    body: &close_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-            ];
-            let frames = match conn.execute_compound(&ops).await {
-                Ok(v) => v,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
-            let responses = match all_or_first_err(frames) {
-                Ok(v) => v,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
-            let parsed = self.parse_stat_batch_response(&responses, &mut cleanup_handles);
-            if parsed.is_ok() {
-                trace!("tree: batch stat done for file={}", path);
-            }
-            results.push(parsed);
-        }
-
-        // Phase 3: Cleanup -- standalone CLOSEs for leaked handles.
-        for file_id in &cleanup_handles {
-            warn!(
-                "tree: batch stat cleanup, issuing standalone CLOSE for {:?}",
-                file_id
-            );
-            let _ = self.close_handle(conn, *file_id).await;
+            results.push(self.stat(conn, path).await);
         }
 
         debug!(
@@ -1098,108 +925,6 @@ impl Tree {
             paths.len()
         );
         results
-    }
-
-    /// Parse a single stat compound response for the batch stat method.
-    ///
-    /// Expects exactly four sub-frames (CREATE, QUERY_INFO basic,
-    /// QUERY_INFO standard, CLOSE).
-    fn parse_stat_batch_response(
-        &self,
-        responses: &[crate::client::connection::Frame],
-        cleanup_handles: &mut Vec<FileId>,
-    ) -> Result<FileInfo> {
-        debug_assert_eq!(
-            responses.len(),
-            4,
-            "stat compound must have 4 sub-responses"
-        );
-
-        let create_header = &responses[0].header;
-        let create_body = &responses[0].body;
-        let basic_header = &responses[1].header;
-        let basic_body = &responses[1].body;
-        let std_header = &responses[2].header;
-        let std_body = &responses[2].body;
-
-        if create_header.status != NtStatus::SUCCESS {
-            return Err(Error::Protocol {
-                status: create_header.status,
-                command: Command::Create,
-            });
-        }
-
-        // CREATE succeeded -- if a later op fails, we need cleanup.
-        let file_id = CreateResponse::unpack(&mut ReadCursor::new(create_body))
-            .map(|r| r.file_id)
-            .ok();
-
-        if !basic_header.status.is_success_or_partial() {
-            if let Some(fid) = file_id {
-                cleanup_handles.push(fid);
-            }
-            return Err(Error::Protocol {
-                status: basic_header.status,
-                command: Command::QueryInfo,
-            });
-        }
-
-        let mut cursor = ReadCursor::new(basic_body);
-        let basic_resp = QueryInfoResponse::unpack(&mut cursor)?;
-        let basic_buf = &basic_resp.output_buffer;
-
-        if basic_buf.len() < 36 {
-            if let Some(fid) = file_id {
-                cleanup_handles.push(fid);
-            }
-            return Err(Error::invalid_data(format!(
-                "FileBasicInformation too short: {} bytes",
-                basic_buf.len()
-            )));
-        }
-
-        let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
-        let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
-        let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
-        let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
-
-        if !std_header.status.is_success_or_partial() {
-            if let Some(fid) = file_id {
-                cleanup_handles.push(fid);
-            }
-            return Err(Error::Protocol {
-                status: std_header.status,
-                command: Command::QueryInfo,
-            });
-        }
-
-        let mut cursor = ReadCursor::new(std_body);
-        let std_resp = QueryInfoResponse::unpack(&mut cursor)?;
-        let std_buf = &std_resp.output_buffer;
-
-        if std_buf.len() < 22 {
-            if let Some(fid) = file_id {
-                cleanup_handles.push(fid);
-            }
-            return Err(Error::invalid_data(format!(
-                "FileStandardInformation too short: {} bytes",
-                std_buf.len()
-            )));
-        }
-
-        let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
-        let is_directory_byte = std_buf[21];
-
-        let is_directory =
-            is_directory_byte != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-        Ok(FileInfo {
-            size: end_of_file,
-            is_directory,
-            created,
-            modified,
-            accessed,
-        })
     }
 
     /// Query file system space information for this share.
@@ -1268,7 +993,7 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
 
         let create_header = &responses[0].header;
         let query_header = &responses[1].header;
@@ -1416,7 +1141,7 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
 
         let create_header = &responses[0].header;
         let create_body = &responses[0].body;
@@ -1481,113 +1206,9 @@ impl Tree {
 
         debug!("tree: rename_files batch, count={}", renames.len());
 
-        // Sequential `execute_compound` per rename. See `delete_files` for
-        // the pipelining note.
         let mut results: Vec<Result<()>> = Vec::with_capacity(renames.len());
-        let mut cleanup_handles: Vec<FileId> = Vec::new();
-
         for (from, to) in renames {
-            let from_normalized = self.format_path(from);
-            let to_normalized = normalize_path(to);
-            let create_req = CreateRequest {
-                requested_oplock_level: OplockLevel::None,
-                impersonation_level: ImpersonationLevel::Impersonation,
-                desired_access: FileAccessMask::new(
-                    FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
-                ),
-                file_attributes: 0,
-                share_access: ShareAccess(
-                    ShareAccess::FILE_SHARE_READ
-                        | ShareAccess::FILE_SHARE_WRITE
-                        | ShareAccess::FILE_SHARE_DELETE,
-                ),
-                create_disposition: CreateDisposition::FileOpen,
-                create_options: 0,
-                name: from_normalized,
-                create_contexts: vec![],
-            };
-            let setinfo_req = SetInfoRequest {
-                info_type: InfoType::File,
-                file_info_class: FILE_RENAME_INFORMATION,
-                additional_information: 0,
-                file_id: FileId::SENTINEL,
-                buffer: build_rename_info_buffer(&to_normalized),
-            };
-            let close_req = CloseRequest {
-                flags: 0,
-                file_id: FileId::SENTINEL,
-            };
-            let ops = [
-                CompoundOp {
-                    command: Command::Create,
-                    body: &create_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::SetInfo,
-                    body: &setinfo_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-                CompoundOp {
-                    command: Command::Close,
-                    body: &close_req,
-                    tree_id: Some(self.tree_id),
-                    credit_charge: CreditCharge(1),
-                },
-            ];
-            let frames = match conn.execute_compound(&ops).await {
-                Ok(v) => v,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
-            let responses = match all_or_first_err(frames) {
-                Ok(v) => v,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
-            let create_header = &responses[0].header;
-            let create_body = &responses[0].body;
-            let setinfo_header = &responses[1].header;
-            let close_header = &responses[2].header;
-
-            if create_header.status != NtStatus::SUCCESS {
-                results.push(Err(Error::Protocol {
-                    status: create_header.status,
-                    command: Command::Create,
-                }));
-            } else if setinfo_header.status != NtStatus::SUCCESS {
-                if let Ok(create_resp) = CreateResponse::unpack(&mut ReadCursor::new(create_body)) {
-                    cleanup_handles.push(create_resp.file_id);
-                }
-                results.push(Err(Error::Protocol {
-                    status: setinfo_header.status,
-                    command: Command::SetInfo,
-                }));
-            } else {
-                if close_header.status != NtStatus::SUCCESS {
-                    debug!(
-                        "tree: batch rename CLOSE returned {:?} (non-fatal)",
-                        close_header.status,
-                    );
-                }
-                debug!("tree: batch renamed from={} to={}", from, to);
-                results.push(Ok(()));
-            }
-        }
-
-        // Phase 3: Cleanup -- standalone CLOSEs for leaked handles.
-        for file_id in &cleanup_handles {
-            warn!(
-                "tree: batch rename cleanup, issuing standalone CLOSE for {:?}",
-                file_id
-            );
-            let _ = self.close_handle(conn, *file_id).await;
+            results.push(self.rename(conn, from, to).await);
         }
 
         debug!(
@@ -1687,7 +1308,7 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
 
         let create_header = &responses[0].header;
         let create_body = &responses[0].body;
@@ -2334,9 +1955,17 @@ impl Tree {
                     | ShareAccess::FILE_SHARE_DELETE,
             ),
             create_disposition: CreateDisposition::FileOpen,
-            create_options: FILE_DELETE_ON_CLOSE | type_option,
+            create_options: type_option,
             name: normalized.clone(),
             create_contexts: vec![],
+        };
+
+        let disposition_req = SetInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_DISPOSITION_INFORMATION,
+            additional_information: 0,
+            file_id: FileId::SENTINEL,
+            buffer: vec![1], // DeletePending = true (MS-FSCC 2.4.11).
         };
 
         let close_req = CloseRequest {
@@ -2352,6 +1981,12 @@ impl Tree {
                 credit_charge: CreditCharge(1),
             },
             CompoundOp {
+                command: Command::SetInfo,
+                body: &disposition_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
                 command: Command::Close,
                 body: &close_req,
                 tree_id: Some(self.tree_id),
@@ -2359,11 +1994,12 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?)?;
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
 
         let create_header = &responses[0].header;
         let create_body = &responses[0].body;
-        let close_header = &responses[1].header;
+        let setinfo_header = &responses[1].header;
+        let close_header = &responses[2].header;
 
         // If CREATE failed, all ops in the compound fail (cascaded). No handle to clean up.
         if create_header.status != NtStatus::SUCCESS {
@@ -2373,20 +2009,26 @@ impl Tree {
             });
         }
 
-        // CREATE succeeded. If CLOSE failed, issue a standalone CLOSE
-        // to avoid leaking the handle (and to ensure deletion happens).
-        if close_header.status != NtStatus::SUCCESS {
-            let mut cursor = ReadCursor::new(create_body);
-            let create_resp = CreateResponse::unpack(&mut cursor)?;
-            warn!(
-                "tree: compound CLOSE failed ({:?}), issuing standalone CLOSE",
-                close_header.status
-            );
-            let _ = self.close_handle(conn, create_resp.file_id).await;
-            return Err(Error::Protocol {
-                status: close_header.status,
-                command: Command::Close,
-            });
+        // CREATE succeeded, so a handle exists. Any later failure has to close
+        // it by hand: a cascaded CLOSE fails along with the op before it and
+        // leaves the handle open on the server.
+        for (header, command) in [
+            (setinfo_header, Command::SetInfo),
+            (close_header, Command::Close),
+        ] {
+            if header.status != NtStatus::SUCCESS {
+                let mut cursor = ReadCursor::new(create_body);
+                let create_resp = CreateResponse::unpack(&mut cursor)?;
+                warn!(
+                    "tree: compound {:?} failed ({:?}), issuing standalone CLOSE",
+                    command, header.status
+                );
+                let _ = self.close_handle(conn, create_resp.file_id).await;
+                return Err(Error::Protocol {
+                    status: header.status,
+                    command,
+                });
+            }
         }
 
         debug!("tree: deleted {}={}", kind, normalized);
@@ -4007,18 +3649,8 @@ mod tests {
     }
 
     use crate::client::test_helpers::{
-        build_query_info_response, build_query_info_response_with_status,
+        build_query_info_response, build_query_info_response_with_status, build_set_info_response,
     };
-
-    fn build_set_info_response() -> Vec<u8> {
-        use crate::msg::set_info::SetInfoResponse;
-        let mut h = Header::new_request(Command::SetInfo);
-        h.flags.set_response();
-        h.credits = 32;
-
-        let body = SetInfoResponse;
-        pack_message(&h, &body)
-    }
 
     /// Build a FileBasicInformation buffer (40 bytes).
     fn build_file_basic_info(
@@ -4064,10 +3696,11 @@ mod tests {
             volatile: 0xBB,
         };
 
-        // DELETE = compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        // DELETE = compound CREATE + SET_INFO(disposition) + CLOSE
         let create_resp = build_create_response(file_id, 0);
+        let setinfo_resp = build_set_info_response();
         let close_resp = build_close_response();
-        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -4084,13 +3717,14 @@ mod tests {
         // One compound frame sent.
         assert_eq!(mock.sent_count(), 1);
 
-        // Verify the CREATE request has DELETE access and DELETE_ON_CLOSE
+        // The CREATE asks for DELETE access and leaves the deleting to the
+        // SET_INFO. Pre-fix this asserted FILE_DELETE_ON_CLOSE, which Samba
+        // silently ignores on a non-empty directory.
         let sent = mock.sent_message(0).unwrap();
         let mut cursor = ReadCursor::new(&sent);
         let _header = Header::unpack(&mut cursor).unwrap();
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert!(req.desired_access.contains(FileAccessMask::DELETE));
-        assert_ne!(req.create_options & FILE_DELETE_ON_CLOSE, 0);
         assert_ne!(req.create_options & FILE_NON_DIRECTORY_FILE, 0);
     }
 
@@ -4123,7 +3757,19 @@ mod tests {
             },
         );
 
-        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        let mut setinfo_hdr = Header::new_request(Command::SetInfo);
+        setinfo_hdr.flags.set_response();
+        setinfo_hdr.credits = 32;
+        setinfo_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let setinfo_resp = pack_message(
+            &setinfo_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -4153,8 +3799,9 @@ mod tests {
             volatile: 0xBB,
         };
 
-        // Compound: CREATE succeeds, CLOSE fails.
+        // Compound: CREATE and SET_INFO succeed, CLOSE fails.
         let create_resp = build_create_response(file_id, 0);
+        let setinfo_resp = build_set_info_response();
 
         let mut close_hdr = Header::new_request(Command::Close);
         close_hdr.flags.set_response();
@@ -4168,7 +3815,7 @@ mod tests {
             },
         );
 
-        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
         mock.queue_response(frame);
 
         // Queue response for the standalone CLOSE retry.
@@ -4955,10 +4602,11 @@ mod tests {
             volatile: 0x66,
         };
 
-        // DELETE = compound CREATE(DELETE_ON_CLOSE) + CLOSE
+        // DELETE = compound CREATE + SET_INFO(disposition) + CLOSE
         let create_resp = build_create_response(file_id, 0);
+        let setinfo_resp = build_set_info_response();
         let close_resp = build_close_response();
-        let frame = build_compound_response_frame(&[create_resp, close_resp]);
+        let frame = build_compound_response_frame(&[create_resp, setinfo_resp, close_resp]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -4975,13 +4623,86 @@ mod tests {
         // One compound frame sent.
         assert_eq!(mock.sent_count(), 1);
 
-        // Verify the CREATE has DELETE_ON_CLOSE and FILE_DIRECTORY_FILE
+        // The CREATE opens the directory; the SET_INFO is what deletes it.
         let sent = mock.sent_message(0).unwrap();
         let mut cursor = ReadCursor::new(&sent);
         let _header = Header::unpack(&mut cursor).unwrap();
         let req = CreateRequest::unpack(&mut cursor).unwrap();
-        assert_ne!(req.create_options & FILE_DELETE_ON_CLOSE, 0);
+        assert!(req.desired_access.contains(FileAccessMask::DELETE));
         assert_ne!(req.create_options & FILE_DIRECTORY_FILE, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_directory_surfaces_not_empty_instead_of_reporting_success() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0x51,
+            volatile: 0x52,
+        };
+
+        // A non-empty directory: CREATE opens it, SET_INFO refuses. Pre-fix
+        // this used FILE_DELETE_ON_CLOSE, where Samba answers every op with
+        // SUCCESS and deletes nothing, so the caller was told it worked.
+        let create_resp = build_create_response(file_id, 0);
+        let mut setinfo_hdr = Header::new_request(Command::SetInfo);
+        setinfo_hdr.flags.set_response();
+        setinfo_hdr.credits = 32;
+        setinfo_hdr.status = NtStatus::DIRECTORY_NOT_EMPTY;
+        let setinfo_resp = pack_message(
+            &setinfo_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = NtStatus::DIRECTORY_NOT_EMPTY;
+        let close_resp = pack_message(
+            &close_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            setinfo_resp,
+            close_resp,
+        ]));
+        // The standalone CLOSE that releases the handle.
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let result = tree.delete_directory(&mut conn, "full_dir").await;
+
+        assert_eq!(
+            result.unwrap_err().status(),
+            Some(NtStatus::DIRECTORY_NOT_EMPTY)
+        );
+        // The compound plus the standalone CLOSE, so the handle isn't leaked.
+        assert_eq!(mock.sent_count(), 2);
+    }
+
+    #[test]
+    fn all_or_first_err_rejects_a_short_chain() {
+        // Callers index responses[2] straight after this returns, so a chain
+        // that came back short has to be an error, not a panic waiting to
+        // happen.
+        let result = all_or_first_err(vec![], 3);
+        assert!(
+            result.is_err(),
+            "a 3-op chain answered with 0 frames must be an error"
+        );
     }
 
     // ── Batch delete tests ───────────────────────────────────────────
@@ -4990,15 +4711,20 @@ mod tests {
     async fn delete_files_batch_happy_path() {
         let mock = Arc::new(MockTransport::new());
 
-        // Queue 3 compound responses (CREATE+CLOSE each).
+        // Queue 3 compound responses (CREATE+SET_INFO+CLOSE each).
         for i in 0..3u64 {
             let file_id = FileId {
                 persistent: i + 1,
                 volatile: i + 100,
             };
             let create_resp = build_create_response(file_id, 0);
+            let setinfo_resp = build_set_info_response();
             let close_resp = build_close_response();
-            mock.queue_response(build_compound_response_frame(&[create_resp, close_resp]));
+            mock.queue_response(build_compound_response_frame(&[
+                create_resp,
+                setinfo_resp,
+                close_resp,
+            ]));
         }
 
         let mut conn = setup_connection(&mock);
@@ -5037,8 +4763,11 @@ mod tests {
             volatile: 100,
         };
         let create_resp = build_create_response(file_id, 0);
-        let close_resp = build_close_response();
-        mock.queue_response(build_compound_response_frame(&[create_resp, close_resp]));
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            build_set_info_response(),
+            build_close_response(),
+        ]));
 
         // File 2: CREATE fails (not found) -- cascaded failure
         let mut create_hdr = Header::new_request(Command::Create);
@@ -5052,7 +4781,17 @@ mod tests {
         close_hdr.credits = 32;
         close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
         let close_err = pack_message(&close_hdr, &err_body);
-        mock.queue_response(build_compound_response_frame(&[create_err, close_err]));
+
+        let mut setinfo_hdr = Header::new_request(Command::SetInfo);
+        setinfo_hdr.flags.set_response();
+        setinfo_hdr.credits = 32;
+        setinfo_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
+        let setinfo_err = pack_message(&setinfo_hdr, &err_body);
+        mock.queue_response(build_compound_response_frame(&[
+            create_err,
+            setinfo_err,
+            close_err,
+        ]));
 
         // File 3: success
         let file_id = FileId {
@@ -5060,8 +4799,11 @@ mod tests {
             volatile: 102,
         };
         let create_resp = build_create_response(file_id, 0);
-        let close_resp = build_close_response();
-        mock.queue_response(build_compound_response_frame(&[create_resp, close_resp]));
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            build_set_info_response(),
+            build_close_response(),
+        ]));
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -5107,7 +4849,15 @@ mod tests {
         close_hdr.credits = 32;
         close_hdr.status = NtStatus::UNSUCCESSFUL;
         let close_fail = pack_message(&close_hdr, &err_body);
-        mock.queue_response(build_compound_response_frame(&[create_resp, close_fail]));
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            build_set_info_response(),
+            close_fail,
+        ]));
+
+        // File 1's handle is closed before file 2 starts, so its standalone
+        // CLOSE response is queued between the two compounds.
+        mock.queue_response(build_close_response());
 
         // File 2: success
         let file_id2 = FileId {
@@ -5116,10 +4866,11 @@ mod tests {
         };
         let create_resp2 = build_create_response(file_id2, 0);
         let close_resp2 = build_close_response();
-        mock.queue_response(build_compound_response_frame(&[create_resp2, close_resp2]));
-
-        // Queue response for the standalone CLOSE cleanup of file 1.
-        mock.queue_response(build_close_response());
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp2,
+            build_set_info_response(),
+            close_resp2,
+        ]));
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {

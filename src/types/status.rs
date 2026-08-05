@@ -177,6 +177,9 @@ nt_status_codes! {
     /// No more connections can be made to this remote computer at this time.
     REQUEST_NOT_ACCEPTED = 0xC000_00D0, "STATUS_REQUEST_NOT_ACCEPTED";
 
+    /// The directory still has entries in it, so it cannot be deleted.
+    DIRECTORY_NOT_EMPTY = 0xC000_0101, "STATUS_DIRECTORY_NOT_EMPTY";
+
     /// A requested opened file is not a directory.
     NOT_A_DIRECTORY = 0xC000_0103, "STATUS_NOT_A_DIRECTORY";
 
@@ -399,6 +402,7 @@ mod tests {
             NtStatus::NETWORK_NAME_DELETED,
             NtStatus::BAD_NETWORK_NAME,
             NtStatus::REQUEST_NOT_ACCEPTED,
+            NtStatus::DIRECTORY_NOT_EMPTY,
             NtStatus::NOT_A_DIRECTORY,
             NtStatus::CANCELLED,
             NtStatus::FILE_CLOSED,
