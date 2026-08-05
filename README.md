@@ -429,6 +429,13 @@ which means system package management, cross-compilation headaches, and all the 
 
 `smb2` is pure Rust. `cargo build` and done.
 
+## Sister projects
+
+- [smb2-cli](https://github.com/vdavid/smb2-cli): a command-line client built on this crate. Run `ls`, `stat`, `rm`,
+  `rmdir`, `mv`, and file transfers against a share without mounting it, and spread a batch over N connections. Bulk
+  deletes go 34/s through a macOS mount and 500/s here.
+- [Cmdr](https://github.com/vdavid/cmdr): an AI-native file manager that uses `smb2` for SMB access.
+
 ## Implementation notes
 
 - I used Claude extensively for this implementation. The code has a comprehensive test suite (unit tests with mock
