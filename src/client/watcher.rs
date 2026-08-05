@@ -99,8 +99,10 @@ pub struct FileNotifyEvent {
     /// A recursive watch reports something below the directory it was armed
     /// on, so this can carry separators. They are `/`, and each component has
     /// been mapped back out of the private-use area (see [`crate::name`]), so
-    /// the value goes straight into any [`Tree`](crate::Tree) method after
-    /// being joined onto the watched directory's path.
+    /// the value goes straight into any [`Tree`] method after being joined
+    /// onto the watched directory's path.
+    ///
+    /// [`Tree`]: crate::Tree
     pub filename: String,
 }
 
