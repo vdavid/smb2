@@ -795,6 +795,81 @@ async fn a_long_poll_with_the_keepalive_off_is_never_given_up_on() {
     watching.abort();
 }
 
+// ── When the stall is on our side of the wire ──────────────────────────────
+
+/// Freeze the whole process, the way a starved or napped one is frozen.
+///
+/// `#[tokio::test]` runs on a current-thread runtime, so blocking it stops
+/// every task and every timer while `Instant` keeps advancing. That IS the
+/// fault being simulated: a process nobody scheduled cannot hear a server
+/// that is answering perfectly, and afterwards its clocks read as if the
+/// server had been silent the whole time.
+fn stall_the_process(how_long: Duration) {
+    std::thread::sleep(how_long);
+}
+
+/// A process that stopped running is not a server that stopped answering.
+///
+/// Every liveness clock in this file measures wall time, so a stretch the
+/// process spent unscheduled reads exactly like a server gone quiet — and the
+/// verdict it produces blames a machine that was answering the whole time.
+/// Cmdr hit this on 2026-08-08 with three freezes of 62 s, 175 s, and 355 s
+/// (a concurrent `cargo build` starving the dev app), each one ending in a
+/// declared-dead session against a perfectly healthy NAS. A closed laptop lid
+/// is the same shape, so this is a user-facing case rather than a dev-box one.
+#[tokio::test]
+async fn a_stall_on_our_side_is_not_blamed_on_a_server_that_kept_answering() {
+    let server = ScriptedServer::new(Answer::Everything);
+    let conn = connect(&server);
+    let watching = spawn_change_notify(&conn);
+    wait_until("the CHANGE_NOTIFY to reach the wire", || {
+        server.count_of(Command::ChangeNotify) >= 1
+    })
+    .await;
+
+    // Well past the response deadline, so the only thing standing between a
+    // healthy connection and a death verdict is knowing who went quiet.
+    stall_the_process(BASE_DEADLINE * 3);
+    tokio::time::sleep(KEEPALIVE * 4).await;
+
+    assert!(
+        !watching.is_finished(),
+        "a server that answered everything was declared dead because WE stopped running"
+    );
+    assert!(!conn.diagnostics().disconnected);
+    assert!(
+        conn.metrics().scheduling_stalls >= 1,
+        "the stall has to be recognized as ours, not waited out by luck"
+    );
+    watching.abort();
+}
+
+/// Forgiving a stall must not blind the connection to the death after it.
+///
+/// The guard says "we were not listening", which is only ever a reason to ask
+/// again — the ECHO probes restart and reach the same verdict a moment later.
+/// A guard that instead suppressed the verdict outright would trade a false
+/// death for a permanent hang, which is the worse of the two by far.
+#[tokio::test]
+async fn a_server_that_really_is_dead_is_still_told_of_after_a_stall() {
+    let server = ScriptedServer::new(Answer::Nothing);
+    let conn = connect(&server);
+    conn.set_response_timeout(Some(BASE_DEADLINE * 4));
+    let watching = spawn_change_notify(&conn);
+    wait_until("the CHANGE_NOTIFY to reach the wire", || {
+        server.count_of(Command::ChangeNotify) >= 1
+    })
+    .await;
+
+    stall_the_process(BASE_DEADLINE * 3);
+
+    let outcome = finish(watching, "the CHANGE_NOTIFY").await;
+    assert!(
+        matches!(outcome, Err(Error::ServerUnresponsive { .. })),
+        "a dead server still has to be declared dead once we are running again, got {outcome:?}"
+    );
+}
+
 /// The same verdict, reached through the type a consumer actually holds.
 ///
 /// The two tests above drive CHANGE_NOTIFY through `Connection::execute`,

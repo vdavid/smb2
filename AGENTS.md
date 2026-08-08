@@ -251,6 +251,8 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 23. **A filename SMB2 refuses is mapped, not rejected -- and the table is an interop contract, not a choice** ✅ -- Eight ASCII characters (`"`, `*`, `:`, `<`, `>`, `?`, `\`, `|`), the control characters, and a trailing space or period are illegal in an SMB2 name, so a share simply cannot hold `"how are you?".json` verbatim; the server answers `STATUS_OBJECT_NAME_INVALID` and nothing can retry it. `src/name.rs` substitutes each into the Unicode private-use area at U+F000 on the way out and back on the way in, which is what every SMB client carrying POSIX names has done since Services for Macintosh. ❌ **Don't "improve" the table.** Its whole value is that a file written here and the same file written by macOS Finder land on the same on-disk name; a different-but-reasonable mapping makes two clients disagree about what a share contains. It was derived by creating probe files through a macOS `/Volumes` mount and reading the on-disk bytes over SSH on a QNAP TS-464 (2026-08-05), and `src/name.rs` pins those bytes in both UTF-16LE and UTF-8 so it cannot drift. Three constraints that are easy to get wrong: the trailing rule takes the **last character of each component only** (`"a.. "` maps one character); `/` is the only separator a caller can write, because a `\` has to be available as a name character to map to U+F026; and **encode and decode must stay symmetric across every site** -- an asymmetry is worse than no mapping, since a listing would hand back a name the next CREATE cannot open. Spans `src/name.rs` + `client/tree.rs` (`format_path`, directory-listing parse) + `client/watcher.rs` + `client/mod.rs` (the DFS referral path); the fixture that proves Finder parity in CI is `tests/docker/internal/smb-weirdnames`.
 
+24. **Silence you weren't listening to is not evidence** ✅ -- Every liveness clock here measures wall time, which quietly assumes the process was running to hear the silence it is measuring. It isn't always: a system sleep, an App Nap, or a machine starved by a parallel build stops the loops while `Instant` keeps advancing, and the wire then reads as silent for minutes because nobody was listening. Cmdr hit this three times in twelve minutes on 2026-08-08 (62 s, 175 s, 355 s of a fully frozen process, each ending in a declared-dead session against a NAS that had been answering the whole time); a closed laptop lid is the same shape, so it is a user-facing case rather than a dev-box one. `Inner::forgive_scheduling_stall` catches it with the one witness available for free: cadence. Every loop on a connection wakes on a `keepalive_tick` or faster, so a gap since the last one that exceeds the probe threshold on top of the tick is us, not the server -- and forgiving it shifts `last_frame_at` and every waiter's timestamps forward by the gap, which is exactly the statement "nothing aged while we were gone". ❌ Don't leave the check to the keepalive task alone: every wait loop wakes from the same stall at the same instant, so `await_response` and `await_long_poll` each call it before reading any clock (it is idempotent; whoever arrives first corrects). ⚠️ It forgives, it never exonerates -- the probes restart with the clocks and a genuinely dead server is declared dead one budget later, because suppressing the verdict would trade a false death for a permanent hang. Counted as `scheduling_stalls`, logged at `info`. Spans `client/connection.rs`; see `client/CLAUDE.md` § Liveness.
+
 ## Testing
 
 See `tests/CLAUDE.md` for the full testing guide. Quick reference:
@@ -352,11 +354,13 @@ offline) so local clippy matches CI's always-latest stable, then runs `cargo fmt
 
 ## Diagnostics
 
-`SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 26
+`SmbClient::diagnostics()` and `Connection::diagnostics()` return an in-process snapshot of the client's state plus 30
 `AtomicU64` counters per connection (`requests_sent`, `wire_bytes_*`, the disjoint routing partition `responses_*`,
 `status_pending_loops`, `signature_failures`, `credit_waits` / `credit_starvations` / `response_timeouts`,
 `keepalive_probes_sent` / `keepalive_probes_skipped` / `keepalive_failures` / `response_deadline_extensions`,
-`long_poll_refreshes`, `reconnect_attempts` / `reconnects_succeeded` / `reconnects_failed`, etc.) and three client-level counters (`reconnects`,
+`long_poll_refreshes`, `scheduling_stalls` (the only one about THIS PROCESS rather than the server: read it before
+blaming a burst of `response_timeouts` on the network), `reconnect_attempts` / `reconnects_succeeded` /
+`reconnects_failed`, etc.) and three client-level counters (`reconnects`,
 `dfs_referrals_resolved`, `dfs_cache_hits`). Eventually consistent, survives connection teardown, and now survives a
 reconnect too (which revives the connection in place rather than replacing it), so the numbers describe the whole life
 of the link. `OutstandingRequest::sent_age` says which side of the wire a request is on: `None` means
@@ -390,8 +394,10 @@ Two follow-on rules fall out of it:
 **Log levels:**
 
 - `info`: connection and session milestones only. Connected, negotiated dialect, session established, tree
-  connected/disconnected, reconnect succeeded, durable handle reclaimed. There are ~11 `info` sites in the whole crate,
-  and four of them fire per connect. Keep it that way.
+  connected/disconnected, reconnect succeeded, durable handle reclaimed. The one exception is the scheduling-stall
+  notice, which is here because it is the only line that can explain a burst of timeouts nobody could otherwise account
+  for, and it fires only when the process genuinely stopped running. There are 12 `info` sites in the whole crate, and
+  four of them fire per connect. Keep it that way.
 - `debug`: what changed the connection's capabilities (negotiate params, signing/encryption activation, credit
   starvation and recovery), the mutations a consumer asked for (write, rename, delete, mkdir), one summary per
   multi-round-trip transfer (bytes and MB/s), and anomalies (orphan frames, non-fatal compound sub-request failures,
@@ -401,9 +407,15 @@ Two follow-on rules fall out of it:
   reads, opening a handle), because reads change nothing and are what a polling consumer does constantly, plus
   byte-level detail: raw message sizes, signature bytes (first four), nonce values, preauth hash updates, individual
   directory entries, Kerberos and NTLM key and ciphertext lengths.
-- `warn`: unexpected but recoverable. Signature verification skipped, credit starvation, retryable errors.
-- `error`: shouldn't happen during normal operation. Protocol violations, decryption and signature failures,
-  connection drops.
+- `warn`: unexpected but recoverable, AND the reader has somewhere to look. Signature verification skipped, credit
+  starvation, retryable errors, a session declared dead because the server stopped answering (the crate reconnects
+  itself, but a server that accepts a session and then serves nothing is a real fault with a real place to check).
+  Say what to check in the line itself.
+- `error`: no recovery path from here. Protocol violations, decryption and signature failures, malformed frames, a
+  reclaimed handle pointing at the wrong file, a partly-written frame that leaves the stream out of sync, a revival
+  that gave up.
+  ❌ Not for anything the crate heals on its own: a self-healing `error` teaches consumers to filter the level out,
+  and a file manager watching two panes across a laptop sleep can emit a lot of them.
 
 An idle connection is the test case that matters: keepalive `ECHO`s and long-polling `CHANGE_NOTIFY`s must produce
 nothing at `debug` when they're working.

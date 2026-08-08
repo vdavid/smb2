@@ -598,6 +598,12 @@ async fn keepalive_loop(weak: Weak<Inner>) {
         if inner.disconnected.load(Ordering::Acquire) {
             return;
         }
+        // The guaranteed heartbeat behind the stall witness. Every wait loop
+        // corrects for a stall too, but only this one runs on a cadence of its
+        // own, so only this one notices a stall on a connection with nothing
+        // outstanding — and the clocks have to be right BEFORE the next
+        // request arrives, not after it has already been misjudged.
+        inner.forgive_scheduling_stall();
         let Some(after) = *inner.keepalive_after.lock().unwrap() else {
             continue;
         };
@@ -1020,6 +1026,13 @@ struct Inner {
     /// has never said anything has not proven anything, and the deadline
     /// extension must never be granted on an assumption.
     last_frame_at: StdMutex<Option<std::time::Instant>>,
+    /// When one of this connection's own loops was last scheduled: the
+    /// process's liveness clock, as opposed to the server's.
+    ///
+    /// Every other clock here measures wall time, which silently assumes we
+    /// were running to hear the silence we are measuring. This is the witness
+    /// that says whether we were. See [`Inner::forgive_scheduling_stall`].
+    last_scheduled_at: StdMutex<std::time::Instant>,
     /// How much server silence, with work outstanding, triggers an ECHO probe,
     /// or `None` to never probe. See `Connection::set_keepalive`.
     keepalive_after: StdMutex<Option<Duration>>,
@@ -1173,6 +1186,7 @@ impl Inner {
             stale_request_after: StdMutex::new(Some(STALE_WAITER_AFTER)),
             response_timeout: StdMutex::new(Some(RESPONSE_TIMEOUT)),
             last_frame_at: StdMutex::new(None),
+            last_scheduled_at: StdMutex::new(std::time::Instant::now()),
             keepalive_after: StdMutex::new(Some(KEEPALIVE_AFTER)),
             long_poll_refresh: StdMutex::new(Some(LONG_POLL_REFRESH)),
             credits: CreditPool::new(),
@@ -1390,6 +1404,79 @@ impl Inner {
         Some(now.saturating_duration_since(reference))
     }
 
+    /// Freeze every liveness clock across a stretch this PROCESS spent
+    /// unscheduled, and report how long that was.
+    ///
+    /// Every clock on a connection measures wall time, which quietly assumes
+    /// we were running to hear the silence we are measuring. A system sleep,
+    /// an App Nap, or a machine starved by a parallel build breaks that
+    /// assumption: the wire looks silent for minutes because nobody was
+    /// listening, and [`unresponsive_for`](Self::unresponsive_for) then
+    /// convicts a server that was answering the whole time. Cmdr saw three of
+    /// these in twelve minutes on 2026-08-08 (62 s, 175 s, 355 s, a concurrent
+    /// `cargo build` starving the app), each ending in a declared-dead session
+    /// against a healthy NAS; a closed laptop lid is the same shape.
+    ///
+    /// The witness is cadence: this connection's loops wake on a
+    /// [`keepalive_tick`](Self::keepalive_tick) or faster, so a gap since the
+    /// last one that exceeds `after` on top of the tick is not a slow server,
+    /// it is us not running. Forgiving it pushes every clock forward by the
+    /// gap, which is the exact statement "nothing aged while we were gone".
+    ///
+    /// Idempotent and safe to call from any loop: the gap is measured from the
+    /// shared witness and calling this updates it, so whichever loop reaches a
+    /// verdict first does the correction and the rest see nothing to forgive.
+    /// ❌ Don't leave it to the keepalive task alone — every wait loop wakes
+    /// from the same stall at the same moment, and one that read its clock
+    /// before the keepalive got scheduled would declare the death this exists
+    /// to prevent.
+    ///
+    /// ⚠️ This forgives, it never exonerates. The clocks restart, the probes
+    /// restart with them, and a server that really is dead is declared dead
+    /// one budget later. Suppressing the verdict instead would trade a false
+    /// death for a permanent hang.
+    fn forgive_scheduling_stall(&self) -> Option<Duration> {
+        // The threshold rides on the probe cadence whether or not probing is
+        // armed: "we were not running" is a fact about this process, and
+        // `set_keepalive(None)` says nothing about it either way.
+        let after = (*self.keepalive_after.lock().unwrap()).unwrap_or(KEEPALIVE_AFTER);
+        let now = std::time::Instant::now();
+        let stall = {
+            let mut witness = self.last_scheduled_at.lock().unwrap();
+            let gap = now
+                .saturating_duration_since(*witness)
+                .saturating_sub(Self::keepalive_tick(after));
+            *witness = now;
+            (gap >= after).then_some(gap)
+        }?;
+        // Shifting forward, rather than resetting to now, keeps whatever the
+        // clocks legitimately read BEFORE the stall: a request the server had
+        // already owed us for 10 s is still 10 s overdue afterwards.
+        let shift = |t: &mut std::time::Instant| *t = t.checked_add(stall).unwrap_or(now);
+        if let Some(spoke) = self.last_frame_at.lock().unwrap().as_mut() {
+            shift(spoke);
+        }
+        for waiter in self.waiters.lock().unwrap().values_mut() {
+            shift(&mut waiter.registered_at);
+            shift(&mut waiter.last_activity);
+            if let Some(sent) = waiter.sent_at.as_mut() {
+                shift(sent);
+            }
+        }
+        self.metrics
+            .scheduling_stalls
+            .fetch_add(1, Ordering::Relaxed);
+        // INFO, not WARN: nothing is broken and nobody has anything to fix.
+        // It earns the level by being the one line that explains a burst of
+        // timeouts nobody could otherwise account for.
+        info!(
+            "this process was not scheduled for {stall:?} (system sleep, App Nap, or a starved \
+             machine). Nothing can be concluded about the server from silence nobody was \
+             listening to, so every liveness clock on this connection moves forward with it"
+        );
+        Some(stall)
+    }
+
     /// How often the keepalive loop wakes to check the liveness clock.
     ///
     /// Derived from the probe threshold rather than configured separately: the
@@ -1571,6 +1658,9 @@ pub(crate) struct Metrics {
     /// Long-poll requests retired and re-issued on the refresh cycle. Says a
     /// handover happened, never that anything was wrong.
     pub long_poll_refreshes: AtomicU64,
+    /// Stretches this PROCESS spent unscheduled, caught by the keepalive loop
+    /// overrunning its own cadence. Says nothing about the server.
+    pub scheduling_stalls: AtomicU64,
 
     // Reconnect
     /// Dials made trying to bring this connection back, across all revivals.
@@ -1623,6 +1713,7 @@ impl Metrics {
             keepalive_failures: self.keepalive_failures.load(Relaxed),
             response_deadline_extensions: self.response_deadline_extensions.load(Relaxed),
             long_poll_refreshes: self.long_poll_refreshes.load(Relaxed),
+            scheduling_stalls: self.scheduling_stalls.load(Relaxed),
             reconnect_attempts: self.reconnect_attempts.load(Relaxed),
             reconnects_succeeded: self.reconnects_succeeded.load(Relaxed),
             reconnects_failed: self.reconnects_failed.load(Relaxed),
@@ -2992,6 +3083,11 @@ impl Connection {
                 Either::Left((frame, _)) => return frame,
                 Either::Right((_, still_receiving)) => {
                     receiving = still_receiving;
+                    // Before any clock on this connection is read: a tick that
+                    // came back late because nothing was scheduled has to be
+                    // taken off every clock first, or this request is about to
+                    // be timed out over silence nobody was listening to.
+                    self.inner.forgive_scheduling_stall();
                     // `None` means the response has been routed and the next
                     // poll will produce it — never a timeout.
                     if let Some(idle) = self.inner.waiter_idle_for(msg_id) {
@@ -3028,7 +3124,7 @@ impl Connection {
                         // server death, while one that kept answering has a
                         // single stalled operation on it.
                         if let Some(silent_for) = verdict {
-                            return Err(self.declare_unresponsive(silent_for));
+                            return Err(self.declare_unresponsive(silent_for, command, msg_id));
                         }
                         warn!(
                             "no response: cmd={:?}, msg_id={}, silent for {:?}; giving up — \
@@ -3110,6 +3206,10 @@ impl Connection {
                 Ok(frame) => return frame.map(LongPollOutcome::Answered),
                 Err(_tick_elapsed) => {}
             }
+            // Same reason as in `await_response`: a tick this loop spent
+            // unscheduled is not silence the server owes an answer for, and
+            // this is the loop that would otherwise convict it.
+            self.inner.forgive_scheduling_stall();
             // The response has been routed and the next poll will produce
             // it — never a timeout.
             if self.inner.waiter_idle_for(msg_id).is_none() {
@@ -3127,12 +3227,7 @@ impl Connection {
                     .metrics
                     .response_timeouts
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    "no sign of life: cmd={:?}, msg_id={}, nothing on the wire for {:?} \
-                     while this long poll waited; giving up on it",
-                    command, msg_id.0, quiet
-                );
-                return Err(self.declare_unresponsive(quiet));
+                return Err(self.declare_unresponsive(quiet, command, msg_id));
             }
             let Some(registered_for) =
                 refresh.and_then(|r| self.inner.waiter_sent_age(msg_id).filter(|age| *age >= r))
@@ -3178,13 +3273,31 @@ impl Connection {
     /// ❌ This is deliberately not something the keepalive can reach on its
     /// own. A missed probe means "no extension" and nothing more; see
     /// [`KEEPALIVE_AFTER`] for the NAS that made that distinction necessary.
-    fn declare_unresponsive(&self, silent_for: Duration) -> Error {
+    ///
+    /// **Logged at WARN, and it earns the level.** The connection recovers
+    /// itself, so this is not an ERROR — but it is not routine either: the
+    /// wire is still up, so this is a server that accepted a session and
+    /// stopped serving it, and every request outstanding on it just failed.
+    /// The reader has somewhere to look (the server, or the path to it), which
+    /// is what separates a WARN from an INFO. Silence we merely failed to
+    /// listen to never reaches here; see
+    /// [`forgive_scheduling_stall`](Inner::forgive_scheduling_stall).
+    fn declare_unresponsive(
+        &self,
+        silent_for: Duration,
+        command: Command,
+        msg_id: MessageId,
+    ) -> Error {
         let err = Error::ServerUnresponsive { silent_for };
-        error!(
-            "the server has put nothing on the wire for {:?} while work was outstanding and \
-             the keepalive was probing it; declaring the session dead and failing {} other \
-             waiter(s)",
+        warn!(
+            "the server has put nothing on the wire for {:?} while work was outstanding and every \
+             ECHO probe went unanswered; declaring the session dead (waiting on cmd={:?}, \
+             msg_id={}) and failing {} other waiter(s). Reconnecting is the recovery and it is \
+             automatic; if this repeats against one server, it is wedging sessions instead of \
+             closing them, so restart its SMB service or check the path to it",
             silent_for,
+            command,
+            msg_id.0,
             self.inner.waiters.lock().unwrap().len()
         );
         fan_error_to_waiters(&self.inner, &err);

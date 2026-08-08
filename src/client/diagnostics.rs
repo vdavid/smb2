@@ -456,6 +456,16 @@ pub struct MetricsSnapshot {
     /// watcher has been open for longer than the interval means the refresh is
     /// turned off, which is what leaves a dropped subscription dead forever.
     pub long_poll_refreshes: u64,
+    /// Stretches this PROCESS spent unscheduled, long enough that its own
+    /// clocks could no longer be trusted: a system sleep, an App Nap, a
+    /// machine so starved that a 1 s timer came back seconds late.
+    ///
+    /// Says nothing whatever about the server. It is here because every other
+    /// number on this connection measures wall time, so a stall inflates
+    /// silence readings that the server had no part in, and a reader
+    /// diagnosing a burst of `response_timeouts` wants to know the process
+    /// stopped running before blaming the network.
+    pub scheduling_stalls: u64,
 
     /// Dials made trying to bring this connection back, across every revival.
     pub reconnect_attempts: u64,
@@ -609,6 +619,14 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
     )?;
     if m.long_poll_refreshes > 0 {
         writeln!(f, "  long polls: {} refreshed", m.long_poll_refreshes)?;
+    }
+    if m.scheduling_stalls > 0 {
+        writeln!(
+            f,
+            "  scheduling: {} stall(s) on OUR side (process unscheduled; silence readings across \
+             them mean nothing)",
+            m.scheduling_stalls,
+        )?;
     }
     if m.reconnect_attempts > 0 {
         writeln!(

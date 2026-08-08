@@ -5,6 +5,23 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.1] - 2026-08-08
+
+### Fixed
+
+- **A process that stops running no longer gets a healthy server declared dead.** Every liveness clock in the crate measures wall time, which quietly assumes the process was running to hear the silence it is measuring. A system sleep, an App Nap, or a machine starved by a parallel build breaks that assumption: the loops stop, `Instant` keeps advancing, and the first tick after the freeze reads minutes of "server silence" that nobody was listening to. The verdict that followed was `Error::ServerUnresponsive` against a NAS that had been answering the whole time, every waiter failed, and the session torn down and rebuilt. A consumer watching a directory saw it three times in twelve minutes on a busy dev machine (freezes of 62 s, 175 s, and 355 s), and **a closed laptop lid produces the same shape on any machine**, which is what makes this worth a patch release rather than a dev-box curiosity.
+  - **The witness is cadence, and it was already there.** Every loop on a connection wakes on a keepalive tick or faster, so a gap since the last one that exceeds the probe threshold on top of the tick is this process, not the server. `Inner::forgive_scheduling_stall` shifts `last_frame_at` and every waiter's timestamps forward by that gap, which is exactly the statement "nothing aged while we were gone".
+  - **It forgives, it never exonerates.** The clocks restart and the ECHO probes restart with them, so a server that really is dead is declared dead one response deadline later. Suppressing the verdict instead would have traded a false death for a permanent hang, which is the worse of the two.
+  - **Checked by every loop, not just the keepalive task.** They all wake from the same stall at the same instant, so `await_response` and `await_long_poll` each correct before reading a clock. The correction is idempotent; whoever gets there first does it.
+
+### Changed
+
+- **`Error::ServerUnresponsive` is logged at `warn` instead of `error`, and says what to check.** The crate reconnects itself, and an `error` a library heals on its own teaches consumers to filter the level out. It stays above `info` because the reader does have somewhere to look: the wire is up, so this is a server that accepted a session and then served nothing. The line now names the command and message id it was waiting on, replacing a duplicate pair of lines that reported the same silence twice.
+
+### Added
+
+- **`MetricsSnapshot::scheduling_stalls`**, the only counter here about the process rather than the server. Read it before blaming a burst of `response_timeouts` on the network. `Connection::diagnostics()` prints it only when non-zero.
+
 ## [0.18.0] - 2026-08-05
 
 ### Breaking
