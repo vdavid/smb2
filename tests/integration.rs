@@ -1541,22 +1541,27 @@ async fn watch_directory_on_nas() {
                 .create_directory(&mut watcher_share, "_test/watch_probe")
                 .await;
 
-            // Spawn a local task to create a file after a short delay.
-            let test_file_path = "_test/watch_probe/smb2_watch_test.tmp";
-
-            // Clear a leftover from an interrupted run BEFORE the watch opens.
-            // Writing over a file that already exists is a `modified`, not an
-            // `Added`, so without this one failed run makes every later run
-            // fail for a different reason than the first.
-            let _ = watcher_client
-                .delete_file(&mut watcher_share, test_file_path)
-                .await;
-
             // Start watching it (non-recursive).
             let mut watcher = watcher_client
                 .watch(&watcher_share, "_test/watch_probe/", false)
                 .await
                 .expect("watch failed");
+
+            // A FRESH file every 300 ms until the watcher has seen one, rather
+            // than one file after a fixed 500 ms sleep.
+            //
+            // `watch()` returning means the handle is open, not that the server
+            // has registered the subscription, and under the full suite (36
+            // tests against one NAS at once) that gap grew past the sleep: the
+            // watcher armed after the CREATE and caught only the `modified`
+            // that the same `write_file`'s WRITE produced, so the test failed
+            // in the suite and passed alone. ❌ Don't "fix" it by sleeping
+            // longer — a loaded machine only ever makes the gap wider, which
+            // is the reasoning behind `wait_until` at the top of this file.
+            // Every file here carries a new name, so every one is an `added`:
+            // a late arm misses some and catches the next.
+            let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+            let writer_stop = std::rc::Rc::clone(&stop);
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = connect_client_to_nas().await;
                 let mut writer_share = writer_client
@@ -1564,51 +1569,58 @@ async fn watch_directory_on_nas() {
                     .await
                     .expect("tree connect failed (writer)");
 
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                writer_client
-                    .write_file(&mut writer_share, test_file_path, b"watch test")
-                    .await
-                    .expect("write_file failed");
-
-                println!("Writer: created {}", test_file_path);
-                (writer_client, writer_share)
+                let mut created = Vec::new();
+                for i in 0..30 {
+                    if writer_stop.get() {
+                        break;
+                    }
+                    let path = format!("_test/watch_probe/smb2_watch_test_{i}.tmp");
+                    writer_client
+                        .write_file(&mut writer_share, &path, b"watch test")
+                        .await
+                        .expect("write_file failed");
+                    created.push(path);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                (writer_client, writer_share, created)
             });
 
-            // Wait for the notification (with a timeout so we don't hang).
-            let events = tokio::time::timeout(Duration::from_secs(10), watcher.next_events())
-                .await
-                .expect("timed out waiting for change notification")
-                .expect("next_events failed");
-
-            println!("Received {} event(s):", events.len());
-            for event in &events {
-                println!("  {} {}", event.action, event.filename);
-            }
-
-            assert!(!events.is_empty(), "expected at least one event");
-
-            // We should see an Added event for our test file.
-            let added = events.iter().find(|e| e.action == FileNotifyAction::Added);
-            assert!(
-                added.is_some(),
-                "expected an Added event, got: {:?}",
-                events
-                    .iter()
-                    .map(|e| format!("{}: {}", e.action, e.filename))
-                    .collect::<Vec<_>>()
-            );
+            // Read batches until one carries an Added, bounded so a watcher
+            // that never fires fails instead of hanging.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut seen: Vec<String> = Vec::new();
+            let added = loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no Added event in 20 s; saw: {seen:?}"
+                );
+                let events = tokio::time::timeout(Duration::from_secs(10), watcher.next_events())
+                    .await
+                    .expect("timed out waiting for change notification")
+                    .expect("next_events failed");
+                for event in &events {
+                    println!("  {} {}", event.action, event.filename);
+                    seen.push(format!("{}: {}", event.action, event.filename));
+                }
+                if let Some(added) = events.iter().find(|e| e.action == FileNotifyAction::Added) {
+                    break added.filename.clone();
+                }
+            };
+            println!("Saw the Added event for {added}");
+            stop.set(true);
 
             // Close the watcher.
             watcher.close().await.expect("watcher close failed");
 
-            // Wait for the writer task and clean up.
-            let (mut writer_client, mut writer_share) = writer_task.await.unwrap();
-            writer_client
-                .delete_file(&mut writer_share, test_file_path)
-                .await
-                .expect("delete_file failed");
-            println!("Cleaned up {}", test_file_path);
+            // Wait for the writer task and clean up everything it made.
+            let (mut writer_client, mut writer_share, created) = writer_task.await.unwrap();
+            for path in &created {
+                writer_client
+                    .delete_file(&mut writer_share, path)
+                    .await
+                    .expect("delete_file failed");
+            }
+            println!("Cleaned up {} file(s)", created.len());
 
             let _ = writer_client.disconnect_share(&writer_share).await;
         })

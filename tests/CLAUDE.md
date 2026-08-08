@@ -42,7 +42,8 @@ cargo test --test integration -- --ignored --nocapture
 - Raspberry Pi at 192.168.1.150, share `PiHDD`, user `david`, SMB 3.1.1 signed (verified 2026-08-08). It took guest
   sessions on Debian buster and takes a real account on Debian 13 trixie / Samba 4.22.10, so a test here needs a
   password. `docs/notes/samba-4.9-compound-write-crash.md` records a compound-write panic that belonged to the old
-  Samba 4.9.5; whether 4.22 shares it is unverified.
+  Samba 4.9.5; 4.22.10 does not share it (re-checked on this box 2026-08-08), so the compound tests here run
+  unrestricted.
 - `SMB2_TEST_NAS_PASSWORD` and `SMB2_TEST_PI_PASSWORD` env vars (from `.env` file or shell). See `.env.example`.
 - **Both hosts are named once**, in `NAS_ADDR` / `PI_ADDR` / `USER` at the top of `integration.rs`. ❌ Don't inline an
   address at a call site: the Pi's was written out four times, so when the box moved, four tests failed at connect and

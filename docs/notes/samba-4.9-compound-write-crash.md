@@ -36,6 +36,9 @@ Raspberry Pi 4 (192.168.1.156), Debian buster, `samba 2:4.9.5+dfsg-5+deb10u1+rpi
 ## Who is affected
 
 - **Samba 4.20.6** (the crate's Docker fixtures): immune. 96 files / 16 concurrent / with a watcher, clean.
+- **Samba 4.22.10** (Debian 13 trixie, armhf): immune. Re-checked on the same Raspberry Pi that used to die, after it
+  was rebuilt on trixie (2026-08-08): `WS_CONC=1 WS_SMALL=4096`, the shape that killed 4.9.5 after two files, plus 96
+  files at 8 concurrent with a watcher. 0 failures, 0 core dumps, no `talloc` line in any log, `smbd` still active.
 - **QNAP TS-464, QTS, SMB 3.1.1**: immune. 768 files × 6 rounds, clean.
 - **Samba 4.9.5**: dies.
 
