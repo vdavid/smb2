@@ -8,6 +8,20 @@ use std::time::Duration;
 
 use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tree};
 
+// ── The two hosts ──────────────────────────────────────────────────────────
+//
+// Named once each, because they were not: the Pi's address and credentials sat
+// inline at four call sites, so when the box was rebuilt (new address, guest
+// access replaced by a real account) every Pi test in this file started failing
+// at connect and stayed that way. A host that moves should be a one-line edit.
+
+/// The NAS: a QNAP TS-464 on the LAN, share `naspi`.
+const NAS_ADDR: &str = "192.168.1.111:445";
+/// The Pi: a Raspberry Pi 4 on Debian trixie, share `PiHDD`.
+const PI_ADDR: &str = "192.168.1.150:445";
+/// The account both hosts share.
+const USER: &str = "david";
+
 /// Load .env file if present (no extra dependencies).
 fn load_dotenv() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
@@ -41,13 +55,49 @@ fn nas_password() -> String {
     )
 }
 
+/// Take a value a test needs, or skip the test saying what is missing.
+///
+/// `#[ignore]` already gates this whole file, so a run that gets here asked for
+/// the live suite: the gear simply is not there. ❌ Don't panic instead. These
+/// are exactly the boxes that get switched off — the Windows AD DC is an EC2
+/// instance nobody pays to leave running — and a suite that goes red whenever
+/// one is down stops being read at all, which costs it every real failure it
+/// would otherwise have caught.
+macro_rules! skip_unless {
+    ($value:expr, $why:expr) => {
+        match $value {
+            Some(value) => value,
+            None => {
+                println!("SKIP: {}", $why);
+                return;
+            }
+        }
+    };
+}
+
+/// An environment variable's value, or `None` when it is unset or empty.
+fn env_opt(key: &str) -> Option<String> {
+    load_dotenv();
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Get the Pi password from SMB2_TEST_PI_PASSWORD (env var or .env file).
+///
+/// The Pi took guest sessions once and takes a real account now, so these tests
+/// need a password where they used to pass two empty strings.
+fn pi_password() -> String {
+    load_dotenv();
+    std::env::var("SMB2_TEST_PI_PASSWORD").expect(
+        "SMB2_TEST_PI_PASSWORD not set. Copy .env.example to .env and fill in your password.",
+    )
+}
+
 #[tokio::test]
 #[ignore]
 async fn connect_and_list_directory_on_real_nas() {
     let _ = env_logger::try_init();
 
-    // Connect to 192.168.1.111.
-    let mut conn = Connection::connect("192.168.1.111:445", Duration::from_secs(5))
+    let mut conn = Connection::connect(NAS_ADDR, Duration::from_secs(5))
         .await
         .expect("failed to connect to NAS");
 
@@ -101,8 +151,7 @@ async fn connect_and_list_directory_on_real_nas() {
 async fn connect_and_list_directory_on_raspberry_pi() {
     let _ = env_logger::try_init();
 
-    // Connect to 192.168.1.156 (Raspberry Pi).
-    let mut conn = Connection::connect("192.168.1.156:445", Duration::from_secs(5))
+    let mut conn = Connection::connect(PI_ADDR, Duration::from_secs(5))
         .await
         .expect("failed to connect to Raspberry Pi");
 
@@ -115,8 +164,7 @@ async fn connect_and_list_directory_on_raspberry_pi() {
     println!("Max transact size: {}", params.max_transact_size);
     println!("Signing required: {}", params.signing_required);
 
-    // Authenticate as guest (empty username and password).
-    let session = Session::setup(&mut conn, "", "", "")
+    let session = Session::setup(&mut conn, USER, &pi_password(), "")
         .await
         .expect("session setup failed");
 
@@ -154,7 +202,7 @@ async fn connect_and_list_directory_on_raspberry_pi() {
 
 /// Helper: connect, negotiate, and authenticate to the QNAP NAS.
 async fn connect_to_nas() -> (Connection, Tree) {
-    let mut conn = Connection::connect("192.168.1.111:445", Duration::from_secs(5))
+    let mut conn = Connection::connect(NAS_ADDR, Duration::from_secs(5))
         .await
         .expect("failed to connect to NAS");
 
@@ -377,7 +425,7 @@ async fn create_and_delete_directory_on_nas() {
 async fn list_shares_on_nas() {
     let _ = env_logger::try_init();
 
-    let mut conn = Connection::connect("192.168.1.111:445", Duration::from_secs(5))
+    let mut conn = Connection::connect(NAS_ADDR, Duration::from_secs(5))
         .await
         .expect("failed to connect to NAS");
 
@@ -409,14 +457,13 @@ async fn list_shares_on_nas() {
 async fn list_shares_on_raspberry_pi() {
     let _ = env_logger::try_init();
 
-    let mut conn = Connection::connect("192.168.1.156:445", Duration::from_secs(5))
+    let mut conn = Connection::connect(PI_ADDR, Duration::from_secs(5))
         .await
         .expect("failed to connect to Raspberry Pi");
 
     conn.negotiate().await.expect("negotiate failed");
 
-    // Guest access
-    let _session = Session::setup(&mut conn, "", "", "")
+    let _session = Session::setup(&mut conn, USER, &pi_password(), "")
         .await
         .expect("session setup failed");
 
@@ -438,7 +485,7 @@ async fn list_shares_on_raspberry_pi() {
 /// Helper: create an SmbClient connected to the QNAP NAS.
 async fn connect_client_to_nas() -> SmbClient {
     SmbClient::connect(ClientConfig {
-        addr: "192.168.1.111:445".to_string(),
+        addr: NAS_ADDR.to_string(),
         timeout: Duration::from_secs(5),
         username: "david".to_string(),
         password: nas_password(),
@@ -880,7 +927,7 @@ async fn debug_rapid_pipelined_writes() {
     let _ = env_logger::try_init();
 
     let config = ClientConfig {
-        addr: "192.168.1.111:445".into(),
+        addr: NAS_ADDR.into(),
         timeout: Duration::from_secs(5),
         username: "david".into(),
         password: nas_password(),
@@ -942,7 +989,7 @@ async fn micro_benchmark_smb2_vs_native() {
 
     // --- smb2 setup ---
     let config = ClientConfig {
-        addr: "192.168.1.111:445".into(),
+        addr: NAS_ADDR.into(),
         timeout: Duration::from_secs(5),
         username: "david".into(),
         password: nas_password(),
@@ -1111,12 +1158,12 @@ async fn micro_benchmark_smb2_vs_native() {
 async fn compound_read_and_write_on_raspberry_pi() {
     let _ = env_logger::try_init();
 
-    let mut conn = Connection::connect("192.168.1.156:445", Duration::from_secs(5))
+    let mut conn = Connection::connect(PI_ADDR, Duration::from_secs(5))
         .await
         .expect("failed to connect to Pi");
     conn.negotiate().await.expect("negotiate failed");
 
-    let session = Session::setup(&mut conn, "", "", "")
+    let session = Session::setup(&mut conn, USER, &pi_password(), "")
         .await
         .expect("session setup failed");
 
@@ -1294,10 +1341,10 @@ async fn streaming_upload_small_file_uses_compound() {
 /// Helper: create an SmbClient connected to the Raspberry Pi.
 async fn connect_client_to_pi() -> SmbClient {
     SmbClient::connect(ClientConfig {
-        addr: "192.168.1.156:445".to_string(),
+        addr: PI_ADDR.to_string(),
         timeout: Duration::from_secs(5),
-        username: String::new(),
-        password: String::new(),
+        username: USER.to_string(),
+        password: pi_password(),
         domain: String::new(),
         auto_reconnect: false,
         compression: true,
@@ -1481,19 +1528,35 @@ async fn watch_directory_on_nas() {
                 .await
                 .expect("tree connect failed (watcher)");
 
-            // Make sure the test directory exists.
+            // A directory of its own, NOT the shared `_test/`. Six other tests
+            // in this file create and delete things directly in `_test/`, and
+            // `cargo test` runs them concurrently, so watching the parent means
+            // watching every one of them: this asserted on an Added event and
+            // got another test's `removed: smb2-illegal-names`. A watch test
+            // has to own its watch scope or it is testing the scheduler.
             let _ = watcher_client
                 .create_directory(&mut watcher_share, "_test")
                 .await;
-
-            // Start watching the _test/ directory (non-recursive).
-            let mut watcher = watcher_client
-                .watch(&watcher_share, "_test/", false)
-                .await
-                .expect("watch failed");
+            let _ = watcher_client
+                .create_directory(&mut watcher_share, "_test/watch_probe")
+                .await;
 
             // Spawn a local task to create a file after a short delay.
-            let test_file_path = "_test/smb2_watch_test.tmp";
+            let test_file_path = "_test/watch_probe/smb2_watch_test.tmp";
+
+            // Clear a leftover from an interrupted run BEFORE the watch opens.
+            // Writing over a file that already exists is a `modified`, not an
+            // `Added`, so without this one failed run makes every later run
+            // fail for a different reason than the first.
+            let _ = watcher_client
+                .delete_file(&mut watcher_share, test_file_path)
+                .await;
+
+            // Start watching it (non-recursive).
+            let mut watcher = watcher_client
+                .watch(&watcher_share, "_test/watch_probe/", false)
+                .await
+                .expect("watch failed");
             let writer_task = tokio::task::spawn_local(async move {
                 let mut writer_client = connect_client_to_nas().await;
                 let mut writer_share = writer_client
@@ -1803,10 +1866,18 @@ async fn nas_accepts_stacked_change_notify() {
 async fn kerberos_auth_against_docker_kdc() {
     let _ = env_logger::try_init();
 
-    // Connect to the Docker Samba server with Kerberos
-    let mut conn = Connection::connect("127.0.0.1:10462", Duration::from_secs(5))
-        .await
-        .expect("failed to connect to Docker Samba");
+    // ⚠️ Nothing in `tests/docker/internal/docker-compose.yml` serves this port
+    // today: the Docker AD DC was abandoned because Samba's AD DC does not run
+    // on macOS (`tests/CLAUDE.md` § AWS integration tests), leaving
+    // `smb-kerberos/Dockerfile` orphaned. So this skips rather than fails, and
+    // starts working again the day a service is wired back up.
+    let mut conn = skip_unless!(
+        Connection::connect("127.0.0.1:10462", Duration::from_secs(5))
+            .await
+            .ok(),
+        "no Kerberos-capable Samba on 127.0.0.1:10462 — the Docker AD DC is not part of the \
+         compose set; Kerberos is covered against real AD by the AWS tests below"
+    );
 
     conn.negotiate().await.expect("negotiate failed");
 
@@ -1859,11 +1930,14 @@ async fn kerberos_auth_against_docker_kdc() {
 async fn kerberos_auth_against_aws_windows_ad() {
     let _ = env_logger::try_init();
 
-    load_dotenv();
-    let server_ip = std::env::var("SMB2_TEST_AWS_AD_IP")
-        .expect("SMB2_TEST_AWS_AD_IP not set (public IP of the Windows AD DC)");
-    let server_hostname = std::env::var("SMB2_TEST_AWS_AD_HOSTNAME").expect(
-        "SMB2_TEST_AWS_AD_HOSTNAME not set (computer name of the DC, e.g. EC2AMAZ-XXXXXXX)",
+    let server_ip = skip_unless!(
+        env_opt("SMB2_TEST_AWS_AD_IP"),
+        "SMB2_TEST_AWS_AD_IP not set (public IP of the Windows AD DC). The DC is an on-demand \
+         EC2 instance; see tests/CLAUDE.md § AWS integration tests to bring one up"
+    );
+    let server_hostname = skip_unless!(
+        env_opt("SMB2_TEST_AWS_AD_HOSTNAME"),
+        "SMB2_TEST_AWS_AD_HOSTNAME not set (computer name of the DC, e.g. EC2AMAZ-XXXXXXX)"
     );
 
     println!("Connecting to AWS Windows AD at {}...", server_ip);
@@ -1932,12 +2006,18 @@ async fn kerberos_auth_against_aws_windows_ad() {
 async fn kerberos_auth_from_ccache() {
     let _ = env_logger::try_init();
 
-    load_dotenv();
-    let server_ip = std::env::var("SMB2_TEST_AWS_AD_IP").expect("SMB2_TEST_AWS_AD_IP not set");
-    let server_hostname =
-        std::env::var("SMB2_TEST_AWS_AD_HOSTNAME").expect("SMB2_TEST_AWS_AD_HOSTNAME not set");
-    let ccache_path = std::env::var("SMB2_TEST_CCACHE")
-        .expect("SMB2_TEST_CCACHE not set (path to a file-based Kerberos ccache)");
+    let server_ip = skip_unless!(
+        env_opt("SMB2_TEST_AWS_AD_IP"),
+        "SMB2_TEST_AWS_AD_IP not set; see tests/CLAUDE.md § AWS integration tests"
+    );
+    let server_hostname = skip_unless!(
+        env_opt("SMB2_TEST_AWS_AD_HOSTNAME"),
+        "SMB2_TEST_AWS_AD_HOSTNAME not set"
+    );
+    let ccache_path = skip_unless!(
+        env_opt("SMB2_TEST_CCACHE"),
+        "SMB2_TEST_CCACHE not set (path to a file-based Kerberos ccache)"
+    );
 
     let spn_hostname = std::env::var("SMB2_TEST_AWS_AD_SPN")
         .unwrap_or_else(|_| format!("{}.test.local", server_hostname.to_lowercase()));
@@ -2267,7 +2347,7 @@ async fn bench_100_tiny_files_seq_vs_parallel() {
     // concurrent ops per connection without a pool. Closer to the real
     // per-session ceiling than the N-connections run above.
     let p3_conn_setup_start = std::time::Instant::now();
-    let mut p3_conn = Connection::connect("192.168.1.111:445", Duration::from_secs(5))
+    let mut p3_conn = Connection::connect(NAS_ADDR, Duration::from_secs(5))
         .await
         .expect("p3 Connection::connect");
     p3_conn.negotiate().await.expect("p3 negotiate");

@@ -39,9 +39,22 @@ cargo test --test integration -- --ignored --nocapture
 
 **Requirements:**
 - QNAP NAS at 192.168.1.111 (NTLM auth, SMB 3.1.1, AES-GMAC signing)
-- Raspberry Pi at 192.168.1.156 (guest access, SMB 3.1.1). ⚠️ Its Samba 4.9.5 panics on repeated compound writes:
-  `docs/notes/samba-4.9-compound-write-crash.md`.
-- `SMB2_TEST_NAS_PASSWORD` env var (from `.env` file or shell). See `.env.example`.
+- Raspberry Pi at 192.168.1.150, share `PiHDD`, user `david`, SMB 3.1.1 signed (verified 2026-08-08). It took guest
+  sessions on Debian buster and takes a real account on Debian 13 trixie / Samba 4.22.10, so a test here needs a
+  password. `docs/notes/samba-4.9-compound-write-crash.md` records a compound-write panic that belonged to the old
+  Samba 4.9.5; whether 4.22 shares it is unverified.
+- `SMB2_TEST_NAS_PASSWORD` and `SMB2_TEST_PI_PASSWORD` env vars (from `.env` file or shell). See `.env.example`.
+- **Both hosts are named once**, in `NAS_ADDR` / `PI_ADDR` / `USER` at the top of `integration.rs`. ❌ Don't inline an
+  address at a call site: the Pi's was written out four times, so when the box moved, four tests failed at connect and
+  nobody could tell it was one fact that had changed.
+- **A test that mutates a share owns its own subdirectory.** `cargo test` runs these concurrently against ONE real
+  server, so a watch on a shared parent picks up whatever the neighbours are doing (`watch_directory_on_nas` asserted
+  on its own Added event and got another test's `removed: smb2-illegal-names`). Clean up leftovers before asserting,
+  too: a run interrupted mid-test leaves a file behind, and a write over an existing file is a `modified` rather than
+  an `Added`.
+- **Gear that is absent skips, it does not fail.** `skip_unless!` prints what is missing and returns. The AWS Windows
+  AD DC is an on-demand EC2 instance and the Docker KDC was abandoned entirely, so panicking on them left `just
+  check-live` permanently red, which is how a suite stops being read.
 
 **What they cover:** Connect, negotiate, auth (NTLM + guest), tree connect, list directory, read/write/delete file, stat, create/delete directory, compound read/write, pipelined I/O, streaming download/upload with progress, reconnect, share enumeration, file watching, disk space, rename, and filenames carrying characters SMB2 forbids (`nas_stores_an_illegal_name_the_way_macos_does`, against real QNAP firmware rather than a container). Also a micro-benchmark comparing smb2 vs native macOS SMB.
 
