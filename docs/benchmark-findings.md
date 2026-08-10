@@ -331,10 +331,11 @@ latency (composition-independent evidence), and cold client throughput ~3.8x at 
 
 ### Expected gains
 
-- **(a) Compound CREATE + QUERY + CLOSE in one frame:** saves the ~8 ms of CREATE + CLOSE (2 of ~4 round trips). On
-  **warm** listings that's ~25% off the ~32 ms per-dir wire time (more on small dirs, where the QUERY is cheap) — a real
-  win for interactive browsing and warm re-scans. On **cold** listings it's ~7%: the metadata-bound QUERY (114 ms) dwarfs
-  the fixed overhead, so compounding does **not** speed up the cold index scan.
+- **(a) Compound CREATE + the first QUERY:** could save the ~4 ms CREATE round trip. CLOSE cannot safely join that
+  compound: a successful QUERY_DIRECTORY response has no "last batch" bit, so only a subsequent
+  `STATUS_NO_MORE_FILES` reply proves the scan is complete. On **warm** listings the CREATE saving is potentially useful;
+  on **cold** listings the metadata-bound QUERY (114 ms) dwarfs it. The compound partial-failure and first-batch
+  buffering complexity is not justified by the current measurements, so skip it for now.
 - **(b) Bigger QUERY_DIRECTORY buffer (>64 KiB):** no measurable win on this tree; dirs are small enough to finish in one
   data round trip at 64 KiB. Only worth it for pathological dirs with hundreds-to-thousands of entries. Skip for now.
 - **(c) Multiple TCP connections:** the single biggest throughput lever, and it helps **both** regimes. Warm scales

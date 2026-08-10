@@ -79,6 +79,9 @@ nt_status_codes! {
     /// The requested operation is not implemented.
     NOT_IMPLEMENTED = 0xC000_0002, "STATUS_NOT_IMPLEMENTED";
 
+    /// The requested file information class is not supported.
+    INVALID_INFO_CLASS = 0xC000_0003, "STATUS_INVALID_INFO_CLASS";
+
     /// An invalid parameter was passed to a service or function.
     INVALID_PARAMETER = 0xC000_000D, "STATUS_INVALID_PARAMETER";
 
@@ -394,6 +397,7 @@ mod tests {
         let errors = [
             NtStatus::UNSUCCESSFUL,
             NtStatus::NOT_IMPLEMENTED,
+            NtStatus::INVALID_INFO_CLASS,
             NtStatus::INVALID_PARAMETER,
             NtStatus::NO_SUCH_DEVICE,
             NtStatus::NO_SUCH_FILE,

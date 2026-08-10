@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tree};
+use smb2::client::{
+    list_shares, ClientConfig, Connection, RenameOptions, Session, SmbClient, Tree,
+};
 
 const GUEST_ADDR: &str = "127.0.0.1:10445";
 const AUTH_ADDR: &str = "127.0.0.1:10446";
@@ -144,6 +146,60 @@ async fn guest_write_read_delete() {
 
 #[tokio::test]
 #[ignore]
+async fn guest_rename_honors_atomic_replace_option() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+    let source = "docker_test_rename_source.tmp";
+    let destination = "docker_test_rename_destination.tmp";
+    let _ = tree.delete_file(&mut conn, source).await;
+    let _ = tree.delete_file(&mut conn, destination).await;
+
+    tree.write_file(&mut conn, source, b"source")
+        .await
+        .expect("write source failed");
+    tree.write_file(&mut conn, destination, b"destination")
+        .await
+        .expect("write destination failed");
+
+    let conflict = tree
+        .rename(&mut conn, source, destination)
+        .await
+        .expect_err("no-replace rename must preserve an existing destination");
+    assert_eq!(conflict.kind(), smb2::ErrorKind::AlreadyExists);
+    assert_eq!(tree.read_file(&mut conn, source).await.unwrap(), b"source");
+    assert_eq!(
+        tree.read_file(&mut conn, destination).await.unwrap(),
+        b"destination"
+    );
+
+    tree.rename_with_options(
+        &mut conn,
+        source,
+        destination,
+        RenameOptions {
+            replace_if_exists: true,
+        },
+    )
+    .await
+    .expect("replace rename failed");
+    assert_eq!(
+        tree.read_file(&mut conn, destination).await.unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        tree.stat(&mut conn, source).await.unwrap_err().kind(),
+        smb2::ErrorKind::NotFound
+    );
+
+    tree.delete_file(&mut conn, destination)
+        .await
+        .expect("cleanup failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn guest_stat_file() {
     let _ = env_logger::try_init();
 
@@ -163,6 +219,66 @@ async fn guest_stat_file() {
         .await
         .expect("delete_file failed");
     tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_listing_stat_and_mutation_handle_share_stable_identity() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    let source = "docker_test_identity_source.tmp";
+    let destination = "docker_test_identity_destination.tmp";
+    let _ = client.delete_file(&mut tree, source).await;
+    let _ = client.delete_file(&mut tree, destination).await;
+    client
+        .write_file(&mut tree, source, b"identity")
+        .await
+        .expect("write identity fixture");
+
+    let stat = tree
+        .stat(client.connection_mut(), source)
+        .await
+        .expect("stat identity fixture");
+    let identity = stat.identity.expect("Samba returned no stable identity");
+    let mut reader = client
+        .open_directory_reader(&mut tree, "")
+        .await
+        .expect("open directory reader");
+    let mut listed = None;
+    while let Some(entries) = reader.next_batch().await.expect("directory batch") {
+        if let Some(entry) = entries.into_iter().find(|entry| entry.name == source) {
+            listed = Some(entry);
+        }
+    }
+    let listed = listed.expect("identity fixture missing from directory listing");
+    assert_eq!(listed.changed, stat.changed);
+    assert_eq!(listed.file_index, Some(identity.index_number));
+
+    let handle = client
+        .open_mutation_handle(&tree, source)
+        .await
+        .expect("open exact mutation handle");
+    assert_eq!(handle.info().identity, Some(identity));
+    handle
+        .rename(destination, RenameOptions::default())
+        .await
+        .expect("rename exact mutation handle");
+    let renamed = tree
+        .stat(client.connection_mut(), destination)
+        .await
+        .expect("stat renamed identity fixture");
+    assert_eq!(renamed.identity, Some(identity));
+
+    client
+        .delete_file(&mut tree, destination)
+        .await
+        .expect("cleanup identity fixture");
+    client.disconnect_share(&tree).await.expect("disconnect");
 }
 
 #[tokio::test]
@@ -714,6 +830,65 @@ async fn guest_streaming_upload() {
         .disconnect_share(&tree)
         .await
         .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_writer_checkpoints_resume_at_an_absolute_existing_offset() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    let path = "docker_test_checkpoint_resume.tmp";
+    let missing = "docker_test_checkpoint_missing.tmp";
+    let _ = client.delete_file(&mut tree, path).await;
+    let _ = client.delete_file(&mut tree, missing).await;
+
+    let mut writer = client
+        .create_file_writer_exclusive(&tree, path)
+        .await
+        .expect("create checkpoint writer");
+    writer.write_chunk(b"durable-").await.expect("write prefix");
+    assert_eq!(writer.flush_checkpoint().await.unwrap(), 8);
+    writer.write_chunk(b"prefix").await.expect("write suffix");
+    assert_eq!(writer.flush_checkpoint().await.unwrap(), 14);
+    assert_eq!(writer.finish().await.unwrap(), 14);
+    let identity = client
+        .stat(&mut tree, path)
+        .await
+        .expect("stat checkpoint")
+        .identity
+        .expect("server exposes stable file identity");
+
+    let mut resumed = client
+        .open_existing_file_writer_at(&tree, path, 14, identity)
+        .await
+        .expect("resume existing checkpoint");
+    resumed
+        .write_chunk(b"!")
+        .await
+        .expect("append after resume");
+    assert_eq!(resumed.flush_checkpoint().await.unwrap(), 15);
+    assert_eq!(resumed.finish().await.unwrap(), 1);
+    assert_eq!(
+        client.read_file(&mut tree, path).await.unwrap(),
+        b"durable-prefix!"
+    );
+
+    let error = match client
+        .open_existing_file_writer_at(&tree, missing, 4096, identity)
+        .await
+    {
+        Ok(_) => panic!("existing-only resume created a missing checkpoint"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), smb2::ErrorKind::NotFound);
+
+    client.delete_file(&mut tree, path).await.expect("cleanup");
+    client.disconnect_share(&tree).await.expect("disconnect");
 }
 
 // ── Write with progress and cancellation (smb-guest) ─────────────────
@@ -2210,6 +2385,77 @@ async fn dfs_list_directory_through_link() {
         .disconnect_share(&tree)
         .await
         .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_routed_streaming_handles_pin_the_target_and_keep_root_immutable() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+    let canonical = (tree.server.clone(), tree.share_name.clone(), tree.tree_id);
+
+    let reader = client
+        .open_file_reader_routed(&tree, "data/hello.txt")
+        .await
+        .expect("routed reader open failed");
+    let contents = reader
+        .read_at(0, reader.size())
+        .await
+        .expect("routed read failed");
+    reader.close().await.expect("reader close failed");
+    assert_eq!(
+        String::from_utf8(contents).unwrap().trim(),
+        "Hello from DFS target!"
+    );
+
+    let mut directory = client
+        .open_directory_reader_routed(&tree, "data")
+        .await
+        .expect("routed directory open failed");
+    let mut names = Vec::new();
+    while let Some(entries) = directory.next_batch().await.unwrap() {
+        names.extend(entries.into_iter().map(|entry| entry.name));
+    }
+    directory.close().await.unwrap();
+    assert!(names.iter().any(|name| name == "hello.txt"));
+
+    let test_path = "data/docker_dfs_routed_writer.tmp";
+    let payload = b"routed writer payload";
+    let mut writer = client
+        .create_file_writer_routed(&tree, test_path)
+        .await
+        .expect("routed writer open failed");
+    writer.write_chunk(payload).await.unwrap();
+    assert_eq!(
+        writer.flush_checkpoint().await.unwrap(),
+        payload.len() as u64
+    );
+    assert_eq!(writer.finish().await.unwrap(), payload.len() as u64);
+
+    let verify = client
+        .open_file_reader_routed(&tree, test_path)
+        .await
+        .expect("routed verify reader open failed");
+    assert_eq!(verify.read_at(0, verify.size()).await.unwrap(), payload);
+    verify.close().await.unwrap();
+
+    assert_eq!(
+        (tree.server.clone(), tree.share_name.clone(), tree.tree_id),
+        canonical,
+        "routed opens must not rewrite the DFS root tree"
+    );
+
+    let mut cleanup_tree = tree.clone();
+    client
+        .delete_file(&mut cleanup_tree, test_path)
+        .await
+        .expect("cleanup failed");
+    client.disconnect_share(&tree).await.unwrap();
 }
 
 #[tokio::test]

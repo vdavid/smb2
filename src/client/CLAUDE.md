@@ -10,7 +10,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `connection.rs` | `Connection` -- message sequencing, response deadline, signing, encryption, `execute` / `execute_compound` |
 | `credits.rs` | `CreditPool` -- the connection-wide credit budget and the send-side gate |
 | `session.rs` | `Session::setup()` -- NTLM auth, key derivation, signing/encryption activation |
-| `tree.rs` | `Tree` -- share connection, file CRUD, compound and pipelined I/O |
+| `tree.rs` | `Tree` -- share connection, file CRUD, exact `MutationHandle`, compound and pipelined I/O |
 | `stream.rs` | `FileDownload` / `FileReader` (random-access positioned reads) / `FileUpload` / `FileWriter` (owns `Connection` + `Arc<Tree>`, `'static`) / `open_file_writer` / `open_file_reader` -- streaming and positioned I/O |
 | `watcher.rs` | `Watcher` -- directory change notifications via CHANGE_NOTIFY long-poll |
 | `pipeline.rs` | `Pipeline` / `Op` / `OpResult` -- batched concurrent operations (the core feature) |
@@ -38,6 +38,7 @@ Full model, rationale, and the incident behind it: `credits.rs` module docs.
 
 - **Credits are reserved on send, never on receipt.** `CreditPool` (`credits.rs`) is a `Semaphore`, one permit per unspent credit; `Inner::reserve_credits` takes the charge before the bytes go out, and only a `CreditResponse` grant puts permits back. Accounting on the response instead makes every in-flight request invisible, which is how concurrent streams over one connection out-spend the server's window and get themselves silently cut off.
 - **The budget is per connection**, on the `Arc<Inner>` every clone shares. ❌ Don't add a per-stream credit check: `conn.credits()` is a gauge, not a gate, and second-guessing the pool can only under-send. The pipelined loops queue against `MAX_PIPELINE_WINDOW` alone for exactly this reason.
+- A reservation retains the exact semaphore generation it debited. If reconnect resets the pool before an unsent request unwinds, its refund stays with the retired session instead of inflating the new session's one-credit starting budget.
 - Multi-credit requests (reads/writes > 64 KB) charge `ceil(payload_size / 65536)` credits and use that many consecutive `MessageId` values. Gaps in `MessageId` sequences cause the server to drop the connection.
 - A short send parks until a grant arrives, bounded so it can't become a starvation hang: nothing outstanding to fund the wait → immediate `Error::CreditStarvation`; connection death → `CreditPool::close` wakes every waiter; otherwise the 30 s `set_credit_wait_timeout` deadline.
 - Every request asks for its own charge back plus enough to reach a 512-credit target. ❌ Don't flatten this to a constant: asking for less than the charge lets the window shrink to nothing and serializes every transfer.
@@ -139,16 +140,19 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 - **Read compound**: CREATE + READ + CLOSE (3 ops, 1 round-trip). Default for `read_file`.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
-- **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.
-- **Stat compound**: CREATE + QUERY_INFO (basic) + QUERY_INFO (standard) + CLOSE (4 ops, 1 round-trip). Default for `stat`.
+- **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). `rename` keeps no-replace semantics; `rename_with_options` sets SMB `ReplaceIfExists` directly when requested and never emulates it with delete + rename.
+- **Exact mutation handle**: `open_mutation_handle` returns metadata and optional stable identity queried from the same CREATE handle later consumed by `rename`, `delete`, or `close`. It records the connection generation and session ID and uses session-bound requests, so an in-place reconnect can never reuse its old `TreeId`/`FileId` against the replacement session. Consumers that must prevent a stat-to-mutation race use this instead of separate path operations.
+- **Stat compound**: CREATE + QUERY_INFO (basic + standard + internal + volume) + CLOSE (6 ops, 1 round-trip). Default for `stat`; the last two queries form optional stable identity.
 - **Fs-info compound**: CREATE + QUERY_INFO (FileFsFullSizeInformation) + CLOSE (3 ops, 1 round-trip). Default for `fs_info`.
-- If CREATE succeeds but a later op fails, the client issues a standalone CLOSE to avoid leaking the handle.
+- If CREATE succeeds but a later op fails, the client issues a standalone CLOSE to avoid leaking the handle. For `stat`, the optional identity query can make a related CLOSE inherit its failure status; both single and batch stat detect that CLOSE response and retry it standalone while still returning metadata with `identity: None`.
 
 ### Receiving compound responses
 
 `execute_compound` returns `Result<Vec<Result<Frame>>>`. The outer `Result` is "did the compound hit the wire"; the inner one is per-sub-op (waiter-level: session expired, signature verify, connection dropped mid-await). Sub-op protocol status codes (`STATUS_OBJECT_NAME_NOT_FOUND` etc.) ride in the inner frame's `header.status`, not the inner `Result`. Per MS-SMB2 3.3.4.1.3 the server MAY split the compound response across multiple transport frames (Samba, QNAP, Windows Server in some cases); the receiver task routes each sub-response by `MessageId` so the per-waiter `oneshot::Receiver`s resolve independently and `execute_compound` reassembles the result vector in submission order.
 
 Most callers use a small `all_or_first_err` helper (see `tree.rs`) that propagates the first inner `Err` as the outer `Err` and hands back a `Vec<Frame>` indexable per sub-op. It takes the expected frame count and errors on a mismatch, because every caller indexes fixed positions (`responses[2]`) straight afterwards and a short chain would otherwise panic. Tolerating partial failure (for example, CREATE ok, READ fails → issue standalone CLOSE with the create's returned `FileId`) keeps the individual inner `Result`s.
+
+Handle- and tree-scoped owned operations use the crate-internal `execute_bound` / `execute_with_credits_bound` / `execute_compound_bound` variants. They check the expected generation before and after credit reservation and, critically, write the expected session ID into the request header. If revival races the final send, the replacement session therefore cannot accept IDs allocated by its predecessor; the request fails closed instead of relying only on a racy before/after check.
 
 ## Batch operations
 
@@ -170,7 +174,22 @@ Reactive DFS resolution with multi-target failover. When a convenience method ge
 **Key design decisions:**
 - Convenience methods take `&mut Tree` (not `&Tree`) so DFS can update the tree in-place
 - `disconnect_share` stays as `&Tree` (no redirect on teardown)
-- Streaming methods (`download`, `upload`) keep `&Tree` because they return handles that borrow the tree for their lifetime
+- Owned stream entry points have explicit immutable routed variants:
+  `open_directory_reader_routed`, `open_file_reader_routed`,
+  `create_file_writer_routed`, `create_file_writer_exclusive_routed`, and
+  `create_file_writer_at_routed`, `open_existing_file_writer_at_routed`, and
+  `open_mutation_handle_routed`. They retry only an initial
+  `STATUS_PATH_NOT_COVERED`, bind the returned handle to the selected target
+  connection, and never mutate the caller's canonical `Tree`. A connection or
+  session failure during a writer CREATE is never replayed.
+- Routed target tree-connects are cached per `(server, share)` in `SmbClient`
+  and shared by owned handles; this avoids one leaked TreeId per stream. Each
+  entry also records its connection generation and session ID. A dead extra
+  connection is replaced, and any epoch mismatch invalidates the cached tree
+  before a fresh TREE_CONNECT. Explicit reconnect and `disconnect_share` also
+  invalidate their affected entries.
+- Legacy borrowed streaming methods (`download`, `upload`) keep `&Tree`; they
+  are direct, non-routed APIs.
 - `watch` now returns an *owned* `Watcher` (no lifetime); see the [Watcher pipelining](#watcher-pipelining) section
 - Batch methods (`delete_files`, `rename_files`, `stat_files`) don't retry per-file; the caller should trigger one single-file operation first to resolve the redirect
 - `dfs_enabled` flag on `ClientConfig` (default `true`) gates all DFS resolution
@@ -192,15 +211,41 @@ Pinned by `client::watcher::loss_window_tests::watcher_does_not_lose_events_betw
 
 For large files, `read_file_pipelined` / `write_file_pipelined` issue multiple `execute_with_credits` calls concurrently on cloned connections via `futures_util::stream::FuturesUnordered`. The sliding window stays at 32 in-flight requests; credits are not checked here (the connection's pool gates every send). Chunk size is `min(512 KB, max_read_size)`. This is the core performance feature -- without it, throughput is ~10x worse.
 
-`FileWriter` owns its `Connection` (cheap `Arc::clone`) and `Arc<Tree>` — no lifetime parameter, no borrow against the `SmbClient` that built it. It keeps an owned `FuturesUnordered<BoxedWriteFut>` field — `launch_wire_chunk` pushes a boxed `execute_with_credits` future, `drain_one` awaits `in_flight.next()`, and the public `write_chunk` / `finish` / `abort` drive that state machine.
+`FileWriter` owns its `Connection` (cheap `Arc::clone`) and `Arc<Tree>` — no lifetime parameter, no borrow against the `SmbClient` that built it. It keeps an owned `FuturesUnordered<BoxedWriteFut>` field — `launch_wire_chunk` pushes a boxed session-bound WRITE future, `drain_one` awaits `in_flight.next()`, and the public `write_chunk` / `flush_checkpoint` / `finish` / `abort` drive that state machine. The writer records the generation and session that created its handle; a revival makes later WRITE/FLUSH/CLOSE calls return `Disconnected` without putting the stale IDs on the new session.
 
-FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, with the sliding window handling backpressure. Complement to FileDownload (read streaming). Build one via `open_file_writer(tree, conn, path)` (free function), `Tree::create_file_writer(&Arc<Self>, conn, path)`, or `SmbClient::create_file_writer(&self, tree, path)` — the last clones the client's primary connection internally for convenience.
+`ClientConfig` has a custom `Debug` that always emits `<redacted>` for its password, including guest configs. Every retained password holder (`ClientConfig`, the connection-owned `ClientReviver`, NTLM credentials, and Kerberos credentials) implements `ZeroizeOnDrop`; all clones therefore clear their own username/password/domain-or-realm buffers when their final owner drops. Keep these implementations in sync with any future type that retains a password.
+
+Because `ClientConfig` and the public credential structs implement `Drop`, callers cannot move individual public fields out of an owned value; they must borrow or clone them. Zeroization clears the currently owned `String` buffers, not caller-owned clones, allocator copies, or swapped memory.
+
+FileWriter provides push-based pipelined writes. The consumer pushes chunks at their own pace via `write_chunk`, with the sliding window handling backpressure. Complement to FileDownload (read streaming). Build one via `open_file_writer(tree, conn, path)` (free function), `Tree::create_file_writer(&Arc<Self>, conn, path)`, or `SmbClient::create_file_writer(&self, tree, path)` — the last clones the client's primary connection internally for convenience. Resume code uses `open_existing_file_writer_at` (or its routed wrapper) and passes the checkpoint's `FileIdentity`: its compounded `FileOpen` + two QUERY_INFO requests prove the retained write handle is still the same file, and CREATE's `EndOfFile` must be at least the resume offset. Missing, replaced, identity-unavailable, and truncated targets all close the handle and fail before any WRITE.
 
 ## Random-access reads (`FileReader`)
 
 `FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&self, tree, path)` (clones the primary connection).
 
 Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
+
+## Incremental directory enumeration (`DirectoryReader`)
+
+`DirectoryReader` owns a cloned `Connection`, a copied `TreeId`, the connection generation and session ID, and one open directory handle. It deliberately does not retain an `Arc<Tree>`: QUERY_DIRECTORY and CLOSE only need the tree ID, so copying the full `Tree` (including its server/share strings) would add avoidable heap allocations to every listing. `next_batch()` issues exactly one QUERY_DIRECTORY and returns that response's entries, so memory use is bounded by the negotiated query buffer instead of the directory's total entry count. The first query sets `SMB2_RESTART_SCANS`; later queries continue the same enumeration. `STATUS_NO_MORE_FILES` closes automatically and returns `None`; early exit requires explicit `close()`. Query failures preserve the query error while attempting CLOSE, matching `list_directory`'s error precedence. `list_directory` now collects this reader, keeping the one-shot API and streaming API on the same wire path.
+
+The reader's `Ready → Querying → Ready/Closing → Done` state machine owns boxed QUERY_DIRECTORY and CLOSE futures before polling them. This is a higher-level cancellation invariant than `Connection`'s drop safety: dropping a `next_batch()` future must keep the same request/response alive because the server-side enumeration cursor may already have advanced. The next call resumes that future instead of issuing another query and silently skipping a batch. Cancelling during EOF cleanup likewise retains the CLOSE waiter. Explicit `close()` drains a pending query before closing so two operations cannot race on the stateful handle. Transport/session errors are terminal and are never retried against the cursor. Because `Connection` clones revive in place, every QUERY checks the generation and session ID captured before CREATE; after detecting a mismatch it returns `Disconnected` without reusing the old `TreeId`/`FileId`, and CLOSE becomes a local no-op because teardown already released the old session's handle. Only `SmbClient::open_directory_reader` may reconnect and retry the initial CREATE, before a reader or any entries have been returned.
+
+Directory queries prefer `FileIdFullDirectoryInformation`: its fixed record is
+80 bytes rather than the 104-byte `FileIdBothDirectoryInformation` layout and
+does not carry the unused DOS short-name field. If the server returns
+`STATUS_NOT_SUPPORTED` or `STATUS_INVALID_INFO_CLASS`, the same open scan is
+restarted with `FileBothDirectoryInformation`; entries then retain all exposed
+metadata but have `file_index: None`. On the preferred path each entry includes
+`ChangeTime` and the server's 64-bit file index. A zero index is `None`, exactly
+as MS-FSCC requires; it is never promoted into a stable identity. `Tree::stat`
+returns the same change time and an optional public
+`FileIdentity`, assembled from `FileInternalInformation` plus
+`FileFsVolumeInformation` in the same compound as the basic metadata. Both
+queries must succeed and the file index must be non-zero; an index without its
+volume is never reported as stable identity. The identity sub-queries are
+deliberately optional: old or limited servers still return useful metadata,
+but callers can fail closed when an operation needs exact source identity.
 
 ## Server-side copy (`copy.rs`)
 
@@ -231,7 +276,8 @@ loops with non-default `chunk_size`. Most users shouldn't need this — `read_fi
 and `Tree::download` / `SmbClient::download` handle the streaming case.
 
 FileWriter has two terminal operations:
-- `finish()` — send all buffered data, drain in-flight WRITEs, FLUSH (fsync on the server), CLOSE. Use on normal completion.
+- `flush_checkpoint()` — send all buffered data, drain in-flight WRITEs, FLUSH, and return the absolute durable file offset without closing. Its offset changes only after FLUSH succeeds. The unsent stash remains owned by `FileWriter` across every await, so cancelling the checkpoint cannot lose accepted bytes or advance durable progress.
+- `finish()` — reuse `flush_checkpoint()`, then CLOSE exactly once. Use on normal completion. A failed checkpoint gets one best-effort cleanup CLOSE before the error is returned.
 - `abort()` — discard unsent data, drain in-flight WRITEs to keep credits/message-ids in sync, skip FLUSH, best-effort CLOSE. Use on cancellation or error paths where the partial remote file is going to be deleted anyway — `abort()` saves the fsync round-trip. The caller is responsible for deleting the partial remote file.
 
 Both consume `self` so write-after-close/abort is a compile error. `Drop` logs a debug warning if neither was called (handle leaks).
@@ -269,7 +315,7 @@ Full rationale on `Connection::reconnect_if_needed` and `ReconnectPolicy`.
 - **The plumbing is respawned, not just the socket.** The keepalive, the stale-request sweeper, and the receiver all exit for good on `disconnected`, so a revival that only swapped the transport would come back with no liveness detection, silently. `spawn_plumbing` is shared with construction so the two can't drift.
 - **The consumer always finds out**: `reconnects_succeeded` / `reconnects_failed` / `reconnect_attempts` counters (always on, answer "was this link quietly flaky?" after the fact), log lines, and a pushed `ReconnectEvent` via `Connection::on_reconnect` for a UI that wants to say "reconnected, resuming" while it happens.
 - **`SESSION_SETUP` announces `PreviousSessionId`** after a revival (`Connection::previous_session_id`), which is how a client says "this is me again" — MS-SMB2 § 2.2.5. Without it the server holds the dead session's state until its own timeout.
-- All previous `Tree` handles and `FileId` values are invalidated regardless; the caller must `connect_share` again. ❌ `execute` never reconnects on your behalf: re-issuing an arbitrary request against a new session is a data-safety decision only the layer that knows the operation's semantics can make. At the `SmbClient` level that means listings, reads, `stat`, and `fs_info` replay; `delete`, `rename`, `create`, and writes surface the error.
+- All previous `Tree` handles and `FileId` values are invalidated regardless; the caller must `connect_share` again. Session-bound owned handles enforce this even when revival happened behind their `Connection` clone. ❌ `execute` never reconnects on your behalf: re-issuing an arbitrary request against a new session is a data-safety decision only the layer that knows the operation's semantics can make. At the `SmbClient` level that means listings, reads, `stat`, and `fs_info` replay; `delete`, `rename`, `create`, and writes surface the error.
 
 ## Durable handles
 

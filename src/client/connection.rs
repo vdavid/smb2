@@ -1303,13 +1303,9 @@ impl Inner {
     /// 2. The connection dies: `CreditPool::close` wakes every waiter.
     /// 3. Otherwise the deadline from
     ///    [`Connection::set_credit_wait_timeout`] applies.
-    async fn reserve_credits(
-        &self,
-        charge: u16,
-        command: Command,
-    ) -> Result<CreditReservation<'_>> {
-        if self.credits.try_reserve(charge) {
-            return Ok(CreditReservation::new(&self.credits, charge));
+    async fn reserve_credits(&self, charge: u16, command: Command) -> Result<CreditReservation> {
+        if let Some(reservation) = self.credits.try_reserve(charge) {
+            return Ok(reservation);
         }
         if self.credits.is_closed() || self.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -1338,14 +1334,14 @@ impl Inner {
             match select(reserving, recheck).await {
                 Either::Left((res, _)) => {
                     return match res {
-                        Ok(()) => {
+                        Ok(reservation) => {
                             debug!(
                                 "credits: {:?} acquired {} credit(s) after {:?}",
                                 command,
                                 charge,
                                 started.elapsed()
                             );
-                            Ok(CreditReservation::new(&self.credits, charge))
+                            Ok(reservation)
                         }
                         // The pool only closes on connection teardown.
                         Err(_) => Err(Error::Disconnected),
@@ -2258,7 +2254,68 @@ impl Connection {
         credit_charge: CreditCharge,
     ) -> Result<Frame> {
         let result = self
-            .execute_with_credits_inner(command, body, tree_id, credit_charge)
+            .execute_with_credits_inner(command, body, tree_id, credit_charge, None)
+            .await;
+        if result.is_err() {
+            self.inner
+                .metrics
+                .requests_returned_err
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Execute a handle- or tree-scoped request only on the session that
+    /// created those IDs.
+    ///
+    /// The expected session ID is written into the request header rather than
+    /// re-read after a possible in-place reconnect. That makes a reconnect
+    /// racing the send fail closed: the replacement session cannot accept a
+    /// request carrying IDs from its predecessor.
+    pub(crate) async fn execute_bound(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<Frame> {
+        let result = self
+            .execute_with_credits_inner(
+                command,
+                body,
+                tree_id,
+                CreditCharge(1),
+                Some((generation, session_id)),
+            )
+            .await;
+        if result.is_err() {
+            self.inner
+                .metrics
+                .requests_returned_err
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Credit-aware sibling of [`Self::execute_bound`].
+    pub(crate) async fn execute_with_credits_bound(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<Frame> {
+        let result = self
+            .execute_with_credits_inner(
+                command,
+                body,
+                tree_id,
+                credit_charge,
+                Some((generation, session_id)),
+            )
             .await;
         if result.is_err() {
             self.inner
@@ -2275,8 +2332,14 @@ impl Connection {
         body: &dyn Pack,
         tree_id: Option<TreeId>,
         credit_charge: CreditCharge,
+        bound_session: Option<(u64, SessionId)>,
     ) -> Result<Frame> {
         if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        if bound_session.is_some_and(|(generation, session_id)| {
+            self.generation() != generation || self.session_id() != session_id
+        }) {
             return Err(Error::Disconnected);
         }
         let charge = credit_charge.0.max(1);
@@ -2285,13 +2348,20 @@ impl Connection {
         // numbers per request), and a reservation that has to wait must not
         // leave a hole in the sequence window meanwhile.
         let reservation = self.inner.reserve_credits(charge, command).await?;
+        if bound_session.is_some_and(|(generation, session_id)| {
+            self.generation() != generation || self.session_id() != session_id
+        }) {
+            return Err(Error::Disconnected);
+        }
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
         header.credits = self.inner.credits.request_for(charge);
         header.credit_charge = CreditCharge(charge);
-        header.session_id = self.session_id();
+        header.session_id = bound_session
+            .map(|(_, session_id)| session_id)
+            .unwrap_or_else(|| self.session_id());
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
         }
@@ -2439,7 +2509,7 @@ impl Connection {
         body: &dyn Pack,
         tree_id: Option<TreeId>,
         charge: u16,
-        reservation: CreditReservation<'_>,
+        reservation: CreditReservation,
     ) -> Result<WaiterGuard> {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -2545,7 +2615,7 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return ProbeOutcome::Broken;
         }
-        if !self.inner.credits.try_reserve(1) {
+        let Some(reservation) = self.inner.credits.try_reserve(1) else {
             self.inner
                 .metrics
                 .keepalive_probes_skipped
@@ -2555,8 +2625,7 @@ impl Connection {
                  liveness signal until a grant comes back"
             );
             return ProbeOutcome::Skipped;
-        }
-        let reservation = CreditReservation::new(&self.inner.credits, 1);
+        };
         // No `tree_id`: ECHO is connection-scoped and needs no share. It does
         // carry the session id and gets signed like anything else, because a
         // session that requires signing rejects what isn't signed.
@@ -2647,7 +2716,7 @@ impl Connection {
             .metrics
             .compound_requests_sent
             .fetch_add(1, Ordering::Relaxed);
-        let result = self.execute_compound_inner(ops).await;
+        let result = self.execute_compound_inner(ops, None).await;
         if result.is_err() {
             self.inner
                 .metrics
@@ -2657,13 +2726,45 @@ impl Connection {
         result
     }
 
-    async fn execute_compound_inner(&self, ops: &[CompoundOp<'_>]) -> Result<Vec<Result<Frame>>> {
+    /// Send a compound whose tree and file IDs belong to one exact session.
+    pub(crate) async fn execute_compound_bound(
+        &self,
+        ops: &[CompoundOp<'_>],
+        generation: u64,
+        session_id: SessionId,
+    ) -> Result<Vec<Result<Frame>>> {
+        self.inner
+            .metrics
+            .compound_requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+        let result = self
+            .execute_compound_inner(ops, Some((generation, session_id)))
+            .await;
+        if result.is_err() {
+            self.inner
+                .metrics
+                .requests_returned_err
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn execute_compound_inner(
+        &self,
+        ops: &[CompoundOp<'_>],
+        bound_session: Option<(u64, SessionId)>,
+    ) -> Result<Vec<Result<Frame>>> {
         if ops.is_empty() {
             return Err(Error::invalid_data(
                 "compound request must have at least one operation",
             ));
         }
         if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        if bound_session.is_some_and(|(generation, session_id)| {
+            self.generation() != generation || self.session_id() != session_id
+        }) {
             return Err(Error::Disconnected);
         }
 
@@ -2684,7 +2785,15 @@ impl Connection {
             .reserve_credits(total_charge, ops[0].command)
             .await?;
 
-        let session_id = self.session_id();
+        if bound_session.is_some_and(|(generation, session_id)| {
+            self.generation() != generation || self.session_id() != session_id
+        }) {
+            return Err(Error::Disconnected);
+        }
+
+        let session_id = bound_session
+            .map(|(_, session_id)| session_id)
+            .unwrap_or_else(|| self.session_id());
         let mut message_ids: Vec<MessageId> = Vec::with_capacity(ops.len());
         let mut sub_requests: Vec<Vec<u8>> = Vec::with_capacity(ops.len());
 

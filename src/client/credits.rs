@@ -102,13 +102,14 @@ impl CreditPool {
     }
 
     /// Take `charge` credits if they are on hand right now.
-    pub(crate) fn try_reserve(&self, charge: u16) -> bool {
-        match self.current().try_acquire_many(u32::from(charge)) {
+    pub(crate) fn try_reserve(&self, charge: u16) -> Option<CreditReservation> {
+        let permits = self.current();
+        match permits.clone().try_acquire_many_owned(u32::from(charge)) {
             Ok(permit) => {
                 permit.forget();
-                true
+                Some(CreditReservation::new(permits, charge))
             }
-            Err(_) => false,
+            Err(_) => None,
         }
     }
 
@@ -121,19 +122,14 @@ impl CreditPool {
     /// Binds to the budget as it is when the wait starts, so a reset mid-wait
     /// resolves the waiter with `Err` (the pool it was queued on was closed)
     /// rather than silently migrating it onto the new session's budget.
-    pub(crate) async fn reserve(&self, charge: u16) -> Result<(), AcquireError> {
-        self.current()
+    pub(crate) async fn reserve(&self, charge: u16) -> Result<CreditReservation, AcquireError> {
+        let permits = self.current();
+        permits
+            .clone()
             .acquire_many_owned(u32::from(charge))
             .await?
             .forget();
-        Ok(())
-    }
-
-    /// Hand back credits reserved for a request whose bytes never reached the
-    /// wire (a signing failure, a transport error). Once the bytes are out,
-    /// the credits are the server's and only a grant returns them.
-    pub(crate) fn refund(&self, charge: u16) {
-        self.grant(charge);
+        Ok(CreditReservation::new(permits, charge))
     }
 
     /// How many credits to request on a request charging `charge`.
@@ -193,29 +189,29 @@ impl CreditPool {
 /// for a request that failed to sign, encrypt, or reach the transport, and for
 /// a caller whose future is dropped before the send.
 #[must_use = "dropping the reservation refunds the credits without sending"]
-pub(crate) struct CreditReservation<'a> {
-    pool: Option<&'a CreditPool>,
+pub(crate) struct CreditReservation {
+    permits: Option<Arc<Semaphore>>,
     charge: u16,
 }
 
-impl<'a> CreditReservation<'a> {
-    pub(crate) fn new(pool: &'a CreditPool, charge: u16) -> Self {
+impl CreditReservation {
+    fn new(permits: Arc<Semaphore>, charge: u16) -> Self {
         Self {
-            pool: Some(pool),
+            permits: Some(permits),
             charge,
         }
     }
 
     /// The bytes are on the wire: the credits belong to the server now.
     pub(crate) fn commit(mut self) {
-        self.pool = None;
+        self.permits = None;
     }
 }
 
-impl Drop for CreditReservation<'_> {
+impl Drop for CreditReservation {
     fn drop(&mut self) {
-        if let Some(pool) = self.pool {
-            pool.refund(self.charge);
+        if let Some(permits) = &self.permits {
+            permits.add_permits(self.charge as usize);
         }
     }
 }
@@ -229,10 +225,9 @@ mod tests {
         let pool = CreditPool::new();
         pool.set_available(10);
 
-        assert!(pool.try_reserve(4));
+        let reservation = pool.try_reserve(4).unwrap();
         assert_eq!(pool.available(), 6);
 
-        let reservation = CreditReservation::new(&pool, 4);
         drop(reservation);
         assert_eq!(
             pool.available(),
@@ -246,8 +241,7 @@ mod tests {
         let pool = CreditPool::new();
         pool.set_available(10);
 
-        assert!(pool.try_reserve(4));
-        CreditReservation::new(&pool, 4).commit();
+        pool.try_reserve(4).unwrap().commit();
 
         assert_eq!(
             pool.available(),
@@ -261,7 +255,7 @@ mod tests {
         let pool = CreditPool::new();
         pool.set_available(3);
 
-        assert!(!pool.try_reserve(4));
+        assert!(pool.try_reserve(4).is_none());
         assert_eq!(pool.available(), 3, "a failed reserve takes nothing");
     }
 
@@ -298,7 +292,10 @@ mod tests {
         );
 
         pool.grant(4);
-        waiting.await.expect("the grant satisfies the waiter");
+        waiting
+            .await
+            .expect("the grant satisfies the waiter")
+            .commit();
         assert_eq!(pool.available(), 0);
     }
 
@@ -339,7 +336,7 @@ mod tests {
             "credits granted by a dead session must not carry over -- the new \
              server's window may be far smaller"
         );
-        assert!(pool.try_reserve(1));
+        pool.try_reserve(1).unwrap().commit();
     }
 
     #[tokio::test]
@@ -368,6 +365,24 @@ mod tests {
                 .is_err(),
             "a send queued against the old session must fail rather than \
              silently continue on the new one"
+        );
+    }
+
+    #[test]
+    fn an_old_reservation_never_refunds_the_new_generation() {
+        let pool = CreditPool::new();
+        let reservation = pool.try_reserve(1).unwrap();
+        assert_eq!(pool.available(), 0);
+
+        pool.close();
+        pool.reset();
+        assert_eq!(pool.available(), 1);
+        drop(reservation);
+
+        assert_eq!(
+            pool.available(),
+            1,
+            "an old session's refund must stay in its retired credit pool"
         );
     }
 }
