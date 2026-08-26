@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::{select, Either};
 use log::{debug, error, info, trace, warn, Level};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 /// One in-flight request: who is waiting, what they asked for, and since when.
 ///
@@ -283,6 +283,48 @@ const ALIVE_DEADLINE_FACTOR: u32 = 6;
 /// detects nothing, and each cycle is one more handover an event can slip
 /// through.
 const LONG_POLL_REFRESH: Duration = Duration::from_secs(600);
+
+/// The unit the write budget is counted in, so one `u32` permit count can
+/// express tens of megabytes.
+const WRITE_BUDGET_UNIT: u64 = 64 * 1024;
+
+/// How many bytes of WRITE payload may be outstanding across the WHOLE
+/// connection at once: launched but not yet acknowledged.
+///
+/// This is the bound that `MAX_PIPELINE_WINDOW` alone cannot give. That window
+/// caps one stream at 32 frames; it says nothing about how many streams there
+/// are, so N concurrent uploads multiply it. A file manager copying 10 files at
+/// once over a 1 MiB `MaxWriteSize` reaches 320 MiB of payload queued in this
+/// process, and every byte of it is latency the consumer pays for: on a
+/// 6.7 MB/s link that is ~48 s between handing a chunk over and it reaching the
+/// socket (measured in the field, `ERR-9WZRR`, 2026-08-26). Cancel waits it out,
+/// progress reporting runs ahead of it, and the memory is real.
+///
+/// 32 MiB, chosen against both ends rather than either:
+///
+/// - **Fast link**: at ~100 MB/s (saturated gigabit) this is 0.3 s of buffer,
+///   many times the bandwidth-delay product of a LAN, so the pipe still never
+///   runs dry. The measured few-large curve is flat from a 4-wide window up
+///   (`docs/notes/transfer-concurrency-window-bench-2026-08-02.md` in the Cmdr
+///   repo), so there is no throughput here to lose.
+/// - **Slow link**: at 6.7 MB/s it is ~5 s of buffer instead of ~48.
+/// - **Memory**: 32 MiB of `Vec<u8>` is a bound a consumer can reason about,
+///   where `concurrency x window x max_write` is not.
+///
+/// ❌ Don't make this adaptive without a measurement that demands it. A fixed
+/// bound is predictable and testable; a control loop over a noisy throughput
+/// estimate can oscillate, and the numbers above say a well-chosen constant
+/// already sits far from both edges.
+///
+/// A frame larger than the whole budget is clamped to the whole budget rather
+/// than refused (`Connection::clamped_units`), so a server negotiating a
+/// `MaxWriteSize` above this can always still send one frame.
+const WRITE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+/// [`WRITE_BUDGET_UNIT`]s needed to cover `bytes`, at least one.
+fn budget_units(bytes: u64) -> usize {
+    usize::try_from(bytes.div_ceil(WRITE_BUDGET_UNIT).max(1)).unwrap_or(usize::MAX)
+}
 
 /// How many frames may be queued for the writer task before callers block.
 ///
@@ -1415,6 +1457,13 @@ struct Inner {
     /// diagnostics and for the stale-waiter warning, which reports it so a
     /// backlog names itself.
     send_queue_depth: AtomicUsize,
+    /// Permits for [`WRITE_BUDGET_BYTES`], counted in [`WRITE_BUDGET_UNIT`]s.
+    ///
+    /// A permit is held by the in-flight WRITE future itself, so it comes back
+    /// when the response is drained, the writer is aborted, or the future is
+    /// dropped mid-flight. ❌ Don't release it by hand anywhere: every cancel
+    /// path already returns it for free, and a manual release would double-count.
+    write_budget: Arc<Semaphore>,
     /// How long one frame may take to reach the socket before its caller
     /// gives up with [`Error::SendTimeout`], or `None` to wait forever.
     send_timeout: StdMutex<Option<Duration>>,
@@ -1536,6 +1585,7 @@ impl Inner {
             write_tx: StdMutex::new(write_tx),
             abandoned: StdMutex::new(VecDeque::new()),
             send_queue_depth: AtomicUsize::new(0),
+            write_budget: Arc::new(Semaphore::new(budget_units(WRITE_BUDGET_BYTES))),
             send_timeout: StdMutex::new(Some(SEND_TIMEOUT)),
             writer_task: StdMutex::new(None),
             keepalive_task: StdMutex::new(None),
@@ -3714,6 +3764,54 @@ impl Connection {
         *self.inner.send_timeout.lock().unwrap() = after;
     }
 
+    /// Reserve write budget for `bytes`, waiting until it is free.
+    ///
+    /// The returned permit must be moved INTO the in-flight WRITE future, so
+    /// that draining, aborting, or dropping that future returns the budget
+    /// without any explicit release. See [`Inner::write_budget`].
+    ///
+    /// ❌ Never await this while holding a permit whose future you are not
+    /// polling: that is the one way to deadlock this budget. `FileWriter` only
+    /// awaits with an EMPTY in-flight set, and otherwise drains one of its own
+    /// responses to free its own budget first.
+    pub(crate) async fn reserve_write_budget(
+        &self,
+        bytes: u64,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let units = self.clamped_units(bytes);
+        Arc::clone(&self.inner.write_budget)
+            .acquire_many_owned(units)
+            .await
+            .ok()
+    }
+
+    /// Reserve write budget for `bytes` if it is free right now.
+    pub(crate) fn try_reserve_write_budget(
+        &self,
+        bytes: u64,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let units = self.clamped_units(bytes);
+        Arc::clone(&self.inner.write_budget)
+            .try_acquire_many_owned(units)
+            .ok()
+    }
+
+    /// Units for `bytes`, never more than the whole budget holds.
+    ///
+    /// Clamping is load-bearing: `acquire_many` for more permits than the
+    /// semaphore will EVER hold waits forever, so a server negotiating a
+    /// `MaxWriteSize` above the budget would wedge its first frame. Clamped, that
+    /// frame simply gets the whole budget to itself, which is the honest
+    /// degradation. ❌ Don't reach for `available_permits()` here: that is what
+    /// is free right now, not what exists, so under contention it would clamp to
+    /// a number smaller than the caller needs and under-charge the budget.
+    fn clamped_units(&self, bytes: u64) -> u32 {
+        let total = u32::try_from(budget_units(WRITE_BUDGET_BYTES)).unwrap_or(u32::MAX);
+        u32::try_from(budget_units(bytes))
+            .unwrap_or(u32::MAX)
+            .min(total)
+    }
+
     /// How long the server may say nothing, while a request is on the wire,
     /// before the client asks it directly with an SMB2 ECHO. `None` turns the
     /// keepalive off.
@@ -5315,6 +5413,77 @@ mod tests {
     /// The default deadlines only work as a set: each layer has to NAME a
     /// problem before the layer above it gives up on it, or the log line that
     /// explains a wedge is never written.
+    #[tokio::test]
+    async fn the_write_budget_gates_the_whole_connection_not_one_stream() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // One holder takes the lot: this stands in for the frames a few busy
+        // FileWriters already have launched and unacknowledged.
+        let whole = conn
+            .try_reserve_write_budget(WRITE_BUDGET_BYTES)
+            .expect("an idle connection can afford its whole budget");
+
+        // The NEXT stream is refused, however much room its own pipeline window
+        // has left. That refusal is the entire point: before this existed, each
+        // stream's window was the only bound and N streams multiplied it.
+        assert!(
+            conn.try_reserve_write_budget(WRITE_BUDGET_UNIT).is_none(),
+            "a spent budget must refuse the next frame, whatever the per-stream window says"
+        );
+
+        // A permit is returned by being dropped, which is how the in-flight
+        // future gives it back on every path including cancel.
+        drop(whole);
+        assert!(
+            conn.try_reserve_write_budget(WRITE_BUDGET_UNIT).is_some(),
+            "dropping the permit must return the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_bigger_than_the_whole_budget_still_gets_sent() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // A server may negotiate a `MaxWriteSize` above the budget. Asking a
+        // semaphore for more permits than it will ever hold waits FOREVER, so
+        // without clamping this writer's first frame would wedge and never
+        // time out. The timeout is the assertion.
+        let huge = WRITE_BUDGET_BYTES * 4;
+        let permit = tokio::time::timeout(Duration::from_secs(5), conn.reserve_write_budget(huge))
+            .await
+            .expect("an oversized frame must not wait forever for budget it can never get");
+        assert!(permit.is_some());
+    }
+
+    #[test]
+    fn the_write_budget_is_smaller_than_one_multiplied_pipeline() {
+        // The field case this exists for: ten concurrent files, each pipelining
+        // `MAX_PIPELINE_WINDOW` frames at a 1 MiB `MaxWriteSize`, is 320 MiB of
+        // payload queued in this process (`ERR-9WZRR`). The budget has to be a
+        // long way under that or it bounds nothing in practice.
+        let multiplied = 10 * 32 * 1024 * 1024u64;
+        assert!(
+            WRITE_BUDGET_BYTES * 4 <= multiplied,
+            "a budget this close to the unbounded case would not be a bound"
+        );
+        // And it must still hold several frames of a common `MaxWriteSize`, or
+        // it would serialize writers that the pipeline window means to overlap.
+        assert!(
+            budget_units(WRITE_BUDGET_BYTES) >= 8 * budget_units(1024 * 1024),
+            "the budget must fit several 1 MiB frames, or it becomes the bottleneck"
+        );
+    }
+
     #[test]
     fn the_default_deadlines_are_layered() {
         assert!(

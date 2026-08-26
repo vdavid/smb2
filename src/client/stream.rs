@@ -1104,7 +1104,13 @@ impl FileWriter {
     }
 
     /// Launch one wire-level WRITE request into the `in_flight` queue.
-    fn launch_wire_chunk(&mut self, data: Vec<u8>) {
+    ///
+    /// `permit` is the connection-wide write budget for this frame's bytes, and
+    /// it is parked INSIDE the future on purpose: completing, aborting, or
+    /// dropping the future returns the budget with no explicit release anywhere.
+    /// ❌ Don't hold it on `self` instead: a writer dropped mid-flight (a user
+    /// cancelling a copy) would strand the budget for the life of the connection.
+    fn launch_wire_chunk(&mut self, data: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) {
         let data_len = data.len() as u64;
         let credit_charge = data_len.div_ceil(65536).max(1) as u16;
 
@@ -1123,6 +1129,7 @@ impl FileWriter {
         let c = self.conn.clone();
         let tree_id = self.tree.tree_id;
         self.in_flight.push(Box::pin(async move {
+            let _budget = permit;
             c.execute_with_credits(
                 Command::Write,
                 &req,
@@ -1189,23 +1196,53 @@ impl FileWriter {
             self.drain_one().await?;
         }
 
-        if self.can_send(&data) {
-            self.launch_wire_chunk(data);
-            return Ok(true);
-        }
-
-        // Window still full — drain one response and retry.
-        if !self.in_flight.is_empty() {
-            self.drain_one().await?;
-            if self.can_send(&data) {
-                self.launch_wire_chunk(data);
-                return Ok(true);
+        if !self.can_send(&data) {
+            // Window still full — drain one response and retry.
+            if !self.in_flight.is_empty() {
+                self.drain_one().await?;
+            }
+            if !self.can_send(&data) {
+                self.stashed_chunk = Some(data);
+                return Ok(false);
             }
         }
 
-        // Still can't send. Stash for later.
-        self.stashed_chunk = Some(data);
-        Ok(false)
+        // This stream has room; the CONNECTION may not. The window bounds one
+        // stream, the budget bounds all of them together.
+        match self.reserve_budget(data.len() as u64).await? {
+            Some(permit) => {
+                self.launch_wire_chunk(data, permit);
+                Ok(true)
+            }
+            None => {
+                self.stashed_chunk = Some(data);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Connection-wide write budget for one wire chunk.
+    ///
+    /// ❌ The ordering here is the whole deadlock argument, don't reorder it. A
+    /// writer parked on the budget is not polling its own `in_flight`, so the
+    /// frames it already launched can never complete and never give their budget
+    /// back. So: take budget only if it is free; otherwise free OUR OWN first by
+    /// draining a response; and only wait once we hold nothing at all, where
+    /// waiting cannot contribute to a cycle. Every other holder is in the same
+    /// loop, draining, so the wait always ends while the server answers.
+    async fn reserve_budget(
+        &mut self,
+        bytes: u64,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        loop {
+            if let Some(permit) = self.conn.try_reserve_write_budget(bytes) {
+                return Ok(Some(permit));
+            }
+            if self.in_flight.is_empty() {
+                return Ok(self.conn.reserve_write_budget(bytes).await);
+            }
+            self.drain_one().await?;
+        }
     }
 
     /// Send any stashed chunk, draining responses as needed to free credits.
@@ -1216,7 +1253,11 @@ impl FileWriter {
                 self.drain_one().await?;
             }
             if self.can_send(&stashed) {
-                self.launch_wire_chunk(stashed);
+                match self.reserve_budget(stashed.len() as u64).await? {
+                    Some(permit) => self.launch_wire_chunk(stashed, permit),
+                    // Re-stash — caller must drain more or give up.
+                    None => self.stashed_chunk = Some(stashed),
+                }
             } else {
                 // Re-stash — caller must drain more or give up.
                 self.stashed_chunk = Some(stashed);
