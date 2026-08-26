@@ -61,6 +61,10 @@ for the writer task's ack; `writer_loop` owns the transport's write half and is 
 - ❌ **Don't add a second writer, or let a caller call `TransportSend::send` directly.** Frames would interleave.
 - The queue is bounded (`WRITE_QUEUE_DEPTH`); `send_queue_depth()` is the gauge. Persistently non-zero while
   `wire_bytes_sent` stands still means the send side is stuck, not the server.
+- ❌ **The writer tallies, it doesn't log per frame.** `SendTally::record` counts every frame that reached the socket
+  and how bad the worst queue time and worst write time were; the sweeper drains it and says so once. `SLOW_SEND_REPORT`
+  (5 s) is a threshold on the frame, never a gate on a log line: every frame in a bulk copy over a slow link crosses it,
+  so per-frame it emitted six or seven `WARN`s a second for a sixteen-minute transfer (2026-08-26).
 
 ## In-flight bookkeeping: registered vs sent
 
@@ -72,20 +76,31 @@ Before that, only the response deadline removed a waiter, which inflated the dia
   queued for the transport. ❌ Never read a large `age` as "the server didn't answer" without checking `sent_age`
   first — that conflation is what sent three investigations after an innocent server.
 - The stale-request warning says which case it is. `classify_outstanding` owns the split into three populations
-  (`unanswered` / `queued` / `parked`) and `sweep_report` turns them into log records, so both the split and the VOLUME
+  (`unanswered` / `queued` / `parked`) and `sweep_report` turns them, plus the send-side reading, into log records, so both the split and the VOLUME
   can be tested apart from the wording.
-- ❌ **One line per sweep for the whole send queue, never one per frame.** Frames waiting for the socket are collapsed
-  into a single record naming the count, the oldest one's age, the command mix, and the queue depth; the frame-by-frame
-  detail is at `TRACE`. Copying 282 × 66 MB to a NAS over 6.7 MB/s Wi-Fi keeps ~320 one-MiB frames queued at all times,
+- ❌ **One line per sweep for the whole send side, never one per frame.** Frames waiting for the socket collapse into a
+  single record naming the count, the oldest one's age, the command mix, the queue depth, and what the writer actually
+  got out over the interval (frames, rate, how many were slow, worst queue time + worst write time); the frame-by-frame
+  detail is at `TRACE`. An idle-and-healthy connection says nothing at all. Copying 282 × 66 MB to a NAS over 6.7 MB/s Wi-Fi keeps ~320 one-MiB frames queued at all times,
   and a line each made 4,487 of the 4,744 lines in a user's diagnostic bundle this one message — a bundle covering
   2 minutes 30 seconds, with everything else already rotated out (2026-08-26).
-- ❌ **A deep send queue is only a `WARN` when it isn't draining.** `Inner::observe_send_side` compares
-  `wire_bytes_sent` against its own previous sweep: bytes moved means the link is simply slower than the writers filling
-  it, the transfer is working, and that gets `INFO`. Nothing moved between two sweeps means the writer task or the
-  socket is the problem, and that keeps `WARN`. ❌ Don't demote the stalled half to match, and ❌ don't call
-  `observe_send_side` from anywhere but the sweeper: it consumes the previous reading, and a second caller would leave
-  the sweeper reading every slow link as a wedge. `INFO` rather than `DEBUG` because consumers ship `INFO` in bundles,
-  and a bundle that can't show the link was the bottleneck sends the next investigation after the server again.
+- ❌ **A deep send queue is only a `WARN` when it isn't draining.** `Inner::observe_send_side` tracks when a whole
+  frame last reached the socket. Recently enough means the link is simply slower than the writers filling it, the
+  transfer is working, and that gets `INFO`. Silence past `stall_tolerance` means the writer task or the socket is the
+  problem, and that keeps `WARN`. ❌ Don't demote the stalled half to match, and ❌ don't call `observe_send_side` from
+  anywhere but the sweeper: it consumes the previous reading, and a second caller would leave the sweeper measuring
+  silence from its own last look. `INFO` rather than `DEBUG` because consumers ship `INFO` in bundles, and a bundle that
+  can't show the link was the bottleneck sends the next investigation after the server again.
+- ❌ **`stall_tolerance` is the send deadline, never one sweep.** `wire_bytes_sent` ticks only on a WHOLE frame, so
+  between completions it stands still by construction and the gap between them is the per-frame write time. Judging a
+  single sweep would call any link slower than one frame per `STALE_WAITER_SWEEP` a wedge: ~105 KB/s at a 1 MiB
+  `MaxWriteSize`, ~840 KB/s at the 8 MiB one Windows and several NAS boxes negotiate, while `SEND_TIMEOUT` is sized for
+  50 KB/s and 400 KB/s. That whole band is ordinary Wi-Fi. Deferring to `send_timeout` closes it by construction: a link
+  the send path tolerates is never called stalled, and one it doesn't tears itself down with `Error::SendTimeout`
+  anyway. `send_timeout: None` falls back to the default rather than going quiet -- that consumer removed the teardown,
+  not the diagnosis, and `set_stale_request_warning(None)` is the knob for silence.
+- The send side's clocks restart on revival (`install_transport`): a fresh socket owes nothing, and carrying the dead
+  one's silence over would let the first sweep call the new connection wedged.
 - ❌ **Long polls are never warned about.** Every line the sweeper writes means "this should have come back by now", which for a CHANGE_NOTIFY is false by construction, so warning about one is the sweeper contradicting the deadline. At the sweeper's cadence it also buries the genuine lines: a file manager watching two panes logged 5,911 `WARN`s in six hours about requests nothing was ever going to answer (2026-08-03). They stay observable at `TRACE` every sweep, and named in full at `WARN` alongside any REAL stale request (an unanswered request, or a send queue that has stopped draining), because a wedge investigation wants the whole in-flight picture.
 - Dropping a guard records the id in a bounded ring so a late response still counts as `responses_late_after_drop`
   rather than `responses_stray`; without it, routine cancellation would drown the "we got a frame we never asked for"
@@ -280,7 +295,7 @@ Full rationale on `Connection::reconnect_if_needed` and `ReconnectPolicy`.
 - **Written for a stampede.** A 32-deep pipeline discovers the same dead session 32 times at once; `reconnect_if_needed` dials once and everyone else returns off the same attempt (`revive_lock` + the `revivals` counter, which is bumped only on success so the double-check can't see a half-built session).
 - **Every bound lives in `ReconnectPolicy`.** The wall-clock budget wraps the ENTIRE revival, not each attempt: a per-attempt timeout multiplies by the attempt count, and an attempt that parks forever never reaches the second one. A failed revival's verdict stands for `failure_cooldown`, or each caller pays the full budget in turn (32 × 60 s is the unbounded hang again).
 - **`install_transport` erases the dead session completely** and in a fixed order: tear down (which sets `disconnected` under the waiters lock), reset, rebuild, clear `disconnected` LAST. ❌ Nothing may carry over — a stale credit window out-spends the new server, a stale message id makes the server drop us for a sequence gap, stale keys fail verification on every frame. `send_queue_depth` is the deliberate exception (resetting it underflows a caller mid-increment).
-- **The plumbing is respawned, not just the socket.** The keepalive, the stale-request sweeper, and the receiver all exit for good on `disconnected`, so a revival that only swapped the transport would come back with no liveness detection, silently. `spawn_plumbing` is shared with construction so the two can't drift.
+- **The plumbing is respawned, not just the socket.** The keepalive, the connection sweeper, and the receiver all exit for good on `disconnected`, so a revival that only swapped the transport would come back with no liveness detection, silently. `spawn_plumbing` is shared with construction so the two can't drift.
 - **The consumer always finds out**: `reconnects_succeeded` / `reconnects_failed` / `reconnect_attempts` counters (always on, answer "was this link quietly flaky?" after the fact), log lines, and a pushed `ReconnectEvent` via `Connection::on_reconnect` for a UI that wants to say "reconnected, resuming" while it happens.
 - **`SESSION_SETUP` announces `PreviousSessionId`** after a revival (`Connection::previous_session_id`), which is how a client says "this is me again" — MS-SMB2 § 2.2.5. Without it the server holds the dead session's state until its own timeout.
 - All previous `Tree` handles and `FileId` values are invalidated regardless; the caller must `connect_share` again. ❌ `execute` never reconnects on your behalf: re-issuing an arbitrary request against a new session is a data-safety decision only the layer that knows the operation's semantics can make. At the `SmbClient` level that means listings, reads, `stat`, and `fs_info` replay; `delete`, `rename`, `create`, and writes surface the error.

@@ -193,8 +193,16 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// side, not expire upstream and leave an innocent server holding the blame.
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A send slower than this is worth a line in the log even though it
-/// succeeded — it is the early warning for the state that used to wedge.
+/// A send slower than this is worth counting even though it succeeded — it is
+/// the early warning for the state that used to wedge.
+///
+/// A threshold on the FRAME, reported per sweep: the writer tallies how many
+/// crossed it and how bad the worst one was, and [`sweep_report`] says so once.
+/// ❌ Never make it a gate on a log line per frame again. Every frame in a bulk
+/// copy over a slow link crosses it — the queue in front of a 6.7 MB/s link is
+/// tens of seconds deep by arithmetic — so per-frame it emitted six or seven
+/// WARN lines a second for a sixteen-minute transfer, which is the same flood
+/// the sweeper's own lines caused (2026-08-26).
 const SLOW_SEND_REPORT: Duration = Duration::from_secs(5);
 
 /// How long the server may say nothing, while work is outstanding, before the
@@ -347,27 +355,21 @@ async fn writer_loop(
 
         let wrote_in = started.elapsed();
         let queued_for = started.saturating_duration_since(job.queued_at);
-        if wrote_in >= SLOW_SEND_REPORT || queued_for >= SLOW_SEND_REPORT {
-            // Splitting the two is the whole diagnostic: time in the queue
-            // means an earlier frame is stuck, time in the write means this
-            // socket is.
-            warn!(
-                "send is slow: cmd={:?}, {} bytes, {:?} queued + {:?} writing, {} frame(s) outstanding",
-                job.command,
-                len,
-                queued_for,
-                wrote_in,
-                strong.send_queue_depth.load(Ordering::Relaxed)
-            );
-        } else {
-            trace!(
-                "send: cmd={:?}, {} bytes, {:?} queued + {:?} writing",
-                job.command,
-                len,
-                queued_for,
-                wrote_in
-            );
+        if result.is_ok() {
+            // Tallied, not logged. The sweeper reports the whole interval in
+            // one line — see [`SLOW_SEND_REPORT`] for what a line each cost.
+            // Splitting queue time from write time is still the whole
+            // diagnostic, so the tally keeps both: time in the queue means an
+            // earlier frame is slow, time in the write means this socket is.
+            strong.send_tally.record(len, queued_for, wrote_in);
         }
+        trace!(
+            "send: cmd={:?}, {} bytes, {:?} queued + {:?} writing",
+            job.command,
+            len,
+            queued_for,
+            wrote_in
+        );
 
         let fatal = matches!(result, Err(Error::SendTimeout { .. }) | Err(Error::Io(_)));
         if let Err(ref e) = result {
@@ -465,31 +467,149 @@ fn classify_outstanding(inner: &Inner, threshold: std::time::Duration) -> Outsta
     split
 }
 
-/// Whether the send side moved between two sweeps.
+/// Whether the send side is still moving.
 ///
 /// The queue depth alone cannot tell a slow link from a wedged writer: both
-/// look like hundreds of frames waiting. Only "did anything reach the socket"
-/// separates them, and that difference is the whole reason one of these is a
-/// warning and the other is not.
+/// look like hundreds of frames waiting. Only "is anything still reaching the
+/// socket" separates them, and that difference is the whole reason one of these
+/// is a warning and the other is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendSide {
-    /// Frames reached the socket since the previous sweep. A deep queue here
-    /// is the link being slow, which is the transfer working.
+    /// Frames are still reaching the socket, or have recently enough that a
+    /// slow link explains the gap. A deep queue here is the link being slow,
+    /// which is the transfer working.
     Draining,
-    /// Not one byte reached the socket since the previous sweep. Whatever is
-    /// wrong is on our side of the wire.
+    /// Nothing has reached the socket for longer than a whole frame is allowed
+    /// to take. Whatever is wrong is on our side of the wire.
     Stalled,
 }
 
-/// Periodically report requests that have gone unanswered, for as long as the
-/// connection lives.
+/// How long the send side may produce nothing before a sweep calls it stalled.
+///
+/// Deliberately the send deadline itself, because that is already the crate's
+/// answer to "how long may one frame take to reach the socket", and a second,
+/// tighter opinion here would warn about links [`SEND_TIMEOUT`] was explicitly
+/// sized to accept.
+///
+/// **Why anything shorter is wrong.** `wire_bytes_sent` only ticks when a WHOLE
+/// frame is out, so between completions it stands still by construction, and
+/// the gap between them is the per-frame write time. Judging a single sweep
+/// interval would therefore call any link slower than one frame per
+/// [`STALE_WAITER_SWEEP`] a wedge: ~105 KB/s at a 1 MiB `MaxWriteSize`, ~840
+/// KB/s at the 8 MiB one Windows and several NAS boxes negotiate. `SEND_TIMEOUT`
+/// is sized for 50 KB/s and 400 KB/s respectively, so that shorter window would
+/// warn across the entire band between the two — ordinary Wi-Fi, and precisely
+/// the false positive the collapse exists to remove. Tying it to the send
+/// deadline closes the gap by construction: a link the send path tolerates is a
+/// link this never calls stalled, and one it doesn't tolerate tears itself down
+/// with [`Error::SendTimeout`] anyway.
+///
+/// A consumer who sets `send_timeout` to `None` has removed the teardown, not
+/// the diagnosis — which makes this the ONLY thing left that can name a wedged
+/// send side, so it falls back to the default rather than going quiet.
+/// `set_stale_request_warning(None)` is the knob for silence.
+///
+/// Floored at two sweeps so a verdict always rests on more than one look.
+fn stall_tolerance(send_timeout: Option<Duration>) -> Duration {
+    send_timeout
+        .unwrap_or(SEND_TIMEOUT)
+        .max(STALE_WAITER_SWEEP * 2)
+}
+
+/// What one sweep learned about the send side.
+#[derive(Debug, Clone, Copy)]
+struct SendSideReading {
+    state: SendSide,
+    /// How long since a whole frame last reached the socket, as of this sweep.
+    ///
+    /// Measured from the sweep that SAW the counter move, not from the move
+    /// itself, so it can lag reality by up to one sweep — conservative in the
+    /// right direction: it can only ever delay a verdict, never rush one.
+    silent_for: Duration,
+    /// Wall time since the previous sweep: the window [`SendActivity`] covers.
+    /// Read from the clock rather than assumed to be [`STALE_WAITER_SWEEP`],
+    /// because a process that went unscheduled did not stop time.
+    window: Duration,
+}
+
+/// The sweeper's memory of the send side.
+#[derive(Debug)]
+struct SendProgress {
+    /// `metrics.wire_bytes_sent` as of the previous sweep.
+    ///
+    /// Deliberately the same reading `CreditInfo::send_queue_depth` documents
+    /// for consumers ("steadily non-zero while `wire_bytes_sent` stands still
+    /// means the send side is stuck"), so the crate's own warning and a
+    /// consumer's dashboard can't disagree.
+    wire_bytes_sent: u64,
+    /// When a sweep last saw that number change.
+    last_progress: Instant,
+    /// When the previous sweep ran.
+    last_sweep: Instant,
+}
+
+/// What the writer task has done since the sweeper last drained it.
+///
+/// Atomics rather than a lock: the writer touches this once per frame on the
+/// hot path, and the sweeper reads it once every [`STALE_WAITER_SWEEP`].
+#[derive(Debug, Default)]
+struct SendTally {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    slow_frames: AtomicU64,
+    worst_queued_nanos: AtomicU64,
+    worst_writing_nanos: AtomicU64,
+}
+
+impl SendTally {
+    /// Note one frame that reached the socket.
+    fn record(&self, bytes: usize, queued_for: Duration, wrote_in: Duration) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        if queued_for >= SLOW_SEND_REPORT || wrote_in >= SLOW_SEND_REPORT {
+            self.slow_frames.fetch_add(1, Ordering::Relaxed);
+        }
+        self.worst_queued_nanos
+            .fetch_max(queued_for.as_nanos() as u64, Ordering::Relaxed);
+        self.worst_writing_nanos
+            .fetch_max(wrote_in.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Take everything since the last drain and start a fresh interval.
+    fn drain(&self) -> SendActivity {
+        SendActivity {
+            frames: self.frames.swap(0, Ordering::Relaxed),
+            bytes: self.bytes.swap(0, Ordering::Relaxed),
+            slow_frames: self.slow_frames.swap(0, Ordering::Relaxed),
+            worst_queued: Duration::from_nanos(self.worst_queued_nanos.swap(0, Ordering::Relaxed)),
+            worst_writing: Duration::from_nanos(
+                self.worst_writing_nanos.swap(0, Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+/// What the send side actually achieved over one sweep interval.
+#[derive(Debug, Clone, Copy, Default)]
+struct SendActivity {
+    frames: u64,
+    bytes: u64,
+    /// Of those, how many crossed [`SLOW_SEND_REPORT`] queueing or writing.
+    slow_frames: u64,
+    worst_queued: Duration,
+    worst_writing: Duration,
+}
+
+/// Periodically report what the connection is doing: the send side's progress,
+/// and any request that has gone unanswered, for as long as the connection
+/// lives.
 ///
 /// A separate task rather than a check inside `receiver_loop`: the loop is parked
 /// in `transport_recv.receive()` exactly when a wedged connection most needs
 /// reporting, and racing that read with a timer would mean dropping a read that
 /// is not necessarily cancel-safe. Holds a `Weak` so it exits once the last
 /// `Connection` clone drops.
-fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
+fn spawn_connection_sweeper(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
     let handle = tokio::spawn(async move {
         loop {
@@ -500,7 +620,7 @@ fn spawn_stale_waiter_sweeper(inner: &Arc<Inner>) {
             if inner.disconnected.load(Ordering::Acquire) {
                 return;
             }
-            warn_on_stale_waiters(&inner);
+            sweep_connection(&inner);
         }
     });
     if let Some(old) = inner.sweeper_task.lock().unwrap().replace(handle) {
@@ -611,7 +731,7 @@ fn spawn_plumbing(
         old.abort();
     }
 
-    spawn_stale_waiter_sweeper(inner);
+    spawn_connection_sweeper(inner);
     spawn_keepalive(inner);
 }
 
@@ -707,37 +827,76 @@ fn describe_requests(requests: &[Outstanding], verb: &str) -> String {
         .join(", ")
 }
 
+/// A throughput a reader can judge without doing arithmetic.
+fn format_rate(bytes: u64, over: Duration) -> String {
+    let seconds = over.as_secs_f64();
+    if seconds <= 0.0 {
+        return "unknown rate".to_string();
+    }
+    let per_second = bytes as f64 / seconds;
+    if per_second >= 1_000_000.0 {
+        format!("{:.1} MB/s", per_second / 1_000_000.0)
+    } else if per_second >= 1_000.0 {
+        format!("{:.0} KB/s", per_second / 1_000.0)
+    } else {
+        format!("{per_second:.0} B/s")
+    }
+}
+
+/// What the send side achieved over the sweep window, in one clause.
+fn describe_activity(activity: &SendActivity, window: Duration) -> String {
+    let mut clause = format!(
+        "{} frame(s) at {} reached the socket in the last {:?}",
+        activity.frames,
+        format_rate(activity.bytes, window),
+        window
+    );
+    if activity.slow_frames > 0 {
+        // The split is the diagnostic: time in the queue means an earlier
+        // frame is slow, time in the write means this socket is.
+        clause.push_str(&format!(
+            ", {} of them slower than {:?} (worst {:?} queued + {:?} writing)",
+            activity.slow_frames, SLOW_SEND_REPORT, activity.worst_queued, activity.worst_writing
+        ));
+    }
+    clause
+}
+
 /// What one sweep has to say, as records for the caller to log.
 ///
 /// Pure so the VOLUME can be tested and not just the wording: "one collapsed
-/// line for the send queue, never one per frame" is a property of this
+/// line for the send side, never one per frame" is a property of this
 /// function's return length, and a regression to per-frame lines shows up as a
 /// longer `Vec`.
 ///
-/// The three populations get three different levels, because they are three
-/// different claims:
+/// The populations get different levels, because they are different claims:
 ///
 /// - **Unanswered** (sent, and the server has said nothing since): WARN,
 ///   always. The server owes us a response and is not producing one; there is
 ///   no reading of that which is healthy.
-/// - **Queued** (registered, never sent): the level depends entirely on
-///   [`SendSide`], and that split is the whole point. A deep queue that is
-///   DRAINING is a slow link with a lot buffered in front of it — the frames
-///   are moving at exactly the rate the link can carry, the transfer is
-///   working, and calling that a warning is the crate crying wolf about
-///   physics. It gets INFO: worth a line, since it is what explains a transfer
-///   that feels slow, but not a fault. A queue that is NOT draining is the
-///   genuine send-side wedge, and keeps WARN. INFO rather than DEBUG on
-///   purpose: consumers ship INFO in their diagnostic bundles, and a bundle
-///   that cannot show the link was the bottleneck is a bundle that sends the
-///   next investigation after the server again.
+/// - **The send side** (frames queued for the socket, and what the writer got
+///   out): the level depends entirely on [`SendSide`], and that split is the
+///   whole point. A deep queue that is DRAINING is a slow link with a lot
+///   buffered in front of it — the frames are moving at exactly the rate the
+///   link can carry, the transfer is working, and calling that a warning is the
+///   crate crying wolf about physics. It gets INFO: worth a line, since it is
+///   what explains a transfer that feels slow, but not a fault. A send side
+///   that has produced nothing for longer than [`stall_tolerance`] is the
+///   genuine wedge, and keeps WARN. INFO rather than DEBUG on purpose:
+///   consumers ship INFO in their diagnostic bundles, and a bundle that cannot
+///   show the link was the bottleneck is a bundle that sends the next
+///   investigation after the server again.
 /// - **Parked** long polls: TRACE normally (waiting for an event is what they
 ///   are for), promoted to WARN alongside a genuine wedge, since an
 ///   investigation wants the whole in-flight picture at the level it is
 ///   reading.
+///
+/// An idle-and-healthy connection says nothing at all: the send-side record
+/// needs either a backlog past the threshold or a frame that was actually slow.
 fn sweep_report(
     split: &OutstandingSplit,
-    send_side: SendSide,
+    reading: &SendSideReading,
+    activity: &SendActivity,
     queue_depth: usize,
 ) -> Vec<(Level, String)> {
     let mut records = Vec::new();
@@ -752,40 +911,53 @@ fn sweep_report(
         ));
     }
 
-    // One line for the whole population. The 2026-08-26 incident that made
-    // this a collapse rather than a loop: 282 × 66 MB copied to a NAS over
-    // 6.7 MB/s Wi-Fi kept ~320 one-MiB frames queued at all times, and a line
-    // each per sweep made 4,487 of the 4,744 lines in the user's diagnostic
-    // bundle this one message — a bundle covering 2 minutes 30 seconds, with
-    // everything that would have explained anything already rotated out.
-    if let Some(oldest) = split.queued.iter().map(|q| q.age).max() {
-        let mix = command_mix(&split.queued);
-        let waiting = split.queued.len();
-        records.push(match send_side {
-            SendSide::Draining => (
-                Level::Info,
-                format!(
-                    "send queue is deep but draining: {waiting} request(s) waiting for the socket \
-                     ({mix}), oldest queued {oldest:?} ago, {queue_depth} frame(s) in the queue; \
-                     the frames are moving at the rate the link can carry them"
-                ),
+    // One line for the whole send side. The 2026-08-26 incident that made this
+    // a collapse rather than a loop: 282 × 66 MB copied to a NAS over 6.7 MB/s
+    // Wi-Fi kept ~320 one-MiB frames queued at all times, and a line each per
+    // sweep made 4,487 of the 4,744 lines in the user's diagnostic bundle this
+    // one message — a bundle covering 2 minutes 30 seconds, with everything
+    // that would have explained anything already rotated out.
+    let backlog = split.queued.iter().map(|q| q.age).max().map(|oldest| {
+        format!(
+            "{} request(s) waiting for the socket ({}), oldest queued {oldest:?} ago, \
+             {queue_depth} frame(s) in the queue",
+            split.queued.len(),
+            command_mix(&split.queued)
+        )
+    });
+    match (&backlog, reading.state) {
+        // The line that names a send-side wedge instead of blaming the server:
+        // nothing was asked, so nothing can be expected back.
+        (Some(backlog), SendSide::Stalled) => records.push((
+            Level::Warn,
+            format!(
+                "send queue is NOT draining: not one byte has reached the socket in {:?}, \
+                 with {backlog}",
+                reading.silent_for
             ),
-            // The line that names a send-side wedge instead of blaming the
-            // server: nothing was asked, so nothing can be expected back.
-            SendSide::Stalled => (
-                Level::Warn,
-                format!(
-                    "send queue is NOT draining: {waiting} request(s) waiting for the socket \
-                     ({mix}), oldest queued {oldest:?} ago, {queue_depth} frame(s) in the queue, \
-                     and not one byte has reached the socket since the previous sweep"
-                ),
+        )),
+        (Some(backlog), SendSide::Draining) => records.push((
+            Level::Info,
+            format!(
+                "send queue is deep but draining: {backlog}; {}",
+                describe_activity(activity, reading.window)
             ),
-        });
+        )),
+        // No backlog worth naming, but the writer is working harder than it
+        // should have to. The early warning, once per sweep.
+        (None, _) if activity.slow_frames > 0 => records.push((
+            Level::Info,
+            format!(
+                "send side is slow but moving: {}",
+                describe_activity(activity, reading.window)
+            ),
+        )),
+        (None, _) => {}
     }
 
     if !split.parked.is_empty() {
         let wedged = !split.unanswered.is_empty()
-            || (!split.queued.is_empty() && send_side == SendSide::Stalled);
+            || (!split.queued.is_empty() && reading.state == SendSide::Stalled);
         let parked = describe_requests(&split.parked, "parked");
         records.push(if wedged {
             (
@@ -808,13 +980,14 @@ fn sweep_report(
     records
 }
 
-/// Report any request outstanding longer than `STALE_WAITER_AFTER`.
+/// Report what one look at a live connection found: what the send side is
+/// doing, and anything outstanding longer than `STALE_WAITER_AFTER`.
 ///
 /// Deliberately re-reports on every sweep: a connection that keeps serving small
 /// requests while a large write hangs looks healthy by every other measure, so
-/// the repetition is the signal. What it may NOT do is repeat per request —
-/// see [`sweep_report`] for the collapse and for how each population earns its
-/// level.
+/// the repetition is the signal. What it may NOT do is repeat per request or
+/// per frame — see [`sweep_report`] for the collapse and for how each
+/// population earns its level.
 ///
 /// ❌ **Long polls are not warned about.** The premise of every line here is
 /// "this should have come back by now", and for a CHANGE_NOTIFY that premise is
@@ -826,19 +999,24 @@ fn sweep_report(
 /// the genuine lines their meaning. They stay observable two ways instead: at
 /// TRACE every sweep, and named in full whenever a REAL stale request is
 /// warned about, since a wedge investigation wants the whole in-flight picture.
-fn warn_on_stale_waiters(inner: &Inner) {
-    // Read before the threshold check, so the baseline stays honest across a
-    // consumer toggling the warning off and back on.
-    let send_side = inner.observe_send_side();
+fn sweep_connection(inner: &Inner) {
+    // Read before anything can return early, so the send side's clock and the
+    // writer's tally stay honest across a consumer toggling the warning off
+    // and back on. Both are consumed by whoever looks, so exactly one look per
+    // sweep is the contract.
+    let tolerance = stall_tolerance(*inner.send_timeout.lock().unwrap());
+    let reading = inner.observe_send_side(Instant::now(), tolerance);
+    let activity = inner.send_tally.drain();
+
     let Some(threshold) = *inner.stale_request_after.lock().unwrap() else {
         return; // consumer turned the warning off
     };
     let split = classify_outstanding(inner, threshold);
     let queue_depth = inner.send_queue_depth.load(Ordering::Relaxed);
-    for (level, message) in sweep_report(&split, send_side, queue_depth) {
+    for (level, message) in sweep_report(&split, &reading, &activity, queue_depth) {
         log::log!(level, "{message}");
     }
-    // The frame-by-frame detail the collapsed send-queue line stands in for.
+    // The frame-by-frame detail the collapsed send-side line stands in for.
     // Built lazily, unlike the parked list above: there can be hundreds of
     // these, and nobody with TRACE off should pay to format them.
     if !split.queued.is_empty() {
@@ -1159,15 +1337,13 @@ struct Inner {
     /// to stay silent. Consumers with a legitimately slow server tune or disable
     /// it; see `Connection::set_stale_request_warning`.
     stale_request_after: StdMutex<Option<std::time::Duration>>,
-    /// `metrics.wire_bytes_sent` as of the previous stale-waiter sweep.
-    ///
-    /// The sweeper's only memory, and what lets one sweep tell "the queue is
-    /// deep because the link is slow" from "the queue is deep because nothing
-    /// is moving" — two states the depth alone cannot separate, and only one
-    /// of which is worth waking anyone up for. Deliberately the same reading
-    /// `CreditInfo::send_queue_depth` documents for consumers, so the crate's
-    /// own warning and a consumer's dashboard can't disagree.
-    swept_wire_bytes_sent: AtomicU64,
+    /// The sweeper's memory of the send side: what lets one sweep tell "the
+    /// queue is deep because the link is slow" from "the queue is deep because
+    /// nothing is moving" — two states the depth alone cannot separate, and
+    /// only one of which is worth waking anyone up for.
+    send_progress: StdMutex<SendProgress>,
+    /// What the writer task has done since the sweeper last looked.
+    send_tally: SendTally,
     /// How long a request may go unanswered before its caller gives up, or
     /// `None` to wait indefinitely. See `Connection::set_response_timeout`.
     response_timeout: StdMutex<Option<std::time::Duration>>,
@@ -1342,7 +1518,12 @@ impl Inner {
         Self {
             waiters: StdMutex::new(HashMap::new()),
             stale_request_after: StdMutex::new(Some(STALE_WAITER_AFTER)),
-            swept_wire_bytes_sent: AtomicU64::new(0),
+            send_progress: StdMutex::new(SendProgress {
+                wire_bytes_sent: 0,
+                last_progress: Instant::now(),
+                last_sweep: Instant::now(),
+            }),
+            send_tally: SendTally::default(),
             response_timeout: StdMutex::new(Some(RESPONSE_TIMEOUT)),
             last_frame_at: StdMutex::new(None),
             last_scheduled_at: StdMutex::new(std::time::Instant::now()),
@@ -1433,21 +1614,34 @@ impl Inner {
         }
     }
 
-    /// Whether anything reached the socket since the previous call.
+    /// How the send side looks as of `now`, and advance the sweeper's memory.
     ///
-    /// ❌ Only the stale-waiter sweeper may call this: it consumes the previous
-    /// reading, so a second caller would leave the sweeper comparing against
-    /// its own last look and reading every slow link as a wedge.
+    /// ❌ Only the connection sweeper may call this: it consumes the previous
+    /// reading, so a second caller would leave the sweeper measuring silence
+    /// from its own last look instead of from the last frame out.
     ///
     /// `wire_bytes_sent` only ticks once a WHOLE frame has reached the socket,
-    /// which is what makes it the right witness: a writer parked mid-frame
-    /// moves nothing, and neither does this counter.
-    fn observe_send_side(&self) -> SendSide {
+    /// which is what makes it the right witness — a writer parked mid-frame
+    /// moves nothing, and neither does this counter — and also why the verdict
+    /// needs [`stall_tolerance`] rather than "did it move since last time".
+    fn observe_send_side(&self, now: Instant, tolerance: Duration) -> SendSideReading {
         let sent = self.metrics.wire_bytes_sent.load(Ordering::Relaxed);
-        if self.swept_wire_bytes_sent.swap(sent, Ordering::Relaxed) == sent {
-            SendSide::Stalled
-        } else {
-            SendSide::Draining
+        let mut progress = self.send_progress.lock().unwrap();
+        if sent != progress.wire_bytes_sent {
+            progress.wire_bytes_sent = sent;
+            progress.last_progress = now;
+        }
+        let silent_for = now.saturating_duration_since(progress.last_progress);
+        let window = now.saturating_duration_since(progress.last_sweep);
+        progress.last_sweep = now;
+        SendSideReading {
+            state: if silent_for >= tolerance {
+                SendSide::Stalled
+            } else {
+                SendSide::Draining
+            },
+            silent_for,
+            window,
         }
     }
 
@@ -3926,6 +4120,18 @@ impl Connection {
         // ❌ `send_queue_depth` is deliberately NOT reset: a caller parked
         // between its increment and its decrement would underflow the gauge
         // into a nonsense number. It drains on its own.
+        //
+        // The send side's clocks DO restart: the new socket has sent nothing
+        // and owes nothing, and carrying the dead one's silence over would let
+        // the first sweep after a revival call the fresh connection wedged.
+        {
+            let now = Instant::now();
+            let mut progress = inner.send_progress.lock().unwrap();
+            progress.wire_bytes_sent = inner.metrics.wire_bytes_sent.load(Ordering::Relaxed);
+            progress.last_progress = now;
+            progress.last_sweep = now;
+        }
+        inner.send_tally.drain();
 
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
         *inner.write_tx.lock().unwrap() = write_tx;
@@ -5142,6 +5348,18 @@ mod tests {
              timing out"
         );
         assert!(
+            stall_tolerance(Some(SEND_TIMEOUT)) >= SEND_TIMEOUT,
+            "the sweeper must never call a send side stalled while the send deadline \
+             is still willing to wait for the frame in flight: `wire_bytes_sent` only \
+             ticks on a WHOLE frame, so a tighter window would warn about every link \
+             slower than one frame per sweep — links SEND_TIMEOUT was sized to accept"
+        );
+        assert!(
+            stall_tolerance(None) >= STALE_WAITER_SWEEP * 2,
+            "and a verdict always rests on more than one look, even when a consumer \
+             has removed the send deadline entirely"
+        );
+        assert!(
             KEEPALIVE_AFTER + Inner::keepalive_tick(KEEPALIVE_AFTER) < RESPONSE_TIMEOUT,
             "a probe has to go out and be given time to come back before the response \
              deadline fires, or the deadline would always decide with no evidence to \
@@ -5792,7 +6010,7 @@ mod tests {
             *conn.inner.stale_request_after.lock().unwrap(),
             Some(Duration::from_millis(0))
         );
-        warn_on_stale_waiters(&conn.inner); // must not panic, and must consider it
+        sweep_connection(&conn.inner); // must not panic, and must consider it
     }
 
     /// A parked long poll is never reported as a stalled request.
@@ -5842,6 +6060,19 @@ mod tests {
         }
     }
 
+    /// A reading the pure reporting tests can hand in, with the send side in a
+    /// given state and one sweep interval behind it.
+    fn reading(state: SendSide) -> SendSideReading {
+        SendSideReading {
+            state,
+            silent_for: match state {
+                SendSide::Draining => Duration::from_secs(0),
+                SendSide::Stalled => Duration::from_secs(25),
+            },
+            window: STALE_WAITER_SWEEP,
+        }
+    }
+
     /// A deep send queue collapses to ONE line however many frames are in it.
     ///
     /// The incident this pins: 282 × 66 MB copied to a NAS over a 6.7 MB/s
@@ -5863,14 +6094,72 @@ mod tests {
             parked: Vec::new(),
         };
 
-        let records = sweep_report(&split, SendSide::Draining, 320);
+        let records = sweep_report(
+            &split,
+            &reading(SendSide::Draining),
+            &SendActivity::default(),
+            320,
+        );
 
         assert_eq!(
             records.len(),
             2,
             "one line for the request the server owes an answer for, and ONE for the \
-             whole send queue — never one per frame: {records:#?}"
+             whole send side — never one per frame: {records:#?}"
         );
+    }
+
+    /// Every frame in a bulk copy over a slow link is a slow send, so the slow
+    /// ones are counted per sweep, never announced one at a time.
+    ///
+    /// Per frame, this was six or seven `WARN` lines a second for a sixteen
+    /// minute transfer, on top of the queue flood above — the same pathology
+    /// twice on the same code path.
+    #[test]
+    fn a_burst_of_slow_sends_collapses_to_one_line_per_sweep() {
+        let activity = SendActivity {
+            frames: 64,
+            bytes: 67_108_864,
+            slow_frames: 64,
+            worst_queued: Duration::from_secs(9),
+            worst_writing: Duration::from_millis(1_200),
+        };
+
+        let records = sweep_report(
+            &OutstandingSplit::default(),
+            &reading(SendSide::Draining),
+            &activity,
+            0,
+        );
+
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].0, Level::Info, "{}", records[0].1);
+        let line = &records[0].1;
+        assert!(
+            line.contains("64 frame(s)"),
+            "the rate, not each frame: {line}"
+        );
+        assert!(
+            line.contains("6.7 MB/s"),
+            "what the link actually carried: {line}"
+        );
+        assert!(
+            line.contains("9s queued") && line.contains("1.2s writing"),
+            "queue time and write time stay split — they blame different things: {line}"
+        );
+    }
+
+    /// A healthy, quiet connection says nothing at all.
+    #[test]
+    fn a_sweep_with_nothing_to_report_stays_silent() {
+        let records = sweep_report(
+            &OutstandingSplit::default(),
+            &reading(SendSide::Draining),
+            &SendActivity::default(),
+            0,
+        );
+
+        assert!(records.is_empty(), "{records:#?}");
     }
 
     /// A deep queue that is MOVING is the link being slow, not a fault, so it
@@ -5896,7 +6185,12 @@ mod tests {
             parked: Vec::new(),
         };
 
-        let records = sweep_report(&split, SendSide::Draining, 322);
+        let records = sweep_report(
+            &split,
+            &reading(SendSide::Draining),
+            &SendActivity::default(),
+            322,
+        );
 
         assert_eq!(records.len(), 1, "{records:#?}");
         assert_eq!(
@@ -5921,7 +6215,7 @@ mod tests {
     ///
     /// This is the half the collapse must not swallow: a wedged writer task or
     /// a dead socket looks identical to a slow link from the queue depth
-    /// alone, and only "did anything reach the socket" tells them apart.
+    /// alone, and only "is anything still reaching the socket" tells them apart.
     #[test]
     fn a_send_queue_that_is_not_draining_still_warns() {
         let split = OutstandingSplit {
@@ -5932,13 +6226,19 @@ mod tests {
             parked: Vec::new(),
         };
 
-        let records = sweep_report(&split, SendSide::Stalled, 320);
+        let records = sweep_report(
+            &split,
+            &reading(SendSide::Stalled),
+            &SendActivity::default(),
+            320,
+        );
 
         assert_eq!(records.len(), 1, "{records:#?}");
         assert_eq!(
             records[0].0,
             Level::Warn,
-            "nothing reached the socket between two sweeps while 320 frames waited: {}",
+            "nothing has reached the socket for longer than a whole frame is allowed \
+             to take, while 320 frames waited: {}",
             records[0].1
         );
     }
@@ -5958,11 +6258,25 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        let tolerance = Duration::from_secs(20);
+        let t0 = Instant::now();
+
+        conn.inner
+            .metrics
+            .wire_bytes_sent
+            .fetch_add(1024, Ordering::Relaxed);
+        assert_eq!(
+            conn.inner.observe_send_side(t0, tolerance).state,
+            SendSide::Draining,
+            "a frame reached the socket"
+        );
 
         assert_eq!(
-            conn.inner.observe_send_side(),
+            conn.inner
+                .observe_send_side(t0 + tolerance + Duration::from_secs(1), tolerance)
+                .state,
             SendSide::Stalled,
-            "nothing has ever reached the socket"
+            "and then nothing did, for longer than one frame may take"
         );
 
         conn.inner
@@ -5970,15 +6284,98 @@ mod tests {
             .wire_bytes_sent
             .fetch_add(1024, Ordering::Relaxed);
         assert_eq!(
-            conn.inner.observe_send_side(),
+            conn.inner
+                .observe_send_side(t0 + tolerance + Duration::from_secs(2), tolerance)
+                .state,
             SendSide::Draining,
-            "a frame got out between the two looks"
+            "one frame getting out clears the verdict"
+        );
+    }
+
+    /// A link too slow to finish a frame between two sweeps is NOT a wedge.
+    ///
+    /// `wire_bytes_sent` only ticks on a WHOLE frame, so between completions it
+    /// stands still by construction, and judging a single sweep interval would
+    /// call any link slower than one frame per `STALE_WAITER_SWEEP` stalled:
+    /// ~105 KB/s at a 1 MiB `MaxWriteSize`, ~840 KB/s at the 8 MiB one Windows
+    /// and several NAS boxes negotiate. `SEND_TIMEOUT` is sized for 50 KB/s and
+    /// 400 KB/s, so that window would have warned across the whole band between
+    /// them — ordinary Wi-Fi, and exactly the false positive the collapse
+    /// exists to remove. `stall_tolerance` closes it by deferring to the send
+    /// deadline.
+    #[tokio::test]
+    async fn a_link_too_slow_to_finish_a_frame_between_sweeps_is_not_a_wedge() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let tolerance = stall_tolerance(Some(SEND_TIMEOUT));
+        let start = Instant::now();
+
+        // A 1 MiB frame crawling out at 60 KB/s: ~17 s each, so most sweeps see
+        // no completion at all, and the send deadline tolerates every one of
+        // them.
+        let per_frame = Duration::from_millis(17_000);
+        assert!(
+            per_frame < SEND_TIMEOUT,
+            "the premise: this link is inside what the send deadline accepts"
+        );
+        assert!(
+            per_frame > STALE_WAITER_SWEEP,
+            "the premise: and slower than one frame per sweep"
         );
 
+        let mut completed = Duration::ZERO;
+        let mut now = start;
+        for _ in 0..12 {
+            now += STALE_WAITER_SWEEP;
+            while completed + per_frame <= now.saturating_duration_since(start) {
+                completed += per_frame;
+                conn.inner
+                    .metrics
+                    .wire_bytes_sent
+                    .fetch_add(1_048_576, Ordering::Relaxed);
+            }
+            assert_eq!(
+                conn.inner.observe_send_side(now, tolerance).state,
+                SendSide::Draining,
+                "a link the send deadline accepts must never read as a wedge \
+                 (at {:?} into the transfer)",
+                now.saturating_duration_since(start)
+            );
+        }
+    }
+
+    /// The writer counts slow sends rather than announcing them.
+    ///
+    /// Pins the split too: a frame that sat in the queue behind a slow one is a
+    /// different diagnosis from a frame this socket was slow to accept, so the
+    /// tally keeps both worst cases apart.
+    #[test]
+    fn the_writer_tallies_slow_sends_instead_of_logging_each_one() {
+        let tally = SendTally::default();
+        tally.record(
+            1_048_576,
+            Duration::from_secs(9),
+            Duration::from_millis(200),
+        );
+        tally.record(1_048_576, Duration::from_millis(10), Duration::from_secs(6));
+        tally.record(4_096, Duration::from_millis(1), Duration::from_millis(2));
+
+        let activity = tally.drain();
+
+        assert_eq!(activity.frames, 3);
+        assert_eq!(activity.bytes, 2_101_248);
+        assert_eq!(activity.slow_frames, 2, "the quick one is not slow");
+        assert_eq!(activity.worst_queued, Duration::from_secs(9));
+        assert_eq!(activity.worst_writing, Duration::from_secs(6));
+
+        let drained_again = tally.drain();
         assert_eq!(
-            conn.inner.observe_send_side(),
-            SendSide::Stalled,
-            "and a second look with no new bytes is a stall again"
+            drained_again.frames, 0,
+            "each sweep reports its own interval, not a running total"
         );
     }
 
