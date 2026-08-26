@@ -738,8 +738,8 @@ mod tests {
             "test-server",
         );
         // Stage the credit window a real connection would hold after
-        // NEGOTIATE / SESSION_SETUP / TREE_CONNECT; a fresh pool holds the
-        // single pre-NEGOTIATE credit, which no compound can afford.
+        // NEGOTIATE / SESSION_SETUP / TREE_CONNECT; a fresh pool is empty,
+        // and nothing but NEGOTIATE can send out of one.
         conn.set_credits(512);
         (conn, mock)
     }
@@ -944,6 +944,9 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // A negotiated connection has a credit window; NEGOTIATE's response is
+        // what opens it. Without staging one, nothing below can be sent.
+        conn.set_credits(512);
 
         let c = conn.clone();
         let handle =
@@ -971,6 +974,9 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // A negotiated connection has a credit window; NEGOTIATE's response is
+        // what opens it. Without staging one, nothing below can be sent.
+        conn.set_credits(512);
 
         let c = conn.clone();
         let handle =

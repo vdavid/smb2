@@ -779,8 +779,12 @@ mod tests {
         );
     }
 
-    /// Helper: set fake negotiated params on a connection.
+    /// Helper: put a connection in the state NEGOTIATE leaves it in.
+    ///
+    /// That includes a credit window: the NEGOTIATE response is what opens
+    /// one, and SESSION_SETUP spends from it like any other request.
     fn set_test_params(conn: &mut Connection, dialect: Dialect) {
+        conn.set_credits(512);
         conn.set_test_params(NegotiatedParams {
             dialect,
             max_read_size: 65536,

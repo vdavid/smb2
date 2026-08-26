@@ -12,6 +12,17 @@
 //! stream: several pipelined transfers over one connection draw on the same
 //! pool.
 //!
+//! **NEGOTIATE is exempt, not funded.** Before the first grant a client may
+//! send NEGOTIATE and nothing else (MS-SMB2 § 3.2.5.1.1). Modelling that as a
+//! seeded permit in the pool is the trap: a permit is fungible, so a request
+//! racing the handshake — a watcher re-arming, a listing retrying, anything
+//! that arrives while a revived connection is re-negotiating — can spend it
+//! and put a frame on the wire the server funded nothing for. The server
+//! discards that frame in silence, so the client learns nothing and waits out
+//! a full response deadline for an answer that was never coming. So the pool
+//! starts EMPTY and NEGOTIATE carries a [`CreditReservation::exempt`], which
+//! is the one shape nothing else can take.
+//!
 //! **Credits are spent on send, not on receipt.** That is the whole point of
 //! this type. Accounting for a request only once its answer arrives leaves
 //! everything currently in flight invisible, and concurrent senders each read
@@ -61,11 +72,17 @@ pub(crate) struct CreditPool {
 }
 
 impl CreditPool {
-    /// A fresh pool holds the single credit a client has before NEGOTIATE
-    /// (MS-SMB2 § 3.2.5.1.1) — enough to send NEGOTIATE and nothing else.
+    /// A fresh pool is empty: the server funds every credit, and it has not
+    /// granted one yet.
+    ///
+    /// The one thing a client may send before a grant is NEGOTIATE (MS-SMB2
+    /// § 3.2.5.1.1), and that is an exemption rather than a credit — see
+    /// [`CreditReservation::exempt`]. ❌ Don't seed a permit for it here: a
+    /// permit is fungible, so anything racing the handshake can spend it
+    /// instead and put a frame on the wire the server funded nothing for.
     pub(crate) fn new() -> Self {
         Self {
-            permits: Mutex::new(Arc::new(Semaphore::new(1))),
+            permits: Mutex::new(Arc::new(Semaphore::new(0))),
             wait_ms: AtomicU64::new(DEFAULT_CREDIT_WAIT.as_millis() as u64),
         }
     }
@@ -75,8 +92,8 @@ impl CreditPool {
         Arc::clone(&self.permits.lock().unwrap())
     }
 
-    /// Throw the spent budget away and start again from the pre-NEGOTIATE
-    /// single credit.
+    /// Throw the spent budget away and start again from empty, the way a
+    /// brand-new connection starts.
     ///
     /// Called when a connection is revived on a new transport. ❌ Don't reuse
     /// the old budget: its permits were granted by a session that no longer
@@ -84,7 +101,7 @@ impl CreditPool {
     /// them over would let the first burst after a reconnect out-spend the
     /// server exactly the way the original wedge did.
     pub(crate) fn reset(&self) {
-        *self.permits.lock().unwrap() = Arc::new(Semaphore::new(1));
+        *self.permits.lock().unwrap() = Arc::new(Semaphore::new(0));
     }
 
     /// Credits on hand: granted by the server and not reserved by a request.
@@ -206,6 +223,24 @@ impl<'a> CreditReservation<'a> {
         }
     }
 
+    /// A reservation for the one request that spends no credits: NEGOTIATE.
+    ///
+    /// MS-SMB2 § 3.2.5.1.1 lets a client send NEGOTIATE holding nothing,
+    /// because every credit it will ever hold arrives on the response. That
+    /// makes NEGOTIATE *exempt* from the window rather than funded by it, and
+    /// exemption is the only shape that can't be spent by something else:
+    /// a seeded permit in the pool is fungible, and a request that grabs it
+    /// while the handshake is still in flight sends a frame the server funded
+    /// nothing for. Servers answer such a frame by silently discarding it, so
+    /// the client waits out a full response deadline for an answer that was
+    /// never coming.
+    pub(crate) fn exempt() -> Self {
+        Self {
+            pool: None,
+            charge: 0,
+        }
+    }
+
     /// The bytes are on the wire: the credits belong to the server now.
     pub(crate) fn commit(mut self) {
         self.pool = None;
@@ -320,8 +355,21 @@ mod tests {
         assert!(pool.is_closed());
     }
 
+    #[test]
+    fn a_fresh_pool_funds_nothing_until_the_server_grants() {
+        let pool = CreditPool::new();
+
+        assert_eq!(pool.available(), 0);
+        assert!(
+            !pool.try_reserve(1),
+            "a credit the server never granted must not be spendable: \
+             NEGOTIATE is exempt from the window, and an exemption is not a \
+             permit anything else can take"
+        );
+    }
+
     #[tokio::test]
-    async fn a_reset_pool_starts_from_one_credit_again_and_is_no_longer_closed() {
+    async fn a_reset_pool_holds_no_ungranted_credit_and_is_no_longer_closed() {
         let pool = CreditPool::new();
         pool.set_available(400);
         pool.close();
@@ -335,11 +383,16 @@ mod tests {
         );
         assert_eq!(
             pool.available(),
-            1,
+            0,
             "credits granted by a dead session must not carry over -- the new \
-             server's window may be far smaller"
+             server's window may be far smaller, and until it says so the \
+             client holds nothing"
         );
-        assert!(pool.try_reserve(1));
+        assert!(
+            !pool.try_reserve(1),
+            "a request racing the revival must wait for a real grant rather \
+             than spend the handshake's exemption"
+        );
     }
 
     #[tokio::test]

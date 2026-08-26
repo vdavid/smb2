@@ -2360,11 +2360,12 @@ impl Connection {
             negotiate_contexts,
         };
 
-        // Register a waiter for msg_id=0 (negotiate is always first). The one
-        // credit a fresh pool holds (MS-SMB2 § 3.2.5.1.1) is exactly enough,
-        // so this reservation never waits — it just keeps the books straight
-        // for whatever the response grants.
-        let reservation = self.inner.reserve_credits(1, Command::Negotiate).await?;
+        // NEGOTIATE is exempt from the credit window rather than funded by it
+        // (MS-SMB2 § 3.2.5.1.1): the server has granted nothing yet, and the
+        // response is what opens the budget. Reserving here instead would mean
+        // seeding a permit in the pool, which anything racing the handshake
+        // could spend — see `CreditReservation::exempt`.
+        let reservation = CreditReservation::exempt();
         let mut header = Header::new_request(Command::Negotiate);
         let msg_id = self.allocate_msg_id(1);
         header.message_id = msg_id;
@@ -6042,6 +6043,9 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // A negotiated connection has a credit window; NEGOTIATE's response is
+        // what opens it. Without staging one, nothing below can be sent.
+        conn.set_credits(512);
 
         // Manually set past negotiate.
         conn.set_next_message_id(5);
@@ -6069,6 +6073,9 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // A negotiated connection has a credit window; NEGOTIATE's response is
+        // what opens it. Without staging one, nothing below can be sent.
+        conn.set_credits(512);
 
         // Activate signing.
         let key = vec![0xAA; 16];
@@ -7354,6 +7361,9 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // A negotiated connection has a credit window; NEGOTIATE's response is
+        // what opens it. Without staging one, nothing below can be sent.
+        conn.set_credits(512);
 
         // Spawn the execute first. `execute` allocates msg_id=0.
         let c = conn.clone();
@@ -7676,6 +7686,9 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
+        // A negotiated connection has a credit window; NEGOTIATE's response is
+        // what opens it. Without staging one, nothing below can be sent.
+        original.set_credits(512);
         let cloned = original.clone();
         drop(original);
 

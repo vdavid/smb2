@@ -779,7 +779,7 @@ mod loss_window_tests {
         let mut conn =
             Connection::from_transport(Box::new(sim.clone()), Box::new(sim.clone()), "test-server");
         // The credit window a real connection holds by the time it watches a
-        // directory; a fresh pool has only the pre-NEGOTIATE credit.
+        // directory; a fresh pool is empty until the server grants.
         conn.set_credits(512);
         conn.set_test_params(NegotiatedParams {
             dialect: Dialect::Smb2_0_2,

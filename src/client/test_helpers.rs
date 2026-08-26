@@ -32,6 +32,20 @@ pub(crate) fn build_set_info_response() -> Vec<u8> {
 /// pending sent msg_id in FIFO order. Replaces the pre-Phase-3
 /// `set_orphan_filter_enabled(false)` path.
 pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
+    let conn = setup_connection_without_credits(mock);
+    // Stage a credit window the way a real connection would have one by this
+    // point: NEGOTIATE, SESSION_SETUP, and TREE_CONNECT have all come back
+    // with grants before any of these tests' operations run.
+    conn.set_credits(512);
+    conn
+}
+
+/// [`setup_connection`] with the credit window left exactly as a connection
+/// that has negotiated nothing yet holds it: empty.
+///
+/// The server funds every credit, so before its first grant a client can send
+/// NEGOTIATE and nothing else (MS-SMB2 § 3.2.5.1.1).
+pub(crate) fn setup_connection_without_credits(mock: &Arc<MockTransport>) -> Connection {
     mock.enable_auto_rewrite_msg_id();
     let mut conn = Connection::from_transport(
         Box::new(mock.clone()),
@@ -51,12 +65,6 @@ pub(crate) fn setup_connection(mock: &Arc<MockTransport>) -> Connection {
         compression_supported: false,
     });
     conn.set_session_id(SessionId(0x1234));
-    // Stage a credit window the way a real connection would have one by this
-    // point: NEGOTIATE, SESSION_SETUP, and TREE_CONNECT have all come back
-    // with grants before any of these tests' operations run. Without it the
-    // pool holds the single pre-NEGOTIATE credit and any compound is
-    // unsendable.
-    conn.set_credits(512);
     conn
 }
 

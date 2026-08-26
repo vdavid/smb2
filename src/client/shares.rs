@@ -730,6 +730,9 @@ pub(crate) mod tests {
         mock.enable_auto_rewrite_msg_id();
         let mut conn =
             Connection::from_transport(Box::new(mock.clone()), Box::new(mock.clone()), "my-nas");
+        // A negotiated connection has a credit window; NEGOTIATE's response is
+        // what opens it. Without staging one, nothing below can be sent.
+        conn.set_credits(512);
         conn.set_test_params(NegotiatedParams {
             dialect: Dialect::Smb2_0_2,
             max_read_size: 65536,

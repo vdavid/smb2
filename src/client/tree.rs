@@ -3225,7 +3225,7 @@ mod tests {
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
         build_close_response, build_create_error_response, build_create_response,
-        build_tree_connect_response, setup_connection,
+        build_tree_connect_response, setup_connection, setup_connection_without_credits,
     };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
@@ -3355,6 +3355,33 @@ mod tests {
         let tree = Tree::connect(&mut conn, "naspi").await.unwrap();
         assert_eq!(tree.tree_id, tree_id);
         assert_eq!(tree.share_name, "naspi");
+    }
+
+    #[tokio::test]
+    async fn nothing_but_negotiate_can_send_before_the_server_grants_a_credit() {
+        let mock = Arc::new(MockTransport::new());
+        // No response queued: the point is that nothing gets asked at all.
+        let mut conn = setup_connection_without_credits(&mock);
+
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Tree::connect(&mut conn, "naspi"),
+        )
+        .await
+        .expect("an unfunded request must fail fast, not park on the wire");
+
+        assert_eq!(
+            mock.sent_count(),
+            0,
+            "a request the server funded no credit for must never reach the \
+             wire: the server silently discards it and the client then waits \
+             out a response deadline for an answer that is never coming"
+        );
+        assert!(
+            matches!(attempt, Err(Error::CreditStarvation { .. })),
+            "the caller gets a bounded error instead, got {:?}",
+            attempt.map(|_| "a tree")
+        );
     }
 
     #[tokio::test]

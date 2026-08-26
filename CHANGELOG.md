@@ -5,6 +5,15 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A request racing the handshake can no longer send a frame the server funded nothing for.** A client holds no credits until the server grants some; the one thing it may send before that is NEGOTIATE (MS-SMB2 § 3.2.5.1.1). That was modelled as a single seeded permit in the credit pool, and a permit is fungible: anything arriving while a connection was negotiating -- a watcher re-arming, a listing retrying, any request on a connection being revived after a Wi-Fi blip or a wake from sleep -- could spend it first.
+  - **The symptom was a silent stall, not an error.** A server answers an over-spent frame by discarding it without a word (MS-SMB2 § 3.3.1.1 permits dropping the connection; Samba instead logs `client used more credits than granted` and stays quiet), so the client waited out a full response deadline for an answer that was never coming. The ECHO keepalive makes that worse rather than better: the connection genuinely is alive, so the probe succeeds and extends the deadline to ~180 s.
+  - **NEGOTIATE is now exempt from the window rather than funded by it.** A fresh or reset pool holds zero permits, and NEGOTIATE carries a reservation that spends nothing -- the one shape no other request can take. A request that races the handshake now waits for a real grant, or gets a bounded `CreditStarvation` if nothing can fund it.
+  - **Do you need to do anything?** No. No signature changes, and nothing that worked before behaves differently once the server has granted its first credit.
+
 ## [0.19.0] - 2026-08-26
 
 ### Changed
