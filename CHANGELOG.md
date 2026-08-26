@@ -5,15 +5,16 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] - 2026-08-26
 
 ### Changed
 
 - **A slow link no longer buys hundreds of megabytes of hidden latency.** `MAX_PIPELINE_WINDOW` caps one stream at 32 in-flight WRITEs, but says nothing about how many streams share the connection, so N concurrent uploads multiplied it. Ten files at a 1 MiB `MaxWriteSize` put 320 MiB of payload in this process at once; on a 6.7 MB/s link that is ~48 seconds between handing a chunk over and it reaching the socket, which the consumer pays for in cancel latency, in progress reporting that runs ahead of reality, and in plain memory.
-  - Outstanding WRITE payload is now bounded connection-wide at 32 MiB. On a saturated gigabit link that is still 0.3 s of buffer, far more than the bandwidth-delay product, so nothing slows down; on a slow link it is ~5 s instead of ~48.
+  - Outstanding WRITE payload is now bounded connection-wide, at 32 MiB by default. On a saturated gigabit link that is still 0.3 s of buffer, far more than the bandwidth-delay product, so nothing slows down; on a slow link it is ~5 s instead of ~48.
+  - **All three pipelined write paths are covered**: `FileWriter`, `Tree::write_file_pipelined`, and `Tree::write_file_streamed`. They pipeline the same way and carried the same multiplication.
   - The permit is held by the in-flight WRITE future itself, so draining, aborting, cancelling, or dropping it returns the budget with no explicit release anywhere.
-  - A frame larger than the whole budget is clamped rather than refused, so a server negotiating a `MaxWriteSize` above 32 MiB can still send one.
-  - `Tree::write_file_pipelined` and `write_file_streamed` are not covered yet; they pipeline the same way and are next.
+  - A frame larger than the whole budget is clamped rather than refused, so a server negotiating a `MaxWriteSize` above the budget can still send one.
+  - **Do you need to do anything?** Only if 32 MiB is the wrong number for your link or your host, and then it is one call: see `Connection::set_write_budget` below. No signature changes, and a transfer that was correct before is correct now.
 
 - **A busy send queue no longer costs a diagnostic bundle its history.** Frames waiting for the socket were reported one `WARN` line each, every sweep. Copying 282 × 66 MB to a NAS over a 6.7 MB/s Wi-Fi link keeps around 320 one-MiB frames queued at all times, so that came to ~320 lines every 10 seconds: 4,487 of the 4,744 lines in one user's bundle were this single message, and the whole bundle covered 2 minutes 30 seconds. Everything that would have explained anything had already rotated out.
   - **One line for the whole send side now**, naming how many frames are waiting, the oldest one's age, the command mix, the queue depth, and what the writer actually got out over the interval: frames, rate, how many were slow, and the worst queue time and write time. The frame-by-frame detail moved to `TRACE`, where the long-poll list already lives. An idle-and-healthy connection says nothing at all.
@@ -22,6 +23,14 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
   - **A queue that is NOT draining stays `WARN`, and says so by name.** Depth alone cannot tell a slow link from a wedged writer task or a dead socket; how long it has been since a whole frame reached the socket can, and that is the reading the split is built on -- the same one `CreditInfo::send_queue_depth` already documents for consumers.
   - **The silence has to outlast the send deadline before it counts.** `wire_bytes_sent` ticks only on a whole frame, so a link too slow to finish one between two sweeps would otherwise read as a wedge: that is ~105 KB/s at a 1 MiB `MaxWriteSize` and ~840 KB/s at the 8 MiB one Windows and several NAS boxes negotiate, while `SEND_TIMEOUT` is sized to accept 50 KB/s and 400 KB/s respectively. The whole band between them is ordinary Wi-Fi. Deferring to `send_timeout` closes it by construction, and a link that deadline won't tolerate tears itself down anyway.
   - The per-request `WARN` for a request the server has been asked and has not answered is untouched: that population is a different claim, and the server does owe us a response.
+
+### Added
+
+- **`Connection::set_write_budget` and `Connection::write_budget`**, so the 32 MiB above is a default rather than a verdict. It is sized for a LAN, and there are two ends where that is the wrong call:
+  - **Raise it on a very fast link.** At 10 GbE (~1.2 GB/s) 32 MiB is ~25 ms of buffer, and a round trip plus the server's own write latency can exceed that, leaving the pipe briefly dry. A few hundred MiB costs nothing but memory there.
+  - **Lower it on a memory-constrained host, or where cancelling has to feel instant.** There is no floor to worry about: a budget below a single `MaxWriteSize` frame clamps that frame to the whole budget rather than wedging it, so an embedded consumer can go well under the default.
+  - Counted in 64 KiB granules, so the value rounds up and `write_budget()` reports what the rounding produced. Raising takes effect at once; lowering takes effect as the frames already on the wire complete, since their bytes are committed.
+  - ❌ It bounds buffering, not bandwidth. It is not a throttle, and setting it low enough to slow a transfer down mostly costs you the pipelining this crate exists for.
 
 ## [0.18.1] - 2026-08-08
 

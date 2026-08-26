@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use log::{debug, trace};
 
-use crate::client::connection::Connection;
+use crate::client::connection::{
+    reserve_write_budget_or_drain, Connection, Frame, WriteBudgetStep,
+};
 use crate::client::tree::Tree;
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
@@ -1110,7 +1112,11 @@ impl FileWriter {
     /// dropping the future returns the budget with no explicit release anywhere.
     /// ❌ Don't hold it on `self` instead: a writer dropped mid-flight (a user
     /// cancelling a copy) would strand the budget for the life of the connection.
-    fn launch_wire_chunk(&mut self, data: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) {
+    fn launch_wire_chunk(
+        &mut self,
+        data: Vec<u8>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         let data_len = data.len() as u64;
         let credit_charge = data_len.div_ceil(65536).max(1) as u16;
 
@@ -1149,6 +1155,16 @@ impl FileWriter {
         let Some(result) = self.in_flight.next().await else {
             return Ok(());
         };
+        self.take_write_response(result).await
+    }
+
+    /// Account for one finished WRITE, whoever awaited it.
+    ///
+    /// Split out of [`Self::drain_one`] so the budget's drain step can hand its
+    /// response here instead of duplicating the failure handling.
+    async fn take_write_response(&mut self, result: Result<Frame>) -> Result<()> {
+        use futures_util::stream::StreamExt;
+
         let frame = result?;
 
         if frame.header.status != NtStatus::SUCCESS {
@@ -1208,40 +1224,29 @@ impl FileWriter {
         }
 
         // This stream has room; the CONNECTION may not. The window bounds one
-        // stream, the budget bounds all of them together.
-        match self.reserve_budget(data.len() as u64).await? {
-            Some(permit) => {
-                self.launch_wire_chunk(data, permit);
-                Ok(true)
-            }
-            None => {
-                self.stashed_chunk = Some(data);
-                Ok(false)
-            }
-        }
+        // stream, the budget bounds all of them together. This waits rather
+        // than stashing: unlike the window, the budget is shared, so there is
+        // nothing the caller could usefully do with an `Ok(false)` here.
+        let permit = self.reserve_budget(data.len() as u64).await?;
+        self.launch_wire_chunk(data, permit);
+        Ok(true)
     }
 
     /// Connection-wide write budget for one wire chunk.
     ///
-    /// ❌ The ordering here is the whole deadlock argument, don't reorder it. A
-    /// writer parked on the budget is not polling its own `in_flight`, so the
-    /// frames it already launched can never complete and never give their budget
-    /// back. So: take budget only if it is free; otherwise free OUR OWN first by
-    /// draining a response; and only wait once we hold nothing at all, where
-    /// waiting cannot contribute to a cycle. Every other holder is in the same
-    /// loop, draining, so the wait always ends while the server answers.
+    /// The deadlock-safe ordering lives in `reserve_write_budget_or_drain`;
+    /// this loop only accounts for the responses that ordering drains on the
+    /// way. ❌ Don't inline a shortcut past it.
     async fn reserve_budget(
         &mut self,
         bytes: u64,
     ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
         loop {
-            if let Some(permit) = self.conn.try_reserve_write_budget(bytes) {
-                return Ok(Some(permit));
+            let step = reserve_write_budget_or_drain(&self.conn, bytes, &mut self.in_flight).await;
+            match step {
+                WriteBudgetStep::Granted(permit) => return Ok(permit),
+                WriteBudgetStep::Drained(result) => self.take_write_response(result).await?,
             }
-            if self.in_flight.is_empty() {
-                return Ok(self.conn.reserve_write_budget(bytes).await);
-            }
-            self.drain_one().await?;
         }
     }
 
@@ -1253,11 +1258,8 @@ impl FileWriter {
                 self.drain_one().await?;
             }
             if self.can_send(&stashed) {
-                match self.reserve_budget(stashed.len() as u64).await? {
-                    Some(permit) => self.launch_wire_chunk(stashed, permit),
-                    // Re-stash — caller must drain more or give up.
-                    None => self.stashed_chunk = Some(stashed),
-                }
+                let permit = self.reserve_budget(stashed.len() as u64).await?;
+                self.launch_wire_chunk(stashed, permit);
             } else {
                 // Re-stash — caller must drain more or give up.
                 self.stashed_chunk = Some(stashed);

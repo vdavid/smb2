@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use log::{debug, info, trace, warn};
 
-use crate::client::connection::{CompoundOp, Connection};
+use crate::client::connection::{
+    reserve_write_budget_or_drain, CompoundOp, Connection, Frame, WriteBudgetStep,
+};
 use crate::client::stream::{FileDownload, Progress};
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
@@ -41,6 +43,23 @@ use crate::Error;
 /// increases memory usage (buffering responses). 32 x 64 KB = 2 MB
 /// in flight is plenty for Gigabit LAN.
 const MAX_PIPELINE_WINDOW: usize = 32;
+
+/// Bytes the server confirmed for one finished WRITE.
+///
+/// The one place the pipelined write loops turn a completed frame into a byte
+/// count, so a status they can't accept fails the same way wherever it is
+/// noticed.
+fn confirmed_write_bytes(frame: Result<Frame>) -> Result<u64> {
+    let frame = frame?;
+    if frame.header.status != NtStatus::SUCCESS {
+        return Err(Error::Protocol {
+            status: frame.header.status,
+            command: Command::Write,
+        });
+    }
+    let mut cursor = ReadCursor::new(&frame.body);
+    Ok(u64::from(WriteResponse::unpack(&mut cursor)?.count))
+}
 
 /// Unwrap an `execute_compound` result, propagating the first inner
 /// waiter-level error (session expired, signature verify failure,
@@ -2703,6 +2722,12 @@ impl Tree {
     ///
     /// Instead of batch send/receive phases, each received response
     /// immediately triggers the next send. The pipe stays full at all times.
+    ///
+    /// Two bounds hold it back, and they answer different questions:
+    /// `MAX_PIPELINE_WINDOW` caps how many frames THIS call keeps queued, and
+    /// the connection-wide write budget caps how much payload every writer on
+    /// the connection has outstanding together. See
+    /// [`reserve_write_budget_or_drain`] for why the order below is what it is.
     async fn write_pipelined_loop(
         &self,
         conn: &mut Connection,
@@ -2732,10 +2757,12 @@ impl Tree {
         );
 
         let mut in_flight = FuturesUnordered::new();
-        let build_req = |chunk_index: usize| -> WriteRequest {
+        let chunk_range = |chunk_index: usize| -> (usize, usize) {
             let offset = chunk_index * chunk_size as usize;
-            let end = (offset + chunk_size as usize).min(data.len());
-            let chunk = &data[offset..end];
+            (offset, (offset + chunk_size as usize).min(data.len()))
+        };
+        let build_req = |chunk_index: usize| -> WriteRequest {
+            let (offset, end) = chunk_range(chunk_index);
             WriteRequest {
                 data_offset: 0x70,
                 offset: offset as u64,
@@ -2745,52 +2772,59 @@ impl Tree {
                 write_channel_info_offset: 0,
                 write_channel_info_length: 0,
                 flags: 0,
-                data: chunk.to_vec(),
+                data: data[offset..end].to_vec(),
             }
         };
-        let launch_chunk = |conn: &Connection, chunk_index: usize, tree_id: TreeId| {
-            let c = conn.clone();
-            let req = build_req(chunk_index);
-            async move {
-                let frame = c
-                    .execute_with_credits(
-                        Command::Write,
-                        &req,
-                        Some(tree_id),
-                        CreditCharge(credit_charge),
-                    )
-                    .await;
-                (chunk_index, frame)
-            }
-        };
-
-        for _ in 0..initial_window {
-            in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
-            chunks_sent += 1;
-        }
+        let launch_chunk =
+            |conn: &Connection,
+             chunk_index: usize,
+             tree_id: TreeId,
+             permit: Option<tokio::sync::OwnedSemaphorePermit>| {
+                let c = conn.clone();
+                let req = build_req(chunk_index);
+                async move {
+                    // Parked inside the future so completing, aborting, or dropping
+                    // it returns the budget with no explicit release anywhere.
+                    let _budget = permit;
+                    let frame = c
+                        .execute_with_credits(
+                            Command::Write,
+                            &req,
+                            Some(tree_id),
+                            CreditCharge(credit_charge),
+                        )
+                        .await;
+                    (chunk_index, frame)
+                }
+            };
 
         while chunks_received < total_chunks {
+            // Room in our own window and something left to send: ask for the
+            // budget, which may hand back one of our own responses instead.
+            if chunks_sent < total_chunks && in_flight.len() < initial_window {
+                let (offset, end) = chunk_range(chunks_sent);
+                let step =
+                    reserve_write_budget_or_drain(conn, (end - offset) as u64, &mut in_flight)
+                        .await;
+                match step {
+                    WriteBudgetStep::Granted(permit) => {
+                        in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id, permit));
+                        chunks_sent += 1;
+                    }
+                    WriteBudgetStep::Drained((_chunk_index, frame_result)) => {
+                        chunks_received += 1;
+                        total_written += confirmed_write_bytes(frame_result)?;
+                    }
+                }
+                continue;
+            }
+
+            // Window full, or everything is on the wire: wait for a response.
             let Some((_chunk_index, frame_result)) = in_flight.next().await else {
                 break;
             };
             chunks_received += 1;
-            let frame = frame_result?;
-
-            if frame.header.status != NtStatus::SUCCESS {
-                return Err(Error::Protocol {
-                    status: frame.header.status,
-                    command: Command::Write,
-                });
-            }
-
-            let mut cursor = ReadCursor::new(&frame.body);
-            let resp = WriteResponse::unpack(&mut cursor)?;
-            total_written += resp.count as u64;
-
-            if chunks_sent < total_chunks {
-                in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id));
-                chunks_sent += 1;
-            }
+            total_written += confirmed_write_bytes(frame_result)?;
         }
 
         Ok(total_written)
@@ -2882,110 +2916,97 @@ impl Tree {
             }
         };
 
-        // Initial fill: queue up to a full window of writes. The window is a
-        // queue bound, not a credit bound — `Connection` reserves credits per
-        // send and parks a write that can't afford one, so a chunk pulled from
-        // the callback is always eventually sent.
-        while in_flight < MAX_PIPELINE_WINDOW {
-            let chunk = next_wire_chunk(
-                &mut pending_data,
-                &mut pending_offset,
-                &mut done,
-                &mut callback_err,
-                next_chunk,
-            );
+        // One chunk pulled from the callback but not yet launched, because the
+        // budget handed back a response first. It goes out next, so the wire
+        // order (and therefore `offset`) never changes.
+        let mut stashed: Option<Vec<u8>> = None;
 
-            match chunk {
-                None => break,
-                Some(chunk_data) => {
+        // Two bounds, answering different questions: `MAX_PIPELINE_WINDOW` caps
+        // how many frames THIS call keeps queued -- a queue bound, not a credit
+        // bound, since `Connection` reserves credits per send and parks a write
+        // that can't afford one -- and the connection-wide write budget caps how
+        // much payload every writer on the connection has outstanding together.
+        loop {
+            // A response handed to us by the budget's drain step, if any.
+            let mut drained: Option<Result<Frame>> = None;
+
+            if in_flight < MAX_PIPELINE_WINDOW && callback_err.is_none() {
+                if stashed.is_none() {
+                    stashed = next_wire_chunk(
+                        &mut pending_data,
+                        &mut pending_offset,
+                        &mut done,
+                        &mut callback_err,
+                        next_chunk,
+                    );
+                }
+
+                if let Some(chunk_data) = stashed.take() {
                     let data_len = chunk_data.len() as u64;
-                    let cc = data_len.div_ceil(65536).max(1) as u16;
-                    let c = conn.clone();
-                    let tree_id = self.tree_id;
-                    let req = WriteRequest {
-                        data_offset: 0x70,
-                        offset,
-                        file_id,
-                        channel: 0,
-                        remaining_bytes: 0,
-                        write_channel_info_offset: 0,
-                        write_channel_info_length: 0,
-                        flags: 0,
-                        data: chunk_data,
-                    };
-                    in_flight_futs.push(Box::pin(async move {
-                        c.execute_with_credits(
-                            Command::Write,
-                            &req,
-                            Some(tree_id),
-                            CreditCharge(cc),
-                        )
-                        .await
-                    }));
-                    offset += data_len;
-                    in_flight += 1;
+                    let step =
+                        reserve_write_budget_or_drain(conn, data_len, &mut in_flight_futs).await;
+                    match step {
+                        WriteBudgetStep::Granted(permit) => {
+                            let cc = data_len.div_ceil(65536).max(1) as u16;
+                            let c = conn.clone();
+                            let tree_id = self.tree_id;
+                            let req = WriteRequest {
+                                data_offset: 0x70,
+                                offset,
+                                file_id,
+                                channel: 0,
+                                remaining_bytes: 0,
+                                write_channel_info_offset: 0,
+                                write_channel_info_length: 0,
+                                flags: 0,
+                                data: chunk_data,
+                            };
+                            in_flight_futs.push(Box::pin(async move {
+                                // Parked inside the future, so every path that
+                                // ends it returns the budget for free.
+                                let _budget = permit;
+                                c.execute_with_credits(
+                                    Command::Write,
+                                    &req,
+                                    Some(tree_id),
+                                    CreditCharge(cc),
+                                )
+                                .await
+                            }));
+                            offset += data_len;
+                            in_flight += 1;
+                            continue;
+                        }
+                        WriteBudgetStep::Drained(frame_result) => {
+                            stashed = Some(chunk_data);
+                            drained = Some(frame_result);
+                        }
+                    }
                 }
             }
-        }
 
-        // Sliding loop: receive one response, send next chunk (if any).
-        while in_flight > 0 {
-            let frame_result = match in_flight_futs.next().await {
-                Some(r) => r,
-                None => break,
+            // Nothing to launch (window full, callback exhausted, or the budget
+            // drained one on us): account for a response.
+            let frame_result = match drained {
+                Some(result) => result,
+                None => {
+                    if in_flight == 0 {
+                        break;
+                    }
+                    match in_flight_futs.next().await {
+                        Some(result) => result,
+                        None => break,
+                    }
+                }
             };
             in_flight -= 1;
-            let frame = frame_result?;
 
-            if frame.header.status != NtStatus::SUCCESS {
-                // Drain remaining in-flight responses (best-effort).
-                while in_flight_futs.next().await.is_some() {}
-                return Err(Error::Protocol {
-                    status: frame.header.status,
-                    command: Command::Write,
-                });
-            }
-
-            let mut cursor = ReadCursor::new(&frame.body);
-            let resp = WriteResponse::unpack(&mut cursor)?;
-            total_written += resp.count as u64;
-
-            if callback_err.is_none() {
-                let chunk = next_wire_chunk(
-                    &mut pending_data,
-                    &mut pending_offset,
-                    &mut done,
-                    &mut callback_err,
-                    next_chunk,
-                );
-
-                if let Some(chunk_data) = chunk {
-                    let data_len = chunk_data.len() as u64;
-                    let cc = data_len.div_ceil(65536).max(1) as u16;
-                    let c = conn.clone();
-                    let tree_id = self.tree_id;
-                    let req = WriteRequest {
-                        data_offset: 0x70,
-                        offset,
-                        file_id,
-                        channel: 0,
-                        remaining_bytes: 0,
-                        write_channel_info_offset: 0,
-                        write_channel_info_length: 0,
-                        flags: 0,
-                        data: chunk_data,
-                    };
-                    in_flight_futs.push(Box::pin(async move {
-                        c.execute_with_credits(
-                            Command::Write,
-                            &req,
-                            Some(tree_id),
-                            CreditCharge(cc),
-                        )
-                        .await
-                    }));
-                    offset += data_len;
-                    in_flight += 1;
+            match confirmed_write_bytes(frame_result) {
+                Ok(count) => total_written += count,
+                Err(e) => {
+                    // Drain remaining in-flight responses (best-effort).
+                    while in_flight_futs.next().await.is_some() {}
+                    return Err(e);
                 }
             }
         }
@@ -5644,6 +5665,230 @@ mod tests {
 
         assert_eq!(written, 65536 + 36 * 1024);
         assert_eq!(mock.sent_count(), 5); // CREATE + 2 WRITEs + FLUSH + CLOSE
+    }
+
+    #[tokio::test]
+    async fn a_write_budget_below_the_pipeline_window_bounds_a_pipelined_write() {
+        // 512 KB = 8 chunks of 64 KB, against a budget that holds exactly one.
+        // `MAX_PIPELINE_WINDOW` would keep all 8 outstanding; the budget is the
+        // only thing that can say otherwise, and it has to do it without the
+        // writer parking on budget that its own unpolled frames are holding.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xF00,
+            volatile: 0xF01,
+        };
+        let data_to_write = vec![0x37u8; 512 * 1024];
+
+        mock.queue_response(build_create_response(file_id, 0));
+        for i in 0u64..8 {
+            mock.queue_response(build_write_response_with_msg_id(MessageId(i + 1), 65536));
+        }
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        conn.set_write_budget(65536);
+        let tree = Tree {
+            tree_id: TreeId(21),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tree.write_file_pipelined(&mut conn, "budgeted.bin", &data_to_write),
+        )
+        .await
+        .expect("a budget below the pipeline window must never wedge the writer")
+        .unwrap();
+
+        assert_eq!(written, 512 * 1024);
+        // 1 CREATE + 8 WRITEs + 1 FLUSH + 1 CLOSE = 11. Nothing is dropped or
+        // re-sent because the budget made the writer wait.
+        assert_eq!(mock.sent_count(), 11);
+        for i in 0..8 {
+            let sent = mock.sent_message(i + 1).unwrap();
+            let mut cursor = ReadCursor::new(&sent);
+            let _header = Header::unpack(&mut cursor).unwrap();
+            let req = WriteRequest::unpack(&mut cursor).unwrap();
+            assert_eq!(req.offset, i as u64 * 65536, "chunks must stay in order");
+            assert_eq!(req.data.len(), 65536);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_budget_below_the_pipeline_window_bounds_a_streamed_write() {
+        // Same bound on the callback-driven path, where a chunk already pulled
+        // from the consumer has to be held back rather than dropped or re-pulled
+        // when the budget hands a response over instead of a permit.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xF10,
+            volatile: 0xF11,
+        };
+        let sizes = [100usize, 200, 150, 400, 50, 300];
+
+        mock.queue_response(build_create_response(file_id, 0));
+        for size in sizes {
+            mock.queue_response(build_write_response(size as u32));
+        }
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        conn.set_write_budget(0); // floors at one 64 KiB granule: one frame at a time
+        let tree = Tree {
+            tree_id: TreeId(22),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+
+        let mut chunk_iter = sizes
+            .iter()
+            .map(|&size| Ok(vec![0x9Cu8; size]))
+            .collect::<Vec<_>>()
+            .into_iter();
+        let mut next_chunk =
+            move || -> Option<std::result::Result<Vec<u8>, std::io::Error>> { chunk_iter.next() };
+
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tree.write_file_streamed(&mut conn, "budgeted_stream.bin", &mut next_chunk),
+        )
+        .await
+        .expect("a budget below the pipeline window must never wedge the writer")
+        .unwrap();
+
+        assert_eq!(written, sizes.iter().sum::<usize>() as u64);
+        // 1 CREATE + 6 WRITEs + 1 FLUSH + 1 CLOSE = 9.
+        assert_eq!(mock.sent_count(), 9);
+        let mut expected_offset = 0u64;
+        for (i, size) in sizes.iter().enumerate() {
+            let sent = mock.sent_message(i + 1).unwrap();
+            let mut cursor = ReadCursor::new(&sent);
+            let _header = Header::unpack(&mut cursor).unwrap();
+            let req = WriteRequest::unpack(&mut cursor).unwrap();
+            assert_eq!(
+                req.offset, expected_offset,
+                "a stashed chunk must go out next, at its own offset"
+            );
+            assert_eq!(req.data.len(), *size);
+            expected_offset += *size as u64;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spent_write_budget_holds_back_a_pipelined_write() {
+        // The proof that this path consults the budget at all: with every byte
+        // of it held by somebody else, the CREATE goes out and the WRITEs do
+        // not, however much room the pipeline window has.
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xF20,
+            volatile: 0xF21,
+        };
+        let data_to_write = vec![0x11u8; 128 * 1024];
+
+        mock.queue_response(build_create_response(file_id, 0));
+        for i in 0u64..2 {
+            mock.queue_response(build_write_response_with_msg_id(MessageId(i + 1), 65536));
+        }
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let holder = conn.clone();
+        let held = holder
+            .try_reserve_write_budget(holder.write_budget())
+            .expect("an idle connection can afford its whole budget");
+
+        let tree = Tree {
+            tree_id: TreeId(23),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+        let sent = mock.clone();
+        let task = tokio::spawn(async move {
+            tree.write_file_pipelined(&mut conn, "held.bin", &data_to_write)
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            sent.sent_count(),
+            1,
+            "only the CREATE may go out while the write budget is spent"
+        );
+
+        drop(held);
+        let written = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("returning the budget must release the writer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, 128 * 1024);
+        assert_eq!(sent.sent_count(), 5); // CREATE + 2 WRITEs + FLUSH + CLOSE
+    }
+
+    #[tokio::test]
+    async fn a_spent_write_budget_holds_back_a_streamed_write() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = FileId {
+            persistent: 0xF30,
+            volatile: 0xF31,
+        };
+
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(500));
+        mock.queue_response(build_write_response(700));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let holder = conn.clone();
+        let held = holder
+            .try_reserve_write_budget(holder.write_budget())
+            .expect("an idle connection can afford its whole budget");
+
+        let tree = Tree {
+            tree_id: TreeId(24),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+        let sent = mock.clone();
+        let task = tokio::spawn(async move {
+            let mut chunk_iter = vec![Ok(vec![0x1Au8; 500]), Ok(vec![0x1Bu8; 700])].into_iter();
+            let mut next_chunk = move || -> Option<std::result::Result<Vec<u8>, std::io::Error>> {
+                chunk_iter.next()
+            };
+            tree.write_file_streamed(&mut conn, "held_stream.bin", &mut next_chunk)
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            sent.sent_count(),
+            1,
+            "only the CREATE may go out while the write budget is spent"
+        );
+
+        drop(held);
+        let written = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("returning the budget must release the writer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, 1200);
+        assert_eq!(sent.sent_count(), 5); // CREATE + 2 WRITEs + FLUSH + CLOSE
     }
 
     // ── Compound request tests ──────────────────────────────────────

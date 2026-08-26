@@ -289,7 +289,8 @@ const LONG_POLL_REFRESH: Duration = Duration::from_secs(600);
 const WRITE_BUDGET_UNIT: u64 = 64 * 1024;
 
 /// How many bytes of WRITE payload may be outstanding across the WHOLE
-/// connection at once: launched but not yet acknowledged.
+/// connection at once — launched but not yet acknowledged — until a consumer
+/// says otherwise with [`Connection::set_write_budget`].
 ///
 /// This is the bound that `MAX_PIPELINE_WINDOW` alone cannot give. That window
 /// caps one stream at 32 frames; it says nothing about how many streams there
@@ -297,8 +298,8 @@ const WRITE_BUDGET_UNIT: u64 = 64 * 1024;
 /// once over a 1 MiB `MaxWriteSize` reaches 320 MiB of payload queued in this
 /// process, and every byte of it is latency the consumer pays for: on a
 /// 6.7 MB/s link that is ~48 s between handing a chunk over and it reaching the
-/// socket (measured in the field, `ERR-9WZRR`, 2026-08-26). Cancel waits it out,
-/// progress reporting runs ahead of it, and the memory is real.
+/// socket (a 2026-08-26 Cmdr report, measured on the user's own link). Cancel
+/// waits it out, progress reporting runs ahead of it, and the memory is real.
 ///
 /// 32 MiB, chosen against both ends rather than either:
 ///
@@ -311,6 +312,10 @@ const WRITE_BUDGET_UNIT: u64 = 64 * 1024;
 /// - **Memory**: 32 MiB of `Vec<u8>` is a bound a consumer can reason about,
 ///   where `concurrency x window x max_write` is not.
 ///
+/// A 10 GbE link or a memory-constrained host is exactly where that reasoning
+/// runs out, which is why the number is a default rather than a constant of
+/// nature: [`Connection::set_write_budget`] moves it.
+///
 /// ❌ Don't make this adaptive without a measurement that demands it. A fixed
 /// bound is predictable and testable; a control loop over a noisy throughput
 /// estimate can oscillate, and the numbers above say a well-chosen constant
@@ -319,11 +324,77 @@ const WRITE_BUDGET_UNIT: u64 = 64 * 1024;
 /// A frame larger than the whole budget is clamped to the whole budget rather
 /// than refused (`Connection::clamped_units`), so a server negotiating a
 /// `MaxWriteSize` above this can always still send one frame.
-const WRITE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_WRITE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
-/// [`WRITE_BUDGET_UNIT`]s needed to cover `bytes`, at least one.
-fn budget_units(bytes: u64) -> usize {
-    usize::try_from(bytes.div_ceil(WRITE_BUDGET_UNIT).max(1)).unwrap_or(usize::MAX)
+/// [`WRITE_BUDGET_UNIT`]s needed to cover `bytes`, at least one and never more
+/// than a `u32` (which is what `Semaphore::acquire_many` takes).
+fn budget_units(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(WRITE_BUDGET_UNIT).max(1)).unwrap_or(u32::MAX)
+}
+
+/// How many write-budget permits the semaphore currently holds, and how many it
+/// should hold.
+///
+/// The two differ only while a reduction is outstanding: `Semaphore` can only
+/// take back permits that are FREE, so shrinking a budget that is fully spent
+/// removes what it can now and the rest as frames complete. `Inner::settle_write_budget`
+/// is what pays the difference down, and every reserve calls it first.
+#[derive(Debug, Clone, Copy)]
+struct WriteBudgetUnits {
+    /// What the semaphore holds right now (free plus held).
+    issued: u32,
+    /// What it should hold, per the last `set_write_budget`.
+    target: u32,
+}
+
+/// One step toward the connection-wide write budget, for a caller that
+/// pipelines WRITE frames of its own.
+pub(crate) enum WriteBudgetStep<T> {
+    /// The budget is yours. Move the permit INTO the frame's future, so every
+    /// path that ends the frame — drained, aborted, cancelled, dropped —
+    /// returns it with no explicit release anywhere.
+    ///
+    /// `None` only if the budget semaphore is closed, which nothing in this
+    /// crate does; send the frame unaccounted rather than dropping it.
+    Granted(Option<tokio::sync::OwnedSemaphorePermit>),
+    /// One of your OWN in-flight frames finished first. Account for it, then
+    /// ask again for the frame you still want to send.
+    Drained(T),
+}
+
+/// Get write budget for one frame without deadlocking the connection.
+///
+/// ❌ **This ordering is the whole deadlock argument. Don't reorder it, and
+/// don't hand-roll a second copy.** A caller parked on the budget is not
+/// polling its own in-flight frames, so the frames that would return the budget
+/// can never complete and the wait can never end. So, in order:
+///
+/// 1. Take the budget if it is free. No wait, no risk.
+/// 2. Otherwise free our OWN first, by waiting on one of our in-flight frames.
+///    That is the only budget we can be sure will come back.
+/// 3. Only when we hold nothing at all — `in_flight` is empty — wait on the
+///    budget itself, where waiting cannot be part of a cycle.
+///
+/// Every holder is in the same loop, draining, so a wait at step 3 always ends
+/// while the server answers. An empty `in_flight` falls through step 2 for
+/// free: a `FuturesUnordered` with nothing in it yields `None` at once.
+pub(crate) async fn reserve_write_budget_or_drain<S>(
+    conn: &Connection,
+    bytes: u64,
+    in_flight: &mut S,
+) -> WriteBudgetStep<S::Item>
+where
+    S: futures_util::stream::Stream + Unpin,
+{
+    use futures_util::stream::StreamExt;
+
+    if let Some(permit) = conn.try_reserve_write_budget(bytes) {
+        return WriteBudgetStep::Granted(Some(permit));
+    }
+    if let Some(finished) = in_flight.next().await {
+        return WriteBudgetStep::Drained(finished);
+    }
+    WriteBudgetStep::Granted(conn.reserve_write_budget(bytes).await)
 }
 
 /// How many frames may be queued for the writer task before callers block.
@@ -1457,13 +1528,18 @@ struct Inner {
     /// diagnostics and for the stale-waiter warning, which reports it so a
     /// backlog names itself.
     send_queue_depth: AtomicUsize,
-    /// Permits for [`WRITE_BUDGET_BYTES`], counted in [`WRITE_BUDGET_UNIT`]s.
+    /// Permits for the outstanding-WRITE-payload budget, counted in
+    /// [`WRITE_BUDGET_UNIT`]s. [`DEFAULT_WRITE_BUDGET_BYTES`] worth to begin
+    /// with; [`Connection::set_write_budget`] moves it.
     ///
     /// A permit is held by the in-flight WRITE future itself, so it comes back
     /// when the response is drained, the writer is aborted, or the future is
     /// dropped mid-flight. ❌ Don't release it by hand anywhere: every cancel
     /// path already returns it for free, and a manual release would double-count.
     write_budget: Arc<Semaphore>,
+    /// What `write_budget` holds versus what it should hold. See
+    /// [`WriteBudgetUnits`] and `Inner::settle_write_budget`.
+    write_budget_units: StdMutex<WriteBudgetUnits>,
     /// How long one frame may take to reach the socket before its caller
     /// gives up with [`Error::SendTimeout`], or `None` to wait forever.
     send_timeout: StdMutex<Option<Duration>>,
@@ -1563,6 +1639,33 @@ struct Inner {
 }
 
 impl Inner {
+    /// Bring the write-budget semaphore in line with the target, and report the
+    /// target in units.
+    ///
+    /// Growing is immediate. Shrinking can only take back permits that are FREE
+    /// right now, so a reduction made while a transfer is running lands as those
+    /// frames complete — which is why every reserve calls this before asking for
+    /// permits, rather than `set_write_budget` doing it once and hoping.
+    fn settle_write_budget(&self) -> u32 {
+        let mut units = self.write_budget_units.lock().unwrap();
+        // `std::cmp::Ordering` spelled out: `Ordering` in this module is the
+        // atomic one.
+        match units.issued.cmp(&units.target) {
+            std::cmp::Ordering::Less => {
+                let grow = units.target - units.issued;
+                self.write_budget.add_permits(grow as usize);
+                units.issued = units.target;
+            }
+            std::cmp::Ordering::Greater => {
+                let shrink = units.issued - units.target;
+                let taken = self.write_budget.forget_permits(shrink as usize);
+                units.issued -= u32::try_from(taken).unwrap_or(u32::MAX);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        units.target
+    }
+
     fn new(write_tx: mpsc::Sender<WriteJob>, server_name: String) -> Self {
         Self {
             waiters: StdMutex::new(HashMap::new()),
@@ -1585,7 +1688,13 @@ impl Inner {
             write_tx: StdMutex::new(write_tx),
             abandoned: StdMutex::new(VecDeque::new()),
             send_queue_depth: AtomicUsize::new(0),
-            write_budget: Arc::new(Semaphore::new(budget_units(WRITE_BUDGET_BYTES))),
+            write_budget: Arc::new(Semaphore::new(
+                budget_units(DEFAULT_WRITE_BUDGET_BYTES) as usize
+            )),
+            write_budget_units: StdMutex::new(WriteBudgetUnits {
+                issued: budget_units(DEFAULT_WRITE_BUDGET_BYTES),
+                target: budget_units(DEFAULT_WRITE_BUDGET_BYTES),
+            }),
             send_timeout: StdMutex::new(Some(SEND_TIMEOUT)),
             writer_task: StdMutex::new(None),
             keepalive_task: StdMutex::new(None),
@@ -3764,6 +3873,60 @@ impl Connection {
         *self.inner.send_timeout.lock().unwrap() = after;
     }
 
+    /// How many bytes of WRITE payload may be outstanding across the whole
+    /// connection at once: handed to the crate but not yet acknowledged by the
+    /// server.
+    ///
+    /// Defaults to 32 MiB. This is the bound `MAX_PIPELINE_WINDOW` cannot give:
+    /// that window caps ONE stream at 32 frames and says nothing about how many
+    /// streams share the connection, so N concurrent uploads multiply it. Ten
+    /// files at a 1 MiB `MaxWriteSize` reach 320 MiB queued in-process, which on
+    /// a 6.7 MB/s link is ~48 s between handing a chunk over and it reaching the
+    /// socket. The consumer pays that in cancel latency, in progress reporting
+    /// that runs ahead of reality, and in plain memory.
+    ///
+    /// The default is sized for a LAN, so move it when your link or your host
+    /// is not one:
+    ///
+    /// - **Raise it on a very fast link.** At 10 GbE (~1.2 GB/s) 32 MiB is
+    ///   ~25 ms of buffer, and a round trip plus server-side write latency can
+    ///   exceed that, leaving the pipe briefly dry. A few hundred MiB costs
+    ///   nothing but memory there.
+    /// - **Lower it on a memory-constrained host, or where cancel has to feel
+    ///   instant.** The floor is one frame (see below), so a small embedded
+    ///   consumer can go well under the default.
+    /// - **Leave it alone otherwise.** On a saturated gigabit link the default
+    ///   is 0.3 s of buffer, many times the bandwidth-delay product, and the
+    ///   measured throughput curve is flat well below it.
+    ///
+    /// The budget is counted in 64 KiB granules, so `bytes` rounds up to one;
+    /// [`write_budget`](Self::write_budget) reports what the rounding produced.
+    /// A budget smaller than a single `MaxWriteSize` frame is not an error and
+    /// never wedges: an oversized frame is clamped to the whole budget and gets
+    /// it to itself, which is honest degradation rather than a writer waiting
+    /// forever for permits that will never exist.
+    ///
+    /// Raising it takes effect at once. Lowering it takes effect as the frames
+    /// already outstanding complete, because the budget those hold has already
+    /// been spent.
+    ///
+    /// ❌ Don't reach for this to throttle a transfer's SPEED. It bounds
+    /// buffering, not bandwidth; a link that can carry the bytes still will,
+    /// and a budget set low enough to slow one down mostly costs you the
+    /// pipelining that makes this crate worth using.
+    pub fn set_write_budget(&self, bytes: u64) {
+        self.inner.write_budget_units.lock().unwrap().target = budget_units(bytes);
+        self.inner.settle_write_budget();
+    }
+
+    /// The current outstanding-WRITE-payload budget in bytes, rounded up to the
+    /// 64 KiB granule the budget is counted in. See
+    /// [`set_write_budget`](Self::set_write_budget).
+    #[must_use]
+    pub fn write_budget(&self) -> u64 {
+        u64::from(self.inner.write_budget_units.lock().unwrap().target) * WRITE_BUDGET_UNIT
+    }
+
     /// Reserve write budget for `bytes`, waiting until it is free.
     ///
     /// The returned permit must be moved INTO the in-flight WRITE future, so
@@ -3771,9 +3934,12 @@ impl Connection {
     /// without any explicit release. See [`Inner::write_budget`].
     ///
     /// ❌ Never await this while holding a permit whose future you are not
-    /// polling: that is the one way to deadlock this budget. `FileWriter` only
-    /// awaits with an EMPTY in-flight set, and otherwise drains one of its own
-    /// responses to free its own budget first.
+    /// polling: that is the one way to deadlock this budget. Go through
+    /// [`reserve_write_budget_or_drain`], which encodes the safe ordering, or
+    /// reproduce it exactly.
+    ///
+    /// `None` means the budget semaphore is closed, which nothing in this crate
+    /// does; the caller sends the frame unaccounted rather than dropping it.
     pub(crate) async fn reserve_write_budget(
         &self,
         bytes: u64,
@@ -3800,16 +3966,17 @@ impl Connection {
     ///
     /// Clamping is load-bearing: `acquire_many` for more permits than the
     /// semaphore will EVER hold waits forever, so a server negotiating a
-    /// `MaxWriteSize` above the budget would wedge its first frame. Clamped, that
-    /// frame simply gets the whole budget to itself, which is the honest
-    /// degradation. ❌ Don't reach for `available_permits()` here: that is what
-    /// is free right now, not what exists, so under contention it would clamp to
-    /// a number smaller than the caller needs and under-charge the budget.
+    /// `MaxWriteSize` above the budget — or a consumer setting a budget below
+    /// one frame — would wedge that frame. Clamped, it simply gets the whole
+    /// budget to itself, which is the honest degradation. ❌ Don't reach for
+    /// `available_permits()` here: that is what is free right now, not what
+    /// exists, so under contention it would clamp to a number smaller than the
+    /// caller needs and under-charge the budget.
     fn clamped_units(&self, bytes: u64) -> u32 {
-        let total = u32::try_from(budget_units(WRITE_BUDGET_BYTES)).unwrap_or(u32::MAX);
-        u32::try_from(budget_units(bytes))
-            .unwrap_or(u32::MAX)
-            .min(total)
+        // Settling here rather than only in `set_write_budget` is what makes a
+        // reduction land once the frames holding the old budget complete.
+        let total = self.inner.settle_write_budget();
+        budget_units(bytes).min(total)
     }
 
     /// How long the server may say nothing, while a request is on the wire,
@@ -5425,7 +5592,7 @@ mod tests {
         // One holder takes the lot: this stands in for the frames a few busy
         // FileWriters already have launched and unacknowledged.
         let whole = conn
-            .try_reserve_write_budget(WRITE_BUDGET_BYTES)
+            .try_reserve_write_budget(DEFAULT_WRITE_BUDGET_BYTES)
             .expect("an idle connection can afford its whole budget");
 
         // The NEXT stream is refused, however much room its own pipeline window
@@ -5446,6 +5613,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_consumer_can_move_the_write_budget_in_both_directions() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        assert_eq!(conn.write_budget(), DEFAULT_WRITE_BUDGET_BYTES);
+
+        // 32 MiB is a LAN default. On 10 GbE it is ~25 ms of buffer, so a
+        // consumer there wants more, and raising it takes effect at once.
+        let bigger = DEFAULT_WRITE_BUDGET_BYTES * 8;
+        conn.set_write_budget(bigger);
+        assert_eq!(conn.write_budget(), bigger);
+        let whole = conn
+            .try_reserve_write_budget(bigger)
+            .expect("a raised budget must be spendable immediately");
+        assert!(
+            conn.try_reserve_write_budget(WRITE_BUDGET_UNIT).is_none(),
+            "and it must still be a bound at the new size"
+        );
+        drop(whole);
+
+        // A memory-constrained consumer goes the other way.
+        conn.set_write_budget(1024 * 1024);
+        assert_eq!(conn.write_budget(), 1024 * 1024);
+        let small = conn
+            .try_reserve_write_budget(1024 * 1024)
+            .expect("a lowered budget must still admit its own size");
+        assert!(
+            conn.try_reserve_write_budget(WRITE_BUDGET_UNIT).is_none(),
+            "a lowered budget must bound at the new size, not the old one"
+        );
+        drop(small);
+    }
+
+    #[tokio::test]
+    async fn lowering_the_write_budget_lands_as_the_outstanding_frames_finish() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // Budget already spent by frames on the wire: their bytes are committed,
+        // so a reduction cannot claw them back and must not pretend to.
+        let outstanding = conn
+            .try_reserve_write_budget(DEFAULT_WRITE_BUDGET_BYTES)
+            .expect("an idle connection can afford its whole budget");
+        conn.set_write_budget(1024 * 1024);
+        assert_eq!(conn.write_budget(), 1024 * 1024);
+        assert!(
+            conn.try_reserve_write_budget(WRITE_BUDGET_UNIT).is_none(),
+            "nothing is free while the old budget is still on the wire"
+        );
+
+        // Once it does complete, the new bound is what is left standing.
+        drop(outstanding);
+        let permit = conn
+            .try_reserve_write_budget(1024 * 1024)
+            .expect("the new budget is available once the old frames finish");
+        assert!(
+            conn.try_reserve_write_budget(WRITE_BUDGET_UNIT).is_none(),
+            "the returned permits must not restore the old, larger budget"
+        );
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn a_budget_smaller_than_one_frame_still_admits_that_frame() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        // A consumer is free to ask for a budget below a single `MaxWriteSize`
+        // frame. Refusing the frame would wedge the writer forever, so the frame
+        // is clamped to the whole budget and gets it to itself.
+        conn.set_write_budget(0);
+        assert_eq!(
+            conn.write_budget(),
+            WRITE_BUDGET_UNIT,
+            "the budget floor is one 64 KiB granule"
+        );
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.reserve_write_budget(8 * 1024 * 1024),
+        )
+        .await
+        .expect("a frame larger than the whole budget must not wait forever");
+        assert!(permit.is_some());
+    }
+
+    #[tokio::test]
     async fn a_frame_bigger_than_the_whole_budget_still_gets_sent() {
         let mock = Arc::new(MockTransport::new());
         let conn = Connection::from_transport(
@@ -5458,7 +5722,7 @@ mod tests {
         // semaphore for more permits than it will ever hold waits FOREVER, so
         // without clamping this writer's first frame would wedge and never
         // time out. The timeout is the assertion.
-        let huge = WRITE_BUDGET_BYTES * 4;
+        let huge = DEFAULT_WRITE_BUDGET_BYTES * 4;
         let permit = tokio::time::timeout(Duration::from_secs(5), conn.reserve_write_budget(huge))
             .await
             .expect("an oversized frame must not wait forever for budget it can never get");
@@ -5469,17 +5733,17 @@ mod tests {
     fn the_write_budget_is_smaller_than_one_multiplied_pipeline() {
         // The field case this exists for: ten concurrent files, each pipelining
         // `MAX_PIPELINE_WINDOW` frames at a 1 MiB `MaxWriteSize`, is 320 MiB of
-        // payload queued in this process (`ERR-9WZRR`). The budget has to be a
-        // long way under that or it bounds nothing in practice.
+        // payload queued in this process (a 2026-08-26 Cmdr report). The budget
+        // has to be a long way under that or it bounds nothing in practice.
         let multiplied = 10 * 32 * 1024 * 1024u64;
         assert!(
-            WRITE_BUDGET_BYTES * 4 <= multiplied,
+            DEFAULT_WRITE_BUDGET_BYTES * 4 <= multiplied,
             "a budget this close to the unbounded case would not be a bound"
         );
         // And it must still hold several frames of a common `MaxWriteSize`, or
         // it would serialize writers that the pipeline window means to overlap.
         assert!(
-            budget_units(WRITE_BUDGET_BYTES) >= 8 * budget_units(1024 * 1024),
+            budget_units(DEFAULT_WRITE_BUDGET_BYTES) >= 8 * budget_units(1024 * 1024),
             "the budget must fit several 1 MiB frames, or it becomes the bottleneck"
         );
     }
