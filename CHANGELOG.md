@@ -7,7 +7,15 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- **`Connection::send_cancel` takes the generation the `MessageId` came from.** `send_cancel(msg_id, async_id)` becomes `send_cancel(msg_id, async_id, generation)`, where `generation` is `Connection::generation()` read at the moment the id was obtained -- not at cancel time, which is already too late. Callers that never reconnect can pass `conn.generation()` inline; callers that do should capture it alongside the `MessageId`. See the fix below for why the parameter exists.
+
 ### Fixed
+
+- **A CANCEL can no longer be sent into a session that never issued the request it names.** A CANCEL identifies its target by `MessageId` alone, and a `MessageId` is only meaningful inside one session: a revival resets the counter to zero, so an id from a dead session names an unrelated live request, or nothing at all. Nothing stopped one from going out.
+  - **The timing is the worst part.** `install_transport` clears `disconnected` before the handshake runs, and `revivals` ticks only once the WHOLE revival has succeeded, so a stale cancel could land during NEGOTIATE / SESSION_SETUP -- exactly when the server's credit window is zero wide. Samba logs that as `client used more credits than granted, mid 1, charge 1, credits_granted 0` and then says nothing, so the client waits out a response deadline for an answer that was never coming.
+  - **The generation is now stamped where the `MessageId` is handed out**, on the waiter itself, and `send_cancel` drops a cancel whose stamp doesn't match -- or that would go out with no session id, which is the handshake window the generation check alone can't see. A skipped cancel is not an error and is not counted in `explicit_cancels_sent`: the request it named died with its session, and the server has already forgotten it.
 
 - **A request racing the handshake can no longer send a frame the server funded nothing for.** A client holds no credits until the server grants some; the one thing it may send before that is NEGOTIATE (MS-SMB2 § 3.2.5.1.1). That was modelled as a single seeded permit in the credit pool, and a permit is fungible: anything arriving while a connection was negotiating -- a watcher re-arming, a listing retrying, any request on a connection being revived after a Wi-Fi blip or a wake from sleep -- could spend it first.
   - **The symptom was a silent stall, not an error.** A server answers an over-spent frame by discarding it without a word (MS-SMB2 § 3.3.1.1 permits dropping the connection; Samba instead logs `client used more credits than granted` and stays quiet), so the client waited out a full response deadline for an answer that was never coming. The ECHO keepalive makes that worse rather than better: the connection genuinely is alive, so the probe succeeds and extends the deadline to ~180 s.

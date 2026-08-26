@@ -221,8 +221,12 @@ impl Watcher {
                 .await?
             {
                 LongPollOutcome::Answered(frame) => break frame,
-                LongPollOutcome::RefreshDue { msg_id, async_id } => {
-                    match self.refresh(msg_id, async_id).await? {
+                LongPollOutcome::RefreshDue {
+                    msg_id,
+                    async_id,
+                    generation,
+                } => {
+                    match self.refresh(msg_id, async_id, generation).await? {
                         // The sibling had an answer waiting after all.
                         Some(frame) => break frame,
                         None => continue,
@@ -305,6 +309,7 @@ impl Watcher {
         &mut self,
         retired: MessageId,
         async_id: Option<u64>,
+        generation: u64,
     ) -> Result<Option<Frame>> {
         debug!(
             "watcher: refreshing its subscription (msg_id={} retired)",
@@ -320,16 +325,17 @@ impl Watcher {
         //    not an option though — on a server that DID remember, every cycle
         //    would leave one more abandoned CHANGE_NOTIFY registered for the
         //    life of the watch.
-        self.retire(retired, async_id).await;
+        self.retire(retired, async_id, generation).await;
 
         // 3. And its equally-old sibling, salvaging an answer if it has one.
         let mut answered = None;
         if let Some(mut sibling) = self.pending.take() {
             let (msg_id, async_id) = (sibling.msg_id(), sibling.async_id());
+            let generation = sibling.generation();
             answered = sibling.try_recv().transpose()?;
             drop(sibling);
             if answered.is_none() {
-                self.retire(msg_id, async_id).await;
+                self.retire(msg_id, async_id, generation).await;
             }
         }
 
@@ -342,8 +348,8 @@ impl Watcher {
     /// Failure is logged and swallowed: the cancel is housekeeping, and a
     /// connection too broken to carry it will surface itself through the next
     /// real request with a far better error than this one could offer.
-    async fn retire(&self, msg_id: MessageId, async_id: Option<u64>) {
-        if let Err(e) = self.conn.send_cancel(msg_id, async_id).await {
+    async fn retire(&self, msg_id: MessageId, async_id: Option<u64>, generation: u64) {
+        if let Err(e) = self.conn.send_cancel(msg_id, async_id, generation).await {
             debug!(
                 "watcher: could not cancel the retired CHANGE_NOTIFY (msg_id={}): {e}",
                 msg_id.0

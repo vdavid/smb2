@@ -72,6 +72,11 @@ struct Waiter {
 pub(crate) struct WaiterGuard {
     inner: Arc<Inner>,
     msg_id: MessageId,
+    /// The connection generation this request was registered under, captured
+    /// here rather than read back later: after a revival the connection's own
+    /// counter has moved on, and a `MessageId` means nothing outside the
+    /// session that issued it.
+    generation: u64,
     /// Taken when the response is claimed; `None` afterwards so `Drop` knows
     /// there is nothing left to clean up.
     rx: Option<oneshot::Receiver<Result<Frame>>>,
@@ -81,6 +86,12 @@ impl WaiterGuard {
     /// The id this guard is holding a slot for.
     pub(crate) fn msg_id(&self) -> MessageId {
         self.msg_id
+    }
+
+    /// The session generation `msg_id` belongs to. What a CANCEL for it has to
+    /// be stamped with, so a revival in between can be spotted.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The `AsyncId` the server assigned this request, if it has sent an
@@ -764,6 +775,9 @@ pub(crate) enum LongPollOutcome {
         /// The `AsyncId` the server gave it, which its CANCEL must carry
         /// (MS-SMB2 § 3.2.4.24).
         async_id: Option<u64>,
+        /// The session generation those ids belong to, which its CANCEL must
+        /// also carry: a revival in between makes them name nothing.
+        generation: u64,
     },
 }
 
@@ -3336,8 +3350,44 @@ impl Connection {
         &self,
         original_msg_id: MessageId,
         async_id: Option<u64>,
+        generation: u64,
     ) -> Result<()> {
         use crate::msg::cancel::CancelRequest;
+
+        // A CANCEL names its target by `MessageId` alone, and a `MessageId` is
+        // only meaningful inside the session that issued it: a revival resets
+        // the counter to zero, so an id from a dead session either names some
+        // unrelated live request or names nothing at all. Both conditions below
+        // are load-bearing, and neither covers the other:
+        //
+        // - The generation moved: the caller obtained these ids from a session
+        //   that has since been replaced.
+        // - There is no session id yet: `install_transport` wipes it and
+        //   `revivals` ticks only once the WHOLE revival has succeeded, so the
+        //   generation still matches for the entire NEGOTIATE / SESSION_SETUP
+        //   handshake. That is the worst possible moment to send one, because
+        //   the server's credit window is exactly zero wide until it grants,
+        //   and an over-spent frame is discarded in silence -- leaving the
+        //   client to wait out a response deadline for an answer that was
+        //   never coming.
+        //
+        // Not an error: nothing is wrong, the request being cancelled died
+        // with its session and the server has already forgotten it.
+        if generation != self.generation() || self.session_id() == SessionId(0) {
+            debug!(
+                "send_cancel: skipping the CANCEL for msg_id={} -- it belongs to \
+                 generation {} and the connection is on {}{}",
+                original_msg_id.0,
+                generation,
+                self.generation(),
+                if self.session_id() == SessionId(0) {
+                    " with no session established"
+                } else {
+                    ""
+                }
+            );
+            return Ok(());
+        }
 
         self.inner
             .metrics
@@ -3505,6 +3555,7 @@ impl Connection {
         Ok(WaiterGuard {
             inner: Arc::clone(&self.inner),
             msg_id,
+            generation: self.inner.revivals.load(Ordering::Acquire),
             rx: Some(rx),
         })
     }
@@ -3773,6 +3824,7 @@ impl Connection {
                 return frame.map(LongPollOutcome::Answered);
             }
             let async_id = guard.async_id();
+            let generation = guard.generation();
             // Dropping the guard deregisters the waiter, so a response that
             // arrives after this counts as late-after-drop rather than as a
             // frame nobody asked for.
@@ -3786,7 +3838,11 @@ impl Connection {
                  a fresh one (routine, not a fault)",
                 command, msg_id.0, registered_for
             );
-            return Ok(LongPollOutcome::RefreshDue { msg_id, async_id });
+            return Ok(LongPollOutcome::RefreshDue {
+                msg_id,
+                async_id,
+                generation,
+            });
         }
     }
 
@@ -6931,6 +6987,65 @@ mod tests {
     // ── CANCEL tests (pitfall #7) ────────────────────────────────────
 
     #[tokio::test]
+    async fn a_cancel_stamped_with_another_generation_never_reaches_the_wire() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_session_id(SessionId(0x1234));
+
+        // The generation the ids came from is not the one on the wire now, so
+        // the request they name died with its session.
+        let stale = conn.generation() + 1;
+        conn.send_cancel(MessageId(7), None, stale).await.unwrap();
+
+        assert_eq!(
+            mock.sent_count(),
+            0,
+            "a CANCEL naming a dead session's MessageId must not be sent: on the \
+             live connection that id belongs to somebody else, or to nobody"
+        );
+        assert_eq!(
+            conn.metrics().explicit_cancels_sent,
+            0,
+            "and a cancel that was never sent must not be counted as one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_handshake_never_reaches_the_wire() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        // A revival wipes the session id and re-negotiates; `revivals` only
+        // ticks once the whole thing has succeeded, so the generation still
+        // matches while the handshake is in flight. This is the state a
+        // reconnecting connection is in for the whole of NEGOTIATE and
+        // SESSION_SETUP.
+        conn.set_session_id(SessionId(0));
+
+        let generation = conn.generation();
+        conn.send_cancel(MessageId(1), None, generation)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.sent_count(),
+            0,
+            "there is no session to cancel anything on yet, and the server's \
+             credit window here is exactly zero wide: a frame sent into it is \
+             discarded in silence"
+        );
+    }
+
+    #[tokio::test]
     async fn send_cancel_does_not_consume_credit_or_advance_message_id() {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
@@ -6942,7 +7057,9 @@ mod tests {
         conn.set_next_message_id(10);
         conn.set_credits(5);
 
-        conn.send_cancel(MessageId(7), None).await.unwrap();
+        conn.send_cancel(MessageId(7), None, conn.generation())
+            .await
+            .unwrap();
 
         // MessageId should NOT have advanced.
         assert_eq!(conn.next_message_id(), 10);
@@ -6961,7 +7078,9 @@ mod tests {
         );
         conn.set_session_id(SessionId(0xAAAA));
 
-        conn.send_cancel(MessageId(42), None).await.unwrap();
+        conn.send_cancel(MessageId(42), None, conn.generation())
+            .await
+            .unwrap();
 
         let sent = mock.sent_message(0).unwrap();
         let mut cursor = ReadCursor::new(&sent);
@@ -6992,7 +7111,7 @@ mod tests {
         conn.set_session_id(SessionId(0xBBBB));
 
         let async_id = 0x1234_5678_9ABC_DEF0u64;
-        conn.send_cancel(MessageId(99), Some(async_id))
+        conn.send_cancel(MessageId(99), Some(async_id), conn.generation())
             .await
             .unwrap();
 
@@ -7023,7 +7142,9 @@ mod tests {
         conn.activate_signing(key, SigningAlgorithm::HmacSha256);
         conn.set_session_id(SessionId(0xDDDD));
 
-        conn.send_cancel(MessageId(50), None).await.unwrap();
+        conn.send_cancel(MessageId(50), None, conn.generation())
+            .await
+            .unwrap();
 
         let sent = mock.sent_message(0).unwrap();
 
@@ -7060,7 +7181,9 @@ mod tests {
         conn.activate_signing(key.clone(), SigningAlgorithm::AesGmac);
         conn.set_session_id(SessionId(0xDDDD));
 
-        conn.send_cancel(MessageId(50), Some(0x77)).await.unwrap();
+        conn.send_cancel(MessageId(50), Some(0x77), conn.generation())
+            .await
+            .unwrap();
         let sent = mock.sent_message(0).unwrap();
 
         // Re-sign the very bytes that went out, both ways. Only one of them can

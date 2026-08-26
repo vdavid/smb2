@@ -344,12 +344,16 @@ fn build_expired_response(msg_id: MessageId) -> Vec<u8> {
 
 /// A connection wired to `server`, tuned to the scaled-down timings above.
 fn connect(server: &Arc<ScriptedServer>) -> Connection {
-    let conn = Connection::from_transport(
+    let mut conn = Connection::from_transport(
         Box::new(Arc::clone(server)),
         Box::new(Arc::clone(server)),
         "scripted-server",
     );
     conn.set_credits(512);
+    // A connection past SESSION_SETUP has a session id, and some paths read it
+    // as the answer to "is there a session on this wire at all" -- a CANCEL
+    // refuses to go out without one.
+    conn.set_session_id(SessionId(0x5E55));
     conn.set_response_timeout(Some(BASE_DEADLINE));
     conn.set_keepalive(Some(KEEPALIVE));
     conn

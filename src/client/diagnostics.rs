@@ -732,15 +732,17 @@ mod tests {
     fn fresh_conn() -> (Connection, Arc<MockTransport>) {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
-        let conn = Connection::from_transport(
+        let mut conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",
         );
-        // Stage the credit window a real connection would hold after
-        // NEGOTIATE / SESSION_SETUP / TREE_CONNECT; a fresh pool is empty,
-        // and nothing but NEGOTIATE can send out of one.
+        // Stage the state a real connection holds after NEGOTIATE /
+        // SESSION_SETUP / TREE_CONNECT: a fresh pool is empty, and nothing but
+        // NEGOTIATE can send out of one, while a CANCEL additionally refuses to
+        // go out on a connection with no session id.
         conn.set_credits(512);
+        conn.set_session_id(crate::types::SessionId(0x1234));
         (conn, mock)
     }
 
@@ -1009,13 +1011,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn explicit_cancels_sent_ticks_on_send_cancel() {
         let mock = Arc::new(MockTransport::new());
-        let conn = Connection::from_transport(
+        let mut conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",
         );
+        // A CANCEL only goes out on a connection with a live session; without
+        // one it is skipped, and a skipped cancel is deliberately not counted.
+        conn.set_session_id(crate::types::SessionId(0x1234));
 
-        conn.send_cancel(MessageId(42), None).await.unwrap();
+        conn.send_cancel(MessageId(42), None, conn.generation())
+            .await
+            .unwrap();
 
         assert_eq!(conn.metrics().explicit_cancels_sent, 1);
         // CANCEL does NOT allocate a msg_id — it reuses the original.
