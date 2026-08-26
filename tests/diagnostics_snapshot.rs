@@ -54,6 +54,45 @@ fn fresh_conn() -> (Connection, Arc<MockTransport>) {
     (conn, mock)
 }
 
+/// A NEGOTIATE response granting a credit window, so the connection can send
+/// something afterwards.
+///
+/// A client holds no credits until the server grants some, and NEGOTIATE is
+/// the only request exempt from that. There is no public way to stage a window
+/// -- deliberately, since no consumer can conjure credits either -- so a test
+/// that needs to send anything has to negotiate for them like everybody else.
+fn negotiate_ok(granting: u16) -> Vec<u8> {
+    let mut h = Header::new_request(Command::Negotiate);
+    h.flags.set_response();
+    h.credits = granting;
+    h.message_id = MessageId(0);
+    h.status = NtStatus::SUCCESS;
+
+    let body = smb2::msg::negotiate::NegotiateResponse {
+        security_mode: smb2::types::flags::SecurityMode::new(0),
+        dialect_revision: smb2::types::Dialect::Smb2_0_2,
+        server_guid: smb2::pack::Guid::ZERO,
+        capabilities: smb2::types::flags::Capabilities::default(),
+        max_transact_size: 65536,
+        max_read_size: 65536,
+        max_write_size: 65536,
+        system_time: 0,
+        server_start_time: 0,
+        security_buffer: Vec::new(),
+        negotiate_contexts: Vec::new(),
+    };
+    pack(&h, &body)
+}
+
+/// [`fresh_conn`] taken through a real NEGOTIATE, which is the only state a
+/// consumer can send a request from.
+async fn negotiated_conn(granting: u16) -> (Connection, Arc<MockTransport>) {
+    let (mut conn, mock) = fresh_conn();
+    mock.queue_response(negotiate_ok(granting));
+    conn.negotiate().await.expect("the mock answers NEGOTIATE");
+    (conn, mock)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_negotiate_snapshot_has_no_negotiated_params() {
     let (conn, mock) = fresh_conn();
@@ -77,7 +116,11 @@ async fn pre_negotiate_snapshot_has_no_negotiated_params() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn in_flight_is_visible_in_snapshot() {
-    let (conn, mock) = fresh_conn();
+    let (conn, mock) = negotiated_conn(512).await;
+    // The handshake is on the wire and counted too, so everything below reads
+    // as a delta from where it left the connection.
+    let base = conn.diagnostics().metrics;
+    let sent_before = mock.sent_count();
 
     let c = conn.clone();
     let handle = tokio::spawn(async move {
@@ -85,14 +128,14 @@ async fn in_flight_is_visible_in_snapshot() {
         c.execute(Command::Echo, &EchoRequest, None).await
     });
 
-    wait_for_sent(&mock, 1).await;
+    wait_for_sent(&mock, sent_before + 1).await;
     // Give the receiver task a tick to register the waiter.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let d = conn.diagnostics();
     assert_eq!(d.credits.in_flight, 1);
-    assert_eq!(d.metrics.requests_sent, 1);
-    assert!(d.metrics.wire_bytes_sent > 0);
+    assert_eq!(d.metrics.requests_sent, base.requests_sent + 1);
+    assert!(d.metrics.wire_bytes_sent > base.wire_bytes_sent);
 
     handle.abort();
     let _ = handle.await;
@@ -101,11 +144,13 @@ async fn in_flight_is_visible_in_snapshot() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_survives_teardown() {
-    let (conn, mock) = fresh_conn();
+    let (conn, mock) = negotiated_conn(512).await;
+    let base = conn.diagnostics().metrics;
+    let sent_before = mock.sent_count();
 
     let c = conn.clone();
     let handle = tokio::spawn(async move { c.execute(Command::Echo, &EchoRequest, None).await });
-    wait_for_sent(&mock, 1).await;
+    wait_for_sent(&mock, sent_before + 1).await;
     mock.queue_response(echo_ok(MessageId(0)));
     handle.await.unwrap().unwrap();
 
@@ -115,10 +160,11 @@ async fn snapshot_survives_teardown() {
     let d = conn.diagnostics();
     assert!(d.disconnected, "after close, snapshot reports disconnected");
     assert_eq!(
-        d.metrics.responses_routed_ok, 1,
+        d.metrics.responses_routed_ok,
+        base.responses_routed_ok + 1,
         "counter survives teardown"
     );
-    assert_eq!(d.metrics.requests_sent, 1);
+    assert_eq!(d.metrics.requests_sent, base.requests_sent + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
