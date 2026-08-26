@@ -5,6 +5,16 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **A busy send queue no longer costs a diagnostic bundle its history.** Frames waiting for the socket were reported one `WARN` line each, every sweep. Copying 282 × 66 MB to a NAS over a 6.7 MB/s Wi-Fi link keeps around 320 one-MiB frames queued at all times, so that came to ~320 lines every 10 seconds: 4,487 of the 4,744 lines in one user's bundle were this single message, and the whole bundle covered 2 minutes 30 seconds. Everything that would have explained anything had already rotated out.
+  - **One line for the whole queue now**, naming how many frames are waiting, the oldest one's age, the command mix, and the queue depth. The frame-by-frame detail moved to `TRACE`, where the long-poll list already lives.
+  - **A deep queue that is DRAINING is `INFO`, not `WARN`.** The frames were moving the whole time, at exactly the rate the link could carry, and the transfer finished; calling that a warning is the crate crying wolf about physics. It still gets a line, because it is what explains a transfer that feels slow. `INFO` rather than `DEBUG` on purpose: consumers ship `INFO` in their bundles, and a bundle that can't show the link was the bottleneck sends the next investigation after the server again.
+  - **A queue that is NOT draining stays `WARN`, and says so by name.** Depth alone cannot tell a slow link from a wedged writer task or a dead socket; `wire_bytes_sent` standing still between two sweeps can, and that is the reading the split is built on -- the same one `CreditInfo::send_queue_depth` already documents for consumers.
+  - The per-request `WARN` for a request the server has been asked and has not answered is untouched: that population is a different claim, and the server does owe us a response.
+
 ## [0.18.1] - 2026-08-08
 
 ### Fixed

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use futures_util::future::{select, Either};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace, warn, Level};
 use tokio::sync::{mpsc, oneshot};
 
 /// One in-flight request: who is waiting, what they asked for, and since when.
@@ -404,37 +404,81 @@ fn is_long_poll(command: Command) -> bool {
     matches!(command, Command::ChangeNotify)
 }
 
-/// Split what is outstanding into "should have come back by now" and "waiting
-/// for an event, as designed".
+/// One outstanding request, named well enough to diagnose from.
+#[derive(Debug, Clone, Copy)]
+struct Outstanding {
+    msg_id: MessageId,
+    command: Command,
+    /// Since the waiter was registered, which is BEFORE the bytes reach the
+    /// transport.
+    age: std::time::Duration,
+}
+
+/// A request the server has been asked and has not answered.
+#[derive(Debug, Clone, Copy)]
+struct Unanswered {
+    request: Outstanding,
+    /// Since the transport accepted the frame. The only clock that can be read
+    /// as "the server is quiet", which is why this bucket is the only one that
+    /// blames it.
+    sent_age: std::time::Duration,
+}
+
+/// Everything in flight, split by which diagnosis it supports.
 ///
-/// Separated from the logging so the split itself can be tested: which bucket a
-/// command lands in is the decision, and the rest is formatting.
-#[allow(clippy::type_complexity)]
-fn classify_outstanding(
-    inner: &Inner,
-    threshold: std::time::Duration,
-) -> (
-    Vec<(
-        MessageId,
-        Command,
-        std::time::Duration,
-        Option<std::time::Duration>,
-    )>,
-    Vec<(MessageId, Command, std::time::Duration)>,
-) {
+/// Three populations, three different things to say about them, and conflating
+/// any two of them is a misdiagnosis: the server owing an answer, the send
+/// queue owing a socket, and a long poll waiting for an event that may never
+/// come. Separated from the logging so the split itself can be tested: which
+/// bucket a request lands in is the decision, and the rest is formatting.
+#[derive(Debug, Default)]
+struct OutstandingSplit {
+    /// Sent, past the threshold, unanswered. The server owes us a response.
+    unanswered: Vec<Unanswered>,
+    /// Past the threshold and never sent. Waiting on the send queue.
+    queued: Vec<Outstanding>,
+    /// Long polls, at any age. Not stale by construction — see [`is_long_poll`].
+    parked: Vec<Outstanding>,
+}
+
+fn classify_outstanding(inner: &Inner, threshold: std::time::Duration) -> OutstandingSplit {
     let now = std::time::Instant::now();
-    let mut stale = Vec::new();
-    let mut parked = Vec::new();
+    let mut split = OutstandingSplit::default();
     for (id, w) in inner.waiters.lock().unwrap().iter() {
-        let age = now.saturating_duration_since(w.registered_at);
+        let request = Outstanding {
+            msg_id: *id,
+            command: w.command,
+            age: now.saturating_duration_since(w.registered_at),
+        };
         if is_long_poll(w.command) {
-            parked.push((*id, w.command, age));
-        } else if age >= threshold {
-            let sent_age = w.sent_at.map(|t| now.saturating_duration_since(t));
-            stale.push((*id, w.command, age, sent_age));
+            split.parked.push(request);
+        } else if request.age >= threshold {
+            match w.sent_at {
+                Some(sent) => split.unanswered.push(Unanswered {
+                    request,
+                    sent_age: now.saturating_duration_since(sent),
+                }),
+                None => split.queued.push(request),
+            }
         }
     }
-    (stale, parked)
+    split
+}
+
+/// Whether the send side moved between two sweeps.
+///
+/// The queue depth alone cannot tell a slow link from a wedged writer: both
+/// look like hundreds of frames waiting. Only "did anything reach the socket"
+/// separates them, and that difference is the whole reason one of these is a
+/// warning and the other is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendSide {
+    /// Frames reached the socket since the previous sweep. A deep queue here
+    /// is the link being slow, which is the transfer working.
+    Draining,
+    /// Not one byte reached the socket since the previous sweep. Whatever is
+    /// wrong is on our side of the wire.
+    Stalled,
 }
 
 /// Periodically report requests that have gone unanswered, for as long as the
@@ -634,11 +678,143 @@ async fn keepalive_loop(weak: Weak<Inner>) {
     }
 }
 
-/// Log any request outstanding longer than `STALE_WAITER_AFTER`.
+/// `Write x318, Read x2`, busiest first — the shape of a backlog in one
+/// phrase, which is what a reader needs before they need message ids.
+fn command_mix(requests: &[Outstanding]) -> String {
+    let mut counts: Vec<(Command, usize)> = Vec::new();
+    for r in requests {
+        match counts.iter_mut().find(|(c, _)| *c == r.command) {
+            Some(entry) => entry.1 += 1,
+            None => counts.push((r.command, 1)),
+        }
+    }
+    // Then by command code, so the same backlog reads the same sweep to sweep
+    // and a reader can diff two lines.
+    counts.sort_by_key(|(c, n)| (std::cmp::Reverse(*n), u16::from(*c)));
+    counts
+        .iter()
+        .map(|(c, n)| format!("{c:?} x{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The per-request detail the collapsed lines stand in for.
+fn describe_requests(requests: &[Outstanding], verb: &str) -> String {
+    requests
+        .iter()
+        .map(|r| format!("{:?}/{} {verb} {:?}", r.command, r.msg_id.0, r.age))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What one sweep has to say, as records for the caller to log.
+///
+/// Pure so the VOLUME can be tested and not just the wording: "one collapsed
+/// line for the send queue, never one per frame" is a property of this
+/// function's return length, and a regression to per-frame lines shows up as a
+/// longer `Vec`.
+///
+/// The three populations get three different levels, because they are three
+/// different claims:
+///
+/// - **Unanswered** (sent, and the server has said nothing since): WARN,
+///   always. The server owes us a response and is not producing one; there is
+///   no reading of that which is healthy.
+/// - **Queued** (registered, never sent): the level depends entirely on
+///   [`SendSide`], and that split is the whole point. A deep queue that is
+///   DRAINING is a slow link with a lot buffered in front of it — the frames
+///   are moving at exactly the rate the link can carry, the transfer is
+///   working, and calling that a warning is the crate crying wolf about
+///   physics. It gets INFO: worth a line, since it is what explains a transfer
+///   that feels slow, but not a fault. A queue that is NOT draining is the
+///   genuine send-side wedge, and keeps WARN. INFO rather than DEBUG on
+///   purpose: consumers ship INFO in their diagnostic bundles, and a bundle
+///   that cannot show the link was the bottleneck is a bundle that sends the
+///   next investigation after the server again.
+/// - **Parked** long polls: TRACE normally (waiting for an event is what they
+///   are for), promoted to WARN alongside a genuine wedge, since an
+///   investigation wants the whole in-flight picture at the level it is
+///   reading.
+fn sweep_report(
+    split: &OutstandingSplit,
+    send_side: SendSide,
+    queue_depth: usize,
+) -> Vec<(Level, String)> {
+    let mut records = Vec::new();
+
+    for u in &split.unanswered {
+        records.push((
+            Level::Warn,
+            format!(
+                "outstanding request: cmd={:?}, msg_id={}, sent {:?} ago, no response",
+                u.request.command, u.request.msg_id.0, u.sent_age
+            ),
+        ));
+    }
+
+    // One line for the whole population. The 2026-08-26 incident that made
+    // this a collapse rather than a loop: 282 × 66 MB copied to a NAS over
+    // 6.7 MB/s Wi-Fi kept ~320 one-MiB frames queued at all times, and a line
+    // each per sweep made 4,487 of the 4,744 lines in the user's diagnostic
+    // bundle this one message — a bundle covering 2 minutes 30 seconds, with
+    // everything that would have explained anything already rotated out.
+    if let Some(oldest) = split.queued.iter().map(|q| q.age).max() {
+        let mix = command_mix(&split.queued);
+        let waiting = split.queued.len();
+        records.push(match send_side {
+            SendSide::Draining => (
+                Level::Info,
+                format!(
+                    "send queue is deep but draining: {waiting} request(s) waiting for the socket \
+                     ({mix}), oldest queued {oldest:?} ago, {queue_depth} frame(s) in the queue; \
+                     the frames are moving at the rate the link can carry them"
+                ),
+            ),
+            // The line that names a send-side wedge instead of blaming the
+            // server: nothing was asked, so nothing can be expected back.
+            SendSide::Stalled => (
+                Level::Warn,
+                format!(
+                    "send queue is NOT draining: {waiting} request(s) waiting for the socket \
+                     ({mix}), oldest queued {oldest:?} ago, {queue_depth} frame(s) in the queue, \
+                     and not one byte has reached the socket since the previous sweep"
+                ),
+            ),
+        });
+    }
+
+    if !split.parked.is_empty() {
+        let wedged = !split.unanswered.is_empty()
+            || (!split.queued.is_empty() && send_side == SendSide::Stalled);
+        let parked = describe_requests(&split.parked, "parked");
+        records.push(if wedged {
+            (
+                Level::Warn,
+                format!(
+                    "also outstanding, but waiting for events by design rather than stalled: \
+                     {parked}"
+                ),
+            )
+        } else {
+            // The healthy shape, and by far the common one. Nothing is wrong,
+            // so nothing above TRACE should say anything.
+            (
+                Level::Trace,
+                format!("long polls outstanding (waiting for events, as designed): {parked}"),
+            )
+        });
+    }
+
+    records
+}
+
+/// Report any request outstanding longer than `STALE_WAITER_AFTER`.
 ///
 /// Deliberately re-reports on every sweep: a connection that keeps serving small
 /// requests while a large write hangs looks healthy by every other measure, so
-/// the repetition is the signal.
+/// the repetition is the signal. What it may NOT do is repeat per request —
+/// see [`sweep_report`] for the collapse and for how each population earns its
+/// level.
 ///
 /// ❌ **Long polls are not warned about.** The premise of every line here is
 /// "this should have come back by now", and for a CHANGE_NOTIFY that premise is
@@ -651,51 +827,24 @@ async fn keepalive_loop(weak: Weak<Inner>) {
 /// TRACE every sweep, and named in full whenever a REAL stale request is
 /// warned about, since a wedge investigation wants the whole in-flight picture.
 fn warn_on_stale_waiters(inner: &Inner) {
+    // Read before the threshold check, so the baseline stays honest across a
+    // consumer toggling the warning off and back on.
+    let send_side = inner.observe_send_side();
     let Some(threshold) = *inner.stale_request_after.lock().unwrap() else {
         return; // consumer turned the warning off
     };
-    let (stale, parked) = classify_outstanding(inner, threshold);
-    for (msg_id, command, age, sent_age) in &stale {
-        match sent_age {
-            Some(sent) => warn!(
-                "outstanding request: cmd={:?}, msg_id={}, sent {:?} ago, no response",
-                command, msg_id.0, sent
-            ),
-            // The line that names the send-side wedge instead of blaming the
-            // server: nothing was asked, so nothing can be expected back.
-            None => warn!(
-                "outstanding request: cmd={:?}, msg_id={}, registered {:?} ago and NOT YET ON THE WIRE \
-                 (waiting on the send queue, {} frame(s) ahead of it)",
-                command,
-                msg_id.0,
-                age,
-                inner.send_queue_depth.load(Ordering::Relaxed)
-            ),
-        }
+    let split = classify_outstanding(inner, threshold);
+    let queue_depth = inner.send_queue_depth.load(Ordering::Relaxed);
+    for (level, message) in sweep_report(&split, send_side, queue_depth) {
+        log::log!(level, "{message}");
     }
-    if parked.is_empty() {
-        return;
-    }
-    let describe = || {
-        parked
-            .iter()
-            .map(|(id, command, age)| format!("{command:?}/{} parked {age:?}", id.0))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if stale.is_empty() {
-        // The healthy shape, and by far the common one. Nothing is wrong, so
-        // nothing above TRACE should say anything.
+    // The frame-by-frame detail the collapsed send-queue line stands in for.
+    // Built lazily, unlike the parked list above: there can be hundreds of
+    // these, and nobody with TRACE off should pay to format them.
+    if !split.queued.is_empty() {
         trace!(
-            "long polls outstanding (waiting for events, as designed): {}",
-            describe()
-        );
-    } else {
-        // Something IS wrong, and a reader diagnosing it wants every request
-        // on the connection named, not just the ones that broke a threshold.
-        warn!(
-            "also outstanding, but waiting for events by design rather than stalled: {}",
-            describe()
+            "not yet on the wire, frame by frame: {}",
+            describe_requests(&split.queued, "waiting")
         );
     }
 }
@@ -1010,6 +1159,15 @@ struct Inner {
     /// to stay silent. Consumers with a legitimately slow server tune or disable
     /// it; see `Connection::set_stale_request_warning`.
     stale_request_after: StdMutex<Option<std::time::Duration>>,
+    /// `metrics.wire_bytes_sent` as of the previous stale-waiter sweep.
+    ///
+    /// The sweeper's only memory, and what lets one sweep tell "the queue is
+    /// deep because the link is slow" from "the queue is deep because nothing
+    /// is moving" — two states the depth alone cannot separate, and only one
+    /// of which is worth waking anyone up for. Deliberately the same reading
+    /// `CreditInfo::send_queue_depth` documents for consumers, so the crate's
+    /// own warning and a consumer's dashboard can't disagree.
+    swept_wire_bytes_sent: AtomicU64,
     /// How long a request may go unanswered before its caller gives up, or
     /// `None` to wait indefinitely. See `Connection::set_response_timeout`.
     response_timeout: StdMutex<Option<std::time::Duration>>,
@@ -1184,6 +1342,7 @@ impl Inner {
         Self {
             waiters: StdMutex::new(HashMap::new()),
             stale_request_after: StdMutex::new(Some(STALE_WAITER_AFTER)),
+            swept_wire_bytes_sent: AtomicU64::new(0),
             response_timeout: StdMutex::new(Some(RESPONSE_TIMEOUT)),
             last_frame_at: StdMutex::new(None),
             last_scheduled_at: StdMutex::new(std::time::Instant::now()),
@@ -1271,6 +1430,24 @@ impl Inner {
             Ok(Err(e)) => Err(e),
             // Writer task died between accepting the job and answering.
             Err(_) => Err(Error::Disconnected),
+        }
+    }
+
+    /// Whether anything reached the socket since the previous call.
+    ///
+    /// ❌ Only the stale-waiter sweeper may call this: it consumes the previous
+    /// reading, so a second caller would leave the sweeper comparing against
+    /// its own last look and reading every slow link as a wedge.
+    ///
+    /// `wire_bytes_sent` only ticks once a WHOLE frame has reached the socket,
+    /// which is what makes it the right witness: a writer parked mid-frame
+    /// moves nothing, and neither does this counter.
+    fn observe_send_side(&self) -> SendSide {
+        let sent = self.metrics.wire_bytes_sent.load(Ordering::Relaxed);
+        if self.swept_wire_bytes_sent.swap(sent, Ordering::Relaxed) == sent {
+            SendSide::Stalled
+        } else {
+            SendSide::Draining
         }
     }
 
@@ -5641,19 +5818,167 @@ mod tests {
 
         // Zero threshold: everything outstanding is old enough to be called
         // out, so only the classification can keep the long poll out.
-        let (stale, parked) = classify_outstanding(&conn.inner, Duration::from_millis(0));
+        let split = classify_outstanding(&conn.inner, Duration::from_millis(0));
 
         assert_eq!(
-            stale.iter().map(|s| s.1).collect::<Vec<_>>(),
+            split.queued.iter().map(|q| q.command).collect::<Vec<_>>(),
             vec![Command::Write],
-            "only the request the server actually owes an answer for is stale"
+            "only the request that is genuinely waiting for the wire is called out"
         );
         assert_eq!(
-            parked.iter().map(|p| p.1).collect::<Vec<_>>(),
+            split.parked.iter().map(|p| p.command).collect::<Vec<_>>(),
             vec![Command::ChangeNotify],
             "the long poll still has to be VISIBLE — it is reported at TRACE, and named \
              in full whenever a real stale request is warned about, because a wedge \
              investigation wants the whole in-flight picture"
+        );
+    }
+
+    fn waiting_frame(msg_id: u64, command: Command, age: Duration) -> Outstanding {
+        Outstanding {
+            msg_id: MessageId(msg_id),
+            command,
+            age,
+        }
+    }
+
+    /// A deep send queue collapses to ONE line however many frames are in it.
+    ///
+    /// The incident this pins: 282 × 66 MB copied to a NAS over a 6.7 MB/s
+    /// Wi-Fi link kept ~320 one-MiB frames queued at all times, and a line per
+    /// frame per sweep made 4,487 of the 4,744 lines in the user's diagnostic
+    /// bundle this one message. The bundle covered 2 minutes 30 seconds;
+    /// everything that would have explained anything had already rotated out
+    /// (2026-08-26).
+    #[test]
+    fn a_deep_send_queue_collapses_to_one_line_however_many_frames_are_in_it() {
+        let split = OutstandingSplit {
+            unanswered: vec![Unanswered {
+                request: waiting_frame(1, Command::Read, Duration::from_secs(20)),
+                sent_age: Duration::from_secs(19),
+            }],
+            queued: (2..=321)
+                .map(|id| waiting_frame(id, Command::Write, Duration::from_secs(70)))
+                .collect(),
+            parked: Vec::new(),
+        };
+
+        let records = sweep_report(&split, SendSide::Draining, 320);
+
+        assert_eq!(
+            records.len(),
+            2,
+            "one line for the request the server owes an answer for, and ONE for the \
+             whole send queue — never one per frame: {records:#?}"
+        );
+    }
+
+    /// A deep queue that is MOVING is the link being slow, not a fault, so it
+    /// must not be reported as one.
+    #[test]
+    fn a_draining_send_queue_is_reported_below_warn() {
+        let split = OutstandingSplit {
+            unanswered: Vec::new(),
+            queued: (1..=320)
+                .map(|id| {
+                    let command = if id <= 2 {
+                        Command::Read
+                    } else {
+                        Command::Write
+                    };
+                    waiting_frame(
+                        id,
+                        command,
+                        Duration::from_secs(70) - Duration::from_millis(id),
+                    )
+                })
+                .collect(),
+            parked: Vec::new(),
+        };
+
+        let records = sweep_report(&split, SendSide::Draining, 322);
+
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(
+            records[0].0,
+            Level::Info,
+            "frames are reaching the socket at exactly the rate the link can carry, \
+             which is the healthy shape: {}",
+            records[0].1
+        );
+        let line = &records[0].1;
+        assert!(line.contains("320"), "how many are waiting: {line}");
+        assert!(line.contains("322"), "how deep the queue is: {line}");
+        assert!(line.contains("69.9"), "the oldest frame's age: {line}");
+        assert!(
+            line.contains("Write x318") && line.contains("Read x2"),
+            "the command mix, busiest first: {line}"
+        );
+    }
+
+    /// A send queue that is deep and NOT MOVING is the pathology the sweeper
+    /// exists for, and it stays loud.
+    ///
+    /// This is the half the collapse must not swallow: a wedged writer task or
+    /// a dead socket looks identical to a slow link from the queue depth
+    /// alone, and only "did anything reach the socket" tells them apart.
+    #[test]
+    fn a_send_queue_that_is_not_draining_still_warns() {
+        let split = OutstandingSplit {
+            unanswered: Vec::new(),
+            queued: (1..=320)
+                .map(|id| waiting_frame(id, Command::Write, Duration::from_secs(70)))
+                .collect(),
+            parked: Vec::new(),
+        };
+
+        let records = sweep_report(&split, SendSide::Stalled, 320);
+
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(
+            records[0].0,
+            Level::Warn,
+            "nothing reached the socket between two sweeps while 320 frames waited: {}",
+            records[0].1
+        );
+    }
+
+    /// "Draining" means bytes actually reached the socket, which is the one
+    /// reading that separates a slow link from a wedged send side.
+    ///
+    /// Deliberately the same signal `CreditInfo::send_queue_depth` documents
+    /// for consumers ("steadily non-zero while `wire_bytes_sent` stands still
+    /// means the send side is stuck"), so the crate's own warning and a
+    /// consumer's dashboard can never disagree.
+    #[tokio::test]
+    async fn draining_is_read_from_bytes_actually_reaching_the_socket() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+
+        assert_eq!(
+            conn.inner.observe_send_side(),
+            SendSide::Stalled,
+            "nothing has ever reached the socket"
+        );
+
+        conn.inner
+            .metrics
+            .wire_bytes_sent
+            .fetch_add(1024, Ordering::Relaxed);
+        assert_eq!(
+            conn.inner.observe_send_side(),
+            SendSide::Draining,
+            "a frame got out between the two looks"
+        );
+
+        assert_eq!(
+            conn.inner.observe_send_side(),
+            SendSide::Stalled,
+            "and a second look with no new bytes is a stall again"
         );
     }
 
