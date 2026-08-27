@@ -3,23 +3,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use smb2::types::status::NtStatus;
 use smb2::{SmbClient, Tree};
 use tokio::io::AsyncWriteExt;
 
 use crate::auth::Credentials;
 use crate::pool;
+use crate::remote::{self, RemoteKind};
 use crate::target::Target;
-
-/// What's already sitting at a path on the share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteKind {
-    Missing,
-    File,
-    Directory,
-    /// A dry run makes no connection, so it can't ask the server.
-    Unknown,
-}
 
 pub async fn cat(target: &Target, credentials: &Credentials) -> Result<()> {
     let (mut client, mut tree) = pool::connect_all(target, credentials, 1)
@@ -116,7 +106,7 @@ pub async fn put(
             .len();
         // No connection, so the server can't be asked whether the target is a
         // directory: a trailing separator is all there is to go on.
-        let remote_path = upload_path(target, RemoteKind::Unknown, source_name)?;
+        let remote_path = upload_path(target, None, source_name)?;
         println!(
             "put {} {}",
             source.display(),
@@ -135,7 +125,7 @@ pub async fn put(
         .pop()
         .expect("connect_all returns one connection");
     let kind = remote_kind(&mut client, &mut tree, target, &target.path).await?;
-    let remote_path = upload_path(target, kind, source_name)?;
+    let remote_path = upload_path(target, Some(kind), source_name)?;
     // Appending the source's name can still land on a directory of its own, and
     // an upload must never replace one.
     if remote_path != target.path {
@@ -165,25 +155,26 @@ pub async fn put(
 /// Where `put` should write, given what the target names and what's already
 /// there. Follows `cp`: a target that ends in a separator, or that is an
 /// existing directory, takes the source's file name inside it.
-fn upload_path(target: &Target, kind: RemoteKind, source_name: &str) -> Result<String> {
+fn upload_path(target: &Target, kind: Option<RemoteKind>, source_name: &str) -> Result<String> {
     // The share root is a directory whether or not it was spelled with a
     // trailing separator.
-    let into_directory = if target.path.is_empty() || kind == RemoteKind::Directory {
+    let into_directory = if target.path.is_empty() || kind == Some(RemoteKind::Directory) {
         true
     } else if target.trailing_slash {
         match kind {
-            RemoteKind::File => bail!(
+            Some(RemoteKind::File) => bail!(
                 "{} is a file, not a directory, so {source_name} can't go inside it",
                 target.display()
             ),
-            RemoteKind::Missing => bail!(
+            Some(RemoteKind::Missing) => bail!(
                 "{} doesn't exist on the share, so {source_name} can't go inside it; \
                  create it first with `smb2 mkdir -p`",
                 target.display()
             ),
-            // A dry run reports what the trailing separator asked for.
-            RemoteKind::Unknown => true,
-            RemoteKind::Directory => unreachable!("handled above"),
+            // A dry run makes no connection, so it reports what the trailing
+            // separator asked for.
+            None => true,
+            Some(RemoteKind::Directory) => unreachable!("handled above"),
         }
     } else {
         false
@@ -199,34 +190,17 @@ fn upload_path(target: &Target, kind: RemoteKind, source_name: &str) -> Result<S
     })
 }
 
-/// What the server has at `path`, so `put` can tell a directory from a file
-/// before it writes. Only a clean "it isn't there" counts as missing; any other
-/// error stops the upload, since guessing wrong means clobbering a directory.
+/// What the server has at `path`, named the way the CLI was asked for it, so
+/// `put` can tell a directory from a file before it writes.
 async fn remote_kind(
     client: &mut SmbClient,
     tree: &mut Tree,
     target: &Target,
     path: &str,
 ) -> Result<RemoteKind> {
-    if path.is_empty() {
-        return Ok(RemoteKind::Directory);
-    }
-    match client.stat(tree, path).await {
-        Ok(info) if info.is_directory => Ok(RemoteKind::Directory),
-        Ok(_) => Ok(RemoteKind::File),
-        Err(error) if is_not_found(&error) => Ok(RemoteKind::Missing),
-        Err(error) => Err(anyhow::Error::new(error))
-            .with_context(|| format!("checking what's at {}", target.with_path(path).display())),
-    }
-}
-
-fn is_not_found(error: &smb2::Error) -> bool {
-    matches!(
-        error.status(),
-        Some(NtStatus::OBJECT_NAME_NOT_FOUND)
-            | Some(NtStatus::OBJECT_PATH_NOT_FOUND)
-            | Some(NtStatus::NO_SUCH_FILE)
-    )
+    remote::kind(client, tree, path)
+        .await
+        .with_context(|| format!("checking what's at {}", target.with_path(path).display()))
 }
 
 #[cfg(test)]
@@ -239,33 +213,34 @@ mod tests {
 
     #[test]
     fn puts_a_file_into_a_target_written_with_a_trailing_separator() {
-        let path = upload_path(&target("inbox/"), RemoteKind::Directory, "a.jpg").unwrap();
+        let path = upload_path(&target("inbox/"), Some(RemoteKind::Directory), "a.jpg").unwrap();
         assert_eq!(path, "inbox/a.jpg");
     }
 
     #[test]
     fn puts_a_file_into_a_target_that_is_already_a_directory() {
-        let path = upload_path(&target("inbox"), RemoteKind::Directory, "a.jpg").unwrap();
+        let path = upload_path(&target("inbox"), Some(RemoteKind::Directory), "a.jpg").unwrap();
         assert_eq!(path, "inbox/a.jpg");
     }
 
     #[test]
     fn puts_a_file_into_the_share_root() {
-        let path = upload_path(&target(""), RemoteKind::Directory, "a.jpg").unwrap();
+        let path = upload_path(&target(""), Some(RemoteKind::Directory), "a.jpg").unwrap();
         assert_eq!(path, "a.jpg");
     }
 
     #[test]
     fn treats_a_plain_target_as_the_destination_name() {
-        let path = upload_path(&target("inbox/b.jpg"), RemoteKind::Missing, "a.jpg").unwrap();
+        let path = upload_path(&target("inbox/b.jpg"), Some(RemoteKind::Missing), "a.jpg").unwrap();
         assert_eq!(path, "inbox/b.jpg");
-        let overwrite = upload_path(&target("inbox/b.jpg"), RemoteKind::File, "a.jpg").unwrap();
+        let overwrite =
+            upload_path(&target("inbox/b.jpg"), Some(RemoteKind::File), "a.jpg").unwrap();
         assert_eq!(overwrite, "inbox/b.jpg");
     }
 
     #[test]
     fn refuses_a_directory_target_that_is_really_a_file() {
-        let error = upload_path(&target("notes.txt/"), RemoteKind::File, "a.jpg")
+        let error = upload_path(&target("notes.txt/"), Some(RemoteKind::File), "a.jpg")
             .unwrap_err()
             .to_string();
         assert!(error.contains("not a directory"), "{error}");
@@ -273,7 +248,7 @@ mod tests {
 
     #[test]
     fn refuses_a_directory_target_that_isnt_there() {
-        let error = upload_path(&target("inbox/"), RemoteKind::Missing, "a.jpg")
+        let error = upload_path(&target("inbox/"), Some(RemoteKind::Missing), "a.jpg")
             .unwrap_err()
             .to_string();
         assert!(error.contains("doesn't exist"), "{error}");
@@ -281,7 +256,7 @@ mod tests {
 
     #[test]
     fn plans_for_a_directory_when_a_dry_run_cannot_ask() {
-        let path = upload_path(&target("inbox/"), RemoteKind::Unknown, "a.jpg").unwrap();
+        let path = upload_path(&target("inbox/"), None, "a.jpg").unwrap();
         assert_eq!(path, "inbox/a.jpg");
     }
 

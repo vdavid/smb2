@@ -6,6 +6,7 @@ mod batch;
 mod commands;
 mod output;
 mod pool;
+mod remote;
 mod target;
 
 use std::path::PathBuf;
