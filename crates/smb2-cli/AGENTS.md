@@ -12,7 +12,7 @@ Don't turn `smb2` into a path or git dependency: a path dep breaks this build wh
 - `src/batch.rs`: turns command-line targets or a `--from-file` list into one share plus a list of paths. Everything in a batch must be on the same host and share.
 - `src/pool.rs`: the concurrency engine. `Job` is the unit of work, `Outcome` the result.
 - `src/output.rs`: timestamp and byte formatting. Dates are ISO in UTC, computed with civil-from-days so we don't pull in a date crate.
-- `src/commands/`: `meta` (read-only), `mutate` (changes the share), `transfer` (bytes in and out).
+- `src/commands/`: `meta` (read-only), `mutate` (changes the share), `transfer` (bytes in and out). `transfer` keeps its destination rules in two pure functions, `upload_path` and `download_path`, so `cargo test` can cover them without a server.
 
 ## How concurrency works
 
@@ -25,12 +25,13 @@ Gotcha: `mkdir -p` forces concurrency to 1, since a parent has to exist before i
 ## Conventions
 
 - Batch commands never abort the whole run on one bad path. They collect failures, report up to 50 on stderr, and exit non-zero.
-- `--dry-run` prints the operations and makes no connection at all for mutating commands.
+- `--dry-run` prints the operations and makes no connection at all. It covers everything that writes: `mkdir`, `rm`, `rmdir`, `mv`, `put`, and `get` (which writes locally). Read-only commands ignore it. `tests/dry_run.rs` holds every one of them to that by aiming at a port nothing listens on, so a command that connects fails the test.
+- `put` picks its destination the way `cp` does: a target written with a trailing separator, or one the server says is already a directory, takes the source's file name inside it; anything else is the full destination path. It stats the target first and refuses to write a file over a directory, since that's how a folder disappears. A dry run can't stat, so it goes on the trailing separator alone.
 - Every command supports `--json`. Human output is for people, JSON is the contract; if you change a JSON key, that's a breaking change.
 
 ## Testing
 
-`cargo test` covers parsing and formatting with no network.
+`cargo test` covers parsing, formatting, and the transfer destination rules with no network. `tests/dry_run.rs` runs the built binary against `//127.0.0.1:1/…`, where connecting is refused instantly, which is what makes "`--dry-run` doesn't connect" testable.
 
 End-to-end runs use the Samba fixtures in the smb2 repo:
 

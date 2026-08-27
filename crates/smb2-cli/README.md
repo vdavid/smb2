@@ -56,7 +56,8 @@ smb2 stat //raspi/PiHDD/photos/IMG_0001.jpg
 # Move bytes
 smb2 cat //raspi/PiHDD/notes.txt
 smb2 get //raspi/PiHDD/notes.txt ./notes.txt
-smb2 put ./notes.txt //raspi/PiHDD/
+smb2 put ./notes.txt //raspi/PiHDD/inbox/     # into the directory, keeping the name
+smb2 put ./notes.txt //raspi/PiHDD/read-me.txt # under a name you choose
 
 # Change things
 smb2 mkdir -p //raspi/PiHDD/2026/2026-08-05
@@ -65,7 +66,9 @@ smb2 rm //raspi/PiHDD/junk.txt
 smb2 rmdir //raspi/PiHDD/empty-dir
 ```
 
-`--json` works on every command. `--dry-run` works on the mutating ones: it prints what would happen and makes no connection at all.
+`put` picks its destination the way `cp` does. A target that ends in `/`, or that's already a directory on the share, gets the file inside it under its own name; anything else is the full path to write. An upload never replaces a directory: if the destination is one, `put` says so and stops.
+
+`--json` works on every command. `--dry-run` works on everything that writes (`mkdir`, `rm`, `rmdir`, `mv`, `put`, and `get`): it prints what would happen and makes no connection at all.
 
 ## Batches
 
