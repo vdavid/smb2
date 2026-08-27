@@ -178,11 +178,13 @@ async fn main() -> Result<()> {
                 &Target::parse(target)?,
                 &credentials,
                 destination.as_deref(),
+                cli.dry_run,
             )
             .await
         }
         Commands::Put { source, target } => {
-            commands::transfer::put(source, &Target::parse(target)?, &credentials).await
+            commands::transfer::put(source, &Target::parse(target)?, &credentials, cli.dry_run)
+                .await
         }
         Commands::Df { target } => {
             commands::meta::df(&Target::parse(target)?, &credentials, cli.json).await

@@ -12,6 +12,10 @@ pub struct Target {
     /// Path inside the share, with `/` separators and no leading slash.
     /// Empty means the share root.
     pub path: String,
+    /// Whether the path was written with a trailing separator. `path` itself is
+    /// always trimmed, so this is the only record of it, and `put` needs it:
+    /// `.../dir/` means "into that directory", the way `cp` reads it.
+    pub trailing_slash: bool,
 }
 
 impl Target {
@@ -52,6 +56,7 @@ impl Target {
             port,
             share: share.to_string(),
             path: trim_path(path),
+            trailing_slash: !path.is_empty() && path.ends_with('/'),
         })
     }
 
@@ -64,6 +69,7 @@ impl Target {
     pub fn with_path(&self, path: &str) -> Self {
         Self {
             path: trim_path(path),
+            trailing_slash: path.ends_with('/'),
             ..self.clone()
         }
     }
@@ -145,6 +151,16 @@ mod tests {
             base.resolve("//other/share2/x").unwrap().display(),
             "//other/share2/x"
         );
+    }
+
+    #[test]
+    fn remembers_a_trailing_separator() {
+        assert!(Target::parse("//host/share/dir/").unwrap().trailing_slash);
+        assert!(Target::parse(r"\\host\share\dir\").unwrap().trailing_slash);
+        assert!(!Target::parse("//host/share/dir").unwrap().trailing_slash);
+        // The share root is a directory whether or not it's spelled with one.
+        assert!(!Target::parse("//host/share").unwrap().trailing_slash);
+        assert!(!Target::parse("//host/share/").unwrap().trailing_slash);
     }
 
     #[test]
