@@ -66,6 +66,8 @@ smb2 rm //raspi/PiHDD/junk.txt
 smb2 rmdir //raspi/PiHDD/empty-dir
 ```
 
+`mkdir -p` is happy to find the directory already there, and stops when the name belongs to a file, the way GNU `mkdir -p` does.
+
 `put` picks its destination the way `cp` does. A target that ends in `/`, or that's already a directory on the share, gets the file inside it under its own name; anything else is the full path to write. An upload never replaces a directory: if the destination is one, `put` says so and stops.
 
 `--json` works on every command. `--dry-run` works on everything that writes (`mkdir`, `rm`, `rmdir`, `mv`, `put`, and `get`): it prints what would happen and makes no connection at all.
@@ -82,7 +84,7 @@ smb2 rmdir --from-file dirs.txt -j 16 //raspi/PiHDD/xiaomi_camera_videos/788b2a1
 printf 'a/old.mp4\ta/new.mp4\n' | smb2 mv --from-file - //raspi/PiHDD
 ```
 
-`-j` sets how many connections to spread the work over (default 8). Everything in one batch has to live on the same host and share.
+`-j` sets how many connections to spread the work over (default 8). It goes after the subcommand, and only the commands that actually spread work take it: `stat`, `mkdir`, `rm`, `rmdir`, and `mv`. Everything in one batch has to live on the same host and share.
 
 ## Exit codes
 
