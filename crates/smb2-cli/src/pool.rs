@@ -14,6 +14,23 @@ use crate::auth::Credentials;
 use crate::remote::{self, RemoteKind};
 use crate::target::Target;
 
+/// The `-j` flag, on the commands whose work actually spreads over
+/// connections. Everything else opens exactly one, so offering it there would
+/// promise an overlap that can't happen.
+#[derive(Debug, Clone, Copy, clap::Args)]
+pub struct Concurrency {
+    /// How many connections to spread batch work over.
+    #[arg(short = 'j', long = "concurrency", default_value_t = 8)]
+    value: usize,
+}
+
+impl Concurrency {
+    /// At least one connection, whatever the flag asked for.
+    pub fn workers(self) -> usize {
+        self.value.max(1)
+    }
+}
+
 /// One unit of work for the pool.
 #[derive(Debug, Clone)]
 pub enum Job {

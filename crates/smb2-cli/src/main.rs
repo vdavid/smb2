@@ -23,15 +23,12 @@ use crate::target::Target;
     version,
     about = "List, move, and delete files on an SMB share without mounting it",
     after_help = "Targets look like //host/share/path. Passwords come from --password-command, \
-                  SMB2_PASS, or a prompt."
+                  SMB2_PASS, or a prompt. -j goes after the subcommand, on the commands that \
+                  spread work over connections: stat, mkdir, rm, rmdir, mv."
 )]
 struct Cli {
     #[command(flatten)]
     auth: AuthArgs,
-
-    /// How many connections to spread batch work over.
-    #[arg(short = 'j', long, default_value_t = 8, global = true)]
-    concurrency: usize,
 
     /// Print machine-readable JSON instead of text.
     #[arg(long, global = true)]
@@ -64,12 +61,16 @@ enum Commands {
         targets: Vec<String>,
         #[command(flatten)]
         input: batch::BatchInput,
+        #[command(flatten)]
+        concurrency: pool::Concurrency,
     },
     /// Create directories.
     Mkdir {
         targets: Vec<String>,
         #[command(flatten)]
         input: batch::BatchInput,
+        #[command(flatten)]
+        concurrency: pool::Concurrency,
         /// Create missing parent directories too.
         #[arg(short = 'p', long)]
         parents: bool,
@@ -79,12 +80,16 @@ enum Commands {
         targets: Vec<String>,
         #[command(flatten)]
         input: batch::BatchInput,
+        #[command(flatten)]
+        concurrency: pool::Concurrency,
     },
     /// Remove empty directories.
     Rmdir {
         targets: Vec<String>,
         #[command(flatten)]
         input: batch::BatchInput,
+        #[command(flatten)]
+        concurrency: pool::Concurrency,
     },
     /// Move or rename within one share.
     Mv {
@@ -93,6 +98,8 @@ enum Commands {
         /// Read `from<TAB>to` pairs from this file, or `-` for stdin.
         #[arg(long, value_name = "FILE")]
         from_file: Option<String>,
+        #[command(flatten)]
+        concurrency: pool::Concurrency,
     },
     /// Print a file to stdout.
     Cat { target: String },
@@ -122,7 +129,6 @@ async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
     let credentials = cli.auth.resolve()?;
-    let concurrency = cli.concurrency.max(1);
 
     match &cli.command {
         Commands::Ls {
@@ -133,37 +139,68 @@ async fn main() -> Result<()> {
             let target = Target::parse(target)?;
             commands::meta::ls(&target, &credentials, *long, *recursive, cli.json).await
         }
-        Commands::Stat { targets, input } => {
+        Commands::Stat {
+            targets,
+            input,
+            concurrency,
+        } => {
             let (base, paths) = input.collect(targets)?;
-            commands::meta::stat(&base, &credentials, paths, concurrency, cli.json).await
+            commands::meta::stat(&base, &credentials, paths, concurrency.workers(), cli.json).await
         }
         Commands::Mkdir {
             targets,
             input,
+            concurrency,
             parents,
         } => {
             commands::mutate::mkdir(
                 targets,
                 input,
                 &credentials,
-                concurrency,
+                concurrency.workers(),
                 *parents,
                 cli.dry_run,
             )
             .await
         }
-        Commands::Rm { targets, input } => {
-            commands::mutate::rm(targets, input, &credentials, concurrency, cli.dry_run).await
+        Commands::Rm {
+            targets,
+            input,
+            concurrency,
+        } => {
+            commands::mutate::rm(
+                targets,
+                input,
+                &credentials,
+                concurrency.workers(),
+                cli.dry_run,
+            )
+            .await
         }
-        Commands::Rmdir { targets, input } => {
-            commands::mutate::rmdir(targets, input, &credentials, concurrency, cli.dry_run).await
+        Commands::Rmdir {
+            targets,
+            input,
+            concurrency,
+        } => {
+            commands::mutate::rmdir(
+                targets,
+                input,
+                &credentials,
+                concurrency.workers(),
+                cli.dry_run,
+            )
+            .await
         }
-        Commands::Mv { targets, from_file } => {
+        Commands::Mv {
+            targets,
+            from_file,
+            concurrency,
+        } => {
             commands::mutate::mv(
                 targets,
                 from_file.as_deref(),
                 &credentials,
-                concurrency,
+                concurrency.workers(),
                 cli.dry_run,
             )
             .await
@@ -217,6 +254,63 @@ mod tests {
     fn verifies_the_cli_definition() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// `-j` opens connections, so it belongs to the commands that open more
+    /// than one. The flag-before-the-subcommand spelling has to stop parsing.
+    #[test]
+    fn takes_concurrency_after_the_subcommand_but_not_before_it() {
+        assert!(Cli::try_parse_from(["smb2", "rm", "//host/share/a", "-j", "16"]).is_ok());
+        assert!(Cli::try_parse_from(["smb2", "-j", "16", "rm", "//host/share/a"]).is_err());
+    }
+
+    #[test]
+    fn offers_concurrency_on_every_command_that_spreads_work_over_connections() {
+        for command in commands_that_pool() {
+            let mut args = command.clone();
+            args.extend(["-j", "4"]);
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "{} feeds pool::run, so it has to take -j",
+                command[1]
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_concurrency_off_commands_that_open_one_connection() {
+        for command in commands_that_open_one_connection() {
+            let mut args = command.clone();
+            args.extend(["-j", "4"]);
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{} opens one connection, so advertising -j on it is a lie",
+                command[1]
+            );
+        }
+    }
+
+    /// The commands whose work goes through `pool::run`.
+    fn commands_that_pool() -> Vec<Vec<&'static str>> {
+        vec![
+            vec!["smb2", "stat", "//host/share/a"],
+            vec!["smb2", "mkdir", "//host/share/a"],
+            vec!["smb2", "rm", "//host/share/a"],
+            vec!["smb2", "rmdir", "//host/share/a"],
+            vec!["smb2", "mv", "//host/share/a", "//host/share/b"],
+        ]
+    }
+
+    /// The commands that call `pool::connect_all` with a count of one.
+    fn commands_that_open_one_connection() -> Vec<Vec<&'static str>> {
+        vec![
+            vec!["smb2", "ls", "//host/share/a"],
+            vec!["smb2", "cat", "//host/share/a"],
+            vec!["smb2", "get", "//host/share/a"],
+            vec!["smb2", "put", "./a", "//host/share/a"],
+            vec!["smb2", "df", "//host/share"],
+            vec!["smb2", "shares", "host"],
+        ]
     }
 
     #[test]
