@@ -5,6 +5,26 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - 2026-08-28
+
+### Fixed
+
+- **Overlapping connects to one server no longer wedge.** A pool of connections opened at once (`smb2-cli -j N`, a test binary running its cases in parallel, any consumer doing the same) could leave one worker hanging 30 s at connect and then failing it with `ServerUnresponsive`. It landed on a different worker each run, at a few percent, from four concurrent connects upward.
+  - **Cause: every connection from one process presented the same `ClientGuid`**, held in a process-wide `OnceLock`. Samba reads a guid it already knows as another channel for a client it has, and passes the new socket to the smbd process owning the first connection (`smbXsrv_connection_pass`). That hand-off is keyed at negprot, before any capability is negotiated, so not advertising multi-channel doesn't opt out of it, and when two connects overlap it loses the negotiate's credit grant: the stored `negotiate_request` in the pass record is empty, the sequence window is never opened, and the SESSION_SETUP that follows is rejected as over-credit. Confirmed at `log level = 10` against Samba 4.20.6, and `server multi channel support = no` makes it vanish.
+  - **The guid now lives on `Inner`**, so each connection has its own and Samba treats them as the separate clients they are. It still survives a revival, which is what durable-handle reclaim needs (MS-SMB2 § 3.3.5.9.12 matches on it), so a reclaim after a reconnect still looks like the same client.
+  - **This also made wide pools faster on a server that never hung.** A shared guid funnels every connection in a pool into one smbd process, so widening the pool bought less than it looked like it did. Against a QNAP TS-464 at `-j 16`: 2.3× on a 107-path batch (60–72 → 147–165 stat/s) and 1.45× on a 1,999-path one (652–693 → 968–1,009 stat/s). Identical at `-j 1`, which is the control. Against Samba 4.22.10 it's a wash, and that server doesn't hang either, so the exposure was version-dependent all along. Details and the log evidence: `docs/notes/samba-client-guid-connection-pass.md`.
+  - **It was also the cause of the docker suite's long-standing flake** (~2 failures in 101 tests, always `ServerUnresponsive`, always different tests). 20 consecutive full runs are now clean, and `concurrent_connects_all_finish_their_handshake` covers it directly: 448 handshakes at widths 4, 8, and 16, which took 51.6 s and failed 25 times before the fix and takes 0.39 s and fails none after.
+
+## [smb2-cli 0.4.1] - 2026-08-28
+
+### Fixed
+
+- **`-j N` is reliable and faster on a Samba server**, via the library fix above. There's no CLI code change; the release exists so installing the binary gets it.
+
+### Changed
+
+- The end-to-end suite runs the pool at the CLI's real default of 8 rather than the `-j 2` it was pinned to, and `rm_at_full_pool_width_deletes_every_path` opens it all the way at `-j 16`.
+
 ## [smb2-cli 0.4.0] - 2026-08-28
 
 ### Fixed
