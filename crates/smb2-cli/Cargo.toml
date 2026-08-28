@@ -11,6 +11,21 @@ categories = ["command-line-utilities", "network-programming", "filesystem"]
 readme = "README.md"
 documentation = "https://docs.rs/smb2-cli"
 
+exclude = [
+    # Agent tooling, not source a consumer installing the binary wants. Restored
+    # after the move into the workspace dropped it: the package root changed, so
+    # the list that used to sit beside these files stopped covering them.
+    "AGENTS.md",
+    # Root-anchored: this one is only an `@AGENTS.md` import, and `AGENTS.md` is
+    # excluded above, so shipping it would publish a pointer to a file that
+    # isn't in the package.
+    "/CLAUDE.md",
+    ".claude/",
+    # Dev-only, same reasoning as the library's: the e2e suite can't run from a
+    # published tarball anyway, since its Samba fixtures live in the repo.
+    "tests/",
+]
+
 [[bin]]
 name = "smb2"
 path = "src/main.rs"
