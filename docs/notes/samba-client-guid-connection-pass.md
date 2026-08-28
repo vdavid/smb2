@@ -15,6 +15,10 @@ smb2_validate_message_id: client used more credits than granted,
 NEGOTIATE (mid 0) and *before* it credited that request's response. In other words, the SESSION_SETUP arrives
 against a connection whose NEGOTIATE grant was never committed.
 
+**This is not the credit-pool bug 0.20.0 fixed**, though it prints the same Samba line. That one was a request
+racing the handshake and spending NEGOTIATE's seeded permit, and it is genuinely gone: the pool starts empty and
+NEGOTIATE is exempt. This one needs no second request at all.
+
 The client is not at fault, and that was measured rather than assumed. Probing the negotiate response and the
 session-setup reservation across 100 concurrent connects gave the same two lines every single time:
 
@@ -56,10 +60,12 @@ against `127.0.0.1:10446`, in waves.
   `ServerUnresponsive`, always different tests. Same cause: 101 tests in one process, one GUID.
 - **`crates/smb2-cli/tests/e2e.rs`** — opens exactly one connection for the whole binary for this reason. Its
   `server()` doc explains it at the call site.
-- **`smb2-cli -j N`** — the pool opens N connections from one process, so they share a GUID too. `-j 16` against
-  a Raspberry Pi is the benchmark the CLI's README quotes and it has been reliable, and the E2E suite's batch
-  commands (2–3 workers) have not tripped it in ~150 runs, but it is the same exposure and it is worth knowing
-  about if a bulk run ever wedges at connect time.
+- **`smb2-cli -j N`** — `pool::run` opens its N connections concurrently from one process, so they share a GUID
+  too, and this is not theoretical: a batch test running three workers hung 30 s at connect and took the suite
+  with it, which is why `e2e.rs` pins those tests to `-j 2`. The `-j 16` benchmark the CLI's README quotes was
+  measured against a Raspberry Pi and has been reliable, so whether a given server does this is worth checking
+  before reading too much into the number. **This is the one place the bug reaches users**, and the cap in the
+  test suite hides it rather than fixing it.
 
 ## What hasn't been decided
 

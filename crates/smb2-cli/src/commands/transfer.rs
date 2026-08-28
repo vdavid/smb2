@@ -1,10 +1,13 @@
 //! Moving bytes between the share and the local machine: `cat`, `get`, `put`.
 
+use std::collections::VecDeque;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use smb2::{SmbClient, Tree};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::auth::Credentials;
 use crate::pool;
@@ -12,18 +15,13 @@ use crate::remote::{self, RemoteKind};
 use crate::target::Target;
 
 pub async fn cat(target: &Target, credentials: &Credentials) -> Result<()> {
-    let (mut client, mut tree) = pool::connect_all(target, credentials, 1)
+    let (mut client, tree) = pool::connect_all(target, credentials, 1)
         .await?
         .pop()
         .expect("connect_all returns one connection");
-    let data = client
-        .read_file(&mut tree, &target.path)
-        .await
-        .with_context(|| format!("reading {}", target.display()))?;
-    tokio::io::stdout()
-        .write_all(&data)
-        .await
-        .context("writing to stdout")?;
+    let mut stdout = tokio::io::stdout();
+    download(&mut client, &tree, target, &mut stdout).await?;
+    stdout.flush().await.context("writing to stdout")?;
     let _ = client.disconnect_share(&tree).await;
     Ok(())
 }
@@ -41,24 +39,126 @@ pub async fn get(
         return Ok(());
     }
 
-    let (mut client, mut tree) = pool::connect_all(target, credentials, 1)
+    let (mut client, tree) = pool::connect_all(target, credentials, 1)
         .await?
         .pop()
         .expect("connect_all returns one connection");
-    let data = client
-        .read_file(&mut tree, &target.path)
+    let mut file = tokio::fs::File::create(&destination)
         .await
-        .with_context(|| format!("reading {}", target.display()))?;
-    tokio::fs::write(&destination, &data)
+        .with_context(|| format!("writing {}", destination.display()))?;
+    let received = download(&mut client, &tree, target, &mut file).await?;
+    file.flush()
         .await
         .with_context(|| format!("writing {}", destination.display()))?;
     println!(
         "Downloaded {} bytes to {}",
-        crate::output::bytes(data.len() as u64),
+        crate::output::bytes(received),
         destination.display()
     );
     let _ = client.disconnect_share(&tree).await;
     Ok(())
+}
+
+/// Bytes to keep in flight while a download runs.
+///
+/// Each positioned read is one wire READ of the server's `MaxReadSize`, so this
+/// budget divided by that size gives the window: 32 reads of 64 KB against a
+/// server with a small cap, two of 8 MB against a generous one. Either way it,
+/// and not the file's size, is what a download costs in memory.
+const IN_FLIGHT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Ceiling on the window, so a server advertising a tiny `MaxReadSize` doesn't
+/// turn the budget into thousands of outstanding requests. Matches the depth
+/// the library's own pipelined read uses.
+const MAX_IN_FLIGHT_READS: u64 = 32;
+
+/// Reads `target` off the share and writes it to `sink`, returning the byte
+/// count.
+///
+/// Reads run in a sliding window and each chunk goes out to `sink` as it lands,
+/// so a download costs [`IN_FLIGHT_BYTES`] of memory whatever the file weighs.
+/// That bound is the point: `get` and `cat` used to ask for the whole file in a
+/// single READ, which held all of it in memory and, past the server's
+/// `MaxReadSize` (8 MB on a stock Samba), could not be answered at all -- a
+/// 12 MB download failed outright.
+///
+/// The cost is that a small file now takes three round trips (open, read,
+/// close) where a compound CREATE+READ+CLOSE took one. Trying the compound
+/// first isn't the way to win it back: the server answers that READ with a full
+/// `MaxReadSize` of data before the client can see the file is too big, so
+/// every large download would pull 8 MB it throws away.
+async fn download<W: AsyncWrite + Unpin>(
+    client: &mut SmbClient,
+    tree: &Tree,
+    target: &Target,
+    sink: &mut W,
+) -> Result<u64> {
+    let chunk = u64::from(
+        client
+            .params()
+            .map(|params| params.max_read_size)
+            .unwrap_or(65_536),
+    )
+    .max(1);
+    let window = (IN_FLIGHT_BYTES / chunk).clamp(2, MAX_IN_FLIGHT_READS) as usize;
+
+    let reader = Arc::new(
+        client
+            .open_file_reader(tree, &target.path)
+            .await
+            .with_context(|| format!("reading {}", target.display()))?,
+    );
+    let size = reader.size();
+
+    let mut in_flight: VecDeque<tokio::task::JoinHandle<smb2::Result<Vec<u8>>>> = VecDeque::new();
+    let mut offset = 0u64;
+    let mut received = 0u64;
+    let mut failure: Option<anyhow::Error> = None;
+
+    loop {
+        while in_flight.len() < window && offset < size {
+            let reader = Arc::clone(&reader);
+            let at = offset;
+            offset += chunk;
+            in_flight.push_back(tokio::spawn(async move { reader.read_at(at, chunk).await }));
+        }
+        let Some(next) = in_flight.pop_front() else {
+            break;
+        };
+        let data = match next.await {
+            Ok(Ok(data)) => data,
+            Ok(Err(error)) => {
+                failure = Some(
+                    anyhow::Error::new(error).context(format!("reading {}", target.display())),
+                );
+                break;
+            }
+            Err(joined) => {
+                failure = Some(anyhow::Error::new(joined).context("a download task failed"));
+                break;
+            }
+        };
+        if let Err(error) = sink.write_all(&data).await {
+            failure = Some(anyhow::Error::new(error).context("writing the downloaded bytes"));
+            break;
+        }
+        received += data.len() as u64;
+    }
+
+    // Whatever is still in flight has to finish before the reader is ours alone
+    // again, and the handle has to be closed explicitly: dropping a `FileReader`
+    // leaks the server-side handle until the session goes away.
+    while let Some(pending) = in_flight.pop_front() {
+        let _ = pending.await;
+    }
+    if let Ok(reader) = Arc::try_unwrap(reader) {
+        let _ = reader.close().await;
+    }
+
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(received),
+    }
 }
 
 /// Where `get` should write. A destination that's an existing local directory,
@@ -116,9 +216,10 @@ pub async fn put(
         return Ok(());
     }
 
-    let data = tokio::fs::read(source)
+    let size = tokio::fs::metadata(source)
         .await
-        .with_context(|| format!("reading {}", source.display()))?;
+        .with_context(|| format!("reading {}", source.display()))?
+        .len();
 
     let (mut client, mut tree) = pool::connect_all(target, credentials, 1)
         .await?
@@ -139,8 +240,7 @@ pub async fn put(
         }
     }
 
-    let written = client
-        .write_file(&mut tree, &remote_path, &data)
+    let written = upload(&mut client, &mut tree, source, &remote_path, size)
         .await
         .with_context(|| format!("writing {}", target.with_path(&remote_path).display()))?;
     println!(
@@ -150,6 +250,63 @@ pub async fn put(
     );
     let _ = client.disconnect_share(&tree).await;
     Ok(())
+}
+
+/// Writes `source` to `remote_path`, returning the byte count the server
+/// acknowledged.
+///
+/// A file that fits in one WRITE goes up as a single compound
+/// CREATE+WRITE+FLUSH+CLOSE, which is one round trip and worth keeping for the
+/// common case of uploading something small. Anything larger is pulled off disk
+/// a chunk at a time and fed to the library's pipelined streaming write, so the
+/// memory an upload costs is the pipeline's window rather than the file: this
+/// path has carried a 2.35 GB video, which the old `tokio::fs::read` held in
+/// full before a single byte went out.
+async fn upload(
+    client: &mut SmbClient,
+    tree: &mut Tree,
+    source: &Path,
+    remote_path: &str,
+    size: u64,
+) -> Result<u64> {
+    let chunk = client
+        .params()
+        .map(|params| params.max_write_size)
+        .unwrap_or(65_536)
+        .max(1);
+
+    if size <= u64::from(chunk) {
+        let data = tokio::fs::read(source)
+            .await
+            .with_context(|| format!("reading {}", source.display()))?;
+        return Ok(client.write_file(tree, remote_path, &data).await?);
+    }
+
+    let mut file =
+        std::fs::File::open(source).with_context(|| format!("reading {}", source.display()))?;
+    let mut next_chunk = || {
+        let mut buffer = vec![0u8; chunk as usize];
+        let mut filled = 0;
+        // `read` is free to return short, and does on a pipe or a network
+        // filesystem, so fill the buffer rather than treating the first short
+        // read as the end of the file.
+        while filled < buffer.len() {
+            match file.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        if filled == 0 {
+            return None;
+        }
+        buffer.truncate(filled);
+        Some(Ok(buffer))
+    };
+    Ok(client
+        .write_file_streamed(tree, remote_path, &mut next_chunk)
+        .await?)
 }
 
 /// Where `put` should write, given what the target names and what's already

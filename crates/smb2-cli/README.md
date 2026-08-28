@@ -71,6 +71,8 @@ smb2 rmdir //raspi/PiHDD/empty-dir
 
 `put` picks its destination the way `cp` does. A target that ends in `/`, or that's already a directory on the share, gets the file inside it under its own name; anything else is the full path to write. An upload never replaces a directory: if the destination is one, `put` says so and stops.
 
+Transfers stream in both directions, so size isn't a limit and neither is your memory: a 600 MB `get` runs in about 60 MB of RAM, and `put` is the same the other way.
+
 `--json` works on every command. `--dry-run` works on everything that writes (`mkdir`, `rm`, `rmdir`, `mv`, `put`, and `get`): it prints what would happen and makes no connection at all.
 
 ## Batches

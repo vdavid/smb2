@@ -20,6 +20,7 @@ Run these from the repo root.
 - `just fix`: Auto-fix formatting and clippy warnings
 - `just check-all`: Include MSRV check, security audit, and license check
 - `just test-consumer`: Consumer integration tests (needs Docker, ~30s)
+- `just test-cli-e2e`: CLI end-to-end tests against a live Samba fixture (needs Docker, ~2s)
 - `just release-dry`: `cargo publish --dry-run` for both crates
 - `cargo test`: Run unit tests across the workspace (mock transport, no server needed)
 - `cargo run -p smb2-cli -- --help`: Run the CLI
@@ -145,6 +146,7 @@ crates/smb2-cli/          # The CLI crate -- see its CLAUDE.md
   src/main.rs             # clap definitions and dispatch
   src/commands/           # meta (read-only), mutate, transfer
   tests/dry_run.rs        # Proves --dry-run opens no connection
+  tests/e2e.rs            # The built binary against a live Samba fixture (#[ignore])
 
 benchmarks/               # Excluded from the workspace; each has its own lockfile
   smb/                    # Throughput vs the `smb` crate
@@ -292,6 +294,10 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 - `cargo test -p smb2 --test integration -- --ignored` — real NAS/Pi tests (needs `.env`)
 - `just test-docker` — Docker container tests (needs Docker, ~28s locally)
 - `just test-consumer` — Consumer integration tests (needs Docker, ~30s locally)
+- `just test-cli-e2e` — the CLI binary against the `smb-auth` fixture (needs Docker, ~2s locally)
+
+`tests/docker/start.sh <profile> [service ...]` brings up only the named services, which is how the CLI suite
+starts one container rather than 16.
 
 ### Docker test containers
 
@@ -348,6 +354,13 @@ Integration tests (`tests/integration.rs`) run against real hardware:
 How much silence a real one of each tolerates before a watch is given up on, and the `SIGSTOP` recipe that
 measures it deterministically: `docs/notes/watcher-silence-tolerance.md`.
 
+⚠️ **Concurrent connects from one process are not reliable against Samba.** Every connection a process opens
+carries the same `ClientGuid`, and Samba answers the second one by passing the TCP connection to the smbd that
+owns the first, losing the NEGOTIATE credit grant on the way: from four at a time upward, roughly 5% of connects
+hang 30 s and end in `ServerUnresponsive`. It is the cause of `docker_integration`'s ~2-of-101 flake and it
+reaches users through `smb2-cli -j N`. Measurements, the reproducer, and the unresolved fix:
+`docs/notes/samba-client-guid-connection-pass.md`.
+
 ## Module docs (CLAUDE.md files)
 
 Each module has a colocated `CLAUDE.md` with architecture, decisions, and gotchas. These are auto-discovered by Claude
@@ -368,7 +381,7 @@ crates/smb2/src/rpc/CLAUDE.md       # RPC-over-pipes, NDR, share enumeration
 crates/smb2/src/pack/CLAUDE.md      # Cursors, GUID, FileTime, MAX_UNPACK_BUFFER
 crates/smb2/src/types/CLAUDE.md     # Newtypes, enums, bitflags, NtStatus
 crates/smb2/tests/CLAUDE.md         # Test categories, how to run, writing new tests, AWS access for Kerberos testing
-crates/smb2-cli/CLAUDE.md           # The CLI: layout, the `-j` concurrency pool, destination rules, its dep on the library
+crates/smb2-cli/CLAUDE.md           # The CLI: layout, the `-j` concurrency pool, destination rules, how bytes stream, its dep on the library
 ```
 
 ## Code style

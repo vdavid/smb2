@@ -5,6 +5,22 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [smb2-cli 0.4.0] - 2026-08-28
+
+### Fixed
+
+- **`get` and `cat` work on files bigger than the server's `MaxReadSize`.** Both asked for the whole file in a single READ, and a server answers a single READ with at most `MaxReadSize` -- 8 MB on a stock Samba. Anything larger failed outright with a message naming a library function (`use read_file_pipelined for files this size`), so a 12 MB download was already impossible while `put` had been carrying a 2.35 GB video the other way. They now stream: a sliding window of positioned reads, written out as each lands.
+- **A transfer costs the window, not the file.** `put` read the whole local file into memory before sending a byte, and `get` held the whole download. On a 600 MB file `put`'s peak resident set drops from 679 MB to 88 MB, and `get` runs in 58 MB where it previously could not run at all. Wall clock is unchanged (19.7 s vs 20.9 s on loopback), because both paths were already pipelined -- only where the bytes live changed.
+  - A file that fits in one WRITE still goes up as a single compound CREATE+WRITE+FLUSH+CLOSE, so uploading something small is still one round trip. Downloads pay three round trips where they used to pay one, which is the price of not asking for a whole file at once; see the note on `commands/transfer.rs::download` for why trying the compound first is worse.
+
+### Added
+
+- **End-to-end tests against a live Samba server** (`crates/smb2-cli/tests/e2e.rs`, 28 of them, ~1.6 s), wired into CI as the `cli-e2e-tests` job. They run the built binary and check the result through the library, covering `put`'s destination rules, `mkdir -p` over a file and over a directory, `get`/`cat` destinations and byte fidelity, dry runs that must change nothing, `--from-file` batches, partial-failure exit codes, and the `--json` keys. Both data-safety bugs this CLI has shipped were caught by hand against a live server because nothing in CI opened a connection.
+
+### Notes
+
+- `smb2 rm -j N` and friends open their connections concurrently, and above two at a time they can hit a Samba connection-passing bug that hangs one of them for 30 s at connect. Not new, not introduced here, and diagnosed in `docs/notes/samba-client-guid-connection-pass.md`.
+
 ## [0.20.0] - 2026-08-26
 
 ### Breaking
