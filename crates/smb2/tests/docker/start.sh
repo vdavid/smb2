@@ -4,6 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PROFILE="${1:-internal}"
+shift || true
+# Optional service names: bring up only those, so a suite that needs one
+# fixture doesn't wait on all 16. No names means the whole profile.
+SERVICES=("$@")
 
 # Internal fixtures are dev-only and live under tests/. Consumer fixtures are
 # embedded into the published crate (the `testing` feature `include_str!`s
@@ -11,16 +15,16 @@ PROFILE="${1:-internal}"
 case "$PROFILE" in
     internal)
         echo "[*] Starting internal test containers..."
-        docker compose -f "$SCRIPT_DIR/internal/docker-compose.yml" up -d --build --wait
+        docker compose -f "$SCRIPT_DIR/internal/docker-compose.yml" up -d --build --wait ${SERVICES[@]+"${SERVICES[@]}"}
         echo "[+] Internal containers ready"
         ;;
     consumer)
         echo "[*] Starting consumer test containers..."
-        docker compose -f "$CRATE_ROOT/src/testing/fixtures/consumer/docker-compose.yml" up -d --build --wait
+        docker compose -f "$CRATE_ROOT/src/testing/fixtures/consumer/docker-compose.yml" up -d --build --wait ${SERVICES[@]+"${SERVICES[@]}"}
         echo "[+] Consumer containers ready"
         ;;
     *)
-        echo "Usage: $0 {internal|consumer}"
+        echo "Usage: $0 {internal|consumer} [service ...]"
         exit 1
         ;;
 esac
