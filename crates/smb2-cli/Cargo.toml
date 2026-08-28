@@ -29,6 +29,13 @@ exclude = [
 [[bin]]
 name = "smb2"
 path = "src/main.rs"
+# The binary is called `smb2` and so is the library crate, so rustdoc wants to
+# write both into `target/doc/smb2/`. A workspace `cargo doc` then races itself
+# and one of the two fails with "failed to remove directory ... Directory not
+# empty" (rust-lang/cargo#6313), which is a coin flip per run rather than a
+# reliable break. Nobody reads rustdoc for a binary anyway; `--help` is its
+# interface.
+doc = false
 
 [dependencies]
 # `version` + `path`: the path is what a workspace build uses, and `cargo
