@@ -19,8 +19,9 @@ pub async fn cat(target: &Target, credentials: &Credentials) -> Result<()> {
         .await?
         .pop()
         .expect("connect_all returns one connection");
+    let download = Download::open(&mut client, &tree, target).await?;
     let mut stdout = tokio::io::stdout();
-    download(&mut client, &tree, target, &mut stdout).await?;
+    download.pump(target, &mut stdout).await?;
     stdout.flush().await.context("writing to stdout")?;
     let _ = client.disconnect_share(&tree).await;
     Ok(())
@@ -43,13 +44,26 @@ pub async fn get(
         .await?
         .pop()
         .expect("connect_all returns one connection");
-    let mut file = tokio::fs::File::create(&destination)
+
+    // Open the remote file before touching anything local, and land the bytes
+    // on a sibling path that's renamed into place only once the whole transfer
+    // has succeeded. A download that fails then leaves the destination exactly
+    // as it found it -- which for `get` means an earlier copy of the file
+    // survives a failed re-download instead of being truncated to nothing.
+    let download = Download::open(&mut client, &tree, target).await?;
+    let partial = partial_path(&destination);
+    let received = write_to_partial(download, target, &partial).await;
+    let received = match received {
+        Ok(received) => received,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(error);
+        }
+    };
+    tokio::fs::rename(&partial, &destination)
         .await
         .with_context(|| format!("writing {}", destination.display()))?;
-    let received = download(&mut client, &tree, target, &mut file).await?;
-    file.flush()
-        .await
-        .with_context(|| format!("writing {}", destination.display()))?;
+
     println!(
         "Downloaded {} bytes to {}",
         crate::output::bytes(received),
@@ -57,6 +71,26 @@ pub async fn get(
     );
     let _ = client.disconnect_share(&tree).await;
     Ok(())
+}
+
+/// Where a download lands while it's still in progress: alongside the
+/// destination, so the rename that finishes it stays on one filesystem and is
+/// therefore atomic.
+fn partial_path(destination: &Path) -> PathBuf {
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    name.push(".smb2-part");
+    destination.with_file_name(name)
+}
+
+async fn write_to_partial(download: Download, target: &Target, partial: &Path) -> Result<u64> {
+    let mut file = tokio::fs::File::create(partial)
+        .await
+        .with_context(|| format!("writing {}", partial.display()))?;
+    let received = download.pump(target, &mut file).await?;
+    file.flush()
+        .await
+        .with_context(|| format!("writing {}", partial.display()))?;
+    Ok(received)
 }
 
 /// Bytes to keep in flight while a download runs.
@@ -72,92 +106,111 @@ const IN_FLIGHT_BYTES: u64 = 16 * 1024 * 1024;
 /// the library's own pipelined read uses.
 const MAX_IN_FLIGHT_READS: u64 = 32;
 
-/// Reads `target` off the share and writes it to `sink`, returning the byte
-/// count.
+/// A file on the share, open and ready to be read.
 ///
-/// Reads run in a sliding window and each chunk goes out to `sink` as it lands,
-/// so a download costs [`IN_FLIGHT_BYTES`] of memory whatever the file weighs.
-/// That bound is the point: `get` and `cat` used to ask for the whole file in a
-/// single READ, which held all of it in memory and, past the server's
-/// `MaxReadSize` (8 MB on a stock Samba), could not be answered at all -- a
-/// 12 MB download failed outright.
-///
-/// The cost is that a small file now takes three round trips (open, read,
-/// close) where a compound CREATE+READ+CLOSE took one. Trying the compound
-/// first isn't the way to win it back: the server answers that READ with a full
-/// `MaxReadSize` of data before the client can see the file is too big, so
-/// every large download would pull 8 MB it throws away.
-async fn download<W: AsyncWrite + Unpin>(
-    client: &mut SmbClient,
-    tree: &Tree,
-    target: &Target,
-    sink: &mut W,
-) -> Result<u64> {
-    let chunk = u64::from(
-        client
-            .params()
-            .map(|params| params.max_read_size)
-            .unwrap_or(65_536),
-    )
-    .max(1);
-    let window = (IN_FLIGHT_BYTES / chunk).clamp(2, MAX_IN_FLIGHT_READS) as usize;
+/// Opening is separate from reading so a caller can find out the transfer will
+/// work before it creates anything locally. `get` depends on that: a download
+/// that fails must leave the destination alone.
+struct Download {
+    reader: Arc<smb2::FileReader>,
+    /// One wire READ, so a positioned read never splits into serial ones.
+    chunk: u64,
+    /// How many reads to keep in flight.
+    window: usize,
+}
 
-    let reader = Arc::new(
-        client
+impl Download {
+    async fn open(client: &mut SmbClient, tree: &Tree, target: &Target) -> Result<Self> {
+        let chunk = u64::from(
+            client
+                .params()
+                .map(|params| params.max_read_size)
+                .unwrap_or(65_536),
+        )
+        .max(1);
+        let reader = client
             .open_file_reader(tree, &target.path)
             .await
-            .with_context(|| format!("reading {}", target.display()))?,
-    );
-    let size = reader.size();
+            .with_context(|| format!("reading {}", target.display()))?;
+        Ok(Self {
+            reader: Arc::new(reader),
+            chunk,
+            window: (IN_FLIGHT_BYTES / chunk).clamp(2, MAX_IN_FLIGHT_READS) as usize,
+        })
+    }
 
-    let mut in_flight: VecDeque<tokio::task::JoinHandle<smb2::Result<Vec<u8>>>> = VecDeque::new();
-    let mut offset = 0u64;
-    let mut received = 0u64;
-    let mut failure: Option<anyhow::Error> = None;
+    /// Reads the whole file into `sink`, returning the byte count.
+    ///
+    /// Reads run in a sliding window and each chunk goes out to `sink` as it
+    /// lands, so a download costs [`IN_FLIGHT_BYTES`] of memory whatever the
+    /// file weighs. That bound is the point: `get` and `cat` used to ask for
+    /// the whole file in a single READ, which held all of it in memory and,
+    /// past the server's `MaxReadSize` (8 MB on a stock Samba), could not be
+    /// answered at all -- a 12 MB download failed outright.
+    ///
+    /// The cost is that a small file takes three round trips (open, read,
+    /// close) where a compound CREATE+READ+CLOSE took one. Trying the compound
+    /// first isn't the way to win it back: the server answers that READ with a
+    /// full `MaxReadSize` of data before the client can see the file is too
+    /// big, so every large download would pull 8 MB it throws away.
+    async fn pump<W: AsyncWrite + Unpin>(self, target: &Target, sink: &mut W) -> Result<u64> {
+        let Self {
+            reader,
+            chunk,
+            window,
+        } = self;
+        let size = reader.size();
 
-    loop {
-        while in_flight.len() < window && offset < size {
-            let reader = Arc::clone(&reader);
-            let at = offset;
-            offset += chunk;
-            in_flight.push_back(tokio::spawn(async move { reader.read_at(at, chunk).await }));
-        }
-        let Some(next) = in_flight.pop_front() else {
-            break;
-        };
-        let data = match next.await {
-            Ok(Ok(data)) => data,
-            Ok(Err(error)) => {
-                failure = Some(
-                    anyhow::Error::new(error).context(format!("reading {}", target.display())),
-                );
+        let mut in_flight: VecDeque<tokio::task::JoinHandle<smb2::Result<Vec<u8>>>> =
+            VecDeque::new();
+        let mut offset = 0u64;
+        let mut received = 0u64;
+        let mut failure: Option<anyhow::Error> = None;
+
+        loop {
+            while in_flight.len() < window && offset < size {
+                let reader = Arc::clone(&reader);
+                let at = offset;
+                offset += chunk;
+                in_flight.push_back(tokio::spawn(async move { reader.read_at(at, chunk).await }));
+            }
+            let Some(next) = in_flight.pop_front() else {
+                break;
+            };
+            let data = match next.await {
+                Ok(Ok(data)) => data,
+                Ok(Err(error)) => {
+                    failure = Some(
+                        anyhow::Error::new(error).context(format!("reading {}", target.display())),
+                    );
+                    break;
+                }
+                Err(joined) => {
+                    failure = Some(anyhow::Error::new(joined).context("a download task failed"));
+                    break;
+                }
+            };
+            if let Err(error) = sink.write_all(&data).await {
+                failure = Some(anyhow::Error::new(error).context("writing the downloaded bytes"));
                 break;
             }
-            Err(joined) => {
-                failure = Some(anyhow::Error::new(joined).context("a download task failed"));
-                break;
-            }
-        };
-        if let Err(error) = sink.write_all(&data).await {
-            failure = Some(anyhow::Error::new(error).context("writing the downloaded bytes"));
-            break;
+            received += data.len() as u64;
         }
-        received += data.len() as u64;
-    }
 
-    // Whatever is still in flight has to finish before the reader is ours alone
-    // again, and the handle has to be closed explicitly: dropping a `FileReader`
-    // leaks the server-side handle until the session goes away.
-    while let Some(pending) = in_flight.pop_front() {
-        let _ = pending.await;
-    }
-    if let Ok(reader) = Arc::try_unwrap(reader) {
-        let _ = reader.close().await;
-    }
+        // Whatever is still in flight has to finish before the reader is ours
+        // alone again, and the handle has to be closed explicitly: dropping a
+        // `FileReader` leaks the server-side handle until the session goes away.
+        while let Some(pending) = in_flight.pop_front() {
+            let _ = pending.await;
+        }
+        if let Ok(reader) = Arc::try_unwrap(reader) {
+            let _ = reader.close().await;
+        }
 
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(received),
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(received),
+        }
     }
 }
 

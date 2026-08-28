@@ -57,10 +57,17 @@ server's `MaxReadSize` (8 MB on a stock Samba) is a hard ceiling on what one REA
   chunk at a time and fed to `write_file_streamed`, whose pipeline window is what the upload then costs. The
   callback reads with blocking `std::fs`, on purpose: it is called from inside the write pipeline's own task, so
   it stalls only itself.
-- **`get` and `cat`** (`transfer::download`): always a `FileReader` plus a sliding window of positioned reads,
+- **`get` and `cat`** (`transfer::Download`): always a `FileReader` plus a sliding window of positioned reads,
   each chunk written to the sink as it lands. The window is `IN_FLIGHT_BYTES / MaxReadSize`, clamped to 2..32, so
   a server with a 64 KB cap gets the same 32-deep pipeline the library's own `read_file_pipelined` uses and one
   with an 8 MB cap gets two.
+  - **Opening is a separate step from pumping, and `get` needs it that way.** Streaming means the destination is
+    open while the bytes are still arriving, so a `get` that creates the destination first turns every failed
+    download into a truncated local file -- including the case where the destination was a good earlier copy of
+    the same file. `Download::open` proves the remote side works before anything local is touched, and the bytes
+    then land on a `.smb2-part` sibling that is renamed into place only on success (sibling, so the rename is
+    within one filesystem and therefore atomic). A failure removes the partial file and leaves the destination
+    exactly as it was.
   - ❌ **Don't "optimize" this by trying the compound `read_file` first and falling back.** It looks free and
     isn't: the server answers that compound's READ with a full `MaxReadSize` of data *before* the client can see
     the file is too big, so every large download would pull 8 MB it throws away. The cost of not doing that is

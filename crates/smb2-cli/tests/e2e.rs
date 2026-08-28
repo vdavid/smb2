@@ -701,7 +701,56 @@ fn cat_prints_the_file_bytes_verbatim() {
     assert_eq!(output.stdout, data);
 }
 
-// ── rm, rmdir, and mv ────────────────────────────────────────────────
+/// A download that fails must not leave anything behind. Streaming made this a
+/// live question: the destination is now opened before the bytes arrive, and
+/// the first version of it created an empty file for every failed `get`.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn a_failed_get_writes_nothing_locally() {
+    let share = Fixture::new("get-failure");
+    let destination = share.local().join("wanted.bin");
+
+    fails(&[
+        "get",
+        &share.target("no-such-file"),
+        destination.to_str().unwrap(),
+    ]);
+    assert!(
+        !destination.exists(),
+        "a failed get created {destination:?}"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(share.local())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a failed get left {leftovers:?} behind"
+    );
+}
+
+/// And it must not damage what's already there. `get` overwrites, so a failure
+/// that had already truncated the destination would trade a missing download
+/// for a destroyed local file.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn a_failed_get_leaves_an_existing_file_intact() {
+    let share = Fixture::new("get-failure-overwrite");
+    let destination = share.local().join("wanted.bin");
+    std::fs::write(&destination, b"the copy I already had").unwrap();
+
+    fails(&[
+        "get",
+        &share.target("no-such-file"),
+        destination.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"the copy I already had"
+    );
+}
+
+// ââ rm, rmdir, and mv â───────────────────────────────────────────────
 
 #[test]
 #[ignore = "needs the smb-auth container"]
@@ -942,7 +991,11 @@ fn read_only_commands_exit_non_zero_on_a_bad_path() {
     ok(&["ls", &share.target("")]);
     fails(&["ls", &share.target("no-such-directory")]);
     fails(&["cat", &share.target("no-such-file")]);
-    fails(&["get", &share.target("no-such-file")]);
+    fails(&[
+        "get",
+        &share.target("no-such-file"),
+        share.local().join("never-written").to_str().unwrap(),
+    ]);
     fails(&["stat", &share.target("no-such-file")]);
     fails(&["df", &format!("//{ADDR}/no-such-share")]);
 }
