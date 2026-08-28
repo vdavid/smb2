@@ -1614,6 +1614,32 @@ struct Inner {
     /// frame after that fails to decrypt.
     session: StdMutex<Option<Arc<crate::client::Session>>>,
 
+    /// This connection's identity to the server: chosen when the connection
+    /// is built, and unchanged for its whole life, revivals included
+    /// (MS-SMB2 § 2.2.3, `ClientGuid`).
+    ///
+    /// ❌ Don't mint a fresh one per NEGOTIATE. A server matches the client
+    /// guid when deciding whether a durable open may be claimed back
+    /// (MS-SMB2 § 3.3.5.9.12), so a connection that reintroduces itself when
+    /// it comes back can never resume anything: Samba 4.x answers a reconnect
+    /// from a "different" client with `STATUS_OBJECT_NAME_NOT_FOUND` (observed
+    /// against the `smb-guest` fixture, 2026-08-02, which grants a 60 s durable
+    /// handle and then refuses to give it back). `Inner` survives a revival, so
+    /// holding the value here is exactly what a reclaim needs.
+    ///
+    /// ❌ Nor share one value across connections, which is what a process-wide
+    /// guid does. The spec calls it a property of the *client*, and a client
+    /// doing multi-channel needs it that way, but this crate opens independent
+    /// connections rather than channels. Samba reads a guid it already knows as
+    /// "another channel for a client I have" and hands the socket to the smbd
+    /// process owning the first connection (`smbXsrv_connection_pass`, keyed at
+    /// negprot before any capability is negotiated, so declining
+    /// `SMB2_GLOBAL_CAP_MULTI_CHANNEL` doesn't opt out). When connects overlap,
+    /// that hand-off loses the negotiate's credit grant: the next request is
+    /// rejected as over-credit and its caller waits out the 30 s watchdog. See
+    /// `docs/notes/samba-client-guid-connection-pass.md`.
+    client_guid: Guid,
+
     /// Server name (hostname or IP) used for UNC paths. Set at construction
     /// and never mutated.
     server_name: String,
@@ -1722,6 +1748,7 @@ impl Inner {
             reconnect_observer: StdMutex::new(None),
             previous_session_id: AtomicU64::new(0),
             session: StdMutex::new(None),
+            client_guid: random_guid(),
             server_name,
             params: StdMutex::new(None),
             estimated_rtt: StdMutex::new(None),
@@ -2337,7 +2364,7 @@ impl Connection {
     /// Perform the SMB2 NEGOTIATE exchange.
     pub async fn negotiate(&mut self) -> Result<()> {
         debug!("negotiate: sending request, dialects={:?}", Dialect::ALL);
-        let client_guid = client_guid();
+        let client_guid = self.inner.client_guid;
 
         let mut negotiate_contexts = vec![
             NegotiateContext::PreauthIntegrity {
@@ -5195,26 +5222,6 @@ pub(crate) fn pack_message(header: &Header, body: &dyn Pack) -> Vec<u8> {
 /// Used for the client GUID at negotiate and for the `CreateGuid` that proves
 /// ownership of a durable handle. ❌ It must stay unpredictable: a guessable
 /// `CreateGuid` would let another client on the same server claim our open.
-/// This client's identity to every server it talks to, for the life of the
-/// process (MS-SMB2 § 3.2.1.1: `ClientGuid` is a property of the *client*, not
-/// of a connection).
-///
-/// ❌ Don't generate a fresh one per NEGOTIATE. A server matches the client
-/// guid when deciding whether a durable open may be claimed back
-/// (MS-SMB2 § 3.3.5.9.12), so a client that reintroduces itself on every
-/// connection can never resume anything: Samba 4.x answers a reconnect from a
-/// "different" client with `STATUS_OBJECT_NAME_NOT_FOUND` (observed against
-/// the `smb-guest` fixture, 2026-08-02, which grants a 60 s durable handle and
-/// then refused to give it back). The same value is what multichannel and
-/// lease keying key on, if either is ever added.
-///
-/// It is stable and therefore identifying, exactly as it is for every other
-/// SMB client — Windows and macOS both send a per-installation guid.
-fn client_guid() -> Guid {
-    static CLIENT_GUID: std::sync::OnceLock<Guid> = std::sync::OnceLock::new();
-    *CLIENT_GUID.get_or_init(random_guid)
-}
-
 pub(crate) fn random_guid() -> Guid {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("failed to generate random GUID");

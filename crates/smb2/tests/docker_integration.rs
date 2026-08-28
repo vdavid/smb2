@@ -4845,3 +4845,79 @@ async fn weirdnames_a_watch_reports_a_changed_name_the_way_a_listing_does() {
         })
         .await;
 }
+
+// ── Concurrent connects ──────────────────────────────────────────────
+
+/// One full handshake against smb-auth: connect, negotiate, authenticate,
+/// tree connect. Everything a pool worker does before it has useful work.
+async fn one_handshake() -> std::result::Result<(), smb2::Error> {
+    let mut conn = Connection::connect(AUTH_ADDR, TIMEOUT).await?;
+    conn.negotiate().await?;
+    let _session = Session::setup(&mut conn, "testuser", "testpass", "").await?;
+    let _tree = Tree::connect(&mut conn, "private").await?;
+    Ok(())
+}
+
+/// Several connections opened at once from one process must all finish their
+/// handshake.
+///
+/// This is what `smb2-cli -j N` does on every batch, and what a test binary
+/// does when its cases run in parallel, so a failure here is a user-visible
+/// 30 s hang rather than a test artifact.
+///
+/// Width is what triggers it: two at a time never failed, four failed 11 times
+/// in 200. The three widths cover the pool sizes the CLI actually offers, and
+/// the whole thing costs about a second when it passes.
+///
+/// What it guards: every connection carries its own `ClientGuid`. Share one
+/// across connections and Samba routes the later ones to the smbd process
+/// owning the first, losing the negotiate's credit grant when they overlap.
+/// See `Inner::client_guid` and `docs/notes/samba-client-guid-connection-pass.md`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn concurrent_connects_all_finish_their_handshake() {
+    let _ = env_logger::try_init();
+
+    const WIDTHS: [usize; 3] = [4, 8, 16];
+    const WAVES: usize = 16;
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut attempts = 0;
+    for width in WIDTHS {
+        for wave in 0..WAVES {
+            let mut set = tokio::task::JoinSet::new();
+            for slot in 0..width {
+                set.spawn(async move {
+                    // A healthy handshake here takes single-digit
+                    // milliseconds. A wedged one waits out the crate's 30 s
+                    // unresponsive-server watchdog, so cutting it short keeps
+                    // a failing run readable instead of quarter-hour long.
+                    let outcome =
+                        tokio::time::timeout(Duration::from_secs(3), one_handshake()).await;
+                    (slot, outcome)
+                });
+            }
+            attempts += width;
+            while let Some(joined) = set.join_next().await {
+                let (slot, outcome) = joined.expect("a handshake task panicked");
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        failures.push(format!("width {width} wave {wave} slot {slot}: {e}"));
+                    }
+                    Err(_) => failures.push(format!(
+                        "width {width} wave {wave} slot {slot}: still unanswered after 3s"
+                    )),
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {attempts} concurrent handshakes failed; each one is a caller \
+         hanging for 30 s and then giving up:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
