@@ -16,7 +16,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **End-to-end tests against a live Samba server** (`crates/smb2-cli/tests/e2e.rs`, 28 of them, ~1.6 s), wired into CI as the `cli-e2e-tests` job. They run the built binary and check the result through the library, covering `put`'s destination rules, `mkdir -p` over a file and over a directory, `get`/`cat` destinations and byte fidelity, dry runs that must change nothing, `--from-file` batches, partial-failure exit codes, and the `--json` keys. Both data-safety bugs this CLI has shipped were caught by hand against a live server because nothing in CI opened a connection.
+- **End-to-end tests against a live Samba server** (`crates/smb2-cli/tests/e2e.rs`, 30 of them, ~1.4 s), wired into CI as the `cli-e2e-tests` job. They run the built binary and check the result through the library, covering `put`'s destination rules, `mkdir -p` over a file and over a directory, `get`/`cat` destinations and byte fidelity, dry runs that must change nothing, `--from-file` batches, partial-failure exit codes, and the `--json` keys. Both data-safety bugs this CLI has shipped were caught by hand against a live server because nothing in CI opened a connection.
 
 ### Notes
 
