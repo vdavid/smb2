@@ -33,7 +33,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Run clippy lints
         run: cargo clippy --all-targets -- -D warnings
@@ -59,16 +59,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Start SMB containers
-        run: ./tests/docker/start.sh internal
+        run: ./crates/smb2/tests/docker/start.sh internal
 
       - name: Run Docker integration tests
-        run: cargo test --test docker_integration -- --ignored
+        run: cargo test -p smb2 --test docker_integration -- --ignored
         env:
           RUST_LOG: smb2=info
 
       - name: Stop containers
         if: always()
-        run: ./tests/docker/stop.sh
+        run: ./crates/smb2/tests/docker/stop.sh
 
   consumer-tests:
     name: Consumer integration tests
@@ -85,16 +85,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Start consumer containers
-        run: ./tests/docker/start.sh consumer
+        run: ./crates/smb2/tests/docker/start.sh consumer
 
       - name: Run consumer integration tests
-        run: cargo test --features testing --test consumer_integration -- --ignored
+        run: cargo test -p smb2 --features testing --test consumer_integration -- --ignored
         env:
           RUST_LOG: smb2=info
 
       - name: Stop containers
         if: always()
-        run: ./tests/docker/stop.sh
+        run: ./crates/smb2/tests/docker/stop.sh
 
   msrv:
     name: Verify MSRV (1.85)

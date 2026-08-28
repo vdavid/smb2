@@ -23,8 +23,11 @@ const PI_ADDR: &str = "192.168.1.150:445";
 const USER: &str = "david";
 
 /// Load .env file if present (no extra dependencies).
+///
+/// `.env` sits at the workspace root, not in this crate, so one file covers
+/// every crate in the repo. `CARGO_MANIFEST_DIR` is `crates/smb2`.
 fn load_dotenv() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env");
     if let Ok(contents) = std::fs::read_to_string(path) {
         for line in contents.lines() {
             let line = line.trim();

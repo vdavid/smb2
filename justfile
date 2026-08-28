@@ -1,5 +1,5 @@
-# smb2 Development Commands
-# =========================
+# smb2 workspace development commands
+# ===================================
 #
 # Available commands (run `just --list` for details):
 #
@@ -38,13 +38,13 @@ default: check
 # Format code with cargo fmt
 fmt:
     @echo "[*] Formatting..."
-    @cargo fmt
+    @cargo fmt --all
     @echo "[+] Formatted"
 
 # Check formatting without modifying files (for CI)
 fmt-check:
     @echo "[*] Checking formatting..."
-    @cargo fmt --check
+    @cargo fmt --all --check
     @echo "[+] Formatting OK"
 
 # Run clippy with strict warnings
@@ -66,26 +66,26 @@ test:
 # Run integration tests against real SMB servers (requires NAS + Pi on LAN)
 test-integration:
     @echo "[*] Running integration tests..."
-    @cargo test --test integration -- --ignored --quiet
+    @cargo test -p smb2 --test integration -- --ignored --quiet
     @echo "[+] Integration tests passed"
 
 # Run Docker integration tests (starts/stops containers automatically)
 test-docker:
     @echo "[*] Starting Docker containers..."
-    @./tests/docker/start.sh internal
+    @./crates/smb2/tests/docker/start.sh internal
     @echo "[*] Running Docker integration tests..."
-    @cargo test --test docker_integration -- --ignored --quiet && \
-        (echo "[*] Stopping Docker containers..." && ./tests/docker/stop.sh && echo "[+] Docker integration tests passed") || \
-        (echo "[*] Stopping Docker containers..." && ./tests/docker/stop.sh && exit 1)
+    @cargo test -p smb2 --test docker_integration -- --ignored --quiet && \
+        (echo "[*] Stopping Docker containers..." && ./crates/smb2/tests/docker/stop.sh && echo "[+] Docker integration tests passed") || \
+        (echo "[*] Stopping Docker containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
 
 # Run consumer integration tests (starts/stops containers automatically)
 test-consumer:
     @echo "[*] Starting consumer containers..."
-    @./tests/docker/start.sh consumer
+    @./crates/smb2/tests/docker/start.sh consumer
     @echo "[*] Running consumer integration tests..."
-    @cargo test --features testing --test consumer_integration -- --ignored --quiet && \
-        (echo "[*] Stopping consumer containers..." && ./tests/docker/stop.sh && echo "[+] Consumer integration tests passed") || \
-        (echo "[*] Stopping consumer containers..." && ./tests/docker/stop.sh && exit 1)
+    @cargo test -p smb2 --features testing --test consumer_integration -- --ignored --quiet && \
+        (echo "[*] Stopping consumer containers..." && ./crates/smb2/tests/docker/stop.sh && echo "[+] Consumer integration tests passed") || \
+        (echo "[*] Stopping consumer containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
 
 # Build documentation
 doc:
@@ -196,12 +196,13 @@ fuzz target duration="300":
         exit 1; \
     fi
     @echo "[*] Fuzzing {{target}} for {{duration}}s..."
-    cargo +nightly fuzz run {{target}} -- -max_total_time={{duration}} -print_final_stats=1
+    # cargo-fuzz looks for `fuzz/` beside the package it targets, so run from the library crate.
+    cd crates/smb2 && cargo +nightly fuzz run {{target}} -- -max_total_time={{duration}} -print_final_stats=1
 
 # Regenerate the committed seed corpus under `fuzz/corpus/`.
 fuzz-seeds:
     @echo "[*] Regenerating fuzz seed corpus..."
-    @cargo test --test fuzz_seeds -- --ignored --nocapture
+    @cargo test -p smb2 --test fuzz_seeds -- --ignored --nocapture
     @echo "[+] Seed corpus updated"
 
 # Install required development tools

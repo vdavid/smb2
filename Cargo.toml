@@ -1,106 +1,12 @@
 [workspace]
+resolver = "2"
+members = ["crates/smb2"]
 # benchmarks/smb excluded: sspi crate pins digest =0.11.0-rc.5 which conflicts with digest 0.11.2.
 # benchmarks/smb-listing excluded to keep it a standalone bench (like benchmarks/smb), independent of the library's lockfile.
-members = ["."]
 exclude = ["benchmarks/smb", "benchmarks/smb-listing"]
 
-[package]
-name = "smb2"
-version = "0.20.0"
+[workspace.package]
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Pure-Rust SMB2/3 client library with pipelined I/O"
 repository = "https://github.com/vdavid/smb2"
-keywords = ["smb", "smb2", "smb3", "cifs", "network"]
-categories = ["network-programming", "filesystem"]
-readme = "README.md"
-documentation = "https://docs.rs/smb2"
-exclude = [
-    ".github/",
-    "AGENTS.md",
-    "docs/",
-    "justfile",
-    "deny.toml",
-    "clippy.toml",
-    "rustfmt.toml",
-    "related-repos/",
-    # Agent tooling, not library source: the CodeGraph index directory ships
-    # nothing but its own .gitignore, and the agent rules are house style for
-    # contributors here, not something a consumer vendoring this crate wants.
-    ".codegraph/",
-    ".claude/",
-    # Root-anchored on purpose: this one is only an `@AGENTS.md` import, and
-    # `AGENTS.md` is excluded above, so shipping it published a pointer to a
-    # file that isn't in the package. A bare `CLAUDE.md` would also drop the
-    # nine colocated module docs under `src/`, which are worth having next to
-    # the source they describe.
-    "/CLAUDE.md",
-    "renovate.json",
-    # tests/ is dev-only: integration tests + Docker fixtures for smb2's own
-    # suite. Fixtures the published crate embeds (the `testing` feature's
-    # consumer Docker files, the ccache test vectors) live under src/, so
-    # excluding tests/ wholesale ships nothing the crate needs.
-    "tests/",
-]
-
-[package.metadata.docs.rs]
-all-features = true
-
-[dependencies]
-# Logging facade -- application picks the backend (env_logger, tracing, etc.)
-log = "0.4"
-
-# Async runtime agnostic
-async-trait = "0.1"
-
-# `FuturesUnordered` for pipelined concurrent `execute` calls.
-futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-
-# Error handling
-thiserror = "2"
-
-# Enum conversion derives
-num_enum = "0.7"
-
-# Async runtime -- transport layer needs net, io-util, time, sync
-tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"] }
-
-# Crypto -- signing, encryption, key derivation
-hmac = "0.13"
-sha2 = "0.11"
-aes = "0.9.1"
-aes-gcm = "0.11.0"
-# ccm has no stable 0.6 yet (newest is 0.6.0-rc.3); revisit and unpin when it ships.
-# It reqs aes ^0.9.0-rc.4 / aead ^0.6.0-rc.10 / cipher ^0.5.0-rc.8, which unify with the stable pins above.
-ccm = "=0.6.0-rc.3"
-cmac = "0.8.0"
-digest = "0.11"
-
-# NTLM authentication (MS-NLMP)
-md-5 = "0.11"
-md4 = "0.11"
-
-# Kerberos key derivation (AES string-to-key)
-pbkdf2 = "0.13.0"
-sha1 = "0.11"
-
-# Cryptographically secure random
-getrandom = "0.4"
-
-# Compression
-lz4_flex = "0.13"
-
-# Optional: `Serialize` derives on diagnostics types. Off by default.
-serde = { version = "1", optional = true, features = ["derive"] }
-
-[features]
-testing = []  # Enables smb2::testing module for Docker-based test servers
-fuzzing = []  # Exposes parser entry points for `fuzz/` targets; not for applications
-serde = ["dep:serde"]  # `Serialize` impls on `Diagnostics` types and the protocol enums they embed.
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
-proptest = "1"
-env_logger = "0.11"
-serde_json = "1"  # JSON round-trip tests for the `serde` feature
