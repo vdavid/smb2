@@ -354,12 +354,11 @@ Integration tests (`tests/integration.rs`) run against real hardware:
 How much silence a real one of each tolerates before a watch is given up on, and the `SIGSTOP` recipe that
 measures it deterministically: `docs/notes/watcher-silence-tolerance.md`.
 
-⚠️ **Concurrent connects from one process are not reliable against Samba.** Every connection a process opens
-carries the same `ClientGuid`, and Samba answers the second one by passing the TCP connection to the smbd that
-owns the first, losing the NEGOTIATE credit grant on the way: from four at a time upward, roughly 5% of connects
-hang 30 s and end in `ServerUnresponsive`. It is the cause of `docker_integration`'s ~2-of-101 flake and it
-reaches users through `smb2-cli -j N`. Measurements, the reproducer, and the unresolved fix:
-`docs/notes/samba-client-guid-connection-pass.md`.
+**Every connection carries its own `ClientGuid`**, and that is load-bearing in both directions. Share one
+across connections and Samba passes each new socket to the smbd process owning the first, losing the NEGOTIATE
+credit grant when connects overlap: roughly 5% of them hang 30 s and end in `ServerUnresponsive`. Mint a fresh
+one per NEGOTIATE and durable-handle reclaim stops working, because the server matches on it. So it lives on
+`Inner`, which is per connection and survives a revival. See `docs/notes/samba-client-guid-connection-pass.md`.
 
 ## Module docs (CLAUDE.md files)
 

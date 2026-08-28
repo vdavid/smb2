@@ -35,19 +35,13 @@ const PASS: &str = "testpass";
 /// The directory on the share that holds every test's scratch directory.
 const ROOT: &str = "cli-e2e";
 
-/// `-j` for the batch tests, which is a cap rather than a preference.
+/// `-j` for the batch tests: the CLI's own default, so they run the pool the
+/// way a user gets it.
 ///
-/// The pool opens its connections concurrently and they all carry the same
-/// `ClientGuid`, so above two at a time they trip the Samba connection-passing
-/// bug in `docs/notes/samba-client-guid-connection-pass.md` and one of them
-/// hangs 30 s at connect. Two still exercises everything the pool does -- jobs
-/// dealt round-robin over several connections, results stitched back into the
-/// caller's order, a batch longer than the worker count.
-///
-/// ⚠️ This cap hides a real exposure rather than fixing it: `smb2 rm -j 16` is
-/// the CLI's headline feature and it runs straight into the same bug. Take the
-/// cap off once the underlying issue is settled.
-const POOL_WIDTH: &str = "2";
+/// `pool::run` clamps workers to the job count, so a three-path batch opens
+/// three connections here. `rm_at_full_pool_width_deletes_every_path` is the
+/// one that opens a wide pool.
+const POOL_WIDTH: &str = "8";
 
 // ── Running the binary ───────────────────────────────────────────────
 
@@ -124,22 +118,11 @@ struct Server {
 
 /// The shared connection, opened on first use.
 ///
-/// ❌ **Don't give each test a connection of its own.** Every connection a
-/// single process opens presents the same `ClientGuid` (MS-SMB2 § 3.2.1.1 makes
-/// it a per-client value, and the crate holds one in a `OnceLock`), and Samba
-/// answers a second connection bearing a `ClientGuid` it already knows by
-/// passing the TCP connection to the smbd process that owns the first. That
-/// hand-off drops the NEGOTIATE credit grant, so the client's next request is
-/// rejected as over-spending credits and the server stops answering: a 30 s
-/// wait ending in `ServerUnresponsive`, landing on a different test each run.
-/// Measured against Samba 4.20.6 on 2026-08-28: from four concurrent connects
-/// upward roughly 5% of them fail, while 250 connects each carrying their own
-/// GUID failed none. See `docs/notes/samba-client-guid-connection-pass.md`.
-///
-/// One connection can't race itself, so the suite keeps running fully parallel
-/// without a thread cap. The lock is held only for the setup and verification
-/// round trips, never across a CLI invocation, so tests still overlap where the
-/// time actually goes.
+/// One connection for the whole binary, rather than one per test: setup and
+/// verification are a handful of round trips each, and 30 handshakes would cost
+/// more than the work they support. The lock is held only for those round
+/// trips, never across a CLI invocation, so tests still overlap where the time
+/// actually goes and the suite needs no thread cap.
 fn server() -> std::sync::MutexGuard<'static, Server> {
     static SERVER: std::sync::OnceLock<std::sync::Mutex<Server>> = std::sync::OnceLock::new();
     SERVER
@@ -807,6 +790,35 @@ fn rm_from_file_deletes_a_batch_relative_to_the_target() {
         &share.target(""),
     ]);
     assert!(stdout.contains("3 of 3"), "{stdout:?}");
+    assert_eq!(share.names(""), Vec::<String>::new());
+}
+
+/// A batch wide enough to open the pool all the way.
+///
+/// `-j 16` is the number the CLI's README quotes, and 16 connections opening at
+/// once is what used to wedge one of them for 30 s against Samba. Nothing here
+/// is about deleting 32 files; it's about opening 16 connections. See
+/// `Inner::client_guid` in the library.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn rm_at_full_pool_width_deletes_every_path() {
+    let share = Fixture::new("rm-full-width");
+    let names: Vec<String> = (0..32).map(|i| format!("f{i:02}.txt")).collect();
+    for name in &names {
+        share.write(name, b"x");
+    }
+    let list = share.local().join("paths.txt");
+    std::fs::write(&list, names.join("\n")).unwrap();
+
+    let stdout = ok(&[
+        "rm",
+        "-j",
+        "16",
+        "--from-file",
+        list.to_str().unwrap(),
+        &share.target(""),
+    ]);
+    assert!(stdout.contains("32 of 32"), "{stdout:?}");
     assert_eq!(share.names(""), Vec::<String>::new());
 }
 

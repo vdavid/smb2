@@ -97,10 +97,9 @@ cargo test -p smb2-cli --test e2e -- --ignored
 
 Two things to know before adding a test there:
 
-- **The suite opens exactly one SMB connection for the whole binary**, and its `server()` doc says why at length:
-  concurrent connects from one process share a `ClientGuid` and trip a Samba bug that hangs one of them for 30 s.
-  Use the `Fixture` helpers rather than reaching for a connection of your own. Same reason the batch tests pass
-  `-j 2`. See `docs/notes/samba-client-guid-connection-pass.md`.
+- **The suite opens exactly one SMB connection for the whole binary**: setup and verification are a few round
+  trips each, and 30 handshakes would cost more than the work they support. Use the `Fixture` helpers rather
+  than reaching for a connection of your own.
 - **Each test owns `cli-e2e/<its own name>/`** and wipes it on entry, which is what lets the file run in parallel
   and makes a re-run independent of the last one. Setup and verification go through the library, so a CLI bug
   can't hide behind the CLI agreeing with itself.
