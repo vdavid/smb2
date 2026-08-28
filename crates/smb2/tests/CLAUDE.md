@@ -34,7 +34,7 @@ Two rules when adding one, both learned the hard way:
 Real-server tests against David's NAS and Pi. Marked `#[ignore]` — skipped by `cargo test`, run with:
 
 ```sh
-cargo test --test integration -- --ignored --nocapture
+cargo test -p smb2 --test integration -- --ignored --nocapture
 ```
 
 **Requirements:**
@@ -80,9 +80,9 @@ Containers live in `tests/docker/internal/`.
 just test-docker
 
 # For faster iteration, keep containers running between runs:
-./tests/docker/start.sh internal    # once (~10s)
-cargo test --test docker_integration -- --ignored   # repeat (~8s)
-./tests/docker/stop.sh              # when done (~10s)
+./crates/smb2/tests/docker/start.sh internal    # once (~10s)
+cargo test -p smb2 --test docker_integration -- --ignored   # repeat (~8s)
+./crates/smb2/tests/docker/stop.sh              # when done (~10s)
 ```
 
 **Containers and what they exercise:**
@@ -122,9 +122,9 @@ Tests against 14 Docker-based Samba containers designed for apps that depend on 
 just test-consumer
 
 # For faster iteration, keep containers running between runs:
-./tests/docker/start.sh consumer    # once
-cargo test --test consumer_integration -- --ignored   # repeat
-./tests/docker/stop.sh              # when done
+./crates/smb2/tests/docker/start.sh consumer    # once
+cargo test -p smb2 --test consumer_integration -- --ignored   # repeat
+./crates/smb2/tests/docker/stop.sh              # when done
 ```
 
 **Feature flag:** The `smb2::testing` module requires `--features testing` to compile. The consumer integration tests enable this automatically. Consumer apps add `smb2 = { features = ["testing"] }` to their `[dev-dependencies]`.
@@ -169,8 +169,8 @@ Both harnesses bind their ports to **127.0.0.1 only** (`${SMB_BIND_ADDR:-127.0.0
 |---|---|---|
 | `cargo test` | Unit tests only (~555) | Nothing |
 | `just check` | fmt + clippy + unit tests + doc | Nothing |
-| `cargo test --test integration -- --ignored` | Real NAS/Pi tests | NAS + Pi + .env |
-| `cargo test --test wire_format_captures -- --ignored` | Wire format vs real server | NAS + .env |
+| `cargo test -p smb2 --test integration -- --ignored` | Real NAS/Pi tests | NAS + Pi + .env |
+| `cargo test -p smb2 --test wire_format_captures -- --ignored` | Wire format vs real server | NAS + .env |
 | `just test-docker` | Docker integration tests | Docker |
 | `just test-consumer` | Consumer integration tests | Docker |
 

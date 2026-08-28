@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/smb2)](https://crates.io/crates/smb2)
 [![docs.rs](https://img.shields.io/docsrs/smb2)](https://docs.rs/smb2)
 [![CI](https://github.com/vdavid/smb2/actions/workflows/ci.yml/badge.svg)](https://github.com/vdavid/smb2/actions/workflows/ci.yml)
-[![License](https://img.shields.io/crates/l/smb2)](LICENSE-MIT)
+[![License](https://img.shields.io/crates/l/smb2)](https://github.com/vdavid/smb2/blob/main/LICENSE-MIT)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. Faster than native macOS SMB in all
@@ -282,12 +282,12 @@ Two runnable examples to see it in action:
 
 ```sh
 # One-shot: connect, list a directory, dump the snapshot.
-SMB2_PASS=secret cargo run --example diagnostics
-SMB2_PASS=secret cargo run --example diagnostics --features serde -- --json
+SMB2_PASS=secret cargo run -p smb2 --example diagnostics
+SMB2_PASS=secret cargo run -p smb2 --example diagnostics --features serde -- --json
 
 # Live: download N files in parallel, tail the snapshot every interval ms.
 SMB2_PASS=secret SMB2_FILE=big.bin \
-  cargo run --example diagnostics_live -- --parallel 7 --interval 200
+  cargo run -p smb2 --example diagnostics_live -- --parallel 7 --interval 200
 ```
 
 Env vars used by both: `SMB2_HOST` (`host:port`), `SMB2_USER`, `SMB2_PASS`, `SMB2_SHARE`. The live example also takes
@@ -431,9 +431,9 @@ which means system package management, cross-compilation headaches, and all the 
 
 ## Sister projects
 
-- [smb2-cli](https://github.com/vdavid/smb2-cli): a command-line client built on this crate. Run `ls`, `stat`, `rm`,
-  `rmdir`, `mv`, and file transfers against a share without mounting it, and spread a batch over N connections. Bulk
-  deletes go 34/s through a macOS mount and 500/s here.
+- [smb2-cli](https://crates.io/crates/smb2-cli): a command-line client built on this crate, in the same repo under
+  `crates/smb2-cli/`. Run `ls`, `stat`, `rm`, `rmdir`, `mv`, and file transfers against a share without mounting it,
+  and spread a batch over N connections. Bulk deletes go 34/s through a macOS mount and 500/s here.
 - [Cmdr](https://github.com/vdavid/cmdr): an AI-native file manager that uses `smb2` for SMB access.
 
 ## Implementation notes

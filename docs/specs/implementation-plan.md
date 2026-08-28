@@ -1144,7 +1144,7 @@ services:
 ```
 
 Integration tests connect to `localhost:10445`. Ignored by default, run with
-`cargo test --test integration -- --ignored`.
+`cargo test -p smb2 --test integration -- --ignored`.
 
 ---
 

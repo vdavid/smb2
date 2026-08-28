@@ -1,8 +1,8 @@
 // Dump the diagnostics tree for an SMB connection.
 //
 // Usage:
-//   SMB2_PASS=secret cargo run --example diagnostics
-//   SMB2_PASS=secret cargo run --example diagnostics --features serde -- --json
+//   SMB2_PASS=secret cargo run -p smb2 --example diagnostics
+//   SMB2_PASS=secret cargo run -p smb2 --example diagnostics --features serde -- --json
 //
 // Env vars: SMB2_HOST (default "192.168.1.100:445"), SMB2_USER (default "user"),
 //           SMB2_PASS (required), SMB2_SHARE (default "Documents").
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if want_json && !cfg!(feature = "serde") {
         eprintln!(
             "--json requires building with `--features serde`. Re-run as:\n  \
-             cargo run --example diagnostics --features serde -- --json"
+             cargo run -p smb2 --example diagnostics --features serde -- --json"
         );
         std::process::exit(2);
     }
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user = env_or("SMB2_USER", "user");
     let pass = std::env::var("SMB2_PASS").unwrap_or_else(|_| {
         eprintln!("Set SMB2_PASS to your SMB password. Example:");
-        eprintln!("  SMB2_PASS=secret cargo run --example diagnostics");
+        eprintln!("  SMB2_PASS=secret cargo run -p smb2 --example diagnostics");
         std::process::exit(1);
     });
     let share_name = env_or("SMB2_SHARE", "Documents");

@@ -5,7 +5,7 @@
 // feature (older Samba, some NAS firmware).
 //
 // Usage:
-//   SMB2_PASS=secret cargo run --example server_side_copy
+//   SMB2_PASS=secret cargo run -p smb2 --example server_side_copy
 //
 // Env vars: SMB2_HOST (default "192.168.1.100:445"), SMB2_USER (default "user"),
 //           SMB2_PASS (required), SMB2_SHARE (default "Documents"),
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user = env_or("SMB2_USER", "user");
     let pass = std::env::var("SMB2_PASS").unwrap_or_else(|_| {
         eprintln!("Set SMB2_PASS to your SMB password. Example:");
-        eprintln!("  SMB2_PASS=secret cargo run --example server_side_copy");
+        eprintln!("  SMB2_PASS=secret cargo run -p smb2 --example server_side_copy");
         std::process::exit(1);
     });
     let share_name = env_or("SMB2_SHARE", "Documents");

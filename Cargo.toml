@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/smb2"]
+members = [
+    "crates/smb2",
+    "crates/smb2-cli",
+]
 # benchmarks/smb excluded: sspi crate pins digest =0.11.0-rc.5 which conflicts with digest 0.11.2.
 # benchmarks/smb-listing excluded to keep it a standalone bench (like benchmarks/smb), independent of the library's lockfile.
 exclude = ["benchmarks/smb", "benchmarks/smb-listing"]
@@ -10,3 +13,11 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vdavid/smb2"
+
+# The CLI is what people install, so the release profile is tuned for it. Thin
+# LTO and a stripped binary cost build time, not runtime behaviour, so applying
+# them workspace-wide keeps one profile instead of a per-crate one cargo would
+# ignore anyway (profiles only take effect at a workspace root).
+[profile.release]
+lto = "thin"
+strip = true

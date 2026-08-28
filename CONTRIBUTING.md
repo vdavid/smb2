@@ -38,23 +38,32 @@ This catches issues that only appear on older Rust versions. CI runs this check,
 
 ## Project structure
 
-```
-src/
-├── lib.rs              # Crate root
-├── error.rs            # Error types, NTSTATUS mapping
-├── pack/               # Binary serialization (ReadCursor, WriteCursor)
-├── types/              # Newtypes (SessionId, TreeId, FileId, etc.)
-├── msg/                # Wire format message structs
-├── transport/          # Transport trait, TCP implementation, mock
-├── crypto/             # Signing, encryption, key derivation
-├── auth/               # NTLM authentication
-└── client/             # High-level API (SmbClient, Tree, Pipeline)
+This is a Cargo workspace with two published crates: the `smb2` library and the `smb2-cli` command-line client built
+on it.
 
-tests/
-├── pack_roundtrip.rs   # Property-based tests for pack/unpack
-├── msg_wire_format.rs  # Test messages against known byte sequences
-├── protocol_flow.rs    # Full protocol flows with mock transport
-└── integration.rs      # Tests against real Samba server (Docker)
+```
+crates/smb2/            # The library (crates.io: smb2)
+├── src/
+│   ├── lib.rs          # Crate root
+│   ├── error.rs        # Error types, NTSTATUS mapping
+│   ├── pack/           # Binary serialization (ReadCursor, WriteCursor)
+│   ├── types/          # Newtypes (SessionId, TreeId, FileId, etc.)
+│   ├── msg/            # Wire format message structs
+│   ├── transport/      # Transport trait, TCP implementation, mock
+│   ├── crypto/         # Signing, encryption, key derivation
+│   ├── auth/           # NTLM authentication
+│   └── client/         # High-level API (SmbClient, Tree, Pipeline)
+├── tests/
+│   ├── pack_roundtrip.rs   # Property-based tests for pack/unpack
+│   ├── msg_wire_format.rs  # Test messages against known byte sequences
+│   ├── protocol_flow.rs    # Full protocol flows with mock transport
+│   └── integration.rs      # Tests against real Samba server (Docker)
+├── examples/           # Runnable samples: `cargo run -p smb2 --example list_shares`
+└── fuzz/               # cargo-fuzz targets (nightly)
+
+crates/smb2-cli/        # The CLI (crates.io: smb2-cli, binary: smb2)
+benchmarks/             # Standalone comparisons, each with its own lockfile
+docs/                   # Specs, release process, migration notes
 ```
 
 ## Running tests
@@ -64,7 +73,7 @@ tests/
 cargo test
 
 # Integration tests (requires Docker Samba)
-cargo test --test integration -- --ignored --nocapture
+cargo test -p smb2 --test integration -- --ignored --nocapture
 ```
 
 Integration tests need a Samba server running in Docker. See the test file for setup instructions.
@@ -89,7 +98,9 @@ The quick version:
 
 A few things that might not be obvious:
 
-- **Single crate:** Everything lives in one crate (like mtp-rs). Keeps things simple, avoids cross-crate dependency management.
+- **Library and CLI in one workspace:** The CLI depends on the library by `version` + `path`, so a protocol fix and
+  the CLI change that uses it land in one commit and get checked together. When it was a separate repo, a fix only
+  reached the CLI after a release, a version bump, and a second publish.
 - **Hand-rolled pack/unpack:** We serialize SMB messages manually with `ReadCursor`/`WriteCursor` instead of using derive macros. Full control, easier to debug protocol issues, and the wire format has too many variable-length fields and padding rules for serde to handle well.
 - **`dyn Transport`:** The transport layer uses trait objects (`async_trait`) instead of generics. Simpler API, and the overhead is negligible compared to network I/O.
 - **Pipeline as a core feature:** The pipeline isn't an optimization bolted on later. It's the reason this library exists. The credit window, message sequencing, and compounding are all designed around it.

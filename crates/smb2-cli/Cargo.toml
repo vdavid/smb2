@@ -1,31 +1,27 @@
 [package]
 name = "smb2-cli"
 version = "0.3.0"
-edition = "2021"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Command-line SMB2/3 client: list, stat, move, and delete files on a share without mounting it"
-repository = "https://github.com/vdavid/smb2-cli"
 keywords = ["smb", "smb2", "smb3", "cifs", "cli"]
 categories = ["command-line-utilities", "network-programming", "filesystem"]
 readme = "README.md"
-exclude = [
-    # Agent tooling, not library source: these are house style for contributors
-    # here, not something a consumer installing the binary wants.
-    "AGENTS.md",
-    # Root-anchored: this one is only an `@AGENTS.md` import, and `AGENTS.md`
-    # is excluded above, so shipping it would publish a pointer to a file
-    # that isn't in the package.
-    "/CLAUDE.md",
-    ".claude/",
-]
+documentation = "https://docs.rs/smb2-cli"
 
 [[bin]]
 name = "smb2"
 path = "src/main.rs"
 
 [dependencies]
-smb2 = "0.18"
+# `version` + `path`: the path is what a workspace build uses, and `cargo
+# publish` rewrites the dependency to the bare version. Keep the version equal
+# to the library's current one -- a stale number here is a publish-time error
+# rather than a CLI that silently ships against an old library.
+smb2 = { version = "0.20.0", path = "../smb2" }
+
 anyhow = "1.0.104"
 clap = { version = "4.6.5", features = ["derive", "env"] }
 env_logger = "0.11.11"
@@ -33,7 +29,3 @@ rpassword = "7.5.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-std", "io-util", "sync"] }
-
-[profile.release]
-lto = "thin"
-strip = true

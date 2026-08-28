@@ -2,7 +2,8 @@
 
 A command-line SMB2/3 client. It talks to a share directly over the network, so you never mount it: no root, no `mount_smbfs`, no kernel client. One binary and a target like `//host/share/path`.
 
-Built on the [`smb2`](https://github.com/vdavid/smb2) crate, which does all the protocol work.
+Built on the [`smb2`](https://crates.io/crates/smb2) crate, which does all the protocol work. Both live in the
+[same repo](https://github.com/vdavid/smb2), so a protocol fix and the CLI change that uses it ship together.
 
 ## Why
 
@@ -19,7 +20,7 @@ For reference, one SSH process doing plain local syscalls on the Pi managed 556/
 
 `-j 16` was the sweet spot on that four-core Pi. `-j 32` was slower, so don't crank it past what the server can serve.
 
-`benchmarks/bulk-bench.sh` reproduces all of this.
+`benchmarks/cli-bulk-ops/bulk-bench.sh` in the repo reproduces all of this.
 
 Every command also prints JSON, which makes it pleasant to drive from a script or an agent.
 

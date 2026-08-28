@@ -1,7 +1,7 @@
 //! Seed-corpus generator for the `fuzz/` crate.
 //!
 //! This is not a real test. It's `#[ignore]`d by default and runs only when
-//! invoked explicitly (`cargo test --test fuzz_seeds -- --ignored`). When
+//! invoked explicitly (`cargo test -p smb2 --test fuzz_seeds -- --ignored`). When
 //! run, it writes hand-constructed valid instances of wire-format types
 //! into `fuzz/corpus/<target>/seed_*.bin`, giving libfuzzer a strong
 //! starting point so it doesn't waste the first hour rediscovering "here's
@@ -242,7 +242,7 @@ fn build_dfs_referral_v4() -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "run explicitly: cargo test --test fuzz_seeds -- --ignored"]
+#[ignore = "run explicitly: cargo test -p smb2 --test fuzz_seeds -- --ignored"]
 fn generate_fuzz_seeds() {
     // ── fuzz_header_parse ───────────────────────────────────────────
     for (i, cmd) in [

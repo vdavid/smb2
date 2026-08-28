@@ -25,7 +25,7 @@
 //!
 //! Run with:
 //!   docker compose -f tests/docker/internal/docker-compose.yml up -d smb-maxreadsize smb-slow
-//!   RUST_LOG=smb2=debug cargo test --test concurrent_writes -- --ignored --nocapture
+//!   RUST_LOG=smb2=debug cargo test -p smb2 --test concurrent_writes -- --ignored --nocapture
 //!   docker compose -f tests/docker/internal/docker-compose.yml down
 
 use std::sync::Arc;

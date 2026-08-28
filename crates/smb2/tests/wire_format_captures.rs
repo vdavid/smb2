@@ -5,7 +5,7 @@
 //! marked `#[ignore]` so they only run when explicitly requested:
 //!
 //! ```sh
-//! cargo test --test wire_format_captures -- --ignored
+//! cargo test -p smb2 --test wire_format_captures -- --ignored
 //! ```
 //!
 //! Required: a NAS at 192.168.1.111:445 with an SMB share named "naspi".

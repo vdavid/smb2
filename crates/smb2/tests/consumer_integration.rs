@@ -9,7 +9,7 @@
 //! and require Docker containers to be running.
 //! Run with:
 //!   just test-consumer                     # starts containers, runs, stops
-//!   cargo test --features testing --test consumer_integration -- --ignored
+//!   cargo test -p smb2 --features testing --test consumer_integration -- --ignored
 
 #![cfg(feature = "testing")]
 

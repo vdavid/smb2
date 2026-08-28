@@ -5,7 +5,7 @@
 //!
 //! Run with:
 //!   just test-docker                      # starts containers, runs, stops
-//!   cargo test --test docker_integration -- --ignored   # if containers are already running
+//!   cargo test -p smb2 --test docker_integration -- --ignored   # if containers are already running
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;

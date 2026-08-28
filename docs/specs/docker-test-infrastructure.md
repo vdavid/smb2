@@ -183,16 +183,16 @@ docker-tests:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
     - name: Start SMB containers
-      run: ./tests/docker/start.sh internal
+      run: ./crates/smb2/tests/docker/start.sh internal
     - name: Wait for health checks
-      run: ./tests/docker/start.sh wait
+      run: ./crates/smb2/tests/docker/start.sh wait
     - name: Run Docker tests
-      run: cargo test --test docker_integration
+      run: cargo test -p smb2 --test docker_integration
       env:
         RUST_LOG: smb2=debug
     - name: Stop containers
       if: always()
-      run: ./tests/docker/stop.sh
+      run: ./crates/smb2/tests/docker/stop.sh
 ```
 
 Runs on every PR. Full suite, all internal containers. These are small Alpine images, startup is fast.

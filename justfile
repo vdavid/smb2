@@ -14,6 +14,10 @@
 #     deny        - License/dependency check (requires cargo-deny)
 #     udeps       - Find unused dependencies (requires nightly + cargo-udeps)
 #
+#   Release helpers:
+#     release-dry     - cargo publish --dry-run for both published crates
+#     release-dry-cli - full CLI dry run, once the library version is on crates.io
+#
 #   Composite commands:
 #     check       - Run fast checks: fmt-check, clippy, test, doc (default)
 #     check-all   - Run all checks including audit and deny
@@ -199,11 +203,46 @@ fuzz target duration="300":
     # cargo-fuzz looks for `fuzz/` beside the package it targets, so run from the library crate.
     cd crates/smb2 && cargo +nightly fuzz run {{target}} -- -max_total_time={{duration}} -print_final_stats=1
 
-# Regenerate the committed seed corpus under `fuzz/corpus/`.
+# Regenerate the committed seed corpus under `crates/smb2/fuzz/corpus/`.
 fuzz-seeds:
     @echo "[*] Regenerating fuzz seed corpus..."
     @cargo test -p smb2 --test fuzz_seeds -- --ignored --nocapture
     @echo "[+] Seed corpus updated"
+
+# ==============================================================================
+# Release helpers
+# ==============================================================================
+
+# The library gets a full `cargo publish --dry-run`: it builds the .crate file
+# and verifies it compiles from the packaged sources.
+#
+# The CLI only gets `cargo package --list`, because it depends on the library
+# via `version = "X.Y.Z", path = "../smb2"`. `cargo publish --dry-run -p
+# smb2-cli` resolves that version against crates.io, which rejects it while the
+# new library version is still local. Run `just release-dry-cli` after the
+# library is published.
+#
+# Dry-run what a release would publish
+release-dry:
+    @echo "[*] Dry-running the smb2 publish..."
+    @cargo publish --dry-run -p smb2
+    @echo ""
+    @echo "[*] Files smb2-cli would publish:"
+    @cargo package -p smb2-cli --list
+    @echo ""
+    @echo "[+] Release dry run complete"
+
+# Only works once the library version the CLI depends on is on crates.io.
+#
+# Full `cargo publish --dry-run` for the CLI
+release-dry-cli:
+    @echo "[*] Dry-running the smb2-cli publish..."
+    @cargo publish --dry-run -p smb2-cli
+    @echo "[+] CLI release dry run complete"
+
+# ==============================================================================
+# Utility Commands (continued)
+# ==============================================================================
 
 # Install required development tools
 install-tools:

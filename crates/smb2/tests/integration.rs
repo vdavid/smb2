@@ -1,7 +1,7 @@
 //! Integration tests against real SMB servers.
 //!
 //! These tests require local network access and are marked `#[ignore]`.
-//! Run with: `RUST_LOG=smb2=debug cargo test --test integration -- --ignored --nocapture`
+//! Run with: `RUST_LOG=smb2=debug cargo test -p smb2 --test integration -- --ignored --nocapture`
 
 use std::ops::ControlFlow;
 use std::time::Duration;
@@ -2239,7 +2239,7 @@ async fn streamed_write_performance_vs_pipelined() {
 // but gives us a useful order-of-magnitude before we commit to scope.
 //
 // Run with:
-//   cargo test --test integration --release bench_100_tiny_files -- --ignored --nocapture
+//   cargo test -p smb2 --test integration --release bench_100_tiny_files -- --ignored --nocapture
 //
 // Files: 100 × 10 KB, located at `_test/bench_100tiny/` on the naspi
 // share. Uploaded once (outside the timing), kept across runs (idempotent).

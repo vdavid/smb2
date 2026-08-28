@@ -2,7 +2,7 @@
 // on a single SMB session.
 //
 // Usage:
-//   SMB2_PASS=secret cargo run --example diagnostics_live -- --parallel 7 --file big.bin
+//   SMB2_PASS=secret cargo run -p smb2 --example diagnostics_live -- --parallel 7 --file big.bin
 //
 // Env vars: SMB2_HOST (default "192.168.1.100:445"), SMB2_USER (default "user"),
 //           SMB2_PASS (required), SMB2_SHARE (default "Documents").

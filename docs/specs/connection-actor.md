@@ -378,7 +378,7 @@ These go in `src/client/connection.rs` tests (a new `actor_routing` test module)
 
 - `just test-docker` (13 internal containers)
 - `just test-consumer` (14 consumer containers, cmdr's contract surface)
-- `cargo test --test integration -- --ignored` against QNAP + Pi manually before push
+- `cargo test -p smb2 --test integration -- --ignored` against QNAP + Pi manually before push
 
 ### `MockTransport::assert_fully_consumed()` adoption
 

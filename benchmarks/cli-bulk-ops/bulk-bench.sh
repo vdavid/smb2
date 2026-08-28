@@ -53,7 +53,7 @@ rmdir)
     ;;
 esac
 
-binary=$(dirname "$0")/../target/release/smb2
+binary=$(dirname "$0")/../../target/release/smb2
 if [ ! -x "$binary" ]; then
     echo "Build the release binary first: cargo build --release" >&2
     exit 1
