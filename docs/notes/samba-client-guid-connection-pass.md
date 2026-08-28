@@ -75,19 +75,30 @@ With a guid per connection, which is what ships: 0 in 448, in 0.39 s.
 
 ## Which servers this reaches
 
-Both real servers here were stormed with 400 concurrent connects from the old shared-guid build, and neither
-wedged, so the hang is not universal. The cost is:
+Both real servers here were stormed with 400 concurrent connects from a shared-guid build, and neither
+wedged, so the hang is not universal:
 
 - **Samba 4.20.6** (the Docker fixture): wedges, as above.
-- **Samba 4.22.10** (the Pi, Debian 13): 400 connects, no wedge, and per-connection guids neither help nor hurt
-  (735–931 stat/s before, 727–1,243 after, on a 1,000-path batch at `-j 8` and `-j 16`). Whatever went wrong in
-  4.20 looks fixed by 4.22, though it hasn't been bisected.
-- **QNAP TS-464 (QTS)**: 400 connects, no wedge, but the hand-off costs real throughput, because a shared guid
-  funnels every pool connection into one smbd process. A guid per connection is worth **2.3× on a small batch**
-  (107 stats at `-j 16`: 60–72 stat/s before, 147–165 after) and **1.45× on a large one** (1,999 stats at
-  `-j 16`: 652–693 before, 968–1,009 after). At `-j 1` the two are identical, which is the control.
+- **Samba 4.22.10** (the Pi, Debian 13): 400 connects, no wedge. Whatever went wrong in 4.20 looks fixed by
+  4.22, though it hasn't been bisected.
+- **QNAP TS-464 (QTS 5.2.9)**: 400 connects, no wedge. It runs userspace Samba (`/usr/local/samba/sbin/smbd`)
+  for these sessions, with a `ksmbd` module also loaded and idle, so a client can meet either server on this
+  box depending on how it connects.
 
-So the fix buys reliability on one server generation and speed on another, and costs nothing anywhere measured.
+**A shared guid costs nothing measurable on either.** Order-balanced A/B on a quiet laptop, `-j 16`, four
+rounds each: on the QNAP 1,999 stats take 1.93–2.19 s either way and 107 stats take 0.68–0.91 s either way;
+on the Pi 1,000 stats take 0.80–0.90 s either way, and 1.14–1.28 s at `-j 8`. A shared guid also does not
+funnel the pool into one server process, which was a plausible-sounding guess that direct observation
+killed: 16 connections produce 16 `smbd` processes with or without it.
+
+⚠️ **Measure this on a quiet machine, with the arms interleaved.** The first pass at these numbers ran while
+a 20-run docker suite was saturating the laptop's cores and finishing, and it ran the old binary first in
+every round. Both arms were client-CPU-bound at `-j 16`, so the arm that ran second got a quieter machine
+each time, and that produced a clean, repeatable, entirely fictitious 2.3x. The client does real
+per-frame AES work, so wide concurrency is exactly where laptop load leaks into a server measurement.
+
+So the fix buys reliability against one server generation, and costs nothing anywhere measured. It does not
+buy throughput.
 
 ## Why a guid per connection is safe
 
