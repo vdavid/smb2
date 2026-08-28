@@ -73,6 +73,22 @@ With one guid shared across connections:
 
 With a guid per connection, which is what ships: 0 in 448, in 0.39 s.
 
+## Which servers this reaches
+
+Both real servers here were stormed with 400 concurrent connects from the old shared-guid build, and neither
+wedged, so the hang is not universal. The cost is:
+
+- **Samba 4.20.6** (the Docker fixture): wedges, as above.
+- **Samba 4.22.10** (the Pi, Debian 13): 400 connects, no wedge, and per-connection guids neither help nor hurt
+  (735–931 stat/s before, 727–1,243 after, on a 1,000-path batch at `-j 8` and `-j 16`). Whatever went wrong in
+  4.20 looks fixed by 4.22, though it hasn't been bisected.
+- **QNAP TS-464 (QTS)**: 400 connects, no wedge, but the hand-off costs real throughput, because a shared guid
+  funnels every pool connection into one smbd process. A guid per connection is worth **2.3× on a small batch**
+  (107 stats at `-j 16`: 60–72 stat/s before, 147–165 after) and **1.45× on a large one** (1,999 stats at
+  `-j 16`: 652–693 before, 968–1,009 after). At `-j 1` the two are identical, which is the control.
+
+So the fix buys reliability on one server generation and speed on another, and costs nothing anywhere measured.
+
 ## Why a guid per connection is safe
 
 `ClientGuid` identifies the *client*, not the connection (MS-SMB2 § 2.2.3), and two things in SMB care:
@@ -90,3 +106,5 @@ minted per NEGOTIATE would break resume, which is a data-integrity feature, not 
   handshakes at widths 4, 8, and 16. It fails within a minute if a shared guid ever comes back.
 - `rm_at_full_pool_width_deletes_every_path` in `crates/smb2-cli/tests/e2e.rs`: the same thing through the
   binary, at the `-j 16` the CLI's README quotes.
+- The docker suite's own parallelism, which used to fail about 2 tests in 101 for this reason. 20 consecutive
+  full runs (2,040 test executions) came back clean.

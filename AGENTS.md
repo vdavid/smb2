@@ -348,8 +348,9 @@ starts one container rather than 16.
 Integration tests (`tests/integration.rs`) run against real hardware:
 
 - QNAP TS-464 NAS (SMB 3.1.1, NTLM auth, AES-GMAC signing)
-- Raspberry Pi 4 Model B (SMB 3.1.1, guest access). ⚠️ Its Samba 4.9.5 crashes on compound writes; that is a server bug,
-  not ours. See `docs/notes/samba-4.9-compound-write-crash.md` before diagnosing a dead connection against it.
+- Raspberry Pi 4 Model B (SMB 3.1.1, guest access), Samba 4.22.10 on Debian 13. It ran 4.9.5 until it was rebuilt on
+  2026-08-08, and 4.9.5 crashes on compound writes: a server bug, not ours, and one to remember if a dead connection
+  ever turns up against an old server. See `docs/notes/samba-4.9-compound-write-crash.md`.
 
 How much silence a real one of each tolerates before a watch is given up on, and the `SIGSTOP` recipe that
 measures it deterministically: `docs/notes/watcher-silence-tolerance.md`.
