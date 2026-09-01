@@ -68,6 +68,22 @@ pub(crate) fn setup_connection_without_credits(mock: &Arc<MockTransport>) -> Con
     conn
 }
 
+/// [`setup_connection`] with a server that negotiated `max_read` bytes per
+/// READ, for tests that care what a read puts on the wire.
+///
+/// The 64 KiB default is below every size a compound read has to distinguish
+/// between; real servers commonly grant 8 MiB.
+pub(crate) fn setup_connection_with_max_read(
+    mock: &Arc<MockTransport>,
+    max_read: u32,
+) -> Connection {
+    let mut conn = setup_connection(mock);
+    let mut params = conn.params().expect("setup_connection negotiates params");
+    params.max_read_size = max_read;
+    conn.set_test_params(params);
+    conn
+}
+
 /// Build a CREATE response with the given file ID and end-of-file size.
 pub(crate) fn build_create_response(file_id: FileId, end_of_file: u64) -> Vec<u8> {
     let mut h = Header::new_request(Command::Create);

@@ -38,12 +38,44 @@ use tokio::sync::{AcquireError, Semaphore};
 ///
 /// Every request asks for its own charge back plus whatever is needed to reach
 /// this number, so an idle connection asks for little and a saturated one asks
-/// for a lot. 512 credits is comfortably more than the deepest pipeline this
-/// crate opens (32 requests at 8 credits each for 512 KB chunks), leaving room
-/// for other work on the same connection. Servers clamp the request to their
-/// own maximum, so asking high is safe; asking low is not, because a window
-/// that shrinks to nothing serializes every transfer.
+/// for a lot. Servers clamp the request to their own maximum, so asking high
+/// is safe; asking low is not, because a window that shrinks to nothing
+/// serializes every transfer.
+///
+/// 512 covers the deepest pipeline this crate opens (32 requests at 8 credits
+/// each for 512 KB chunks) with room for other work on the same connection.
+/// It is *not* generous for whole-file compound reads: one CREATE+READ+CLOSE
+/// asking for a full 8 MiB `MaxReadSize` charges 130, so only three fit at
+/// once. That is a property of the request, not of this number, and the fix is
+/// on the caller's side: read with the size you actually want
+/// (`Tree::read_file_compound_sized`) and size the batch with
+/// [`Connection::credit_capacity_for`](crate::client::Connection::credit_capacity_for).
+/// ❌ Don't raise this to buy concurrency for oversized requests: the server
+/// clamps it anyway, and the requests stay just as expensive.
 const CREDIT_TARGET: u16 = 512;
+
+/// The credits a request costs: `ceil(bytes / 65536)`, at least 1 (MS-SMB2
+/// § 3.1.5.2).
+///
+/// `bytes` is the larger of the send payload and the *expected* response, so a
+/// READ pays for the length it asked for whether or not the file fills it.
+/// That is why a read should ask for the size it actually wants: a 4 KiB file
+/// read with an 8 MiB request costs 128 credits and crowds out every other
+/// request on the connection.
+pub(crate) fn charge_for_payload(bytes: u64) -> u16 {
+    bytes.div_ceil(65536).clamp(1, u16::MAX as u64) as u16
+}
+
+/// How many requests charging `charge` each fit in the window the client
+/// steers toward.
+///
+/// An estimate of steady state, not a reading of what is unspent right now:
+/// the server clamps the target to its own maximum, and other work on the
+/// connection draws on the same pool. Never 0, because a caller uses this to
+/// size a batch and a batch of nothing makes no progress.
+pub(crate) fn capacity_for_charge(charge: u16) -> usize {
+    usize::from((CREDIT_TARGET / charge.max(1)).max(1))
+}
 
 /// Default bound on how long a send waits for the server to grant credits
 /// before giving up with [`Error::CreditStarvation`](crate::Error::CreditStarvation).

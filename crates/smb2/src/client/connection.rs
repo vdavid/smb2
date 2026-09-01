@@ -1154,7 +1154,7 @@ fn sweep_connection(inner: &Inner) {
     }
 }
 
-use crate::client::credits::{CreditPool, CreditReservation};
+use crate::client::credits::{self, CreditPool, CreditReservation};
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
@@ -2629,6 +2629,28 @@ impl Connection {
     /// what the pipeline is currently holding.
     pub fn credits(&self) -> u16 {
         self.inner.credits.available()
+    }
+
+    /// How many concurrent compound reads of `bytes` each the credit window
+    /// can carry. Always at least 1.
+    ///
+    /// `bytes` is a per-operation size in bytes, clamped to the server's
+    /// `MaxReadSize` because one READ can't return more than that. The answer
+    /// counts the whole CREATE+READ+CLOSE chain
+    /// [`Tree::read_file_compound_sized`](crate::Tree::read_file_compound_sized)
+    /// sends, since the server charges every sub-request.
+    ///
+    /// This is an estimate of steady state, not a reading of unspent credits
+    /// (that is [`credits`](Self::credits)): it measures the window the client
+    /// steers the server toward, which the server may clamp lower, and other
+    /// work on the same connection draws on the same pool. Use it to size a
+    /// batch of concurrent reads; launching more than this many just parks the
+    /// extras in `reserve_credits` until earlier ones finish.
+    pub fn credit_capacity_for(&self, bytes: u64) -> usize {
+        let max_read = self.params().map(|p| p.max_read_size).unwrap_or(65536) as u64;
+        let read_charge = credits::charge_for_payload(bytes.min(max_read));
+        // Plus one credit each for the CREATE and the CLOSE riding along.
+        credits::capacity_for_charge(read_charge.saturating_add(2))
     }
 
     /// How long a send waits for the server to grant credits before failing
@@ -5388,6 +5410,31 @@ mod tests {
 
         // Server granted 32 credits, minus 1 consumed for our request.
         assert_eq!(conn.credits(), 32);
+    }
+
+    #[tokio::test]
+    async fn credit_capacity_shrinks_as_the_operation_grows() {
+        let mock = Arc::new(MockTransport::new());
+        let conn =
+            crate::client::test_helpers::setup_connection_with_max_read(&mock, 8 * 1024 * 1024);
+
+        // 4 MiB costs 64 credits for the READ plus one each for CREATE and
+        // CLOSE, so a 512-credit window carries seven of them at once.
+        assert_eq!(conn.credit_capacity_for(4 * 1024 * 1024), 7);
+        // A full-window read costs 130, which is where the wedge came from.
+        assert_eq!(conn.credit_capacity_for(8 * 1024 * 1024), 3);
+        // A small file charges the minimum: one credit each for all three.
+        assert_eq!(conn.credit_capacity_for(4096), 170);
+    }
+
+    #[tokio::test]
+    async fn credit_capacity_is_never_zero() {
+        let mock = Arc::new(MockTransport::new());
+        let conn =
+            crate::client::test_helpers::setup_connection_with_max_read(&mock, 8 * 1024 * 1024);
+
+        assert!(conn.credit_capacity_for(0) >= 1);
+        assert!(conn.credit_capacity_for(u64::MAX) >= 1);
     }
 
     // ── Credit accounting ──────────────────────────────────────────────

@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`Connection::credit_capacity_for(bytes) -> usize`: how many concurrent compound reads of that size the window can carry.** Sizing a batch of reads by hand meant guessing at a number that depends on the server's `MaxReadSize`, and guessing high is what parks tasks in `reserve_credits` for no gain. Counts the whole CREATE+READ+CLOSE chain, clamps `bytes` to `MaxReadSize`, and never returns 0. It estimates steady state rather than reading unspent credits, which is what `Connection::credits` is for.
+
 ## [0.20.1] - 2026-08-28
 
 ### Fixed
