@@ -7,7 +7,15 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- **`Error::FileTooLargeForSingleRead`'s `max_read` field is now `requested`.** It never carried the server's `MaxReadSize` as a fact about the server; it carried the size of the READ that was issued, which used to be the same number and no longer is. A `match` that names the field has to rename it; one using `{ .. }` or `{ size, .. }` is unaffected. The message changed to match (`larger than the {requested}-byte single read issued for it`).
+
 ### Added
+
+- **`Tree::read_file_compound_sized(conn, path, expected_size)`: a compound read that asks for the size you already know**, and pays credits for that instead of for a whole window. A server charges by *expected response* size (MS-SMB2 § 3.2.4.1.2), so the plain `read_file_compound`, which knows nothing about the file, asks for a full `MaxReadSize` and costs 130 credits on an 8 MiB server no matter what the file weighs. Against the 512-credit window that is three concurrent reads and no more: a 300 GB SMB-to-SMB copy that launched ten stalled with seven of them parked in `reserve_credits` behind `Create needs 130 credit(s) but only 0 are available`. A 4 MiB file read at its real size costs 66, so seven fit; a 4 KiB one costs 3, so 170 do. Callers with a directory scan in hand (most of them) get the concurrency back for one extra argument.
+  - **`expected_size` is a bound, not a promise.** A file bigger than it fails with `Error::FileTooLargeForSingleRead` rather than coming back truncated, and the error carries the server's authoritative `size` so a caller can retry with it. This covers the file that grew between the scan and the read: the READ returns exactly `expected_size` bytes, which is indistinguishable from a complete read of a smaller file, so the guard compares the CREATE response's `end_of_file` against what was requested rather than against `MaxReadSize`. Same round-trip, no extra cost.
+  - `read_file_compound` is unchanged in signature and on the wire: it delegates with `expected_size = MaxReadSize`.
 
 - **`Connection::credit_capacity_for(bytes) -> usize`: how many concurrent compound reads of that size the window can carry.** Sizing a batch of reads by hand meant guessing at a number that depends on the server's `MaxReadSize`, and guessing high is what parks tasks in `reserve_credits` for no gain. Counts the whole CREATE+READ+CLOSE chain, clamps `bytes` to `MaxReadSize`, and never returns 0. It estimates steady state rather than reading unspent credits, which is what `Connection::credits` is for.
 

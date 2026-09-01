@@ -151,26 +151,38 @@ pub enum Error {
     #[error("Session expired and reauthentication failed")]
     SessionExpired,
 
-    /// The file is larger than a single READ can return, so a one-shot read
-    /// would truncate it.
+    /// The file is larger than the single READ that was issued for it, so
+    /// returning what came back would truncate it.
     ///
-    /// Returned by [`Tree::read_file`](crate::Tree::read_file) and
-    /// [`Tree::read_file_compound`](crate::Tree::read_file_compound) when the
-    /// file's size exceeds the server's negotiated per-READ maximum
-    /// (`MaxReadSize`). Those paths issue a single READ, so a larger file can't
-    /// come back whole — rather than silently dropping the tail, they fail with
-    /// this. Switch to [`Tree::read_file_pipelined`](crate::Tree::read_file_pipelined),
-    /// which reads the whole file in a sliding window of chunked READs
-    /// regardless of size. Classifies as [`ErrorKind::TooLarge`].
+    /// Returned by [`Tree::read_file`](crate::Tree::read_file),
+    /// [`Tree::read_file_compound`](crate::Tree::read_file_compound), and
+    /// [`Tree::read_file_compound_sized`](crate::Tree::read_file_compound_sized).
+    /// Those paths issue one READ, so a file bigger than that READ asked for
+    /// can't come back whole; rather than silently dropping the tail, they fail
+    /// with this. The two ways to hit it:
+    ///
+    /// - The file exceeds the server's negotiated per-READ maximum
+    ///   (`MaxReadSize`), which is as small as 64 KiB on some servers.
+    /// - The file outgrew the `expected_size` handed to
+    ///   `read_file_compound_sized` between the caller's scan and the read.
+    ///
+    /// `size` is the server's authoritative size from the same round-trip, so
+    /// a caller can retry `read_file_compound_sized` with it, or switch to
+    /// [`Tree::read_file_pipelined`](crate::Tree::read_file_pipelined), which
+    /// reads any size in a sliding window of chunked READs. Classifies as
+    /// [`ErrorKind::TooLarge`].
     #[error(
-        "file is {size} bytes, larger than the server's {max_read}-byte \
-         single-read limit; use read_file_pipelined for files this size"
+        "file is {size} bytes, larger than the {requested}-byte single read \
+         issued for it; retry with the real size or use read_file_pipelined"
     )]
     FileTooLargeForSingleRead {
-        /// The file's size in bytes.
+        /// The file's size in bytes, as the server reported it.
         size: u64,
-        /// The server's negotiated maximum bytes per READ (`MaxReadSize`).
-        max_read: u32,
+        /// The number of bytes that single READ asked for, which is what
+        /// bounds how much it could have returned. At most the server's
+        /// `MaxReadSize`, and less when the caller supplied a smaller
+        /// `expected_size`.
+        requested: u32,
     },
 
     /// The server stopped granting credits, so the request could not be sent.
@@ -385,8 +397,9 @@ pub enum ErrorKind {
     /// The file is too large for a single-read path.
     ///
     /// Returned by [`Tree::read_file`](crate::Tree::read_file) /
-    /// [`read_file_compound`](crate::Tree::read_file_compound) when the file
-    /// exceeds the server's per-READ maximum. Switch to
+    /// [`read_file_compound`](crate::Tree::read_file_compound) /
+    /// [`read_file_compound_sized`](crate::Tree::read_file_compound_sized)
+    /// when the file is bigger than the READ they issued for it. Switch to
     /// [`read_file_pipelined`](crate::Tree::read_file_pipelined), which reads
     /// any size in chunked, pipelined READs.
     TooLarge,
@@ -623,7 +636,7 @@ mod tests {
         assert_eq!(
             Error::FileTooLargeForSingleRead {
                 size: 20_000_000,
-                max_read: 8_388_608,
+                requested: 8_388_608,
             }
             .kind(),
             ErrorKind::TooLarge
@@ -631,7 +644,7 @@ mod tests {
         assert!(
             !Error::FileTooLargeForSingleRead {
                 size: 20_000_000,
-                max_read: 8_388_608,
+                requested: 8_388_608,
             }
             .is_retryable(),
             "too-large is not fixed by retrying the same call"

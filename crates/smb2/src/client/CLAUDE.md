@@ -43,6 +43,8 @@ Full model, rationale, and the incident behind it: `credits.rs` module docs.
 - **❌ Never await the write budget while holding a permit you aren't polling** -- the one way to deadlock it. Go through `reserve_write_budget_or_drain`, which is where that ordering lives: take budget only if free, otherwise drain one of your OWN responses, and wait only when you hold nothing. ❌ Don't hand-roll a second copy of it.
 - Budget granule is 64 KiB, so `set_write_budget` rounds up and floors at one. A frame bigger than the whole budget is clamped to it (`Connection::clamped_units`) rather than refused: `acquire_many` for more permits than the semaphore will ever hold waits forever. Growing is immediate; shrinking takes back only permits that are FREE, so `Inner::settle_write_budget` pays the rest down as frames complete, and every reserve calls it first.
 - Multi-credit requests (reads/writes > 64 KB) charge `ceil(payload_size / 65536)` credits and use that many consecutive `MessageId` values. Gaps in `MessageId` sequences cause the server to drop the connection.
+- **A read charges for what it ASKS for, not for what the file weighs.** The charge follows the *expected response* size (MS-SMB2 § 3.2.4.1.2), and `execute_compound` reserves the sum of the chain. `read_file_compound` knows nothing about the file, so it asks for a whole `MaxReadSize`: 130 credits on a server granting 8 MiB (128 for the READ, 1 each for CREATE and CLOSE), which fits three concurrent reads in the 512-credit window however small the files are. The rest park in `reserve_credits`, and a caller that launched ten looks stalled. Pass a size you already have (a directory scan) to `Tree::read_file_compound_sized`, and size the batch with `Connection::credit_capacity_for(bytes)` rather than guessing. `credits::charge_for_payload` is the one formula.
+- **❌ The compound read's truncation guard compares `end_of_file` against what the READ requested, never against `MaxReadSize`.** A file that grew past the caller's `expected_size` between the scan and the read comes back exactly `requested` bytes, which is indistinguishable from a complete read of a smaller file. `Error::FileTooLargeForSingleRead { size, requested }` carries the server's authoritative size, so the caller can retry with it.
 - A short send parks until a grant arrives, bounded so it can't become a starvation hang: nothing outstanding to fund the wait → immediate `Error::CreditStarvation`; connection death → `CreditPool::close` wakes every waiter; otherwise the 30 s `set_credit_wait_timeout` deadline.
 - Every request asks for its own charge back plus enough to reach a 512-credit target. ❌ Don't flatten this to a constant: asking for less than the charge lets the window shrink to nothing and serializes every transfer.
 - `STATUS_PENDING` interim responses carry credits but the request isn't done -- keep waiting.
@@ -170,7 +172,7 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 
 `Connection::execute_compound(&[CompoundOp])` packs multiple operations into a single transport frame. Each sub-request is 8-byte aligned, linked via `NextCommand`. Subsequent related operations use `FileId::SENTINEL` (the server substitutes the real handle from the first CREATE).
 
-- **Read compound**: CREATE + READ + CLOSE (3 ops, 1 round-trip). Default for `read_file`.
+- **Read compound**: CREATE + READ + CLOSE (3 ops, 1 round-trip). Default for `read_file`. `read_file_compound_sized` is the same chain asking only for a known size, which is what keeps the credit charge off the whole window (see Connection and credits).
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
 - **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.
@@ -261,8 +263,9 @@ Two symmetric ways to start a `FileDownload`:
   download; the receiver task multiplexes responses by `MessageId`). `SmbClient::download` delegates here.
 
 For full control, `Tree::open_file` (returns `(FileId, u64)`) plus `FileDownload::new` let callers build custom chunk
-loops with non-default `chunk_size`. Most users shouldn't need this — `read_file_compound` (1 RTT) handles small files
-and `Tree::download` / `SmbClient::download` handle the streaming case.
+loops with non-default `chunk_size`. Most users shouldn't need this — `read_file_compound` (1 RTT, or `read_file_compound_sized`
+when the size is already known) handles small files and `Tree::download` / `SmbClient::download` handle the streaming
+case.
 
 FileWriter has two terminal operations:
 - `finish()` — send all buffered data, drain in-flight WRITEs, FLUSH (fsync on the server), CLOSE. Use on normal completion.

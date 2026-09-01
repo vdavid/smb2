@@ -13,6 +13,7 @@ use log::{debug, info, trace, warn};
 use crate::client::connection::{
     reserve_write_budget_or_drain, CompoundOp, Connection, Frame, WriteBudgetStep,
 };
+use crate::client::credits;
 use crate::client::stream::{FileDownload, Progress};
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
@@ -441,17 +442,61 @@ impl Tree {
     /// round-trips from 3 to 1. Best for files that fit in a single
     /// READ (up to MaxReadSize).
     ///
+    /// Knowing nothing about the file, this asks for a whole `MaxReadSize` and
+    /// pays the credits to match: 130 on a server granting 8 MiB reads, which
+    /// on a 512-credit window is three concurrent reads and no more, whatever
+    /// the files actually weigh. When the size is already known (a directory
+    /// scan, a stat), reach for
+    /// [`read_file_compound_sized`](Self::read_file_compound_sized) instead
+    /// and let the connection carry many more of them at once.
+    ///
     /// A single READ can't return more than the server's `MaxReadSize`, so a
     /// file larger than that fails with
     /// [`Error::FileTooLargeForSingleRead`]
     /// rather than coming back truncated. Use
     /// [`read_file_pipelined`](Self::read_file_pipelined) for files of any size.
     pub async fn read_file_compound(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        self.read_file_compound_sized(conn, path, max_read as u64)
+            .await
+    }
+
+    /// [`read_file_compound`](Self::read_file_compound) for a file whose size
+    /// the caller already knows.
+    ///
+    /// `expected_size` is the caller's best knowledge of the file's size (from
+    /// a directory scan, say). It bounds both the READ length and the credit
+    /// charge, which is what makes this worth reaching for: the charge follows
+    /// the expected response size (MS-SMB2 § 3.2.4.1.2), so a 4 MiB file read
+    /// as 4 MiB costs 66 credits where a full-window read of the same file
+    /// costs 130. On a 512-credit window that is the difference between seven
+    /// concurrent reads and three. Size a batch with
+    /// [`Connection::credit_capacity_for`](crate::client::Connection::credit_capacity_for).
+    ///
+    /// `expected_size` is a bound, not a promise: a file bigger than it fails
+    /// with [`Error::FileTooLargeForSingleRead`] rather than coming back
+    /// truncated, and that includes a file that grew between the scan and this
+    /// read. The error carries the server's authoritative `size`, so a caller
+    /// can retry with it, or switch to
+    /// [`read_file_pipelined`](Self::read_file_pipelined), which handles any
+    /// size. Over-estimating only costs credits; under-estimating costs a
+    /// round-trip.
+    pub async fn read_file_compound_sized(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        expected_size: u64,
+    ) -> Result<Vec<u8>> {
         let normalized = self.format_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        // Ask for what the caller expects, capped by what one READ can carry
+        // and floored at one byte: a zero-length READ charges zero credits,
+        // which is not a request the spec allows.
+        let requested = expected_size.min(max_read as u64).max(1) as u32;
         trace!(
-            "tree: read_file_compound path={}, max_read={}",
+            "tree: read_file_compound path={}, requested={}, max_read={}",
             normalized,
+            requested,
             max_read
         );
 
@@ -476,13 +521,14 @@ impl Tree {
             create_contexts: vec![],
         };
 
-        // Build READ request with sentinel FileId.
-        // CreditCharge for READ = ceil(max_read / 65536).
-        let read_credit_charge = (max_read as u64).div_ceil(65536) as u16;
+        // Build READ request with sentinel FileId. The credit charge follows
+        // the expected response size (MS-SMB2 § 3.2.4.1.2), so a read that
+        // asks for less pays less.
+        let read_credit_charge = credits::charge_for_payload(requested as u64);
         let read_req = ReadRequest {
             padding: 0x50,
             flags: 0,
-            length: max_read,
+            length: requested,
             offset: 0,
             file_id: FileId::SENTINEL,
             minimum_count: 0,
@@ -540,19 +586,23 @@ impl Tree {
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
-        // A single READ returns at most `max_read` bytes, so a larger file
-        // would come back truncated. Fail with a typed error instead of
-        // silently dropping the tail; the caller switches to
-        // `read_file_pipelined`. The compound's CLOSE already released the
-        // handle, so there's nothing to clean up here.
-        if create_resp.end_of_file > max_read as u64 {
+        // The READ can return at most `requested` bytes, so anything bigger
+        // comes back truncated, and a file that is exactly `requested` bytes
+        // of a larger whole is indistinguishable from a complete one. Compare
+        // against what was asked for, never against `max_read`: a file that
+        // grew past the caller's `expected_size` between its scan and this
+        // read is the case that would otherwise hand back a short buffer that
+        // looks complete. `end_of_file` is the server's authoritative size and
+        // rides in this same frame, so the check is exact. The compound's
+        // CLOSE already released the handle, so there's nothing to clean up.
+        if create_resp.end_of_file > requested as u64 {
             debug!(
-                "tree: read_file_compound path={} is {} bytes > {}-byte single-read limit",
-                normalized, create_resp.end_of_file, max_read
+                "tree: read_file_compound path={} is {} bytes > the {}-byte read issued for it",
+                normalized, create_resp.end_of_file, requested
             );
             return Err(Error::FileTooLargeForSingleRead {
                 size: create_resp.end_of_file,
-                max_read,
+                requested,
             });
         }
 
@@ -3225,7 +3275,8 @@ mod tests {
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
         build_close_response, build_create_error_response, build_create_response,
-        build_tree_connect_response, setup_connection, setup_connection_without_credits,
+        build_tree_connect_response, setup_connection, setup_connection_with_max_read,
+        setup_connection_without_credits,
     };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
@@ -3579,7 +3630,7 @@ mod tests {
                 err,
                 Error::FileTooLargeForSingleRead {
                     size: 100_000,
-                    max_read: 65536
+                    requested: 65536
                 }
             ),
             "expected FileTooLargeForSingleRead, got {err:?}"
@@ -6155,6 +6206,180 @@ mod tests {
         // Verify CLOSE uses sentinel FileId.
         let close_parsed = CloseRequest::unpack(&mut cursor3).unwrap();
         assert_eq!(close_parsed.file_id, FileId::SENTINEL);
+    }
+
+    /// 8 MiB, the `MaxReadSize` real servers commonly negotiate.
+    const EIGHT_MIB: u32 = 8 * 1024 * 1024;
+
+    /// The `CreditCharge` each sub-request of a compound frame carries, in order.
+    fn compound_credit_charges(frame: &[u8]) -> Vec<u16> {
+        let mut charges = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut cursor = ReadCursor::new(&frame[offset..]);
+            let header = Header::unpack(&mut cursor).unwrap();
+            charges.push(header.credit_charge.0);
+            if header.next_command == 0 {
+                break;
+            }
+            offset += header.next_command as usize;
+        }
+        charges
+    }
+
+    /// The `ReadRequest` of a compound frame whose second sub-request is a READ.
+    fn compound_read_request(frame: &[u8]) -> ReadRequest {
+        let mut cursor = ReadCursor::new(frame);
+        let h1 = Header::unpack(&mut cursor).unwrap();
+        let mut cursor2 = ReadCursor::new(&frame[h1.next_command as usize..]);
+        Header::unpack(&mut cursor2).unwrap();
+        ReadRequest::unpack(&mut cursor2).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_sized_rejects_a_file_that_grew_past_the_expected_size() {
+        // The caller's scan said 1000 bytes; by the time the READ ran the file
+        // was 5000. A 1000-byte READ comes back full, which is exactly what a
+        // complete read of a 1000-byte file looks like, so nothing downstream
+        // could tell the difference. The CREATE response's end-of-file is the
+        // server's authoritative size, and it rides in the same frame.
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection_with_max_read(&mock, EIGHT_MIB);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        let create_resp = build_create_response(file_id, 5000);
+        let read_resp = build_read_response(NtStatus::SUCCESS, vec![0xAB; 1000]);
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            read_resp,
+            close_resp,
+        ]));
+
+        let err = tree
+            .read_file_compound_sized(&mut conn, "grew.bin", 1000)
+            .await
+            .expect_err("a file that outgrew the request must not come back truncated");
+
+        assert_eq!(err.kind(), crate::ErrorKind::TooLarge);
+        assert!(
+            matches!(
+                err,
+                Error::FileTooLargeForSingleRead {
+                    size: 5000,
+                    requested: 1000
+                }
+            ),
+            "expected FileTooLargeForSingleRead, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_sized_charges_only_for_what_it_asks_for() {
+        // The charge follows the expected response size (MS-SMB2 § 3.2.4.1.2),
+        // so asking for 4 MiB of an 8 MiB window costs 64 credits for the READ
+        // plus one each for CREATE and CLOSE, not the 130 a full-window read
+        // would take.
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection_with_max_read(&mock, EIGHT_MIB);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        let create_resp = build_create_response(file_id, 5);
+        let read_resp = build_read_response(NtStatus::SUCCESS, vec![1, 2, 3, 4, 5]);
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            read_resp,
+            close_resp,
+        ]));
+
+        tree.read_file_compound_sized(&mut conn, "small.bin", 4 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        let compound = mock.sent_message(1).unwrap();
+        assert_eq!(compound_credit_charges(&compound), vec![1, 64, 1]);
+        assert_eq!(compound_read_request(&compound).length, 4 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_still_asks_for_the_whole_window() {
+        // The unsized entry point knows nothing about the file, so it keeps
+        // asking for a full `MaxReadSize` and paying the full charge.
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection_with_max_read(&mock, EIGHT_MIB);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        let create_resp = build_create_response(file_id, 5);
+        let read_resp = build_read_response(NtStatus::SUCCESS, vec![1, 2, 3, 4, 5]);
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            read_resp,
+            close_resp,
+        ]));
+
+        let data = tree
+            .read_file_compound(&mut conn, "small.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(data, vec![1, 2, 3, 4, 5]);
+        let compound = mock.sent_message(1).unwrap();
+        assert_eq!(compound_credit_charges(&compound), vec![1, 128, 1]);
+        assert_eq!(compound_read_request(&compound).length, EIGHT_MIB);
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_sized_never_asks_for_zero_bytes() {
+        // An empty file still needs a READ on the wire, and a zero-length READ
+        // charging zero credits is not a request the spec allows.
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection_with_max_read(&mock, EIGHT_MIB);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        let create_resp = build_create_response(file_id, 0);
+        let read_resp = build_read_response(NtStatus::END_OF_FILE, vec![]);
+        let close_resp = build_close_response();
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            read_resp,
+            close_resp,
+        ]));
+
+        let data = tree
+            .read_file_compound_sized(&mut conn, "empty.txt", 0)
+            .await
+            .unwrap();
+
+        assert!(data.is_empty());
+        let compound = mock.sent_message(1).unwrap();
+        assert_eq!(compound_credit_charges(&compound), vec![1, 1, 1]);
+        assert_eq!(compound_read_request(&compound).length, 1);
     }
 
     // ── Compound write tests ────────────────────────────────────────
