@@ -15,6 +15,7 @@ use log::{debug, trace};
 use crate::client::connection::{
     reserve_write_budget_or_drain, Connection, Frame, WriteBudgetStep,
 };
+use crate::client::credits;
 use crate::client::tree::Tree;
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
@@ -178,7 +179,7 @@ impl<'a> FileDownload<'a> {
             read_channel_info: vec![],
         };
 
-        let credit_charge = (this_chunk as u64).div_ceil(65536).max(1) as u16;
+        let credit_charge = credits::charge_for_payload(this_chunk as u64);
         let exec_result = self
             .conn
             .execute_with_credits(
@@ -429,7 +430,7 @@ impl FileReader {
                 read_channel_info: vec![],
             };
 
-            let credit_charge = (chunk_len as u64).div_ceil(65536).max(1) as u16;
+            let credit_charge = credits::charge_for_payload(chunk_len as u64);
             let frame = self
                 .conn
                 .execute_with_credits(
@@ -626,7 +627,7 @@ impl<'a> FileUpload<'a> {
             data: chunk.to_vec(),
         };
 
-        let credit_charge = (this_chunk as u64).div_ceil(65536).max(1) as u16;
+        let credit_charge = credits::charge_for_payload(this_chunk as u64);
         let exec_result = self
             .conn
             .execute_with_credits(
@@ -1118,7 +1119,7 @@ impl FileWriter {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let data_len = data.len() as u64;
-        let credit_charge = data_len.div_ceil(65536).max(1) as u16;
+        let credit_charge = credits::charge_for_payload(data_len);
 
         let req = WriteRequest {
             data_offset: 0x70,

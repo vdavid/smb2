@@ -166,14 +166,17 @@ pub enum Error {
     /// - The file outgrew the `expected_size` handed to
     ///   `read_file_compound_sized` between the caller's scan and the read.
     ///
-    /// `size` is the server's authoritative size from the same round-trip, so
-    /// a caller can retry `read_file_compound_sized` with it, or switch to
-    /// [`Tree::read_file_pipelined`](crate::Tree::read_file_pipelined), which
-    /// reads any size in a sliding window of chunked READs. Classifies as
-    /// [`ErrorKind::TooLarge`].
+    /// `size` is the server's authoritative size from the same round-trip.
+    /// Retrying `read_file_compound_sized` with it fixes the second case only,
+    /// where `size` still fits one READ. When `requested` is already the
+    /// server's `MaxReadSize` the retry asks for the same bytes and fails the
+    /// same way; [`Tree::read_file_pipelined`](crate::Tree::read_file_pipelined)
+    /// reads any size in a sliding window of chunked READs and always works.
+    /// Classifies as [`ErrorKind::TooLarge`].
     #[error(
         "file is {size} bytes, larger than the {requested}-byte single read \
-         issued for it; retry with the real size or use read_file_pipelined"
+         issued for it; retry with its real size if that fits one read, \
+         otherwise use read_file_pipelined"
     )]
     FileTooLargeForSingleRead {
         /// The file's size in bytes, as the server reported it.

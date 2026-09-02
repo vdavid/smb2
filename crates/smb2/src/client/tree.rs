@@ -477,7 +477,7 @@ impl Tree {
     /// with [`Error::FileTooLargeForSingleRead`] rather than coming back
     /// truncated, and that includes a file that grew between the scan and this
     /// read. The error carries the server's authoritative `size`, so a caller
-    /// can retry with it, or switch to
+    /// can retry with it when it still fits one READ, or switch to
     /// [`read_file_pipelined`](Self::read_file_pipelined), which handles any
     /// size. Over-estimating only costs credits; under-estimating costs a
     /// round-trip.
@@ -1322,7 +1322,7 @@ impl Tree {
 
         // Build WRITE request with sentinel FileId.
         // DataOffset = Header::SIZE (64) + WriteRequest fixed body (48) = 0x70.
-        let write_credit_charge = (data.len() as u64).div_ceil(65536).max(1) as u16;
+        let write_credit_charge = credits::charge_for_payload(data.len() as u64);
         let write_req = WriteRequest {
             data_offset: 0x70,
             offset: 0,
@@ -1498,7 +1498,7 @@ impl Tree {
             // Use pipeline chunk size, capped to MaxReadSize.
             pipeline_chunk.min(max_read)
         };
-        let credit_charge = chunk_size.div_ceil(65536) as u16;
+        let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
             "tree: read_file_pipelined path={}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
@@ -1576,7 +1576,7 @@ impl Tree {
         } else {
             pipeline_chunk.min(max_read)
         };
-        let credit_charge = chunk_size.div_ceil(65536) as u16;
+        let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
             "tree: read_file_pipelined_with_progress path={}, size={}, chunk_size={}, total_chunks={}",
@@ -1705,7 +1705,7 @@ impl Tree {
         // large payloads being sent (we're sending data, not just a small request).
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let chunk_size = max_write;
-        let credit_charge = chunk_size.div_ceil(65536) as u16;
+        let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = data.len().div_ceil(chunk_size as usize);
         trace!(
             "tree: write_file_pipelined path={}, len={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
@@ -2406,8 +2406,7 @@ impl Tree {
             output_buffer_length,
             file_name: "*".to_string(),
         };
-        let credit_charge =
-            CreditCharge((output_buffer_length as u64).div_ceil(65536).max(1) as u16);
+        let credit_charge = CreditCharge(credits::charge_for_payload(output_buffer_length as u64));
 
         let frame = conn
             .execute_with_credits(
@@ -2997,7 +2996,7 @@ impl Tree {
                         reserve_write_budget_or_drain(conn, data_len, &mut in_flight_futs).await;
                     match step {
                         WriteBudgetStep::Granted(permit) => {
-                            let cc = data_len.div_ceil(65536).max(1) as u16;
+                            let cc = credits::charge_for_payload(data_len);
                             let c = conn.clone();
                             let tree_id = self.tree_id;
                             let req = WriteRequest {

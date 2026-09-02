@@ -1293,7 +1293,7 @@ impl SmbClient {
                 data: chunk.to_vec(),
             };
 
-            let credit_charge = (chunk_size as u64).div_ceil(65536).max(1) as u16;
+            let credit_charge = credits::charge_for_payload(chunk_size as u64);
             let frame = self
                 .conn
                 .execute_with_credits(
