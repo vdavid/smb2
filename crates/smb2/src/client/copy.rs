@@ -559,7 +559,7 @@ impl SmbClient {
         dest_path: &str,
     ) -> Result<u64> {
         let t = tree.clone();
-        let conn = self.connection_for_tree(&t);
+        let conn = self.connection_for_tree(&t)?;
         t.server_side_copy_file(conn, source_path, dest_path).await
     }
 
@@ -579,7 +579,7 @@ impl SmbClient {
         length: u64,
     ) -> Result<u64> {
         let t = tree.clone();
-        let conn = self.connection_for_tree(&t);
+        let conn = self.connection_for_tree(&t)?;
         t.server_side_copy_file_range(
             conn,
             source_path,
