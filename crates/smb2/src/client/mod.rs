@@ -177,6 +177,28 @@ impl connection::SessionReviver for ClientReviver {
     }
 }
 
+/// Turn on encryption for a share that asked for it
+/// (`SMB2_SHAREFLAG_ENCRYPT_DATA`), if it is not on already.
+///
+/// ❌ **Every tree connect goes through here.** A share that asked to be
+/// encrypted and is not is a data-confidentiality bug, not a convenience gap,
+/// and a DFS target share is exactly as entitled to it as the one the caller
+/// named. Falls back to AES-128-CCM when the server sent no encryption
+/// negotiate context, the same fallback session-level encryption makes.
+fn activate_share_encryption(conn: &mut Connection, session: &Session, tree: &Tree) {
+    if !tree.encrypt_data || conn.should_encrypt() {
+        return;
+    }
+    let (Some(enc_key), Some(dec_key)) = (&session.encryption_key, &session.decryption_key) else {
+        return;
+    };
+    let cipher = conn
+        .params()
+        .and_then(|p| p.cipher)
+        .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
+    conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
+}
+
 /// A connection to a specific server with its authenticated session.
 ///
 /// Used for DFS cross-server referrals where the client needs connections
@@ -310,24 +332,7 @@ impl SmbClient {
         self.refresh_session();
         let mut tree = Tree::connect(&mut self.conn, share_name).await?;
         tree.server = self.primary_server.clone();
-
-        // Activate encryption if the share requires it and it's not already active.
-        // Fall back to AES-128-CCM if the server didn't send an encryption
-        // negotiate context (same fallback as session-level encryption).
-        if tree.encrypt_data && !self.conn.should_encrypt() {
-            if let (Some(ref enc_key), Some(ref dec_key)) =
-                (&self.session.encryption_key, &self.session.decryption_key)
-            {
-                let cipher = self
-                    .conn
-                    .params()
-                    .and_then(|p| p.cipher)
-                    .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
-                self.conn
-                    .activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
-            }
-        }
-
+        activate_share_encryption(&mut self.conn, &self.session, &tree);
         Ok(tree)
     }
 
@@ -619,21 +624,28 @@ impl SmbClient {
 
     /// Ensure a tree-connect exists for the given server and share.
     async fn ensure_tree(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
-        let conn = if target_addr == self.primary_server {
-            &mut self.conn
-        } else {
-            &mut self
-                .extra_connections
-                .get_mut(target_addr)
-                .ok_or_else(|| Error::invalid_data("DFS: no connection for target"))?
-                .conn
-        };
+        // `tree.server` is the full addr:port, so `connection_for_tree` can
+        // tell apart targets sharing a hostname on different ports (Docker
+        // port-mapped containers, for one).
+        //
+        // Two branches rather than one, because the primary connection's
+        // session lives beside it on `self` while an extra connection carries
+        // its own, authenticated separately.
+        if target_addr == self.primary_server {
+            self.refresh_session();
+            let mut tree = Tree::connect(&mut self.conn, share).await?;
+            tree.server = target_addr.to_string();
+            activate_share_encryption(&mut self.conn, &self.session, &tree);
+            return Ok(tree);
+        }
 
-        let mut tree = Tree::connect(conn, share).await?;
-        // Override server to the full addr:port so connection_for_tree
-        // can distinguish targets that share the same hostname but
-        // use different ports (for example, Docker port-mapped containers).
+        let entry = self
+            .extra_connections
+            .get_mut(target_addr)
+            .ok_or_else(|| Error::invalid_data("DFS: no connection for target"))?;
+        let mut tree = Tree::connect(&mut entry.conn, share).await?;
         tree.server = target_addr.to_string();
+        activate_share_encryption(&mut entry.conn, &entry.session, &tree);
         Ok(tree)
     }
 
@@ -1426,6 +1438,7 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
 mod tests {
     use super::*;
     use crate::client::connection::pack_message;
+    use crate::client::test_helpers::build_tree_connect_response;
     use crate::msg::header::Header;
     use crate::msg::negotiate::{NegotiateContext, NegotiateResponse, HASH_ALGORITHM_SHA512};
     use crate::msg::session_setup::{SessionFlags, SessionSetupResponse};
@@ -1575,6 +1588,122 @@ mod tests {
         };
 
         SmbClient::from_parts(config, conn, session)
+    }
+
+    /// A TREE_CONNECT response for a share that demands encryption.
+    fn build_encrypting_tree_connect_response(tree_id: TreeId) -> Vec<u8> {
+        let mut h = Header::new_request(Command::TreeConnect);
+        h.flags.set_response();
+        h.credits = 32;
+        h.tree_id = Some(tree_id);
+
+        let body = crate::msg::tree_connect::TreeConnectResponse {
+            share_type: ShareType::Disk,
+            share_flags: crate::types::flags::ShareFlags::new(
+                crate::types::flags::ShareFlags::ENCRYPT_DATA,
+            ),
+            capabilities: crate::types::flags::ShareCapabilities::default(),
+            maximal_access: 0x001F_01FF,
+        };
+        pack_message(&h, &body)
+    }
+
+    /// A session with SMB 3.x encryption keys, which is what session setup
+    /// produces on a dialect that supports encryption.
+    fn session_with_keys(session_id: SessionId) -> Session {
+        Session {
+            session_id,
+            signing_key: vec![0x11; 16],
+            encryption_key: Some(vec![0x22; 16]),
+            decryption_key: Some(vec![0x33; 16]),
+            signing_algorithm: crate::crypto::signing::SigningAlgorithm::HmacSha256,
+            should_sign: false,
+            should_encrypt: false,
+        }
+    }
+
+    /// Put an extra connection in the DFS pool, the way a redirect to another
+    /// server does.
+    fn pool_extra_connection(client: &mut SmbClient, addr: &str, mock: &Arc<MockTransport>) {
+        let conn = crate::client::test_helpers::setup_connection(mock);
+        client.extra_connections.insert(
+            addr.to_string(),
+            ConnectionEntry {
+                conn,
+                session: session_with_keys(SessionId(0x99)),
+            },
+        );
+    }
+
+    /// A DFS target share that asks for encryption gets it.
+    ///
+    /// `ensure_tree` is the path every DFS target goes through, and it skipped
+    /// the activation `connect_share` does — so a target share carrying
+    /// `SMB2_SHAREFLAG_ENCRYPT_DATA` moved the user's files in the clear.
+    /// Both now go through `activate_share_encryption`.
+    #[tokio::test]
+    async fn a_dfs_target_share_that_asks_for_encryption_gets_it() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        let target_mock = Arc::new(MockTransport::new());
+        pool_extra_connection(&mut client, "dfs-target:445", &target_mock);
+
+        target_mock.queue_response(build_encrypting_tree_connect_response(TreeId(5)));
+        let tree = client
+            .ensure_tree("dfs-target:445", "secret")
+            .await
+            .expect("tree connect to the DFS target failed");
+
+        assert!(tree.encrypt_data);
+        assert!(
+            client.extra_connections["dfs-target:445"]
+                .conn
+                .should_encrypt(),
+            "a DFS target share flagged SMB2_SHAREFLAG_ENCRYPT_DATA must be encrypted"
+        );
+    }
+
+    /// A target share that did not ask for encryption does not get it, so the
+    /// fix above cannot have quietly become "encrypt everything".
+    #[tokio::test]
+    async fn a_dfs_target_share_that_did_not_ask_is_left_alone() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        let target_mock = Arc::new(MockTransport::new());
+        pool_extra_connection(&mut client, "dfs-target:445", &target_mock);
+
+        target_mock.queue_response(build_tree_connect_response(TreeId(5), ShareType::Disk));
+        client.ensure_tree("dfs-target:445", "plain").await.unwrap();
+
+        assert!(!client.extra_connections["dfs-target:445"]
+            .conn
+            .should_encrypt());
+    }
+
+    /// Without keys there is nothing to encrypt with, and silently pretending
+    /// otherwise would be worse than leaving it off.
+    #[tokio::test]
+    async fn an_encrypting_share_without_session_keys_is_left_alone() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x78)).await;
+
+        let keyless = Session {
+            encryption_key: None,
+            decryption_key: None,
+            ..session_with_keys(SessionId(0x78))
+        };
+        let tree = Tree {
+            tree_id: TreeId(1),
+            share_name: "secret".to_string(),
+            server: "test-server:445".to_string(),
+            is_dfs: false,
+            encrypt_data: true,
+        };
+
+        activate_share_encryption(client.connection_mut(), &keyless, &tree);
+        assert!(!client.connection_mut().should_encrypt());
     }
 
     #[tokio::test]
