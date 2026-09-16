@@ -289,6 +289,23 @@ pub struct DfsCacheEntry {
     pub path_prefix: String,
     /// Number of failover targets the server returned.
     pub target_count: usize,
+    /// Which target is tried first: the last one that worked (MS-DFSC
+    /// § 3.1.1 TargetHint). `0` until a failover moves it.
+    pub target_hint: usize,
+    /// Whether the referral named DFS *root* targets (`ServerType = 1`).
+    ///
+    /// Read it as a fact about the server's answer, not as a verdict: Samba
+    /// reports `false` for a namespace root that Windows reports `true` for,
+    /// and nothing in this crate gates on it.
+    pub root_targets: bool,
+    /// The referral points into another DFS namespace, so reaching a target
+    /// means resolving it again as a fresh path (§ 3.1.5.4.5).
+    pub interlink: bool,
+    /// The server enabled target failback for this namespace (V4 only).
+    ///
+    /// This crate does not implement failback, so a `true` here explains why
+    /// the client stays on a target it failed over to.
+    pub target_failback: bool,
     /// Remaining time-to-live. `None` if the entry has already expired
     /// (cache eviction is lazy: expired entries linger until the next
     /// `resolve()` for an overlapping prefix).

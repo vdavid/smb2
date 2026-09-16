@@ -212,6 +212,18 @@ impl DfsReferralEntry {
         }
     }
 
+    /// `ServerType`, for the two variants that carry one.
+    ///
+    /// ❌ **Never gate on it.** MS-DFSC § 3.1.1 keeps it as `RootOrLink` for
+    /// deciding what to do *next*, and Samba reports 0 for a root referral
+    /// where Windows reports 1.
+    pub fn server_type(&self) -> Option<u16> {
+        match self {
+            Self::V1 { server_type, .. } | Self::Target { server_type, .. } => Some(*server_type),
+            Self::NameList { .. } => None,
+        }
+    }
+
     /// Caching lifetime in seconds. V1 carries none, and reports 0.
     pub fn ttl(&self) -> u32 {
         match self {

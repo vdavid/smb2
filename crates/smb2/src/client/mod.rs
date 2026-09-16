@@ -566,6 +566,9 @@ impl SmbClient {
             // Get or create tree on the target share.
             match self.ensure_tree(&target_addr, &resolved.share).await {
                 Ok(new_tree) => {
+                    // Remember which target worked, so a failover survives
+                    // the next lookup instead of re-walking the dead one.
+                    self.dfs_resolver.note_target_worked(resolved);
                     // Update the caller's tree in-place.
                     *tree = new_tree;
                     // Back into caller-path form: the retry goes through the
