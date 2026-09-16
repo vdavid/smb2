@@ -121,14 +121,20 @@ src/
     fault_injection_tests.rs # Hostile-but-plausible servers: one that goes silent, one that goes away and comes back
 
 tests/
-  pack_roundtrip.rs       # Property-based tests for pack/unpack
-  msg_wire_format.rs      # Test messages against known byte sequences
-  protocol_flow.rs        # Negotiate -> session -> tree -> file flows (mock)
+  wire_format_captures.rs # Messages against known byte sequences from real captures
+  concurrent_writes.rs    # Many writers over one connection
+  diagnostics_snapshot.rs # The diagnostics tree's shape and consistency model
+  fuzz_seeds.rs           # Generates the committed fuzz corpus (#[ignore])
   integration.rs          # Tests against real NAS/Pi (#[ignore])
   docker_integration.rs   # Tests against Docker Samba containers (#[ignore])
   consumer_integration.rs # Tests against consumer Docker containers (#[ignore])
   docker/                 # Docker infrastructure for smb2's own integration tests
     internal/             # Internal-suite containers (consumer fixtures live in src/testing/fixtures/)
+
+Mock-transport protocol flows (negotiate -> session -> tree -> file, DFS
+resolution, reconnection) live beside the code they exercise, in each module's
+own `#[cfg(test)] mod tests`. `pack_roundtrip.rs` and `protocol_flow.rs` are
+gone; `src/pack/` and `src/client/` carry that coverage now.
 
 examples/
   list_shares.rs          # Connect and enumerate shares
@@ -301,7 +307,7 @@ starts one container rather than 16.
 
 ### Docker test containers
 
-15 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+17 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
@@ -318,8 +324,10 @@ starts one container rather than 16.
 | smb-maxreadsize       | 10454 | 64 KB max read/write, chunking edge cases     |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
 | smb-weirdnames        | 10459 | Names carrying SMB2-illegal characters, seeded as the exact private-use bytes macOS writes |
-| smb-dfs-root          | 10456 | DFS namespace root with msdfs link            |
+| smb-dfs-root          | 10456 | DFS *link* inside a real, tree-connectable share (the `STATUS_PATH_NOT_COVERED` path) |
 | smb-dfs-target        | 10457 | DFS target server with actual files            |
+| smb-dfs-namespace     | 10460 | DFS *namespace root*: `msdfs proxy` makes TreeConnect refuse with `STATUS_BAD_NETWORK_NAME`, and only a V3 root referral over IPC$ says where the storage is. Plus a plain share, so a test can prove an ordinary connect still costs nothing |
+| smb-dfs-failover      | 10461 | Two root targets, the first unreachable: multi-target failover and the `TargetHint` that remembers which one worked |
 
 ### Consumer test containers
 
@@ -480,6 +488,18 @@ their own (for example, `env_logger`). The `env_logger` dev-dependency is only u
 
 Agents MUST read the actual spec files, not work from memory. Protocol specs are dense and full of edge cases that are
 easy to get wrong.
+
+**The corpus is a local checkout under `related-repos/`, which is gitignored, so a fresh clone does not have it.** The
+markdown lives on the **`publish`** branch of `awakecoding/openspecs`, not on the `main` branch that a plain `git clone`
+gives you — clone `main` and the `skills/windows-protocols/` tree below is empty, which is exactly what it looked like
+on 2026-09-16. Fetch just what you need instead:
+
+```sh
+S=MS-DFSC  # or MS-SMB2, MS-ERREF, MS-DTYP, MS-FSCC, MS-NLMP
+mkdir -p related-repos/openspecs/skills/windows-protocols/$S
+curl -sfL "https://raw.githubusercontent.com/awakecoding/openspecs/publish/$S/$S.md" \
+  -o "related-repos/openspecs/skills/windows-protocols/$S/$S.md"
+```
 
 - Implementation plan: `docs/specs/implementation-plan.md`
 - DFS: `docs/specs/dfs-implementation-plan.md` (the reactive link path, shipped) and

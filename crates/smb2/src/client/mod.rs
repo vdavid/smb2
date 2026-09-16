@@ -2068,13 +2068,27 @@ mod tests {
         )
     }
 
-    /// A V3 root referral naming one target per `targets`.
+    /// A Samba-shaped V3 root referral: `ServerType = 0`.
     fn build_root_referral(namespace: &str, targets: &[&str], header_flags: u32) -> Vec<u8> {
+        build_referral(3, 0, namespace, targets, header_flags)
+    }
+
+    /// A referral at a chosen version and `ServerType`, wrapped in an IOCTL
+    /// response.
+    fn build_referral(
+        version: u16,
+        server_type: u16,
+        namespace: &str,
+        targets: &[&str],
+        header_flags: u32,
+    ) -> Vec<u8> {
         let entries: Vec<(&str, &str, &str, u32)> = targets
             .iter()
             .map(|t| (namespace, namespace, *t, 600u32))
             .collect();
-        let payload = crate::client::dfs::tests::pack_dfs_referral_response(
+        let payload = crate::client::dfs::tests::pack_referral(
+            version,
+            server_type,
             (namespace.encode_utf16().count() * 2) as u16,
             header_flags,
             &entries,
@@ -2148,6 +2162,56 @@ mod tests {
             }),
             "the caller's own name for the namespace has to survive the redirect"
         );
+    }
+
+    /// Windows and Samba answer the *same* root referral differently, and both
+    /// must resolve identically.
+    ///
+    /// Windows sets `ServerType = 1` and both header bits (MS-DFSC § 4.3,
+    /// § 4.6); Samba answers `ServerType = 0` and StorageServers alone
+    /// (verified against Samba 4.20.6, 2026-09-16). ❌ Nothing may gate on
+    /// `ServerType`: a client that requires 1 works against Windows and
+    /// silently refuses every Samba namespace. The Docker fixtures only ever
+    /// produce the Samba shape, so this is the side they cannot cover.
+    #[tokio::test]
+    async fn windows_and_samba_shaped_root_referrals_resolve_the_same() {
+        // (version, server_type, header_flags)
+        let shapes = [
+            (4u16, 1u16, 0x03u32, "Windows"),
+            (3, 0, 0x02, "Samba"),
+            // A Windows-shaped V3, which § 4.3's text also allows.
+            (3, 1, 0x03, "Windows V3"),
+        ];
+
+        for (version, server_type, header_flags, who) in shapes {
+            let mock = Arc::new(MockTransport::new());
+            let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+            mock.queue_response(build_tree_connect_refusal(
+                NtStatus::BAD_NETWORK_NAME,
+                false,
+            ));
+            mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+            mock.queue_response(build_referral(
+                version,
+                server_type,
+                r"\test-server\aleu",
+                &[r"\test-server\aleu_dfs"],
+                header_flags,
+            ));
+            mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
+
+            let tree = client
+                .connect_share("aleu")
+                .await
+                .unwrap_or_else(|e| panic!("a {who}-shaped root referral must resolve: {e}"));
+            assert_eq!(tree.share_name, "aleu_dfs", "{who}");
+            assert_eq!(
+                tree.dfs_origin.as_ref().map(|o| o.requested.as_str()),
+                Some(r"\\test-server\aleu"),
+                "{who}"
+            );
+        }
     }
 
     /// ❌ A failed referral must not replace the original error. The

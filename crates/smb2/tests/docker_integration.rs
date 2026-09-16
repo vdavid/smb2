@@ -28,6 +28,8 @@ const ENCRYPTION_AES128_ADDR: &str = "127.0.0.1:10455";
 const WEIRDNAMES_ADDR: &str = "127.0.0.1:10459";
 const DFS_ROOT_ADDR: &str = "127.0.0.1:10456";
 const DFS_TARGET_ADDR: &str = "127.0.0.1:10457";
+const DFS_NAMESPACE_ADDR: &str = "127.0.0.1:10460";
+const DFS_FAILOVER_ADDR: &str = "127.0.0.1:10461";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -4919,5 +4921,205 @@ async fn concurrent_connects_all_finish_their_handshake() {
          hanging for 30 s and then giving up:\n  {}",
         failures.len(),
         failures.join("\n  ")
+    );
+}
+
+// ── DFS namespace roots (smb-dfs-namespace:10460, smb-dfs-failover:10461) ──
+//
+// A namespace root is a name that is NOT a tree-connectable share: TREE_CONNECT
+// is refused with STATUS_BAD_NETWORK_NAME and only a ROOT referral over IPC$
+// says where the storage is. That is the shape a domain-based DFS namespace has
+// in the field, and it is the one `smb-dfs-root` (the *link* fixture) cannot
+// reproduce, because its `[dfs]` is a real share.
+//
+// Samba serves it with `msdfs root = yes` + `msdfs proxy`, and smbd says so in
+// as many words: "refusing connection to dfs proxy share".
+//
+// ⚠️ These fixtures are the STRICTER of the two shapes for our accept-anything
+// reading: Samba answers `ServerType = 0` with header flags `0x02`, where
+// Windows answers `1` and `0x03` (MS-DFSC § 4.3, § 4.6). They would not catch a
+// regression that started demanding the Windows values. The two mock tests in
+// `protocol_flow.rs` cover that side.
+
+/// A client pointed at the namespace server, with the referral target mapped
+/// back to its port on the host.
+async fn dfs_namespace_client(addr: &str) -> SmbClient {
+    let mut overrides = HashMap::new();
+    overrides.insert("smb-dfs-target".to_string(), DFS_TARGET_ADDR.to_string());
+    SmbClient::connect(ClientConfig {
+        addr: addr.to_string(),
+        timeout: TIMEOUT,
+        username: String::new(),
+        password: String::new(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: overrides,
+    })
+    .await
+    .unwrap_or_else(|e| panic!("SmbClient::connect to {addr} failed: {e}"))
+}
+
+/// The headline. Before this, `connect_share` on a namespace root returned
+/// "the share does not exist", which is the one thing that is not true.
+#[tokio::test]
+#[ignore]
+async fn dfs_namespace_root_connects_through_a_referral() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
+    let tree = client
+        .connect_share("aleu")
+        .await
+        .expect("the namespace root must resolve to its target");
+
+    // The tree really sits on the target server, not the namespace server.
+    assert_eq!(tree.server, DFS_TARGET_ADDR);
+    assert_eq!(tree.share_name, "files");
+
+    // And it remembers what the caller actually asked for.
+    let origin = tree
+        .dfs_origin
+        .as_ref()
+        .expect("a redirected tree must carry its origin");
+    assert_eq!(origin.requested, r"\\127.0.0.1\aleu");
+    assert_eq!(origin.target, r"\\smb-dfs-target\files");
+}
+
+/// The referral is not just a connect: the files behind it are readable.
+#[tokio::test]
+#[ignore]
+async fn dfs_namespace_root_reads_a_file_from_the_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
+    let mut tree = client.connect_share("aleu").await.expect("connect_share");
+
+    let data = client
+        .read_file(&mut tree, "hello.txt")
+        .await
+        .expect("read through the namespace root");
+    assert_eq!(
+        String::from_utf8_lossy(&data).trim(),
+        "Hello from DFS target!"
+    );
+
+    let entries = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list through the namespace root");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"hello.txt"), "got {names:?}");
+}
+
+/// MS-DFSC § 3.1.4.1 step 2: a known namespace goes straight to its target, so
+/// the refused TREE_CONNECT and the referral are paid once per TTL rather than
+/// once per connect.
+#[tokio::test]
+#[ignore]
+async fn dfs_namespace_root_is_cached_after_the_first_connect() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
+    client.connect_share("aleu").await.expect("first connect");
+    let after_first = client.diagnostics().client.metrics.dfs_referrals_resolved;
+    assert_eq!(after_first, 1, "the first connect resolves one referral");
+
+    let tree = client.connect_share("aleu").await.expect("second connect");
+    assert!(tree.dfs_origin.is_some());
+
+    let metrics = client.diagnostics().client.metrics;
+    assert_eq!(
+        metrics.dfs_referrals_resolved, 1,
+        "the second connect must not ask for another referral"
+    );
+    assert!(metrics.dfs_cache_hits >= 1);
+
+    // And the cache says what it knows about the namespace.
+    let cache = client.diagnostics().dfs_cache;
+    assert_eq!(cache.len(), 1, "one namespace, one entry");
+    assert!(
+        !cache[0].interlink,
+        "a plain root referral is not an interlink"
+    );
+}
+
+/// An ordinary share on the same server still tree-connects directly. The
+/// namespace machinery must not become a tax on every connect.
+#[tokio::test]
+#[ignore]
+async fn an_ordinary_share_on_a_namespace_server_connects_directly() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
+    let tree = client.connect_share("plain").await.expect("connect_share");
+
+    assert_eq!(tree.server, DFS_NAMESPACE_ADDR);
+    assert!(
+        tree.dfs_origin.is_none(),
+        "an ordinary share was not redirected anywhere"
+    );
+    assert_eq!(
+        client.diagnostics().client.metrics.dfs_referrals_resolved,
+        0,
+        "no referral should have been asked for"
+    );
+}
+
+/// ❌ A failed referral must not replace the original error. A share that is
+/// genuinely missing comes back as STATUS_BAD_NETWORK_NAME, not as anything
+/// about DFS — telling someone who mistyped a share name about namespaces is
+/// worse than telling them nothing.
+#[tokio::test]
+#[ignore]
+async fn a_missing_share_on_a_dfs_server_still_reports_a_missing_share() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_namespace_client(DFS_NAMESPACE_ADDR).await;
+    let err = client
+        .connect_share("no-such-share")
+        .await
+        .expect_err("a share that isn't there must fail");
+
+    assert_eq!(
+        err.status(),
+        Some(smb2::types::status::NtStatus::BAD_NETWORK_NAME),
+        "expected the original refusal, got {err:?}"
+    );
+    assert_eq!(err.kind(), smb2::ErrorKind::NotFound);
+}
+
+/// Two root targets with the first unreachable: a client that stops at the
+/// first one never reaches the files.
+#[tokio::test]
+#[ignore]
+async fn dfs_namespace_root_falls_through_to_a_live_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_namespace_client(DFS_FAILOVER_ADDR).await;
+    let mut tree = client
+        .connect_share("aleu")
+        .await
+        .expect("the second target must be reached");
+
+    assert_eq!(tree.server, DFS_TARGET_ADDR, "landed on the live target");
+    let data = client
+        .read_file(&mut tree, "hello.txt")
+        .await
+        .expect("read from the target we failed over to");
+    assert_eq!(
+        String::from_utf8_lossy(&data).trim(),
+        "Hello from DFS target!"
+    );
+
+    // § 3.1.1 TargetHint: the working target is remembered, so the next
+    // lookup does not re-walk the dead one.
+    let cache = client.diagnostics().dfs_cache;
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache[0].target_count, 2, "the referral offered two targets");
+    assert_eq!(
+        cache[0].target_hint, 1,
+        "the second one is the one that works"
     );
 }

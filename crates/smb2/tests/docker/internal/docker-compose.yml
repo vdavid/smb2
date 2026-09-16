@@ -97,3 +97,15 @@ services:
       context: smb-dfs-target
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10457:445"
+
+  smb-dfs-namespace:
+    build:
+      context: smb-dfs-namespace
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10460:445"
+
+  smb-dfs-failover:
+    build:
+      context: smb-dfs-failover
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10461:445"

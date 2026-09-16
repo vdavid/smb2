@@ -660,7 +660,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{build_tree_connect_response, setup_connection};
-    use crate::msg::dfs::DfsReferralEntry;
+    use crate::msg::dfs::{DfsReferralEntry, ReferralEntryFlags};
     use crate::msg::header::{ErrorResponse, Header};
     use crate::msg::ioctl::IoctlResponse as IoctlResp;
     use crate::msg::tree_connect::ShareType;
@@ -699,15 +699,30 @@ pub(crate) mod tests {
         pack_message(&h, &body)
     }
 
-    /// Pack a known DFS referral response into bytes.
-    ///
-    /// Builds a V3 referral with the given entries.
+    /// Pack a Samba-shaped V3 referral: `ServerType = 0`, whatever header
+    /// flags the caller gives.
     pub(crate) fn pack_dfs_referral_response(
         path_consumed: u16,
         header_flags: u32,
         entries: &[(&str, &str, &str, u32)], // (dfs_path, alt_path, net_addr, ttl)
     ) -> Vec<u8> {
-        // We build a V3 referral response manually.
+        pack_referral(3, 0, path_consumed, header_flags, entries)
+    }
+
+    /// Pack a referral at a chosen version and `ServerType`.
+    ///
+    /// The two shapes that matter are Samba's (V3, `ServerType = 0`, header
+    /// flags `0x02`) and Windows' (V4, `ServerType = 1`, `0x03`, and
+    /// TargetSetBoundary on the first entry, which MS-DFSC § 2.2.5.4 requires
+    /// of a V4 response). The V4 entry layout is identical to V3's.
+    pub(crate) fn pack_referral(
+        version: u16,
+        server_type: u16,
+        path_consumed: u16,
+        header_flags: u32,
+        entries: &[(&str, &str, &str, u32)], // (dfs_path, alt_path, net_addr, ttl)
+    ) -> Vec<u8> {
+        // We build the referral response manually.
         // Entry fixed size: 4 (version+size) + 2+2+4 (server_type+flags+ttl)
         //   + 2+2+2 (offsets) + 16 (guid) = 34 bytes
         let entry_fixed_size: u16 = 34;
@@ -767,10 +782,16 @@ pub(crate) mod tests {
         for (i, (_, _, _, ttl)) in entries.iter().enumerate() {
             let (dfs_off, alt_off, net_off) = per_entry_offsets[i];
 
-            buf.extend_from_slice(&3u16.to_le_bytes()); // version = 3
+            buf.extend_from_slice(&version.to_le_bytes());
             buf.extend_from_slice(&entry_fixed_size.to_le_bytes()); // size
-            buf.extend_from_slice(&0u16.to_le_bytes()); // server_type
-            buf.extend_from_slice(&0u16.to_le_bytes()); // referral_entry_flags
+            buf.extend_from_slice(&server_type.to_le_bytes());
+            // § 2.2.5.4: the first entry of a V4 response MUST open a target set.
+            let entry_flags = if version == 4 && i == 0 {
+                ReferralEntryFlags::TARGET_SET_BOUNDARY
+            } else {
+                0
+            };
+            buf.extend_from_slice(&entry_flags.to_le_bytes());
             buf.extend_from_slice(&ttl.to_le_bytes()); // ttl
             buf.extend_from_slice(&dfs_off.to_le_bytes());
             buf.extend_from_slice(&alt_off.to_le_bytes());
