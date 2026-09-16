@@ -482,6 +482,8 @@ Agents MUST read the actual spec files, not work from memory. Protocol specs are
 easy to get wrong.
 
 - Implementation plan: `docs/specs/implementation-plan.md`
+- DFS: `docs/specs/dfs-implementation-plan.md` (the reactive link path, shipped) and
+  `docs/specs/dfs-namespace-root-plan.md` (namespace roots, referral-parser gaps, and the TCP connect budget)
 - MS-SMB2 spec: `related-repos/openspecs/skills/windows-protocols/MS-SMB2/MS-SMB2.md`
 - MS-ERREF (NTSTATUS codes): `related-repos/openspecs/skills/windows-protocols/MS-ERREF/MS-ERREF.md`
 - MS-DTYP (data types): `related-repos/openspecs/skills/windows-protocols/MS-DTYP/MS-DTYP.md`

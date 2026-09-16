@@ -212,6 +212,12 @@ Reactive DFS resolution with multi-target failover. When a convenience method ge
 - `dfs_enabled` flag on `ClientConfig` (default `true`) gates all DFS resolution
 - Borrow checker requires inlining the connection lookup in `handle_dfs_redirect` to avoid double `&mut self` borrows
 
+**Gotcha — a DFS namespace root never reaches this path.** `\\<domain>\<namespace>` is not a share on the server
+answering that name, so its TreeConnect fails with `STATUS_BAD_NETWORK_NAME` (MS-SMB2 § 3.3.5.7) and
+`STATUS_PATH_NOT_COVERED` is never returned. Resolving it needs a ROOT referral issued *before or instead of* the tree
+connect, which this crate does not do yet. Design, evidence, and the referral-parser gaps it exposes:
+`docs/specs/dfs-namespace-root-plan.md`.
+
 ## Watcher pipelining
 
 `Watcher` keeps **one CHANGE_NOTIFY request pre-issued on the wire at all times** after the first `next_events()` call. The wire never sits idle between responses. This closes the response→re-arm loss window that strict servers (older Samba builds, NAS firmware) drop events through.
