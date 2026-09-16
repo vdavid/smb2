@@ -34,7 +34,8 @@ we have more control to reach even better speeds.
 - Streaming downloads and uploads with progress reporting and cancellation
 - File watching (CHANGE_NOTIFY for live directory updates)
 - Disk space queries (total, free, used)
-- DFS path resolution (standalone DFS with transparent referral follow-through)
+- DFS: namespace roots (`\\domain\namespace`), links inside a share, and multi-target failover, all resolved
+  transparently
 - Reconnection after network failures
 - Auto-flush on writes (data safety for family photos and company docs)
 - Filenames carrying characters SMB2 forbids (`?`, `*`, `"`, `:`, `<`, `>`, `\`, `|`, a trailing space or period),
@@ -81,8 +82,13 @@ Two things to know:
 
 Not yet supported:
 
-- **Domain-based DFS**: standalone DFS links work; AD domain-based namespaces aren't supported yet
-- **DFS target failback**: uses the first reachable target; no automatic failback to preferred targets
+- **Listing the namespaces a domain hosts**: a domain name legitimately has zero disk shares, and MS-DFSC has no
+  operation that enumerates its namespaces — that lives in MS-DFSNM, a different protocol. Open a namespace by name
+  and it works; there is no way to discover its name from here.
+- **NetBIOS-only domain names**: a domain name DNS cannot resolve needs a DC referral against a domain-joined
+  client's cache, which a client that isn't domain-joined never has.
+- **DFS target failback**: uses the first reachable target and remembers it; no automatic failback to a preferred
+  target that comes back up.
 - **Multi-channel**: single TCP connection per client
 - **QUIC/RDMA transport**: TCP only (covers ~99% of use cases)
 

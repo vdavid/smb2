@@ -5,6 +5,46 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **`DfsReferralEntry` is a sum type over the three tails MS-DFSC defines**, rather than one struct flattening V2–V4. A field a given shape doesn't carry can no longer be read off it: `V1 { server_type, share_name }` has no DFS path and no TTL, `Target { .. }` is a V2/V3/V4 target, and `NameList { .. }` is a domain or DC referral. `RespGetDfsReferral::header_flags` is a typed `ReferralHeaderFlags` rather than a bare `u32`, and an entry's flags are a typed `ReferralEntryFlags`. Accessors (`version()`, `target_address()`, `dfs_path()`, `ttl()`, `flags()`, `server_type()`) cover what most code wants without matching.
+- **`Tree` is `#[non_exhaustive]`**, so an external struct literal no longer compiles. Only the library ever produces one, so nothing of value is lost and every later field is free — starting with `dfs_origin`, below. `Tree` also derives `Debug` now.
+- **`TcpTransport::connect` gains a `+ Display` bound** on its address argument, so a failed connect can name what it tried to reach. `&str`, `String`, and `SocketAddr` satisfy it; a `(&str, u16)` tuple does not.
+
+### Added
+
+- **DFS namespace roots resolve, which nothing could open before.** `\\<domain>\<namespace>` is MS-DFSC § 2.2.1.4's *preferred* form for a domain-based namespace, and it is not a share on the server answering that name — so `TREE_CONNECT` is refused with `STATUS_BAD_NETWORK_NAME`, and the existing DFS support keys off `STATUS_PATH_NOT_COVERED`, which a server can only send once a share has tree-connected. To a consumer it read as "the server exists, the share does not", which is the one thing that isn't true.
+  - `SmbClient::connect_share` now checks the referral cache first, otherwise tree-connects as before, and on a refusal from a server that advertised `SMB2_GLOBAL_CAP_DFS` asks for a ROOT referral and connects the target it names, on whichever server that turns out to be. Interlinks (§ 3.1.5.4.5) are followed by re-resolving, bounded at eight hops.
+  - ❌ **A failed referral never replaces the original error.** The overwhelmingly common cause of `STATUS_BAD_NETWORK_NAME` is a mistyped share name, and telling that person about DFS is worse than telling them nothing. The only outcome that reports differently is `Error::DfsNoReachableTarget`: the namespace is real, we found it, its storage is out of reach.
+  - A namespace resolved once is cached, so the refused tree connect and the referral are paid once per TTL rather than once per connect. An ordinary share on a DFS-capable server still costs exactly one tree connect.
+
+- **`Tree::dfs_origin: Option<DfsOrigin>`** carries both the name the caller asked for and the target the tree landed on. Show `requested`, not `server`: a person who typed `\\lgs-net.com\aleu` should not be shown `\\fs01\aleu_dfs`, and macOS reports `SERVER_NAME lgs-net.com` for exactly this mount.
+
+- **`ConnectOptions` + `TcpTransport::connect_with` / `Connection::connect_with`**, and `ClientConfig::connect_options`, for tuning how a connect is spread across a name's addresses.
+
+- **`ClientConfig` implements `Default`**, so the next field added to it isn't a breaking change for every caller writing a struct literal. Fill in `addr` and spread the rest.
+
+- **New error variants** (`Error` and `ErrorKind` are both `#[non_exhaustive]`, so this is not breaking): `DfsNoReachableTarget`, `DfsTooManyReferrals`, `ShareRedirected`, and `ConnectFailed { host, attempts }`.
+
+- **`DfsCacheEntry` reports what the resolver knows about a namespace**: which target is the hint, whether the referral named root targets, whether it is an Interlink, and whether the server enabled target failback.
+
+- **V1 referral entries parse**, and `NameListReferral` entries get their own branch. The request asks for `MaxReferralLevel = 4` and MS-DFSC § 2.2.2 says a client MUST support every version up to the one it asks for, so refusing V1 was a false claim on the wire. A NameList entry read as a target used to yield three plausible-looking strings from wherever the buffer happened to point, and never an error.
+
+### Fixed
+
+- **A DFS-resolved path no longer comes back lowercased.** The resolver normalized the whole input and then sliced the *normalized* string, so `Docs/Report.PDF` under a DFS prefix resolved to `docs\report.pdf` — the wrong file, or none at all, on a case-sensitive export. Matching stays case-insensitive, because DFS paths are; the path handed back is the caller's own.
+- **A cached DFS prefix no longer matches mid-component.** `\\dom\ns` used to swallow `\\dom\nsfoo\x` and route it to a server that had never heard of it. MS-DFSC § 3.1.4.1: "Whole path components are used in the match."
+- **A DFS target share that asked to be encrypted is no longer moved in the clear.** `connect_share` activated share encryption for `SMB2_SHAREFLAG_ENCRYPT_DATA`; the DFS target path did not.
+- **`auto_reconnect` now covers DFS target connections.** They were armed with no reviver and `recover_tree` refused any tree not on the primary connection — which on a namespace root is the only connection carrying the user's traffic.
+- **A DFS referral costs one frame instead of three.** It reused nothing: every referral tree-connected and tree-disconnected IPC$. MS-SMB2 § 3.2.4.20.3 permits any existing tree connect, so the connection keeps one.
+- **A referral bigger than 8 KiB no longer fails outright.** MS-DFSC § 3.1.5.4 says to retry with a bigger buffer; a namespace with many root targets needs it.
+- **A target that works is remembered** (§ 3.1.1 TargetHint), so a failover survives the next lookup instead of re-walking the dead target on every operation. The referral cache is also bounded now; it was keyed by server-supplied strings and grew forever.
+- **One dead address no longer eats the whole TCP connect budget.** `TcpStream::connect` walks every resolved address serially under one deadline, so a single blackholed address spent the entire budget and the live ones were never dialled — which is exactly what a multi-homed AD domain name looks like. Attempts are staggered now (RFC 8305's shape), with the families alternating, and `Error::ConnectFailed` says what each address did.
+- **Using a `Tree` whose DFS connection is gone is an error, not a panic.** `SmbClient::reconnect` drops every extra connection, and the next operation on a DFS-resolved tree hit an `.expect()` inside the library. It reports `Error::Disconnected`, whose documented response — reconnect, then `connect_share` again — is exactly right.
+- **A scale-out cluster redirect is no longer mistaken for a missing share.** MS-SMB2 § 2.2.2.2.2 reuses `STATUS_BAD_NETWORK_NAME` with an `SMB2_ERROR_ID_SHARE_REDIRECT` error context; it now reports as `Error::ShareRedirected`.
+
 ## [0.21.0] - 2026-09-02
 
 ### Breaking

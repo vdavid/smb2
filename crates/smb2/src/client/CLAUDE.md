@@ -194,29 +194,48 @@ Decision/Why — these are convenience, not throughput. Each item costs one roun
 
 ## DFS (Distributed File System) resolution
 
-Reactive DFS resolution with multi-target failover. When a convenience method gets `STATUS_PATH_NOT_COVERED` (mapped to `ErrorKind::DfsReferral`), it:
+**Two entry points, because a namespace root and a link fail in completely different places.** Design and evidence:
+`docs/specs/dfs-namespace-root-plan.md` (roots) and `docs/specs/dfs-implementation-plan.md` (links).
 
-1. Calls `handle_dfs_redirect()` which resolves the referral via `DfsResolver` (cache or IOCTL)
-2. Tries each target in the referral response (multi-target failover)
-3. Creates a new connection + session for cross-server targets via `ensure_connection()`
-4. Tree-connects to the target share via `ensure_tree()`
-5. Updates the caller's `&mut Tree` in-place to point to the new server/share
-6. Retries the operation with the resolved remaining path
+**A namespace root, at `connect_share`.** `\\<domain>\<namespace>` is not a share on the server answering that name,
+so its TreeConnect is refused with `STATUS_BAD_NETWORK_NAME` — required by MS-SMB2 § 3.3.5.7, so a contract rather than
+a quirk — and `STATUS_PATH_NOT_COVERED` is never returned. `connect_share` checks the referral cache first
+(§ 3.1.4.1 step 2), otherwise tree-connects, and on refusal asks for a ROOT referral and connects the target, following
+an Interlink by re-resolving and stopping at `MAX_DFS_HOPS`.
+
+**A link, at any convenience method.** `STATUS_PATH_NOT_COVERED` (mapped to `ErrorKind::DfsReferral`) sends
+`handle_dfs_redirect` to resolve the referral, connect the target, update the caller's `&mut Tree` in place, and retry
+with the resolved remaining path.
+
+- ❌ **A failed referral must never replace the original error.** The overwhelmingly common cause of
+  `STATUS_BAD_NETWORK_NAME` is a mistyped share name, and telling that person about DFS is worse than telling them
+  nothing. A referral that fails, is empty, or names nothing connectable gives back the refusal. The one exception is
+  `Error::DfsNoReachableTarget`: the namespace is real, and its storage is not reachable.
+- **The trigger is gated on the negotiated `SMB2_GLOBAL_CAP_DFS`**, so a plain NAS pays zero extra round-trips when
+  someone mistypes a share name.
+- ❌ **Never gate on `ServerType`.** Samba answers a root referral with `0` and header flags `0x02` where Windows
+  answers `1` and `0x03` (verified 2026-09-16). A client that requires the Windows values works against Windows and
+  silently refuses every Samba namespace. `RootOrLink` is stored, and decides what happens next, never whether to
+  accept the referral.
+- **`Error::ShareRedirected` is not a DFS case.** MS-SMB2 § 2.2.2.2.2 reuses `STATUS_BAD_NETWORK_NAME` with an
+  `SMB2_ERROR_ID_SHARE_REDIRECT` context for scale-out cluster redirection. `Tree::connect` separates it out, so the
+  namespace trigger can't fire on it by construction.
+- **`Tree::dfs_origin` keeps the caller's own name for a redirected tree.** Show `requested`, not `server`: a person
+  who typed `\\lgs-net.com\aleu` should not be shown `\\fs01\aleu_dfs`, and macOS reports `SERVER_NAME lgs-net.com`
+  for exactly this mount.
+- **`TargetHint`** (§ 3.1.1): the target that worked is tried first next time, so a failover survives the next lookup
+  instead of re-walking the dead target on every operation.
+- **A root target is `\\server\share` and nothing more** (§ 2.2.1.6). A target carrying a path suffix is skipped, not
+  silently truncated: a `Tree` cannot express one, and dropping it would open the wrong directory.
 
 **Key design decisions:**
 - Convenience methods take `&mut Tree` (not `&Tree`) so DFS can update the tree in-place
 - `disconnect_share` stays as `&Tree` (no redirect on teardown)
 - Streaming methods (`download`, `upload`) keep `&Tree` because they return handles that borrow the tree for their lifetime
-- `watch` now returns an *owned* `Watcher` (no lifetime); see the [Watcher pipelining](#watcher-pipelining) section
+- `watch` returns an *owned* `Watcher` (no lifetime); see the [Watcher pipelining](#watcher-pipelining) section
 - Batch methods (`delete_files`, `rename_files`, `stat_files`) don't retry per-file; the caller should trigger one single-file operation first to resolve the redirect
 - `dfs_enabled` flag on `ClientConfig` (default `true`) gates all DFS resolution
-- Borrow checker requires inlining the connection lookup in `handle_dfs_redirect` to avoid double `&mut self` borrows
-
-**Gotcha — a DFS namespace root never reaches this path.** `\\<domain>\<namespace>` is not a share on the server
-answering that name, so its TreeConnect fails with `STATUS_BAD_NETWORK_NAME` (MS-SMB2 § 3.3.5.7) and
-`STATUS_PATH_NOT_COVERED` is never returned. Resolving it needs a ROOT referral issued *before or instead of* the tree
-connect, which this crate does not do yet. Design, evidence, and the referral-parser gaps it exposes:
-`docs/specs/dfs-namespace-root-plan.md`.
+- Borrow checker requires inlining the connection lookup in `handle_dfs_redirect` and `root_referral` to avoid double `&mut self` borrows
 
 ## Watcher pipelining
 

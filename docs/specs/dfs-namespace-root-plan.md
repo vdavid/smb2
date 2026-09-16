@@ -141,12 +141,17 @@ The flow, following § 3.1.4.1 steps 2 and 5–8 with the DomainCache branch rem
 
 1. **Cache first.** Look `\\<server>\<share>` up in `DfsResolver`. On an unexpired hit, go straight to the target, so
    the wasted TreeConnect is paid once per TTL and not once per connect. This is § 3.1.4.1 step 2 and it is why the
-   feature does not need a "proactive" mode.
+   feature does not need a "proactive" mode. **A cache hit is terminal** (decided during implementation): falling back
+   to a plain TreeConnect when the cached targets don't answer would resolve the namespace twice and double the wait on
+   the one path where the wait is long. An expired entry reports a miss, so a namespace that has genuinely become an
+   ordinary share is found again then.
 2. **Otherwise TreeConnect**, as today. Success ends it, which is the entire non-DFS world at zero extra cost.
 3. **On `STATUS_BAD_NETWORK_NAME`**, and only when `dfs_enabled` is on *and* the connection negotiated
    `SMB2_GLOBAL_CAP_DFS`, issue a ROOT referral for `\<server>\<share>` over IPC$ on the connection we already have.
 4. **On a referral with at least one entry**, try each target in order: connect (pooled), tree-connect the target
-   share, activate share encryption, done. First success wins.
+   share, activate share encryption, done. First success wins. A target carrying a **path suffix** is skipped with a
+   `debug` line rather than connected (decided during implementation): a root target is `\\server\share` and nothing
+   more (§ 2.2.1.6), a `Tree` cannot express a suffix, and dropping one silently would open the wrong directory.
 5. **On anything else** — the server does not advertise DFS, the referral fails, the referral is empty, or every
    target is unreachable — the caller gets a truthful error. See below.
 
@@ -180,6 +185,19 @@ DfsNoReachableTarget {
 That variant says something no existing error says: the namespace is real, we found it, the storage behind it is out of
 reach. `Error` and `ErrorKind` are both `#[non_exhaustive]`, so adding it and an `ErrorKind::DfsNoReachableTarget` is
 **not breaking**.
+
+### The other thing `STATUS_BAD_NETWORK_NAME` means
+
+MS-SMB2 § 2.2.2.2.2 reuses the same status with an `SMB2_ERROR_ID_SHARE_REDIRECT` error context for scale-out cluster
+redirection, an unrelated mechanism this crate does not implement. Our tree connect never sets
+`SMB2_TREE_CONNECT_FLAG_REDIRECT_TO_OWNER`, so a conforming server should not send it — but "should not" is not a
+guarantee, and chasing a DFS referral for a cluster redirect would be nonsense.
+
+**Implemented as a separate error rather than an inline check** (decided during implementation): `Tree::connect`
+inspects the error contexts and returns `Error::ShareRedirected { share }`. Making them two different errors means the
+namespace trigger, which matches on `Error::Protocol { status: BAD_NETWORK_NAME, .. }`, cannot fire on a redirect **by
+construction** rather than by remembering to check. A malformed context chain can never answer "yes", which would turn
+a missing share into an unfollowable redirect.
 
 ### Keeping the caller's own name for the share
 
@@ -248,7 +266,9 @@ unrepresentable:
 
 ```rust
 pub enum DfsReferralEntry {
-    /// A root, link, or sysvol target.
+    /// A V1 entry: an inline share name, with no DFS path and no TTL.
+    V1 { server_type: u16, share_name: String },
+    /// A root, link, or sysvol target (V2, V3, V4).
     Target { version: u16, server_type: u16, flags: ReferralEntryFlags, ttl: u32,
              dfs_path: String, dfs_alternate_path: String, network_address: String },
     /// A domain or DC referral (NameListReferral set). Parsed so it cannot be
@@ -257,6 +277,12 @@ pub enum DfsReferralEntry {
                special_name: String, expanded_names: Vec<String> },
 }
 ```
+
+**Three variants, not two** (changed during implementation). V1 genuinely has no `DFSPath` and no `TimeToLive`, so
+folding it into `Target` would have reintroduced exactly the conditionally-meaningful fields this sum type exists to
+remove: an empty `dfs_path` and a `ttl` of 0 that mean "this version has no such field" by convention rather than by
+type. Accessors (`version()`, `target_address()`, `dfs_path()`, `ttl()`, `flags()`, `server_type()`) cover what most
+code wants without matching, and `dfs_path()` returning `None` is what tells the resolver to key from `PathConsumed`.
 
 Breaking for anyone matching on `DfsReferralEntry`'s fields. The type is `pub` in `msg::dfs` and exists to describe the
 wire, so the honest shape wins over the compatible one.
@@ -267,7 +293,11 @@ Keep `DfsResolver`, and grow it to what § 3.1.1's ReferralCache actually needs:
 
 - **Store `RootOrLink`** (from `ServerType`) so `connect_share` can tell a root entry from a link entry, per
   § 3.1.4.1 steps 4 and 7. ❌ Store it, never gate on it — Samba reports `0` for a root referral.
-- **Store `Interlink`** (the § 3.1.5.4.5 test) and `TargetFailback`, evaluated once at insert.
+- **Store `Interlink`** (the § 3.1.5.4.5 test) and `TargetFailback`, evaluated once at insert. All three, plus the
+  `TargetHint`, are surfaced through `DfsCacheEntry` in `SmbClient::diagnostics`, which is where someone asking "why is
+  my namespace on that server?" looks. `TargetSetBoundary` is **not** stored (changed during implementation): the
+  parser exposes the flag on `ReferralEntryFlags`, which is the durable part, but nothing reads it until failback
+  lands, and a field nothing reads is a cost paid every session.
 - **Key from `dfs_path` when present, from `PathConsumed` when it is not** (V1). `PathConsumed` counts **bytes of
   UTF-16LE**, so the prefix is the first `path_consumed / 2` code units of the request path, taken with
   `encode_utf16`, never `chars()` and never a byte slice.
@@ -323,7 +353,12 @@ pub struct ConnectOptions {
     pub timeout: Duration,
     /// How long to wait before starting the next address. Zero dials all at once.
     pub attempt_delay: Duration,
-    /// Cap on how many resolved addresses to try.
+    /// Cap on how many resolved addresses to try. Defaults to **8**: enough
+    /// for a realistically-sized set of domain controllers across both address
+    /// families, and at the default stagger the eighth attempt starts 1.75 s
+    /// in. Past that a name is a load-balanced pool whose extras are
+    /// interchangeable. Clamped to at least 1, so a zero can't make connecting
+    /// impossible.
     pub max_addresses: usize,
 }
 
@@ -333,8 +368,10 @@ impl TcpTransport {
 }
 ```
 
-`connect` keeps its signature and delegates with `ConnectOptions::default()`, so this is a **behavior change and not an
-API break**. `ClientConfig` grows an optional `connect_options: Option<ConnectOptions>` in the same release that adds
+`connect` keeps its shape and delegates, so this is a **behavior change** rather than a rewrite. One small break did
+turn up in implementation: both functions need `impl ToSocketAddrs + Display`, because `ConnectFailed` has to be able
+to name what it tried to reach, and `ToSocketAddrs` alone cannot. `&str`, `String`, and `SocketAddr` satisfy it; a
+`(&str, u16)` tuple does not. `ClientConfig` grows an optional `connect_options: Option<ConnectOptions>` in the same release that adds
 its `Default` impl.
 
 When everything fails, `Error::Timeout` says nothing about what was tried. Add:
@@ -390,7 +427,8 @@ tests close that: one feeding a Windows-shaped V4 root referral (`ServerType = 1
 first entry) and one feeding the Samba-shaped V3 response, both asserting the same resolution. The V4 bytes come from
 the existing `resp_parse_v4_referral` test vector, which is a captured Windows response.
 
-**Mock-transport tests** carry everything a container cannot stage: V1 entries; NameListReferral entries; a referral
+**Mock-transport tests** live in each module's own `#[cfg(test)] mod tests` — `crates/smb2/tests/protocol_flow.rs`,
+which the plan assumed, does not exist. They carry everything a container cannot stage: V1 entries; NameListReferral entries; a referral
 answering `STATUS_BUFFER_OVERFLOW` then succeeding on retry; `PathConsumed` values that are odd, zero, or longer than
 the request; an Interlink response; a referral loop hitting `MAX_DFS_HOPS`; and a target list whose every member
 refuses, asserting `DfsNoReachableTarget`.
@@ -449,12 +487,6 @@ breaking surface, so the whole thing lands as one minor bump.
 
 ## Open questions
 
-- **The spec corpus is not checked out.** `AGENTS.md` points at
-  `related-repos/openspecs/skills/windows-protocols/MS-*/`, and that tree holds only the upstream repo's `AGENTS.md`
-  and `README.md`. The spec text used here came from the `publish` branch of `awakecoding/openspecs`
-  (`raw.githubusercontent.com/awakecoding/openspecs/publish/MS-DFSC/MS-DFSC.md`, and the same for MS-SMB2 and
-  MS-ERREF). Someone should restore the local corpus or fix the path in `AGENTS.md`; every agent that reads that
-  section today finds nothing.
 - **No Windows verification.** Everything about Windows behavior here comes from MS-DFSC's own text plus one field log
   from a consumer. The AWS Windows Server 2022 AD DS setup described in `crates/smb2/tests/CLAUDE.md` could host a real
   domain-based namespace and settle it, and is the single highest-value follow-up.
@@ -464,10 +496,6 @@ breaking surface, so the whole thing lands as one minor bump.
 - **`STATUS_BAD_NETWORK_NAME` as the sole trigger is a one-server sample.** MS-SMB2 § 3.3.5.7 makes it the required
   status, and Samba agrees, so the ground is firm for Windows and Samba. NetApp, EMC, and other SMB namespace
   implementations are untested. If a second status turns up in the field, it is a one-line addition to the match.
-- **Share-redirect collision.** MS-SMB2 § 2.2.2.2.2 uses `STATUS_BAD_NETWORK_NAME` with an
-  `SMB2_ERROR_ID_SHARE_REDIRECT` error context for scale-out cluster redirection, an unrelated mechanism the crate does
-  not implement. Our trigger never sets `SMB2_TREE_CONNECT_FLAG_REDIRECT_TO_OWNER`, so a server should not send it, but
-  it is worth an explicit check on the error context before treating the status as DFS.
 
 ## Follow-up work, deliberately out of scope
 
@@ -479,3 +507,21 @@ breaking surface, so the whole thing lands as one minor bump.
 - **Target failback** (§ 3.1.5.4.3), which needs periodic health checks of a target we moved off.
 - **DFS in the batch and pipelined paths**, still excluded as in the original plan.
 - **A pure-Rust resolver**, to bound DNS rather than abandon it.
+
+## Status
+
+All eight steps landed, each committed green on its own. Divergences from the plan are noted inline above, at the
+paragraph each one changes. Three things were scoped in that the plan did not call for, all of them clear wins found
+while working in the same code:
+
+- **`connection_for_tree` no longer panics.** It ended in `.expect("no connection for tree server")`, and reaching it
+  took nothing exotic: `SmbClient::reconnect` drops every extra connection, and a consumer holding the DFS-resolved
+  `Tree` it had is exactly the state the reconnect docs describe them being in. It returns `Error::Disconnected` now.
+- **`Tree` derives `Debug`.** It holds an id, two names, and three flags; printing one is what a consumer reaches for
+  first when a DFS redirect put it somewhere unexpected.
+- **`AGENTS.md` § "Spec files" told agents where the corpus is not.** It pointed at a gitignored `related-repos/`
+  tree that, cloned from the upstream repo's `main` branch, holds no spec text at all — the corpus is on the `publish`
+  branch. The section now carries the `curl` that fetches one spec, which is what actually works.
+
+Everything in § "Follow-up work" is still out of scope, and § "No Windows verification" is still the
+highest-value follow-up: every claim about Windows behavior here rests on MS-DFSC's own text plus one field log.
