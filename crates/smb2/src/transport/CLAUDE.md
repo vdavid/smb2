@@ -29,6 +29,29 @@ The blanket impl `Transport` combines both halves. `Connection` stores `Box<dyn 
 
 `TcpTransport::send` prepends the 4-byte header. `TcpTransport::receive` reads the header, then `read_exact` for the payload.
 
+## The connect budget is per address, not per name
+
+`TcpTransport::connect` resolves the name itself and dials the addresses with a stagger (RFC 8305's shape, not the full
+algorithm): next address after `attempt_delay` (250 ms), earlier attempts left running, first connected socket wins,
+all under one deadline. `connect_with` takes a `ConnectOptions` to tune it. Every failure reports
+`Error::ConnectFailed` with one `ConnectAttempt` per address.
+
+- **Gotcha:** `TcpStream::connect(addr)` walks every resolved address *serially* underneath a single
+  `tokio::time::timeout`, so one address that blackholes SYNs spends the entire budget and the live ones are never
+  dialled. Every AD domain name and plenty of NASes are multi-homed, and a DFS namespace root makes it worse by
+  construction: the name being dialled *is* a domain name. ❌ Don't "simplify" this back to one timeout around
+  `TcpStream::connect`.
+- **Families alternate** (`interleave_families`), keeping the resolver's own preference for which goes first. Without
+  it, a name whose IPv6 addresses all come first and all blackhole pushes every IPv4 address past
+  `max_addresses × attempt_delay` — the same failure, just later.
+- **`error_kind: None` on an attempt means "ran out of budget", not "failed".** Nothing is known about that address.
+- **Known limit, documented rather than solved:** `lookup_host` runs `getaddrinfo` on a blocking pool thread. A timeout
+  abandons the future; the thread stays until the resolver returns. A pure-Rust resolver would fix it and is a
+  dependency this crate has no other reason to take.
+- `connect` and `connect_with` need `impl ToSocketAddrs + Display`, because an error that cannot name what it tried to
+  reach is worth less than the tighter bound costs. `&str`, `String`, and `SocketAddr` all satisfy it; a
+  `(&str, u16)` tuple does not.
+
 ## Who reads the transport
 
 `TransportReceive::receive()` is called by exactly one owner: the background receiver task spawned by `Connection::from_transport` (Phase 2 actor refactor). No other code path calls `receive()` in production. This is the invariant that makes per-`MessageId` routing sound — there's a single serialized read of the wire, then demux to per-request `oneshot::Sender`s. See `src/client/CLAUDE.md` § "Connection internals: receiver task + `oneshot` routing".

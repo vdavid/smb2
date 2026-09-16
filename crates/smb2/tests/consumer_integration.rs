@@ -88,6 +88,7 @@ async fn connect_guest(addr: &str) -> SmbClient {
         compression: false,
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
+        connect_options: None,
     })
     .await
     .unwrap_or_else(|e| panic!("SmbClient::connect to {addr} failed: {e}"))
@@ -105,6 +106,7 @@ async fn connect_auth(addr: &str, username: &str, password: &str) -> SmbClient {
         compression: false,
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
+        connect_options: None,
     })
     .await
     .unwrap_or_else(|e| panic!("SmbClient::connect to {addr} failed: {e}"))

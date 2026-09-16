@@ -117,6 +117,58 @@ pub struct ClientConfig {
     /// Default: empty (use the server hostname from the referral
     /// with port 445).
     pub dfs_target_overrides: std::collections::HashMap<String, String>,
+    /// How the TCP connect is spread across the addresses
+    /// [`addr`](Self::addr) resolves to.
+    ///
+    /// `None` uses [`ConnectOptions::with_timeout`](crate::transport::ConnectOptions::with_timeout) with
+    /// [`timeout`](Self::timeout), which is what you want unless you are
+    /// tuning for a name with an unusual number of addresses. See
+    /// [`ConnectOptions`](crate::transport::ConnectOptions) for why a single deadline around
+    /// `TcpStream::connect` is not enough.
+    pub connect_options: Option<crate::transport::ConnectOptions>,
+}
+
+impl ClientConfig {
+    /// The connect budget this config asks for: its own
+    /// [`connect_options`](Self::connect_options), or the defaults with
+    /// [`timeout`](Self::timeout) as the whole-attempt budget.
+    pub(crate) fn connect_options(&self) -> crate::transport::ConnectOptions {
+        self.connect_options
+            .clone()
+            .unwrap_or_else(|| crate::transport::ConnectOptions::with_timeout(self.timeout))
+    }
+}
+
+impl Default for ClientConfig {
+    /// Guest access to nothing, with compression and DFS on.
+    ///
+    /// Exists so a field added here is not a breaking change for every caller
+    /// writing a struct literal, which is all of them: fill in
+    /// [`addr`](Self::addr) and whatever else you need, and spread the rest.
+    ///
+    /// ```
+    /// # use smb2::ClientConfig;
+    /// let config = ClientConfig {
+    ///     addr: "nas.local:445".to_string(),
+    ///     username: "david".to_string(),
+    ///     auto_reconnect: true,
+    ///     ..Default::default()
+    /// };
+    /// ```
+    fn default() -> Self {
+        Self {
+            addr: String::new(),
+            timeout: Duration::from_secs(5),
+            username: String::new(),
+            password: String::new(),
+            domain: String::new(),
+            auto_reconnect: false,
+            compression: true,
+            dfs_enabled: true,
+            dfs_target_overrides: std::collections::HashMap::new(),
+            connect_options: None,
+        }
+    }
 }
 
 /// Dials and re-authenticates on a consumer's behalf when a session dies.
@@ -131,7 +183,7 @@ pub struct ClientConfig {
 /// re-prompting.
 struct ClientReviver {
     addr: String,
-    timeout: Duration,
+    connect_options: crate::transport::ConnectOptions,
     compression: bool,
     username: String,
     password: String,
@@ -151,7 +203,7 @@ impl ClientReviver {
     fn for_addr(config: &ClientConfig, addr: String) -> Self {
         Self {
             addr,
-            timeout: config.timeout,
+            connect_options: config.connect_options(),
             compression: config.compression,
             username: config.username.clone(),
             password: config.password.clone(),
@@ -169,7 +221,8 @@ impl connection::SessionReviver for ClientReviver {
         Box<dyn crate::transport::TransportReceive>,
     )> {
         let transport = std::sync::Arc::new(
-            crate::transport::TcpTransport::connect(&self.addr, self.timeout).await?,
+            crate::transport::TcpTransport::connect_with(&self.addr, self.connect_options.clone())
+                .await?,
         );
         Ok((
             Box::new(std::sync::Arc::clone(&transport)),
@@ -275,7 +328,7 @@ impl SmbClient {
     pub async fn connect(config: ClientConfig) -> Result<Self> {
         debug!("smb_client: connecting to {}", config.addr);
 
-        let mut conn = Connection::connect(&config.addr, config.timeout).await?;
+        let mut conn = Connection::connect_with(&config.addr, config.connect_options()).await?;
         conn.set_compression_requested(config.compression);
         conn.negotiate().await?;
 
@@ -899,7 +952,7 @@ impl SmbClient {
         }
 
         // Create new connection to target.
-        let mut conn = Connection::connect(target_addr, self.config.timeout).await?;
+        let mut conn = Connection::connect_with(target_addr, self.config.connect_options()).await?;
         conn.set_compression_requested(self.config.compression);
         conn.negotiate().await?;
 
@@ -1785,6 +1838,7 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
         compression: true,
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     })
     .await
 }
@@ -1940,6 +1994,7 @@ mod tests {
             compression: true,
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
+            connect_options: None,
         };
 
         SmbClient::from_parts(config, conn, session)
@@ -2947,6 +3002,7 @@ mod tests {
             compression: true,
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
+            connect_options: None,
         };
 
         let client = SmbClient::from_parts(config, conn, session);

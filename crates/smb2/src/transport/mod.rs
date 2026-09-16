@@ -15,7 +15,7 @@ pub mod mock;
 pub mod tcp;
 
 pub use mock::MockTransport;
-pub use tcp::TcpTransport;
+pub use tcp::{ConnectAttempt, ConnectOptions, TcpTransport};
 
 use crate::error::Result;
 use async_trait::async_trait;

@@ -82,6 +82,22 @@ pub enum Error {
     #[error("Operation timed out")]
     Timeout,
 
+    /// Every address a name resolved to failed.
+    ///
+    /// [`Error::Timeout`] says a connect ran out of budget and nothing else.
+    /// This says which addresses were tried and what each one did, which is
+    /// the difference between "the server is down" and "three of its four
+    /// addresses answer and the one your resolver returns first does not".
+    ///
+    /// Classifies as [`ErrorKind::ConnectionLost`] and reports as retryable.
+    #[error("could not connect to {host}: {} address(es) tried", attempts.len())]
+    ConnectFailed {
+        /// The name, as the caller gave it.
+        host: String,
+        /// One entry per address, in the order they were attempted.
+        attempts: Vec<crate::transport::ConnectAttempt>,
+    },
+
     /// The connection was lost.
     #[error("Disconnected from server")]
     Disconnected,
@@ -362,6 +378,7 @@ impl Error {
                 | Error::ReconnectFailed { .. }
                 | Error::DurableHandleLost { .. }
                 | Error::DfsNoReachableTarget { .. }
+                | Error::ConnectFailed { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
                     ..
@@ -521,6 +538,8 @@ impl Error {
             Error::Io(_) => ErrorKind::Io,
             Error::Disconnected => ErrorKind::ConnectionLost,
             Error::Timeout => ErrorKind::TimedOut,
+            // Nothing answered on any address, so the link is what is missing.
+            Error::ConnectFailed { .. } => ErrorKind::ConnectionLost,
             Error::Cancelled => ErrorKind::Cancelled,
             Error::SessionExpired => ErrorKind::SessionExpired,
             Error::DfsReferralRequired { .. } => ErrorKind::DfsReferral,

@@ -898,6 +898,7 @@ async fn connect_guest(addr: &str) -> Result<SmbClient> {
         compression: true,
         dfs_enabled: false,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     })
     .await
     .map_err(Error::Smb)
@@ -914,6 +915,7 @@ async fn connect_auth(addr: &str, user: &str, pass: &str) -> Result<SmbClient> {
         compression: true,
         dfs_enabled: false,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     })
     .await
     .map_err(Error::Smb)

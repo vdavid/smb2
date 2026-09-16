@@ -497,6 +497,7 @@ async fn connect_client_to_nas() -> SmbClient {
         compression: true,
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     })
     .await
     .expect("SmbClient::connect failed")
@@ -939,6 +940,7 @@ async fn debug_rapid_pipelined_writes() {
         compression: true,
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     };
 
     let mut client = SmbClient::connect(config).await.expect("connect failed");
@@ -1001,6 +1003,7 @@ async fn micro_benchmark_smb2_vs_native() {
         compression: true,
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     };
     let mut client = SmbClient::connect(config).await.expect("connect");
     let mut share = client.connect_share("naspi").await.expect("tree");
@@ -1353,6 +1356,7 @@ async fn connect_client_to_pi() -> SmbClient {
         compression: true,
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     })
     .await
     .expect("SmbClient::connect to Pi failed")

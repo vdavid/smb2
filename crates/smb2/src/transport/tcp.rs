@@ -6,12 +6,17 @@
 //! encoding in the entire SMB2 protocol.
 
 use async_trait::async_trait;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error, trace};
+use std::collections::VecDeque;
+use std::fmt;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::transport::{TransportReceive, TransportSend};
@@ -22,6 +27,86 @@ use crate::transport::{TransportReceive, TransportSend};
 /// Real SMB2 messages are typically much smaller (the largest negotiated
 /// MaxReadSize/MaxWriteSize is usually 8 MB).
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// How a connect attempt is bounded, and how it is spread across the addresses
+/// a name resolves to.
+///
+/// The thing this exists to prevent: `TcpStream::connect` walks every address
+/// `getaddrinfo` returns, one at a time, and a single deadline around it means
+/// one address that blackholes SYNs eats the whole budget while the live ones
+/// are never dialled. Every AD domain name, and plenty of NASes, resolve to
+/// several addresses, and a DFS namespace root makes it worse by construction:
+/// the name being dialled *is* a domain name.
+///
+/// So attempts are staggered instead, RFC 8305's shape without the full
+/// algorithm: start the next address after [`attempt_delay`](Self::attempt_delay),
+/// leave the earlier ones running, first connected socket wins, and every
+/// address gets a real chance inside the caller's budget.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectOptions {
+    /// Budget for the whole attempt, name resolution included.
+    pub timeout: Duration,
+    /// How long to wait before starting the next address, with earlier
+    /// attempts left running. Zero dials every address at once, which puts a
+    /// SYN on every interface of every server for every connect — rarely what
+    /// you want.
+    pub attempt_delay: Duration,
+    /// Cap on how many resolved addresses to try. Clamped to at least 1, so a
+    /// zero cannot make connecting impossible.
+    ///
+    /// Eight covers a realistically-sized set of domain controllers across
+    /// both address families, and at the default stagger the eighth attempt
+    /// starts 1.75 s in — comfortably inside any sane budget. A name with more
+    /// addresses than that is a load-balanced pool where the extras are
+    /// interchangeable, so trying them all buys nothing and costs a SYN each.
+    pub max_addresses: usize,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+            // RFC 8305 § 5 recommends 250 ms, with 2 s as the maximum.
+            attempt_delay: Duration::from_millis(250),
+            max_addresses: 8,
+        }
+    }
+}
+
+impl ConnectOptions {
+    /// The defaults with the whole-attempt budget replaced.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..Self::default()
+        }
+    }
+}
+
+/// What happened on one address of a name that could not be connected.
+///
+/// Part of [`Error::ConnectFailed`], which is the difference between "the
+/// connect timed out" and "these four addresses were tried, three refused and
+/// one never answered".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectAttempt {
+    /// The address that was dialled.
+    pub addr: SocketAddr,
+    /// Why it failed, as a typed kind so nothing downstream is tempted to
+    /// match on a message. `None` means the attempt ran out of budget rather
+    /// than failing outright — it may still have been on its way.
+    pub error_kind: Option<std::io::ErrorKind>,
+}
+
+impl fmt::Display for ConnectAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.error_kind {
+            Some(kind) => write!(f, "{}: {kind}", self.addr),
+            None => write!(f, "{}: no answer within the budget", self.addr),
+        }
+    }
+}
 
 /// Direct TCP transport for SMB2.
 ///
@@ -40,13 +125,49 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Connect to an SMB server over TCP.
     ///
-    /// Applies the given timeout to the connection attempt. Once connected,
-    /// the socket is split into independent read/write halves.
-    pub async fn connect(addr: impl ToSocketAddrs, timeout: Duration) -> Result<Self> {
-        let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+    /// `timeout` bounds the whole attempt, name resolution included. Every
+    /// address the name resolves to gets a real chance inside it: see
+    /// [`ConnectOptions`] for why that is not the same as "a deadline around
+    /// `TcpStream::connect`". Once connected, the socket is split into
+    /// independent read/write halves.
+    pub async fn connect(
+        addr: impl ToSocketAddrs + fmt::Display,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with(addr, ConnectOptions::with_timeout(timeout)).await
+    }
+
+    /// [`connect`](Self::connect) with the stagger and the address cap under
+    /// the caller's control.
+    pub async fn connect_with(
+        addr: impl ToSocketAddrs + fmt::Display,
+        opts: ConnectOptions,
+    ) -> Result<Self> {
+        let host = addr.to_string();
+        let deadline = Instant::now() + opts.timeout;
+
+        // Resolution is inside the budget, because it is part of the wait the
+        // caller is bounding.
+        //
+        // **Known limit, documented rather than solved:** `lookup_host` runs
+        // `getaddrinfo` on a blocking pool thread. A timeout abandons the
+        // future; the thread stays until the resolver returns. A pure-Rust
+        // resolver would fix it, and is a dependency this crate has no other
+        // reason to take.
+        let resolved = tokio::time::timeout_at(deadline, tokio::net::lookup_host(addr))
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(Error::Io)?;
+
+        let addrs = interleave_families(resolved, opts.max_addresses.max(1));
+        if addrs.is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{host} resolved to no addresses"),
+            )));
+        }
+
+        let stream = dial_staggered(&host, &addrs, &opts, deadline).await?;
 
         // Disable Nagle's algorithm for lower latency on small messages.
         stream.set_nodelay(true).map_err(Error::Io)?;
@@ -59,6 +180,122 @@ impl TcpTransport {
             writer: Mutex::new(writer),
         })
     }
+}
+
+/// Dial `addrs` with a stagger, under one shared deadline. First socket to
+/// connect wins; the rest are dropped.
+pub(crate) async fn dial_staggered(
+    host: &str,
+    addrs: &[SocketAddr],
+    opts: &ConnectOptions,
+    deadline: Instant,
+) -> Result<TcpStream> {
+    // One slot per address, filled in as attempts finish. An address still in
+    // flight when the budget runs out keeps its `None`, which is the honest
+    // answer: nothing is known about it.
+    let mut attempts: Vec<ConnectAttempt> = addrs
+        .iter()
+        .map(|&addr| ConnectAttempt {
+            addr,
+            error_kind: None,
+        })
+        .collect();
+
+    let mut in_flight = FuturesUnordered::new();
+    let mut next = 0usize;
+
+    loop {
+        if next < addrs.len() {
+            let (index, addr) = (next, addrs[next]);
+            next += 1;
+            trace!("tcp: dialling {addr} for {host} (attempt {})", index + 1);
+            in_flight.push(async move { (index, TcpStream::connect(addr).await) });
+        }
+
+        if in_flight.is_empty() && next >= addrs.len() {
+            break;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Wake to start the next address, or at the deadline once they have
+        // all been started.
+        let wake_in = if next < addrs.len() {
+            opts.attempt_delay.min(remaining)
+        } else {
+            remaining
+        };
+
+        tokio::select! {
+            biased;
+            Some((index, result)) = in_flight.next(), if !in_flight.is_empty() => {
+                match result {
+                    Ok(stream) => {
+                        debug!(
+                            "tcp: {host} connected on {} ({} of {} address(es) tried)",
+                            addrs[index],
+                            index + 1,
+                            addrs.len()
+                        );
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        trace!("tcp: {} refused {host}: {e}", addrs[index]);
+                        attempts[index].error_kind = Some(e.kind());
+                    }
+                }
+            }
+            _ = tokio::time::sleep(wake_in) => {}
+        }
+    }
+
+    Err(Error::ConnectFailed {
+        host: host.to_string(),
+        attempts,
+    })
+}
+
+/// Order addresses so the families alternate, keeping the resolver's own
+/// preference for which goes first.
+///
+/// Without this, a name whose IPv6 addresses all come first and all blackhole
+/// pushes every IPv4 address past `max_addresses * attempt_delay`, which is
+/// the exact failure the stagger exists to prevent — just later. The field log
+/// that started this had an `os error 65` (no route to host) on an IPv6
+/// address of a name whose IPv4 addresses connected in 4–22 ms.
+fn interleave_families(addrs: impl IntoIterator<Item = SocketAddr>, max: usize) -> Vec<SocketAddr> {
+    let mut v6: VecDeque<SocketAddr> = VecDeque::new();
+    let mut v4: VecDeque<SocketAddr> = VecDeque::new();
+    let mut prefer_v6: Option<bool> = None;
+
+    for addr in addrs {
+        prefer_v6.get_or_insert(addr.is_ipv6());
+        if addr.is_ipv6() {
+            v6.push_back(addr);
+        } else {
+            v4.push_back(addr);
+        }
+    }
+
+    let mut take_v6 = prefer_v6.unwrap_or(false);
+    let mut out = Vec::new();
+    while out.len() < max && !(v6.is_empty() && v4.is_empty()) {
+        let preferred = if take_v6 { &mut v6 } else { &mut v4 };
+        let picked = preferred.pop_front().or_else(|| {
+            if take_v6 {
+                v4.pop_front()
+            } else {
+                v6.pop_front()
+            }
+        });
+        if let Some(addr) = picked {
+            out.push(addr);
+        }
+        take_v6 = !take_v6;
+    }
+    out
 }
 
 #[async_trait]
@@ -403,6 +640,168 @@ mod tests {
         send_task.await.unwrap();
     }
 
+    // ── Connect budget ──────────────────────────────────────────────
+
+    /// TEST-NET-1 (RFC 5737). It is guaranteed not to be routed anywhere, and
+    /// it **drops** SYNs rather than refusing them, so an attempt against it
+    /// hangs exactly the way a dead domain controller does.
+    const BLACKHOLE: &str = "192.0.2.1:445";
+
+    /// The bug this whole thing exists for: `TcpStream::connect` walks the
+    /// resolved addresses one at a time under one deadline, so a single
+    /// blackholed address eats the entire budget and the live ones are never
+    /// dialled. Staggering makes the live address win in well under a second.
+    #[tokio::test]
+    async fn a_blackholed_address_does_not_eat_the_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+
+        let opts = ConnectOptions {
+            timeout: Duration::from_secs(10),
+            attempt_delay: Duration::from_millis(250),
+            max_addresses: 8,
+        };
+        let addrs = vec![BLACKHOLE.parse().unwrap(), live];
+
+        let started = std::time::Instant::now();
+        let stream = dial_staggered("test", &addrs, &opts, Instant::now() + opts.timeout)
+            .await
+            .expect("the live address must win");
+        let elapsed = started.elapsed();
+
+        assert_eq!(stream.peer_addr().unwrap(), live);
+        // The stagger makes this a real bound rather than a race: the second
+        // attempt starts at 250 ms and connects to loopback immediately.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "took {elapsed:?}; a serial walk would have taken the full 10 s"
+        );
+    }
+
+    /// A `ConnectAttempt` per address, saying what each one did. `None` means
+    /// the address ran out of budget rather than failing, which is a different
+    /// thing to know.
+    #[tokio::test]
+    async fn every_address_failing_reports_every_address() {
+        // One that refuses immediately (nothing listens on a port we just
+        // released) and one that drops.
+        let released = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let addrs = vec![released, BLACKHOLE.parse().unwrap()];
+
+        let opts = ConnectOptions {
+            timeout: Duration::from_millis(400),
+            attempt_delay: Duration::from_millis(50),
+            max_addresses: 8,
+        };
+        let err = dial_staggered("test", &addrs, &opts, Instant::now() + opts.timeout)
+            .await
+            .expect_err("nothing should have connected");
+
+        match err {
+            Error::ConnectFailed { host, attempts } => {
+                assert_eq!(host, "test");
+                assert_eq!(attempts.len(), 2);
+                assert_eq!(attempts[0].addr, released);
+                assert!(
+                    attempts[0].error_kind.is_some(),
+                    "a refused connect has a kind"
+                );
+                assert_eq!(attempts[1].addr, BLACKHOLE.parse().unwrap());
+                assert_eq!(
+                    attempts[1].error_kind, None,
+                    "a blackholed address ran out of budget, it did not fail"
+                );
+            }
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
+    }
+
+    /// The families alternate, so a name whose IPv6 addresses all come first
+    /// and all blackhole cannot push every IPv4 address past the stagger.
+    #[test]
+    fn families_alternate_keeping_the_resolvers_preference() {
+        let a: Vec<SocketAddr> = [
+            "[2001:db8::1]:445",
+            "[2001:db8::2]:445",
+            "192.0.2.1:445",
+            "192.0.2.2:445",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+
+        let ordered = interleave_families(a.clone(), 8);
+        assert_eq!(
+            ordered,
+            vec![a[0], a[2], a[1], a[3]],
+            "v6 first (the resolver's order), then alternating"
+        );
+
+        // The other preference, from the same input reversed.
+        let reversed: Vec<SocketAddr> = a.iter().rev().copied().collect();
+        let ordered = interleave_families(reversed.clone(), 8);
+        assert_eq!(
+            ordered,
+            vec![reversed[0], reversed[2], reversed[1], reversed[3]]
+        );
+    }
+
+    /// One family only still drains in order, with no gaps.
+    #[test]
+    fn a_single_family_is_left_in_order() {
+        let a: Vec<SocketAddr> = ["192.0.2.1:445", "192.0.2.2:445", "192.0.2.3:445"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(interleave_families(a.clone(), 8), a);
+    }
+
+    #[test]
+    fn the_address_cap_is_honored() {
+        let a: Vec<SocketAddr> = (1..=6)
+            .map(|i| format!("192.0.2.{i}:445").parse().unwrap())
+            .collect();
+
+        assert_eq!(interleave_families(a.clone(), 2).len(), 2);
+        assert_eq!(interleave_families(a, 100).len(), 6);
+    }
+
+    /// A cap of zero would otherwise mean "try nothing", which is a config
+    /// that can never connect. It is clamped to one.
+    #[tokio::test]
+    async fn an_address_cap_of_zero_still_tries_one_address() {
+        let err = TcpTransport::connect_with(
+            BLACKHOLE,
+            ConnectOptions {
+                timeout: Duration::from_millis(100),
+                max_addresses: 0,
+                ..ConnectOptions::default()
+            },
+        )
+        .await
+        .expect_err("TEST-NET-1 never answers");
+
+        match err {
+            Error::ConnectFailed { attempts, .. } => assert_eq!(attempts.len(), 1),
+            // An ICMP unreachable rather than a drop; still one address tried.
+            Error::Io(_) => {}
+            other => panic!("expected ConnectFailed, got: {other}"),
+        }
+    }
+
+    /// A name that resolves to nothing is an error, not a hang.
+    #[tokio::test]
+    async fn no_addresses_is_a_clean_error() {
+        let opts = ConnectOptions::default();
+        let err = dial_staggered("nowhere", &[], &opts, Instant::now() + opts.timeout)
+            .await
+            .expect_err("no addresses, no connection");
+        assert!(matches!(err, Error::ConnectFailed { ref attempts, .. } if attempts.is_empty()));
+    }
+
     #[tokio::test]
     async fn partial_reads_are_handled_by_read_exact() {
         // This test exercises the read_exact behavior by sending data
@@ -471,15 +870,29 @@ mod tests {
 
     #[tokio::test]
     async fn connect_timeout_fires() {
-        // Try to connect to a non-routable address. This should time out.
-        // 192.0.2.1 is a TEST-NET address (RFC 5737) that should be unreachable.
-        let result = TcpTransport::connect("192.0.2.1:445", Duration::from_millis(100)).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        // Could be Timeout or Io depending on OS behavior.
+        // A non-routable address that drops SYNs, so the budget is what ends
+        // the attempt. The error names the address and says it never answered,
+        // rather than the bare `Error::Timeout` this used to give.
+        let started = std::time::Instant::now();
+        let err = TcpTransport::connect(BLACKHOLE, Duration::from_millis(100))
+            .await
+            .expect_err("nothing is listening on TEST-NET-1");
+
         assert!(
-            matches!(err, Error::Timeout | Error::Io(_)),
-            "expected Timeout or Io error, got: {err}"
+            started.elapsed() < Duration::from_secs(2),
+            "the budget must still bound the whole attempt"
         );
+        match err {
+            Error::ConnectFailed { host, attempts } => {
+                assert_eq!(host, BLACKHOLE);
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].addr, BLACKHOLE.parse().unwrap());
+            }
+            // Some networks answer TEST-NET-1 with an ICMP unreachable, which
+            // is a real failure rather than a timeout; the error still names
+            // the address either way.
+            Error::Io(_) => {}
+            other => panic!("expected ConnectFailed, got: {other}"),
+        }
     }
 }

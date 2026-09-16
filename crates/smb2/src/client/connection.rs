@@ -2357,9 +2357,24 @@ impl Connection {
     }
 
     /// Connect to an SMB server over TCP.
+    ///
+    /// `timeout` bounds the whole attempt, name resolution included, and every
+    /// address the name resolves to gets a chance inside it. To tune how those
+    /// attempts are spread, use
+    /// [`connect_with`](Self::connect_with).
     pub async fn connect(addr: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_with(
+            addr,
+            crate::transport::ConnectOptions::with_timeout(timeout),
+        )
+        .await
+    }
+
+    /// [`connect`](Self::connect) with the connect budget under the caller's
+    /// control. See [`ConnectOptions`](crate::transport::ConnectOptions).
+    pub async fn connect_with(addr: &str, opts: crate::transport::ConnectOptions) -> Result<Self> {
         let server_name = addr.split(':').next().unwrap_or(addr).to_string();
-        let transport = TcpTransport::connect(addr, timeout).await?;
+        let transport = TcpTransport::connect_with(addr, opts).await?;
         info!("connection: connected to {}", addr);
         let transport = Arc::new(transport);
         Ok(Self::from_transport(

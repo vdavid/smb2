@@ -56,6 +56,7 @@ fn guest_config(addr: &str) -> ClientConfig {
         compression: true,
         dfs_enabled: false,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     }
 }
 
