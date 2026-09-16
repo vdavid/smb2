@@ -353,7 +353,10 @@ impl DfsResolver {
 
         // Use the dfs_path from the first entry as the cache key.
         // Normalize to lowercase backslash form with `\\` prefix (UNC canonical).
-        let mut dfs_path_prefix = resp.entries[0].dfs_path.to_lowercase().replace('/', "\\");
+        let Some(dfs_path) = resp.entries[0].dfs_path() else {
+            return;
+        };
+        let mut dfs_path_prefix = dfs_path.to_lowercase().replace('/', "\\");
         if !dfs_path_prefix.starts_with("\\\\") {
             if let Some(stripped) = dfs_path_prefix.strip_prefix('\\') {
                 dfs_path_prefix = format!("\\\\{stripped}");
@@ -364,14 +367,15 @@ impl DfsResolver {
         let targets: Vec<DfsTarget> = resp
             .entries
             .iter()
-            .filter_map(|e| parse_unc_target(&e.network_address))
+            .filter_map(|e| e.target_address())
+            .filter_map(parse_unc_target)
             .collect();
 
         if targets.is_empty() {
             return;
         }
 
-        let ttl = resp.entries[0].ttl.max(1); // At least 1 second
+        let ttl = resp.entries[0].ttl().max(1); // At least 1 second
 
         debug!(
             "dfs: caching {:?} with {} targets, ttl={}s",
@@ -597,16 +601,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.path_consumed, 48);
-        assert_eq!(resp.header_flags, 0x02);
+        assert_eq!(resp.header_flags.bits(), 0x02);
         assert_eq!(resp.entries.len(), 2);
 
-        assert_eq!(resp.entries[0].version, 3);
-        assert_eq!(resp.entries[0].dfs_path, r"\domain\dfs\docs");
-        assert_eq!(resp.entries[0].network_address, r"\server1\share");
-        assert_eq!(resp.entries[0].ttl, 600);
+        assert_eq!(resp.entries[0].version(), 3);
+        assert_eq!(resp.entries[0].dfs_path(), Some(r"\domain\dfs\docs"));
+        assert_eq!(resp.entries[0].target_address(), Some(r"\server1\share"));
+        assert_eq!(resp.entries[0].ttl(), 600);
 
-        assert_eq!(resp.entries[1].network_address, r"\server2\share");
-        assert_eq!(resp.entries[1].ttl, 300);
+        assert_eq!(resp.entries[1].target_address(), Some(r"\server2\share"));
+        assert_eq!(resp.entries[1].ttl(), 300);
 
         // Should have sent 3 messages: TreeConnect, IOCTL, TreeDisconnect
         assert_eq!(mock.sent_count(), 3);
@@ -721,10 +725,10 @@ mod tests {
 
         let referral_entries: Vec<DfsReferralEntry> = entries
             .iter()
-            .map(|(net_addr, ttl)| DfsReferralEntry {
+            .map(|(net_addr, ttl)| DfsReferralEntry::Target {
                 version: 3,
                 server_type: 0,
-                referral_entry_flags: 0,
+                flags: crate::msg::dfs::ReferralEntryFlags::default(),
                 ttl: *ttl,
                 dfs_path: dfs_path.to_string(),
                 dfs_alternate_path: dfs_path.to_string(),
@@ -734,7 +738,7 @@ mod tests {
 
         RespGetDfsReferral {
             path_consumed: 0,
-            header_flags: 0,
+            header_flags: crate::msg::dfs::ReferralHeaderFlags::default(),
             entries: referral_entries,
         }
     }

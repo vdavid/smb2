@@ -63,6 +63,10 @@ macro_rules! impl_flags {
     };
 }
 
+// Wire-format flag types that live beside their message module (MS-DFSC's
+// referral flags, in `msg::dfs`) get the same accessors from here.
+pub(crate) use impl_flags;
+
 // ── HeaderFlags ─────────────────────────────────────────────────────────
 
 /// SMB2 packet header flags (32-bit field from MS-SMB2 2.2.1).

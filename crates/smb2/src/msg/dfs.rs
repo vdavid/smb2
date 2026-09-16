@@ -5,7 +5,9 @@
 
 use crate::error::Result;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
+use crate::types::flags::impl_flags;
 use crate::Error;
+use std::ops::{BitAnd, BitOr, BitOrAssign};
 
 // ── ReqGetDfsReferral ─────────────────────────────────────────────────
 
@@ -47,6 +49,61 @@ impl Unpack for ReqGetDfsReferral {
 
 // ── RespGetDfsReferral ────────────────────────────────────────────────
 
+/// ReferralHeaderFlags in a RESP_GET_DFS_REFERRAL (MS-DFSC 2.2.4).
+///
+/// Only the R, S, and T bits are defined; a server sets everything else to 0
+/// and a client ignores it.
+///
+/// ❌ **Don't require any particular combination before accepting a referral.**
+/// Windows answers a root referral with R and S both set (MS-DFSC § 4.3,
+/// § 4.6), Samba answers the same referral with S alone (verified against
+/// Samba 4.20.6 on 2026-09-16). A client that insists on the Windows shape
+/// silently refuses every Samba namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReferralHeaderFlags(pub u32);
+
+impl ReferralHeaderFlags {
+    /// R: every target in the response is a DFS root target that can itself
+    /// answer referral requests.
+    pub const REFERRAL_SERVERS: u32 = 0x0000_0001;
+    /// S: every target in the response can be reached without a further
+    /// referral.
+    pub const STORAGE_SERVERS: u32 = 0x0000_0002;
+    /// T: target failback is enabled for every target. V4 only; a server sets
+    /// it to 0 for every other version.
+    pub const TARGET_FAILBACK: u32 = 0x0000_0004;
+
+    /// Whether this response points into another DFS namespace, by the first
+    /// of the two tests in MS-DFSC § 3.1.5.4.5: ReferralServers set and
+    /// StorageServers clear.
+    ///
+    /// The section's second test needs a DomainCache, which a client that is
+    /// not domain-joined never has, so this is the whole test here.
+    #[inline]
+    pub const fn is_interlink(&self) -> bool {
+        self.contains(Self::REFERRAL_SERVERS) && !self.contains(Self::STORAGE_SERVERS)
+    }
+}
+
+impl_flags!(ReferralHeaderFlags, u32);
+
+/// ReferralEntryFlags in a referral entry (MS-DFSC 2.2.5.3, 2.2.5.4).
+///
+/// V1 and V2 entries set this to 0. V3 defines NameListReferral, and V4 adds
+/// TargetSetBoundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReferralEntryFlags(pub u16);
+
+impl ReferralEntryFlags {
+    /// The entry carries a domain name and a DC list rather than a target
+    /// path, so its tail is laid out as in MS-DFSC § 2.2.5.3.2.
+    pub const NAME_LIST_REFERRAL: u16 = 0x0002;
+    /// V4 only: this entry is the first target of a target set.
+    pub const TARGET_SET_BOUNDARY: u16 = 0x0004;
+}
+
+impl_flags!(ReferralEntryFlags, u16);
+
 /// RESP_GET_DFS_REFERRAL (MS-DFSC 2.2.4).
 ///
 /// Returned in the output buffer of an IOCTL response for
@@ -54,48 +111,139 @@ impl Unpack for ReqGetDfsReferral {
 /// consumed by the server, header flags, and a list of referral entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RespGetDfsReferral {
-    /// Number of bytes (not characters) of the path prefix that matched.
+    /// Number of **bytes of UTF-16LE**, not characters, of the request path
+    /// that the server matched. Divide by two for a count of code units.
     pub path_consumed: u16,
     /// Header flags (ReferralServers | StorageServers | TargetFailback).
-    pub header_flags: u32,
-    /// The list of referral entries (V2, V3, or V4).
+    pub header_flags: ReferralHeaderFlags,
+    /// The list of referral entries (V1 through V4).
     pub entries: Vec<DfsReferralEntry>,
 }
 
-/// A single DFS referral entry (V2-V4 flattened).
+/// A single DFS referral entry.
 ///
-/// V1 is not supported (extremely rare in practice). Each entry describes
-/// one target server/share that the client can use to access the DFS path.
+/// The three variants are the three tails MS-DFSC defines, kept apart so that
+/// a field a given shape does not carry cannot be read off it. A V1 entry has
+/// no DFS path and no TTL; a NameList entry has no target address at all and
+/// would otherwise be read as three path offsets, yielding strings from
+/// wherever in the buffer those bytes happened to point.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DfsReferralEntry {
-    /// Referral entry version (2, 3, or 4).
-    pub version: u16,
-    /// Server type: 0 = non-root/link target, 1 = root target.
-    pub server_type: u16,
-    /// Referral entry flags (version-specific).
-    pub referral_entry_flags: u16,
-    /// Time-to-live in seconds for caching this referral.
-    pub ttl: u32,
-    /// The DFS path prefix that matched.
-    pub dfs_path: String,
-    /// The DFS alternate path (usually identical to dfs_path).
-    pub dfs_alternate_path: String,
-    /// The target UNC path (for example, `\\server\share`).
-    pub network_address: String,
+pub enum DfsReferralEntry {
+    /// A V1 entry (MS-DFSC § 2.2.5.1): a bare target share name, inline and
+    /// null-terminated, with no DFS path and no TTL.
+    ///
+    /// This crate asks for `MaxReferralLevel = 4` and MS-DFSC § 2.2.2 says a
+    /// client MUST support every version up to the one it asks for, so V1 is
+    /// parsed even though no server has been seen to send it.
+    V1 {
+        /// 0 = non-root (link) targets, 1 = root targets. ❌ Never gate on it.
+        server_type: u16,
+        /// The target share, for example `\\server\share`.
+        share_name: String,
+    },
+    /// A root, link, or sysvol target (V2, V3, or V4).
+    Target {
+        /// Referral entry version (2, 3, or 4).
+        version: u16,
+        /// 0 = non-root (link) targets, 1 = root targets.
+        ///
+        /// ❌ **Never gate on it.** Samba answers a namespace-root referral
+        /// with 0 where Windows answers 1 (verified against Samba 4.20.6,
+        /// 2026-09-16). Store it, and let the path shape decide.
+        server_type: u16,
+        /// Entry flags. `TARGET_SET_BOUNDARY` is meaningful on V4 only.
+        flags: ReferralEntryFlags,
+        /// Time-to-live in seconds for caching this referral.
+        ttl: u32,
+        /// The DFS path prefix that matched.
+        dfs_path: String,
+        /// The DFS alternate path (usually identical to `dfs_path`).
+        dfs_alternate_path: String,
+        /// The target UNC path (for example, `\\server\share`).
+        network_address: String,
+    },
+    /// A domain or DC referral (V3/V4 with `NAME_LIST_REFERRAL` set).
+    ///
+    /// This crate never requests the referral types that produce one, so
+    /// parsing it is about never mistaking it for a target rather than about
+    /// using it.
+    NameList {
+        /// Referral entry version (3 or 4).
+        version: u16,
+        /// Entry flags, with `NAME_LIST_REFERRAL` set.
+        flags: ReferralEntryFlags,
+        /// Time-to-live in seconds.
+        ttl: u32,
+        /// The domain name this entry describes.
+        special_name: String,
+        /// The DC host names returned for it. Empty for a domain referral.
+        expanded_names: Vec<String>,
+    },
+}
+
+impl DfsReferralEntry {
+    /// The referral version this entry was parsed from.
+    pub fn version(&self) -> u16 {
+        match self {
+            Self::V1 { .. } => 1,
+            Self::Target { version, .. } | Self::NameList { version, .. } => *version,
+        }
+    }
+
+    /// The target UNC path, for the two variants that name one.
+    pub fn target_address(&self) -> Option<&str> {
+        match self {
+            Self::V1 { share_name, .. } => Some(share_name),
+            Self::Target {
+                network_address, ..
+            } => Some(network_address),
+            Self::NameList { .. } => None,
+        }
+    }
+
+    /// The DFS path prefix this entry covers, when the entry carries one.
+    ///
+    /// `None` for V1, which has no DFSPath field: its cache key has to come
+    /// from `PathConsumed` against the request path instead.
+    pub fn dfs_path(&self) -> Option<&str> {
+        match self {
+            Self::Target { dfs_path, .. } => Some(dfs_path),
+            Self::V1 { .. } | Self::NameList { .. } => None,
+        }
+    }
+
+    /// Caching lifetime in seconds. V1 carries none, and reports 0.
+    pub fn ttl(&self) -> u32 {
+        match self {
+            Self::V1 { .. } => 0,
+            Self::Target { ttl, .. } | Self::NameList { ttl, .. } => *ttl,
+        }
+    }
+
+    /// Entry flags. V1 has no meaningful ones and reports empty.
+    pub fn flags(&self) -> ReferralEntryFlags {
+        match self {
+            Self::V1 { .. } => ReferralEntryFlags::default(),
+            Self::Target { flags, .. } | Self::NameList { flags, .. } => *flags,
+        }
+    }
 }
 
 impl Unpack for RespGetDfsReferral {
     fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
         let path_consumed = cursor.read_u16_le()?;
         let number_of_referrals = cursor.read_u16_le()?;
-        let header_flags = cursor.read_u32_le()?;
+        let header_flags = ReferralHeaderFlags::new(cursor.read_u32_le()?);
 
         // The remaining data contains all referral entries followed by a
         // string buffer. We need the full remaining slice to resolve
         // offsets that are relative to each entry's start.
         let entry_data = cursor.read_bytes(cursor.remaining())?;
 
-        let mut entries = Vec::with_capacity(number_of_referrals as usize);
+        // `number_of_referrals` is server-controlled, so the vector grows as
+        // entries actually parse rather than reserving what a hostile server
+        // claims.
+        let mut entries = Vec::new();
         let mut offset = 0usize;
 
         for _ in 0..number_of_referrals {
@@ -145,12 +293,30 @@ impl Unpack for RespGetDfsReferral {
 /// Parse a single referral entry starting at `entry_start` within `buf`.
 ///
 /// String offsets in V2/V3/V4 are relative to the start of the entry
-/// (which includes the 4-byte version+size prefix).
+/// (which includes the 4-byte version+size prefix). V1's `ShareName` carries
+/// no offset at all: it sits inline right after the 8-byte fixed part.
 fn parse_referral_entry(version: u16, buf: &[u8], entry_start: usize) -> Result<DfsReferralEntry> {
     // Skip version (2) + size (2) -- already read by caller.
     let mut pos = entry_start + 4;
 
     match version {
+        1 => {
+            // V1: server_type(2) + referral_entry_flags(2), then an inline
+            // null-terminated ShareName. No offsets, no DFSPath, no TTL.
+            ensure_remaining(buf, pos, 4)?;
+            let server_type = read_u16(buf, pos);
+            pos += 2;
+            // ReferralEntryFlags MUST be 0 and ignored on receipt for V1.
+            let _flags = read_u16(buf, pos);
+            pos += 2;
+
+            let share_name = read_null_terminated_utf16_at(buf, pos)?;
+
+            Ok(DfsReferralEntry::V1 {
+                server_type,
+                share_name,
+            })
+        }
         2 => {
             // V2: server_type(2) + flags(2) + proximity(4) + ttl(4) +
             //     dfs_path_offset(2) + dfs_alternate_path_offset(2) + network_address_offset(2)
@@ -158,7 +324,7 @@ fn parse_referral_entry(version: u16, buf: &[u8], entry_start: usize) -> Result<
             ensure_remaining(buf, pos, 18)?;
             let server_type = read_u16(buf, pos);
             pos += 2;
-            let referral_entry_flags = read_u16(buf, pos);
+            let flags = ReferralEntryFlags::new(read_u16(buf, pos));
             pos += 2;
             let _proximity = read_u32(buf, pos);
             pos += 4;
@@ -175,10 +341,10 @@ fn parse_referral_entry(version: u16, buf: &[u8], entry_start: usize) -> Result<
                 read_offset_string(buf, entry_start, dfs_alternate_path_offset)?;
             let network_address = read_offset_string(buf, entry_start, network_address_offset)?;
 
-            Ok(DfsReferralEntry {
+            Ok(DfsReferralEntry::Target {
                 version,
                 server_type,
-                referral_entry_flags,
+                flags,
                 ttl,
                 dfs_path,
                 dfs_alternate_path,
@@ -186,41 +352,78 @@ fn parse_referral_entry(version: u16, buf: &[u8], entry_start: usize) -> Result<
             })
         }
         3 | 4 => {
-            // V3/V4 share the same layout for the common (non-NameListReferral) case.
-            // server_type(2) + flags(2) + ttl(4) +
-            // dfs_path_offset(2) + dfs_alternate_path_offset(2) + network_address_offset(2)
-            // V3/V4: + service_site_guid(16) when NameListReferral=0
-            ensure_remaining(buf, pos, 14)?;
+            // V3/V4 share a common head: server_type(2) + flags(2) + ttl(4).
+            // The tail depends on the NameListReferral flag (§ 2.2.5.3.1 vs
+            // § 2.2.5.3.2), and reading the wrong one yields strings from
+            // arbitrary buffer positions rather than an error.
+            ensure_remaining(buf, pos, 8)?;
             let server_type = read_u16(buf, pos);
             pos += 2;
-            let referral_entry_flags = read_u16(buf, pos);
+            let flags = ReferralEntryFlags::new(read_u16(buf, pos));
             pos += 2;
             let ttl = read_u32(buf, pos);
             pos += 4;
-            let dfs_path_offset = read_u16(buf, pos) as usize;
-            pos += 2;
-            let dfs_alternate_path_offset = read_u16(buf, pos) as usize;
-            pos += 2;
-            let network_address_offset = read_u16(buf, pos) as usize;
-            // Skip the rest of the fixed entry (service_site_guid for V3/V4).
 
-            let dfs_path = read_offset_string(buf, entry_start, dfs_path_offset)?;
-            let dfs_alternate_path =
-                read_offset_string(buf, entry_start, dfs_alternate_path_offset)?;
-            let network_address = read_offset_string(buf, entry_start, network_address_offset)?;
+            if flags.contains(ReferralEntryFlags::NAME_LIST_REFERRAL) {
+                // § 2.2.5.3.2: special_name_offset(2) +
+                // number_of_expanded_names(2) + expanded_name_offset(2).
+                ensure_remaining(buf, pos, 6)?;
+                let special_name_offset = read_u16(buf, pos) as usize;
+                pos += 2;
+                let number_of_expanded_names = read_u16(buf, pos);
+                pos += 2;
+                let expanded_name_offset = read_u16(buf, pos) as usize;
 
-            Ok(DfsReferralEntry {
-                version,
-                server_type,
-                referral_entry_flags,
-                ttl,
-                dfs_path,
-                dfs_alternate_path,
-                network_address,
-            })
+                let special_name = read_offset_string(buf, entry_start, special_name_offset)?;
+
+                // The names are packed back to back, each null-terminated, and
+                // the count is server-supplied: read them one at a time so a
+                // bogus count runs out of buffer instead of allocating for it.
+                let mut expanded_names = Vec::new();
+                let mut name_pos = entry_start
+                    .checked_add(expanded_name_offset)
+                    .ok_or_else(|| Error::invalid_data("DFS NameList offset overflows"))?;
+                for _ in 0..number_of_expanded_names {
+                    let (name, next) = read_null_terminated_utf16_span(buf, name_pos)?;
+                    expanded_names.push(name);
+                    name_pos = next;
+                }
+
+                Ok(DfsReferralEntry::NameList {
+                    version,
+                    flags,
+                    ttl,
+                    special_name,
+                    expanded_names,
+                })
+            } else {
+                // § 2.2.5.3.1: three path offsets, then a 16-byte
+                // ServiceSiteGuid that is always zero and always ignored.
+                ensure_remaining(buf, pos, 6)?;
+                let dfs_path_offset = read_u16(buf, pos) as usize;
+                pos += 2;
+                let dfs_alternate_path_offset = read_u16(buf, pos) as usize;
+                pos += 2;
+                let network_address_offset = read_u16(buf, pos) as usize;
+
+                let dfs_path = read_offset_string(buf, entry_start, dfs_path_offset)?;
+                let dfs_alternate_path =
+                    read_offset_string(buf, entry_start, dfs_alternate_path_offset)?;
+                let network_address = read_offset_string(buf, entry_start, network_address_offset)?;
+
+                Ok(DfsReferralEntry::Target {
+                    version,
+                    server_type,
+                    flags,
+                    ttl,
+                    dfs_path,
+                    dfs_alternate_path,
+                    network_address,
+                })
+            }
         }
         _ => Err(Error::invalid_data(format!(
-            "unsupported DFS referral version: {version} (only V2-V4 are supported)"
+            "unsupported DFS referral version: {version} (only V1-V4 are supported)"
         ))),
     }
 }
@@ -243,10 +446,16 @@ fn read_null_terminated_utf16(cursor: &mut ReadCursor<'_>) -> Result<String> {
 
 /// Read a null-terminated UTF-16LE string from a raw byte buffer at a given absolute offset.
 fn read_null_terminated_utf16_at(buf: &[u8], offset: usize) -> Result<String> {
+    read_null_terminated_utf16_span(buf, offset).map(|(s, _)| s)
+}
+
+/// Read a null-terminated UTF-16LE string, returning it and the offset just
+/// past its terminator (where the next string in a packed list begins).
+fn read_null_terminated_utf16_span(buf: &[u8], offset: usize) -> Result<(String, usize)> {
     let mut code_units: Vec<u16> = Vec::new();
     let mut pos = offset;
     loop {
-        if pos + 2 > buf.len() {
+        if pos.saturating_add(2) > buf.len() {
             return Err(Error::invalid_data(
                 "DFS referral string extends past buffer",
             ));
@@ -258,13 +467,16 @@ fn read_null_terminated_utf16_at(buf: &[u8], offset: usize) -> Result<String> {
         }
         code_units.push(cu);
     }
-    String::from_utf16(&code_units)
-        .map_err(|_| Error::invalid_data("invalid UTF-16LE in DFS referral string"))
+    let s = String::from_utf16(&code_units)
+        .map_err(|_| Error::invalid_data("invalid UTF-16LE in DFS referral string"))?;
+    Ok((s, pos))
 }
 
 /// Read a null-terminated UTF-16LE string at an offset relative to an entry start.
 fn read_offset_string(buf: &[u8], entry_start: usize, offset: usize) -> Result<String> {
-    let abs = entry_start + offset;
+    let abs = entry_start
+        .checked_add(offset)
+        .ok_or_else(|| Error::invalid_data("DFS referral string offset overflows"))?;
     read_null_terminated_utf16_at(buf, abs)
 }
 
@@ -280,7 +492,7 @@ fn read_u32(buf: &[u8], pos: usize) -> u32 {
 
 /// Check that at least `need` bytes are available at `pos` in `buf`.
 fn ensure_remaining(buf: &[u8], pos: usize, need: usize) -> Result<()> {
-    if pos + need > buf.len() {
+    if pos.saturating_add(need) > buf.len() {
         Err(Error::invalid_data(format!(
             "DFS referral entry truncated: need {need} bytes at offset {pos}, buf len {}",
             buf.len()
@@ -375,24 +587,178 @@ mod tests {
 
         assert_eq!(resp.path_consumed, 48);
         // header_flags = 0x00000002 (StorageServers)
-        assert_eq!(resp.header_flags, 0x0000_0002);
+        assert_eq!(resp.header_flags.bits(), 0x0000_0002);
+        assert!(!resp.header_flags.is_interlink());
         assert_eq!(resp.entries.len(), 2);
 
-        let e0 = &resp.entries[0];
-        assert_eq!(e0.version, 4);
-        assert_eq!(e0.server_type, 0); // non-root
-        assert_eq!(e0.ttl, 1800);
-        assert_eq!(e0.dfs_path, r"\ADC.aviv.local\dfs\Docs");
-        assert_eq!(e0.dfs_alternate_path, r"\ADC.aviv.local\dfs\Docs");
-        assert_eq!(e0.network_address, r"\ADC\Shares\Docs");
+        let DfsReferralEntry::Target {
+            version,
+            server_type,
+            flags,
+            ttl,
+            dfs_path,
+            dfs_alternate_path,
+            network_address,
+        } = &resp.entries[0]
+        else {
+            panic!("expected a Target entry, got {:?}", resp.entries[0]);
+        };
+        assert_eq!(*version, 4);
+        assert_eq!(*server_type, 0); // non-root
+        assert_eq!(*ttl, 1800);
+        // The first entry of a V4 response MUST carry TargetSetBoundary.
+        assert!(flags.contains(ReferralEntryFlags::TARGET_SET_BOUNDARY));
+        assert_eq!(dfs_path, r"\ADC.aviv.local\dfs\Docs");
+        assert_eq!(dfs_alternate_path, r"\ADC.aviv.local\dfs\Docs");
+        assert_eq!(network_address, r"\ADC\Shares\Docs");
 
         let e1 = &resp.entries[1];
-        assert_eq!(e1.version, 4);
-        assert_eq!(e1.server_type, 0);
-        assert_eq!(e1.ttl, 1800);
-        assert_eq!(e1.dfs_path, r"\ADC.aviv.local\dfs\Docs");
-        assert_eq!(e1.dfs_alternate_path, r"\ADC.aviv.local\dfs\Docs");
-        assert_eq!(e1.network_address, r"\FSRV\Shares\MyShare");
+        assert_eq!(e1.version(), 4);
+        assert_eq!(e1.ttl(), 1800);
+        assert!(!e1.flags().contains(ReferralEntryFlags::TARGET_SET_BOUNDARY));
+        assert_eq!(e1.dfs_path(), Some(r"\ADC.aviv.local\dfs\Docs"));
+        assert_eq!(e1.target_address(), Some(r"\FSRV\Shares\MyShare"));
+    }
+
+    /// V1 entries carry their share name inline, with no offsets, no DFS
+    /// path, and no TTL. MS-DFSC § 2.2.2 makes supporting them a MUST for a
+    /// client that asks for `MaxReferralLevel = 4`, as this one does.
+    #[test]
+    fn resp_parse_v1_referral() {
+        let share_name = encode_null_utf16(r"\srv\legacy");
+        // 4 (version+size) + 2 (server_type) + 2 (flags) + the inline string.
+        let entry_size = 8u16 + share_name.len() as u16;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&22u16.to_le_bytes()); // path_consumed
+        buf.extend_from_slice(&1u16.to_le_bytes()); // number_of_referrals
+        buf.extend_from_slice(&1u32.to_le_bytes()); // header_flags
+
+        buf.extend_from_slice(&1u16.to_le_bytes()); // version = 1
+        buf.extend_from_slice(&entry_size.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // server_type = root
+        buf.extend_from_slice(&0u16.to_le_bytes()); // flags (MUST be 0)
+        buf.extend_from_slice(&share_name);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let resp = RespGetDfsReferral::unpack(&mut cursor).unwrap();
+
+        assert_eq!(resp.entries.len(), 1);
+        assert_eq!(
+            resp.entries[0],
+            DfsReferralEntry::V1 {
+                server_type: 1,
+                share_name: r"\srv\legacy".to_string(),
+            }
+        );
+        // No DFS path means the cache key has to come from `path_consumed`.
+        assert_eq!(resp.entries[0].dfs_path(), None);
+        assert_eq!(resp.entries[0].ttl(), 0);
+        assert_eq!(resp.entries[0].target_address(), Some(r"\srv\legacy"));
+    }
+
+    /// A NameListReferral entry's tail is `SpecialNameOffset` +
+    /// `NumberOfExpandedNames` + `ExpandedNameOffset` (§ 2.2.5.3.2), not the
+    /// three path offsets. Read as a target it would yield strings from
+    /// wherever those two bytes happened to point.
+    #[test]
+    fn resp_parse_name_list_referral() {
+        let domain = encode_null_utf16("CONTOSO");
+        let dc1 = encode_null_utf16(r"\dc1.contoso.com");
+        let dc2 = encode_null_utf16(r"\dc2.contoso.com");
+
+        // 4 + 2+2+4 (head) + 2+2+2 (tail) = 18, then 16 optional padding bytes
+        // the server MAY insert; use them here so the parser proves it follows
+        // `Size` rather than assuming a layout.
+        let entry_size: u16 = 34;
+        let special_name_offset = entry_size;
+        let expanded_name_offset = special_name_offset + domain.len() as u16;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&14u16.to_le_bytes()); // path_consumed
+        buf.extend_from_slice(&1u16.to_le_bytes()); // number_of_referrals
+        buf.extend_from_slice(&0u32.to_le_bytes()); // header_flags
+
+        buf.extend_from_slice(&3u16.to_le_bytes()); // version = 3
+        buf.extend_from_slice(&entry_size.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // server_type
+        buf.extend_from_slice(&ReferralEntryFlags::NAME_LIST_REFERRAL.to_le_bytes());
+        buf.extend_from_slice(&600u32.to_le_bytes()); // ttl
+        buf.extend_from_slice(&special_name_offset.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes()); // number_of_expanded_names
+        buf.extend_from_slice(&expanded_name_offset.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 16]); // padding the server MAY insert
+
+        buf.extend_from_slice(&domain);
+        buf.extend_from_slice(&dc1);
+        buf.extend_from_slice(&dc2);
+
+        let mut cursor = ReadCursor::new(&buf);
+        let resp = RespGetDfsReferral::unpack(&mut cursor).unwrap();
+
+        assert_eq!(resp.entries.len(), 1);
+        let DfsReferralEntry::NameList {
+            version,
+            ttl,
+            special_name,
+            expanded_names,
+            ..
+        } = &resp.entries[0]
+        else {
+            panic!("expected a NameList entry, got {:?}", resp.entries[0]);
+        };
+        assert_eq!(*version, 3);
+        assert_eq!(*ttl, 600);
+        assert_eq!(special_name, "CONTOSO");
+        assert_eq!(expanded_names, &[r"\dc1.contoso.com", r"\dc2.contoso.com"]);
+        // Nothing here can be mistaken for somewhere to connect.
+        assert_eq!(resp.entries[0].target_address(), None);
+    }
+
+    /// A NameList entry claiming more DC names than the buffer holds is a
+    /// clean error, never an allocation sized by the server.
+    #[test]
+    fn resp_parse_name_list_bogus_count_errors() {
+        let domain = encode_null_utf16("CONTOSO");
+        let entry_size: u16 = 18;
+        let special_name_offset = entry_size;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        buf.extend_from_slice(&3u16.to_le_bytes());
+        buf.extend_from_slice(&entry_size.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&ReferralEntryFlags::NAME_LIST_REFERRAL.to_le_bytes());
+        buf.extend_from_slice(&600u32.to_le_bytes());
+        buf.extend_from_slice(&special_name_offset.to_le_bytes());
+        buf.extend_from_slice(&u16::MAX.to_le_bytes()); // absurd name count
+        buf.extend_from_slice(&(special_name_offset + domain.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&domain);
+
+        let mut cursor = ReadCursor::new(&buf);
+        assert!(RespGetDfsReferral::unpack(&mut cursor).is_err());
+    }
+
+    /// The Interlink test of § 3.1.5.4.5: R set and S clear.
+    #[test]
+    fn header_flags_interlink_test() {
+        let interlink = ReferralHeaderFlags::new(ReferralHeaderFlags::REFERRAL_SERVERS);
+        assert!(interlink.is_interlink());
+
+        // What Samba answers for a namespace root: S alone.
+        let samba = ReferralHeaderFlags::new(ReferralHeaderFlags::STORAGE_SERVERS);
+        assert!(!samba.is_interlink());
+
+        // What Windows answers for the same: R and S together.
+        let windows = ReferralHeaderFlags::new(
+            ReferralHeaderFlags::REFERRAL_SERVERS | ReferralHeaderFlags::STORAGE_SERVERS,
+        );
+        assert!(!windows.is_interlink());
+
+        assert!(!ReferralHeaderFlags::default().is_interlink());
     }
 
     #[test]
@@ -436,16 +802,21 @@ mod tests {
         let resp = RespGetDfsReferral::unpack(&mut cursor).unwrap();
 
         assert_eq!(resp.path_consumed, 20);
-        assert_eq!(resp.header_flags, 3);
+        assert_eq!(resp.header_flags.bits(), 3);
         assert_eq!(resp.entries.len(), 1);
 
-        let e = &resp.entries[0];
-        assert_eq!(e.version, 3);
-        assert_eq!(e.server_type, 1);
-        assert_eq!(e.ttl, 600);
-        assert_eq!(e.dfs_path, r"\dom\share");
-        assert_eq!(e.dfs_alternate_path, r"\dom\share");
-        assert_eq!(e.network_address, r"\srv\share");
+        assert_eq!(
+            resp.entries[0],
+            DfsReferralEntry::Target {
+                version: 3,
+                server_type: 1,
+                flags: ReferralEntryFlags::default(),
+                ttl: 600,
+                dfs_path: r"\dom\share".to_string(),
+                dfs_alternate_path: r"\dom\share".to_string(),
+                network_address: r"\srv\share".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -486,16 +857,21 @@ mod tests {
         let resp = RespGetDfsReferral::unpack(&mut cursor).unwrap();
 
         assert_eq!(resp.path_consumed, 24);
-        assert_eq!(resp.header_flags, 1);
+        assert_eq!(resp.header_flags.bits(), 1);
         assert_eq!(resp.entries.len(), 1);
 
-        let e = &resp.entries[0];
-        assert_eq!(e.version, 2);
-        assert_eq!(e.server_type, 0);
-        assert_eq!(e.ttl, 300);
-        assert_eq!(e.dfs_path, r"\domain\dfs");
-        assert_eq!(e.dfs_alternate_path, r"\domain\dfs");
-        assert_eq!(e.network_address, r"\server\data");
+        assert_eq!(
+            resp.entries[0],
+            DfsReferralEntry::Target {
+                version: 2,
+                server_type: 0,
+                flags: ReferralEntryFlags::default(),
+                ttl: 300,
+                dfs_path: r"\domain\dfs".to_string(),
+                dfs_alternate_path: r"\domain\dfs".to_string(),
+                network_address: r"\server\data".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -509,7 +885,7 @@ mod tests {
         let mut cursor = ReadCursor::new(&buf);
         let resp = RespGetDfsReferral::unpack(&mut cursor).unwrap();
         assert_eq!(resp.path_consumed, 0);
-        assert_eq!(resp.header_flags, 0);
+        assert_eq!(resp.header_flags, ReferralHeaderFlags::default());
         assert!(resp.entries.is_empty());
     }
 
@@ -580,11 +956,10 @@ mod tests {
         let resp = RespGetDfsReferral::unpack(&mut cursor).unwrap();
 
         assert_eq!(resp.entries.len(), 2);
-        assert_eq!(resp.entries[0].ttl, 120);
-        assert_eq!(resp.entries[0].network_address, r"\srv1\data");
-        assert_eq!(resp.entries[1].ttl, 240);
-        assert_eq!(resp.entries[1].server_type, 1);
-        assert_eq!(resp.entries[1].network_address, r"\srv2\data");
+        assert_eq!(resp.entries[0].ttl(), 120);
+        assert_eq!(resp.entries[0].target_address(), Some(r"\srv1\data"));
+        assert_eq!(resp.entries[1].ttl(), 240);
+        assert_eq!(resp.entries[1].target_address(), Some(r"\srv2\data"));
     }
 
     #[test]
@@ -594,8 +969,8 @@ mod tests {
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
         buf.extend_from_slice(&0u32.to_le_bytes());
-        // Entry with version 1 (unsupported)
-        buf.extend_from_slice(&1u16.to_le_bytes()); // version
+        // Entry with version 5 (past everything MS-DFSC defines)
+        buf.extend_from_slice(&5u16.to_le_bytes()); // version
         buf.extend_from_slice(&8u16.to_le_bytes()); // size
         buf.extend_from_slice(&[0u8; 4]); // padding to reach size
 

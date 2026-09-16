@@ -241,6 +241,71 @@ fn build_dfs_referral_v4() -> Vec<u8> {
     buf
 }
 
+/// V1 puts its `ShareName` inline with no offset at all, which is a layout no
+/// other version has.
+fn build_dfs_referral_v1() -> Vec<u8> {
+    let share_name: Vec<u8> = r"\srv\legacy"
+        .encode_utf16()
+        .flat_map(|cu| cu.to_le_bytes().to_vec())
+        .chain([0u8, 0u8])
+        .collect();
+
+    let entry_size = 8u16 + share_name.len() as u16;
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&22u16.to_le_bytes()); // path_consumed
+    buf.extend_from_slice(&1u16.to_le_bytes()); // number_of_referrals
+    buf.extend_from_slice(&1u32.to_le_bytes()); // header_flags
+
+    buf.extend_from_slice(&1u16.to_le_bytes()); // version
+    buf.extend_from_slice(&entry_size.to_le_bytes()); // size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // server_type
+    buf.extend_from_slice(&0u16.to_le_bytes()); // referral_entry_flags
+    buf.extend_from_slice(&share_name);
+
+    buf
+}
+
+/// A NameListReferral entry: a server-supplied count of variable-length names
+/// at one offset, which is the only place in this parser where a count from
+/// the wire drives a loop.
+fn build_dfs_referral_name_list() -> Vec<u8> {
+    let encode = |s: &str| -> Vec<u8> {
+        s.encode_utf16()
+            .flat_map(|cu| cu.to_le_bytes().to_vec())
+            .chain([0u8, 0u8])
+            .collect()
+    };
+    let domain = encode("CONTOSO");
+    let dc1 = encode(r"\dc1.contoso.com");
+    let dc2 = encode(r"\dc2.contoso.com");
+
+    let entry_size: u16 = 34; // 18 fixed + the 16 padding bytes a server MAY add
+    let special_name_offset = entry_size;
+    let expanded_name_offset = special_name_offset + domain.len() as u16;
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&14u16.to_le_bytes()); // path_consumed
+    buf.extend_from_slice(&1u16.to_le_bytes()); // number_of_referrals
+    buf.extend_from_slice(&0u32.to_le_bytes()); // header_flags
+
+    buf.extend_from_slice(&3u16.to_le_bytes()); // version
+    buf.extend_from_slice(&entry_size.to_le_bytes()); // size
+    buf.extend_from_slice(&0u16.to_le_bytes()); // server_type
+    buf.extend_from_slice(&0x0002u16.to_le_bytes()); // NameListReferral
+    buf.extend_from_slice(&600u32.to_le_bytes()); // ttl
+    buf.extend_from_slice(&special_name_offset.to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes()); // number_of_expanded_names
+    buf.extend_from_slice(&expanded_name_offset.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 16]); // padding
+
+    buf.extend_from_slice(&domain);
+    buf.extend_from_slice(&dc1);
+    buf.extend_from_slice(&dc2);
+
+    buf
+}
+
 #[test]
 #[ignore = "run explicitly: cargo test -p smb2 --test fuzz_seeds -- --ignored"]
 fn generate_fuzz_seeds() {
@@ -434,6 +499,16 @@ fn generate_fuzz_seeds() {
         "fuzz_dfs_referral_response_parse",
         "v4",
         &build_dfs_referral_v4(),
+    );
+    write_seed(
+        "fuzz_dfs_referral_response_parse",
+        "v1",
+        &build_dfs_referral_v1(),
+    );
+    write_seed(
+        "fuzz_dfs_referral_response_parse",
+        "name_list",
+        &build_dfs_referral_name_list(),
     );
 
     // ── fuzz_name_round_trip ────────────────────────────────────────
