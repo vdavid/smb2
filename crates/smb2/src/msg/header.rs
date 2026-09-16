@@ -214,6 +214,58 @@ pub struct ErrorResponse {
 
 impl ErrorResponse {
     pub const STRUCTURE_SIZE: u16 = 9;
+
+    /// `SMB2_ERROR_ID_SHARE_REDIRECT` (MS-SMB2 § 2.2.2.1).
+    const ERROR_ID_SHARE_REDIRECT: u32 = 0x7264_5253;
+
+    /// Whether any error context says this is a scale-out cluster redirect
+    /// rather than whatever the status code usually means.
+    ///
+    /// `STATUS_BAD_NETWORK_NAME` carries an `SMB2_ERROR_ID_SHARE_REDIRECT`
+    /// context when a server moves a share to another cluster node
+    /// (§ 2.2.2.2.2), so the same status stands for two unrelated things and
+    /// only the context tells them apart. A DFS namespace root refuses
+    /// `TREE_CONNECT` with that same status, which is why this check exists.
+    ///
+    /// Contexts are `ErrorDataLength(4)` + `ErrorId(4)` + data, each starting
+    /// on an 8-byte boundary relative to the start of the ERROR response — and
+    /// the fixed part is exactly 8 bytes, so the same alignment holds inside
+    /// `error_data`. A context that runs off the end ends the walk; a
+    /// malformed tail cannot make this say "yes".
+    pub fn is_share_redirect(&self) -> bool {
+        if self.error_context_count == 0 {
+            return false;
+        }
+        let mut pos = 0usize;
+        for _ in 0..self.error_context_count {
+            if pos + 8 > self.error_data.len() {
+                return false;
+            }
+            let data_len = u32::from_le_bytes(
+                self.error_data[pos..pos + 4]
+                    .try_into()
+                    .expect("4 bytes, just bounds-checked"),
+            ) as usize;
+            let error_id = u32::from_le_bytes(
+                self.error_data[pos + 4..pos + 8]
+                    .try_into()
+                    .expect("4 bytes, just bounds-checked"),
+            );
+            if error_id == Self::ERROR_ID_SHARE_REDIRECT {
+                return true;
+            }
+            // Next context, 8-byte aligned.
+            let advance = 8usize
+                .saturating_add(data_len)
+                .checked_next_multiple_of(8)
+                .unwrap_or(usize::MAX);
+            match pos.checked_add(advance) {
+                Some(next) if next > pos => pos = next,
+                _ => return false,
+            }
+        }
+        false
+    }
 }
 
 impl Pack for ErrorResponse {
@@ -269,6 +321,82 @@ impl Unpack for ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Error context tests ─────────────────────────────────────────
+
+    /// One SMB2 ERROR Context: length, id, then `body_len` bytes of body,
+    /// padded out to the next 8-byte boundary.
+    fn error_context(error_id: u32, body_len: usize) -> Vec<u8> {
+        let mut ctx = Vec::new();
+        ctx.extend_from_slice(&(body_len as u32).to_le_bytes());
+        ctx.extend_from_slice(&error_id.to_le_bytes());
+        ctx.resize(ctx.len() + body_len, 0xAB);
+        while ctx.len() % 8 != 0 {
+            ctx.push(0);
+        }
+        ctx
+    }
+
+    #[test]
+    fn share_redirect_context_is_recognized() {
+        let resp = ErrorResponse {
+            error_context_count: 1,
+            error_data: error_context(0x7264_5253, 48),
+        };
+        assert!(resp.is_share_redirect());
+    }
+
+    /// The one that matters for DFS: a plain `STATUS_BAD_NETWORK_NAME` carries
+    /// no contexts at all, and must not read as a redirect.
+    #[test]
+    fn a_plain_error_response_is_not_a_share_redirect() {
+        let resp = ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+        assert!(!resp.is_share_redirect());
+    }
+
+    #[test]
+    fn share_redirect_is_found_after_another_context() {
+        let mut data = error_context(0x0000_0000, 12);
+        data.extend_from_slice(&error_context(0x7264_5253, 48));
+        let resp = ErrorResponse {
+            error_context_count: 2,
+            error_data: data,
+        };
+        assert!(resp.is_share_redirect());
+    }
+
+    /// A count or a length the buffer cannot back ends the walk. ❌ A
+    /// malformed tail must never be able to answer "yes": that would turn a
+    /// missing share into an unfollowable cluster redirect.
+    #[test]
+    fn a_malformed_context_chain_never_claims_a_redirect() {
+        // Claims two contexts, holds one.
+        let resp = ErrorResponse {
+            error_context_count: 2,
+            error_data: error_context(0x0000_0000, 8),
+        };
+        assert!(!resp.is_share_redirect());
+
+        // A length that runs off the end.
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let resp = ErrorResponse {
+            error_context_count: 2,
+            error_data: data,
+        };
+        assert!(!resp.is_share_redirect());
+
+        // A truncated first context.
+        let resp = ErrorResponse {
+            error_context_count: 1,
+            error_data: vec![0x53, 0x52],
+        };
+        assert!(!resp.is_share_redirect());
+    }
 
     // ── Header tests ────────────────────────────────────────────────
 

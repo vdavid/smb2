@@ -176,6 +176,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         }
     }
 

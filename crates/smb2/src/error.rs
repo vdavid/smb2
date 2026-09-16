@@ -139,6 +139,67 @@ pub enum Error {
         path: String,
     },
 
+    /// The path is a DFS namespace, and none of its targets could be reached.
+    ///
+    /// Distinct from "the share does not exist", which is what a failed
+    /// `TREE_CONNECT` normally means, and distinct from a referral that never
+    /// came back — both of those surface as the original
+    /// `STATUS_BAD_NETWORK_NAME`. This one says something no other error does:
+    /// the namespace is real, we found it, the storage behind it is out of
+    /// reach. A consumer's useful response is "the namespace is up, its file
+    /// servers are not", which is a very different thing to tell someone than
+    /// "no such share".
+    ///
+    /// Classifies as [`ErrorKind::ConnectionLost`] and reports as retryable:
+    /// a target that is down now may be up later, and the namespace itself
+    /// resolved fine.
+    #[error("DFS namespace {namespace} resolved to {target_count} target(s), none reachable")]
+    DfsNoReachableTarget {
+        /// The namespace path the caller asked for, for example
+        /// `\\lgs-net.com\aleu`.
+        namespace: String,
+        /// How many targets the referral offered.
+        target_count: usize,
+        /// Why the last one failed.
+        source: Box<Error>,
+    },
+
+    /// A DFS path kept referring us somewhere else, so we stopped following.
+    ///
+    /// A namespace that points at itself, or a chain of Interlinks with no end
+    /// (MS-DFSC § 3.1.5.4.5), would otherwise resolve forever. The bound is a
+    /// constant, not a setting: a legitimate namespace resolves in one hop and
+    /// an Interlink adds one more, so anything near the limit is a
+    /// misconfiguration on the server, and a knob would only let a consumer
+    /// wait longer for the same answer.
+    #[error("DFS path {namespace} was still being referred elsewhere after {hops} hops")]
+    DfsTooManyReferrals {
+        /// The path the caller asked for.
+        namespace: String,
+        /// How many referrals were followed before giving up.
+        hops: usize,
+    },
+
+    /// The server moved this share to another node of a scale-out cluster.
+    ///
+    /// MS-SMB2 § 2.2.2.2.2: a `STATUS_BAD_NETWORK_NAME` carrying an
+    /// `SMB2_ERROR_ID_SHARE_REDIRECT` error context. It reuses the status code
+    /// a missing share uses, and means something else entirely — which is why
+    /// it gets its own variant rather than a flag on
+    /// [`Protocol`](Self::Protocol). Telling them apart also keeps DFS
+    /// resolution off it: a cluster redirect is not a namespace, and chasing
+    /// a referral for it would be nonsense.
+    ///
+    /// This crate implements neither side of the mechanism and never asks for
+    /// it (it never sets `SMB2_TREE_CONNECT_FLAG_REDIRECT_TO_OWNER`), so a
+    /// conforming server should not send it. Handling it anyway costs one
+    /// branch and turns a silently-wrong answer into a true one.
+    #[error("the server moved {share} to another cluster node, which this client does not follow")]
+    ShareRedirected {
+        /// The share the server refused, as the caller named it.
+        share: String,
+    },
+
     /// The operation was cancelled by the caller (via progress callback).
     #[error("Operation cancelled")]
     Cancelled,
@@ -300,6 +361,7 @@ impl Error {
                 | Error::ServerUnresponsive { .. }
                 | Error::ReconnectFailed { .. }
                 | Error::DurableHandleLost { .. }
+                | Error::DfsNoReachableTarget { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
                     ..
@@ -462,6 +524,14 @@ impl Error {
             Error::Cancelled => ErrorKind::Cancelled,
             Error::SessionExpired => ErrorKind::SessionExpired,
             Error::DfsReferralRequired { .. } => ErrorKind::DfsReferral,
+            // The namespace resolved; its storage is unreachable. That is a
+            // connectivity answer, and the target may be back later.
+            Error::DfsNoReachableTarget { .. } => ErrorKind::ConnectionLost,
+            // A namespace that refers in circles is a server misconfiguration
+            // with nothing behind it to find.
+            Error::DfsTooManyReferrals { .. } => ErrorKind::NotFound,
+            // The share exists, on a node this client won't follow to.
+            Error::ShareRedirected { .. } => ErrorKind::Unsupported,
             Error::FileTooLargeForSingleRead { .. } => ErrorKind::TooLarge,
             // A connection whose credits never come back is a dead connection
             // wearing a live socket; consumers already reconnect on TimedOut.

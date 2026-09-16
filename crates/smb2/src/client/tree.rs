@@ -230,8 +230,31 @@ pub struct FsInfo {
     pub sectors_per_unit: u32,
 }
 
+/// Where a tree came from, when a DFS referral put it somewhere else.
+///
+/// A file manager showing `\\fs01\aleu_dfs` for a path the person typed as
+/// `\\lgs-net.com\aleu` is showing them a server they have never heard of.
+/// Every other client keeps the requested name (macOS reports
+/// `SERVER_NAME lgs-net.com` for exactly this mount), so a library that threw
+/// it away would make every consumer shadow it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DfsOrigin {
+    /// The UNC path the caller asked for, for example `\\lgs-net.com\aleu`.
+    pub requested: String,
+    /// The referral target this tree actually sits on, for example
+    /// `\\fs01\aleu_dfs`.
+    pub target: String,
+}
+
 /// A connection to a specific share (tree connect).
-#[derive(Clone)]
+///
+/// `#[non_exhaustive]`: only the library produces a `Tree`, so nothing is lost
+/// by making it unconstructable from outside, and every later field is free.
+/// `Debug` holds nothing secret: an id, two names, and three flags. Printing
+/// a tree is what a consumer reaches for first when a DFS redirect put it
+/// somewhere unexpected.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Tree {
     /// The tree ID assigned by the server.
     pub tree_id: TreeId,
@@ -246,6 +269,10 @@ pub struct Tree {
     pub is_dfs: bool,
     /// Whether the share requires encryption.
     pub encrypt_data: bool,
+    /// `Some` when DFS resolution moved this tree off the path the caller
+    /// named. Show the caller [`DfsOrigin::requested`], not
+    /// [`server`](Self::server).
+    pub dfs_origin: Option<DfsOrigin>,
 }
 
 impl Tree {
@@ -272,6 +299,23 @@ impl Tree {
         }
 
         if frame.header.status != NtStatus::SUCCESS {
+            // `STATUS_BAD_NETWORK_NAME` stands for two unrelated things, and
+            // only the error context tells them apart: a share that isn't
+            // there, and a scale-out cluster moving one to another node
+            // (MS-SMB2 § 2.2.2.2.2). They get different errors, so nothing
+            // downstream — DFS namespace-root resolution above all — can
+            // mistake a redirect for a namespace.
+            if frame.header.status == NtStatus::BAD_NETWORK_NAME {
+                let mut cursor = ReadCursor::new(&frame.body);
+                if let Ok(err) = crate::msg::header::ErrorResponse::unpack(&mut cursor) {
+                    if err.is_share_redirect() {
+                        debug!("tree: {share_name} was redirected to another cluster node");
+                        return Err(Error::ShareRedirected {
+                            share: share_name.to_string(),
+                        });
+                    }
+                }
+            }
             return Err(Error::Protocol {
                 status: frame.header.status,
                 command: Command::TreeConnect,
@@ -306,6 +350,7 @@ impl Tree {
             server: server.clone(),
             is_dfs,
             encrypt_data,
+            dfs_origin: None,
         })
     }
 
@@ -3488,6 +3533,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let entries = tree.list_directory(&mut conn, "somedir").await.unwrap();
@@ -3535,6 +3581,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let (entries, trace) = tree
@@ -3586,6 +3633,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let data = tree.read_file(&mut conn, "test.txt").await.unwrap();
@@ -3621,6 +3669,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let err = tree.read_file(&mut conn, "big.bin").await.unwrap_err();
@@ -3678,6 +3727,7 @@ mod tests {
             server: "server1".to_string(),
             is_dfs: true,
             encrypt_data: false,
+            dfs_origin: None,
         };
         assert_eq!(
             tree.format_path("data/hello.txt"),
@@ -3698,6 +3748,7 @@ mod tests {
             server: "server1:10456".to_string(),
             is_dfs: true,
             encrypt_data: false,
+            dfs_origin: None,
         };
         assert_eq!(
             tree.format_path("data/hello.txt"),
@@ -3713,6 +3764,7 @@ mod tests {
             server: "server1".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
         assert_eq!(tree.format_path("data/hello.txt"), "data\\hello.txt");
         assert_eq!(tree.format_path(""), "");
@@ -3746,6 +3798,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         tree.disconnect(&mut conn).await.unwrap();
@@ -3832,6 +3885,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         tree.delete_file(&mut conn, "remove.txt").await.unwrap();
@@ -3901,6 +3955,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.delete_file(&mut conn, "nonexistent.txt").await;
@@ -3950,6 +4005,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.delete_file(&mut conn, "tricky.txt").await;
@@ -3985,6 +4041,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let written = tree
@@ -4030,6 +4087,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let info = tree.stat(&mut conn, "doc.txt").await.unwrap();
@@ -4085,6 +4143,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.stat(&mut conn, "nonexistent.txt").await;
@@ -4143,6 +4202,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.stat(&mut conn, "tricky.txt").await;
@@ -4190,6 +4250,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree
@@ -4271,6 +4332,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree
@@ -4296,6 +4358,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results: Vec<Result<FileInfo>> = tree.stat_files(&mut conn, &[]).await;
@@ -4326,6 +4389,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         tree.rename(&mut conn, "old.txt", "new.txt").await.unwrap();
@@ -4392,6 +4456,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.rename(&mut conn, "old.txt", "new.txt").await;
@@ -4452,6 +4517,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.rename(&mut conn, "old.txt", "new.txt").await;
@@ -4490,6 +4556,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree
@@ -4576,6 +4643,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree
@@ -4609,6 +4677,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results: Vec<Result<()>> = tree.rename_files(&mut conn, &[]).await;
@@ -4636,6 +4705,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         tree.create_directory(&mut conn, "new_dir").await.unwrap();
@@ -4668,6 +4738,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         tree.open_file_for_exclusive_create(&mut conn, "new.bin")
@@ -4701,6 +4772,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let err = tree
@@ -4738,6 +4810,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         tree.delete_directory(&mut conn, "old_dir").await.unwrap();
@@ -4803,6 +4876,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.delete_directory(&mut conn, "full_dir").await;
@@ -4856,6 +4930,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree
@@ -4934,6 +5009,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree
@@ -5001,6 +5077,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree.delete_files(&mut conn, &["leaky.txt", "ok.txt"]).await;
@@ -5022,6 +5099,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let results = tree.delete_files(&mut conn, &[]).await;
@@ -5145,6 +5223,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let data = tree
@@ -5197,6 +5276,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let data = tree
@@ -5227,6 +5307,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let data = tree
@@ -5272,6 +5353,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let data = tree
@@ -5369,6 +5451,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let data = tree
@@ -5451,6 +5534,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let data = tree
@@ -5518,6 +5602,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut progress_reports = Vec::new();
@@ -5584,6 +5669,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         // Cancel after the first chunk.
@@ -5639,6 +5725,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut progress_called = false;
@@ -5687,6 +5774,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let written = tree
@@ -5733,6 +5821,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let written = tree
@@ -5772,6 +5861,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let written = tokio::time::timeout(
@@ -5823,6 +5913,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut chunk_iter = sizes
@@ -5890,6 +5981,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
         let sent = mock.clone();
         let task = tokio::spawn(async move {
@@ -5940,6 +6032,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
         let sent = mock.clone();
         let task = tokio::spawn(async move {
@@ -6700,6 +6793,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         // Should succeed despite BUFFER_OVERFLOW on the basic info query.
@@ -6743,6 +6837,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut next_chunk =
@@ -6808,6 +6903,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut next_chunk = || -> Option<std::result::Result<Vec<u8>, std::io::Error>> { None };
@@ -6859,6 +6955,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut call_count = 0u32;
@@ -6912,6 +7009,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut call_count = 0u32;
@@ -6978,6 +7076,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         // Streamed write: 2 chunks succeed, then callback errors.
@@ -7110,6 +7209,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut download = tree
@@ -7156,6 +7256,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let result = tree.download(&mut conn, "missing.txt").await;
@@ -7188,6 +7289,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         };
 
         let mut download = tree.download(&mut conn, "big.bin").await.expect("download");
@@ -7258,6 +7360,7 @@ mod tests {
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         });
 
         let payload = b"shared-body-for-both-readers".to_vec();

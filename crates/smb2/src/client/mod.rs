@@ -37,7 +37,7 @@ pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
-pub use tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
+pub use tree::{DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
@@ -48,12 +48,13 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use log::debug;
+use log::{debug, info, trace};
 
 use crate::client::dfs::DfsResolver;
 use crate::error::{ErrorKind, Result};
 use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
+use crate::types::status::NtStatus;
 use crate::types::FileId;
 use crate::Error;
 
@@ -208,6 +209,15 @@ fn activate_share_encryption(conn: &mut Connection, session: &Session, tree: &Tr
     conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
 }
 
+/// How many referrals one connect may follow before we call it a loop.
+///
+/// A real namespace resolves in one hop, and an Interlink (MS-DFSC
+/// § 3.1.5.4.5) adds one more. Anything near this limit is a namespace
+/// pointing at itself or a chain with no end, which is a misconfiguration on
+/// the server: a knob here would only let a consumer wait longer for the same
+/// answer.
+const MAX_DFS_HOPS: usize = 8;
+
 /// One `Error::Disconnected` per item, for a batch method that never found a
 /// connection to run on.
 ///
@@ -349,12 +359,264 @@ impl SmbClient {
     /// If the share requires encryption (`SMB2_SHAREFLAG_ENCRYPT_DATA`)
     /// and encryption is not already active, encryption is activated
     /// using the session's keys.
+    ///
+    /// # DFS namespace roots
+    ///
+    /// `share_name` may be a **DFS namespace** rather than a share on this
+    /// server — `\\lgs-net.com\aleu`, where `lgs-net.com` is a domain name and
+    /// `aleu` is the namespace. There is no such share to tree-connect, so the
+    /// server refuses with `STATUS_BAD_NETWORK_NAME`; this method then asks it
+    /// for a root referral and connects the target the referral names, on
+    /// whichever server that turns out to be. The returned `Tree` carries a
+    /// [`DfsOrigin`] recording both names, so a consumer can keep showing the
+    /// path the person asked for.
+    ///
+    /// A cached namespace skips straight to the target, so the wasted
+    /// `TREE_CONNECT` is paid once per TTL rather than once per connect.
+    ///
+    /// **A mistyped share name is still a mistyped share name.** The referral
+    /// only happens when the server advertised `SMB2_GLOBAL_CAP_DFS`, and if
+    /// it fails, comes back empty, or names nothing reachable-looking, the
+    /// caller gets the original `STATUS_BAD_NETWORK_NAME` back rather than
+    /// something about DFS. The one case that reports differently is a real
+    /// namespace whose storage is all down:
+    /// [`Error::DfsNoReachableTarget`].
     pub async fn connect_share(&mut self, share_name: &str) -> Result<Tree> {
         self.refresh_session();
-        let mut tree = Tree::connect(&mut self.conn, share_name).await?;
-        tree.server = self.primary_server.clone();
-        activate_share_encryption(&mut self.conn, &self.session, &tree);
-        Ok(tree)
+
+        // § 3.1.4.1 step 2: the cache first, so a known namespace never pays
+        // the refused TreeConnect again inside its TTL. Terminal on purpose —
+        // falling back to a plain tree connect afterwards would resolve the
+        // namespace twice and double the wait on the one path where the wait
+        // is long (every target down). An entry whose TTL has run out reports
+        // a miss, so a namespace that has genuinely become an ordinary share
+        // is found again then.
+        let requested = self.unc_for(share_name);
+        if self.config.dfs_enabled && self.dfs_resolver.resolve_from_cache(&requested).is_some() {
+            trace!("dfs: {requested:?} is a known namespace, going straight to its targets");
+            return self.connect_namespace(&requested, share_name).await;
+        }
+
+        // § 3.1.4.1 step 8 for the ordinary world: tree-connect, and on
+        // success we are done at zero extra cost.
+        let refusal = match Tree::connect(&mut self.conn, share_name).await {
+            Ok(mut tree) => {
+                tree.server = self.primary_server.clone();
+                activate_share_encryption(&mut self.conn, &self.session, &tree);
+                return Ok(tree);
+            }
+            Err(err) => err,
+        };
+
+        if !self.looks_like_a_namespace_root(&refusal) {
+            return Err(refusal);
+        }
+
+        debug!(
+            "dfs: {share_name:?} is not a share on {}, and the server speaks DFS; \
+             asking it for a root referral",
+            self.primary_server
+        );
+        match self.connect_namespace(&requested, share_name).await {
+            Ok(tree) => Ok(tree),
+            // ❌ A failed referral must not replace the original error. The
+            // overwhelmingly common reason for STATUS_BAD_NETWORK_NAME is a
+            // typo in a share name, and telling that person about DFS is
+            // worse than telling them nothing. Only the one outcome that is
+            // genuinely about DFS survives.
+            Err(err @ (Error::DfsNoReachableTarget { .. } | Error::DfsTooManyReferrals { .. })) => {
+                Err(err)
+            }
+            Err(err) => {
+                debug!("dfs: no namespace behind {share_name:?} ({err}); reporting the refusal");
+                Err(refusal)
+            }
+        }
+    }
+
+    /// The UNC path for a share on the primary server, as a referral names it.
+    fn unc_for(&self, share_name: &str) -> String {
+        let host = self
+            .primary_server
+            .rsplit_once(':')
+            .map_or(self.primary_server.as_str(), |(host, _)| host);
+        format!(r"\\{host}\{share_name}")
+    }
+
+    /// Whether a refused `TREE_CONNECT` might be a DFS namespace root rather
+    /// than a share that is simply not there.
+    ///
+    /// MS-SMB2 § 3.3.5.7 makes `STATUS_BAD_NETWORK_NAME` the required answer
+    /// for a name the server has no share for, which is what a namespace root
+    /// is from the server's point of view. Gating on the negotiated
+    /// `SMB2_GLOBAL_CAP_DFS` keeps a plain NAS at zero extra round-trips when
+    /// someone mistypes a share name; a server that does advertise DFS pays
+    /// one extra frame on an error path.
+    ///
+    /// `Error::ShareRedirected` deliberately does not reach here:
+    /// `Tree::connect` separates cluster redirection out, and it shares only
+    /// the status code with this.
+    fn looks_like_a_namespace_root(&self, err: &Error) -> bool {
+        self.config.dfs_enabled
+            && matches!(
+                err,
+                Error::Protocol {
+                    status: NtStatus::BAD_NETWORK_NAME,
+                    command: crate::types::Command::TreeConnect,
+                }
+            )
+            && self.conn.params().is_some_and(|p| {
+                p.capabilities
+                    .contains(crate::types::flags::Capabilities::DFS)
+            })
+    }
+
+    /// Resolve `requested` as a DFS namespace and connect the first target
+    /// that answers.
+    ///
+    /// Follows Interlinks (MS-DFSC § 3.1.5.4.5: the target is a path in
+    /// another namespace, so it is re-resolved rather than connected) up to
+    /// [`MAX_DFS_HOPS`], which is what stops a namespace that points at
+    /// itself from resolving forever.
+    async fn connect_namespace(&mut self, requested: &str, share_name: &str) -> Result<Tree> {
+        let mut path = requested.to_string();
+        let mut last_error: Option<Error> = None;
+        let mut target_count = 0usize;
+
+        for _ in 0..MAX_DFS_HOPS {
+            let targets = self.root_referral(&path).await?;
+            if targets.is_empty() {
+                break;
+            }
+            target_count = targets.len();
+
+            // An Interlink means the whole response is a path in another
+            // namespace, so there is nothing here to connect to.
+            if let Some(first) = targets.first().filter(|t| t.interlink) {
+                path = format!(r"\\{}\{}", first.server, first.share);
+                trace!("dfs: {requested:?} is an interlink, re-resolving as {path:?}");
+                continue;
+            }
+
+            for target in &targets {
+                // A root target is `\\server\share` and nothing more
+                // (MS-DFSC § 2.2.1.6). A `Tree` cannot express a path suffix,
+                // so a target carrying one is skipped rather than silently
+                // dropping the suffix and opening the wrong directory.
+                if !target.remaining_path.is_empty() {
+                    debug!(
+                        "dfs: skipping target \\\\{}\\{} for {requested:?}: a root target \
+                         cannot carry the path suffix {:?}",
+                        target.server, target.share, target.remaining_path
+                    );
+                    continue;
+                }
+
+                let target_addr = self.target_addr(target);
+                match self.connect_target(&target_addr, &target.share).await {
+                    Ok(mut tree) => {
+                        self.dfs_resolver.note_target_worked(target);
+                        tree.dfs_origin = Some(DfsOrigin {
+                            requested: requested.to_string(),
+                            target: format!(r"\\{}\{}", target.server, target.share),
+                        });
+                        info!(
+                            "dfs: namespace {requested} resolved to \\\\{}\\{}",
+                            target.server, target.share
+                        );
+                        return Ok(tree);
+                    }
+                    Err(err) => {
+                        debug!("dfs: target {target_addr} for {requested:?} refused: {err}");
+                        last_error = Some(err);
+                    }
+                }
+            }
+
+            return match last_error {
+                Some(source) => Err(Error::DfsNoReachableTarget {
+                    namespace: requested.to_string(),
+                    target_count,
+                    source: Box::new(source),
+                }),
+                // Every target was skipped as unusable rather than failing,
+                // so there is no connectivity story to tell.
+                None => Err(Error::invalid_data(format!(
+                    "DFS referral for {requested} named {target_count} target(s), \
+                     none of them a share this client can connect to"
+                ))),
+            };
+        }
+
+        if target_count > 0 {
+            return Err(Error::DfsTooManyReferrals {
+                namespace: requested.to_string(),
+                hops: MAX_DFS_HOPS,
+            });
+        }
+        Err(Error::invalid_data(format!(
+            "no DFS referral for {share_name}"
+        )))
+    }
+
+    /// Ask the server that owns `path` for a referral, resolving from cache
+    /// when it is already known.
+    async fn root_referral(&mut self, path: &str) -> Result<Vec<dfs::ResolvedPath>> {
+        // The referral goes to the server naming the path, which after an
+        // Interlink is not the one the caller started on.
+        let host = path.trim_start_matches('\\');
+        let host = host.split('\\').next().unwrap_or(host);
+        let addr = self.dfs_addr_for_host(host);
+
+        if addr != self.primary_server {
+            self.ensure_connection(&addr).await?;
+        }
+        // Inlined rather than `connection_for_tree`, so `self.dfs_resolver`
+        // and the connection aren't borrowed from `self` at the same time.
+        let conn = if addr == self.primary_server {
+            &mut self.conn
+        } else {
+            &mut self
+                .extra_connections
+                .get_mut(&addr)
+                .ok_or(Error::Disconnected)?
+                .conn
+        };
+        self.dfs_resolver.resolve(conn, path).await
+    }
+
+    /// Where to actually dial for a referral target, honouring
+    /// [`ClientConfig::dfs_target_overrides`].
+    fn target_addr(&self, target: &dfs::ResolvedPath) -> String {
+        self.config
+            .dfs_target_overrides
+            .get(&target.server)
+            .cloned()
+            .unwrap_or_else(|| format!("{}:{}", target.server, target.port))
+    }
+
+    /// The same mapping for a bare host name, which is what an Interlink
+    /// hands back.
+    fn dfs_addr_for_host(&self, host: &str) -> String {
+        self.config
+            .dfs_target_overrides
+            .get(host)
+            .cloned()
+            .unwrap_or_else(|| {
+                if host == self.primary_server
+                    || self.primary_server.starts_with(&format!("{host}:"))
+                {
+                    self.primary_server.clone()
+                } else {
+                    format!("{host}:445")
+                }
+            })
+    }
+
+    /// Connect (pooling the connection) and tree-connect one referral target.
+    async fn connect_target(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
+        self.ensure_connection(target_addr).await?;
+        self.ensure_tree(target_addr, share).await
     }
 
     /// Reconnect now, whether or not the connection has noticed it is dead.
@@ -1735,6 +1997,7 @@ mod tests {
             server: addr.to_string(),
             is_dfs: false,
             encrypt_data: false,
+            dfs_origin: None,
         }
     }
 
@@ -1771,6 +2034,368 @@ mod tests {
         // "recoverable", whatever the primary says.
         let stranger = a_dfs_target_tree("somewhere-else:445", "secret");
         assert!(!client.session_is_gone(&stranger, &Error::Disconnected));
+    }
+
+    // ── DFS namespace roots ───────────────────────────────────────────
+
+    /// A TREE_CONNECT refusal, optionally carrying the cluster-redirect error
+    /// context that reuses the same status code.
+    fn build_tree_connect_refusal(status: NtStatus, share_redirect: bool) -> Vec<u8> {
+        let mut h = Header::new_request(Command::TreeConnect);
+        h.flags.set_response();
+        h.credits = 32;
+        h.status = status;
+
+        let (error_context_count, error_data) = if share_redirect {
+            // One SMB2 ERROR Context: ErrorDataLength(4) + ErrorId(4) + a
+            // Share Redirect body we never look inside.
+            let body = vec![0u8; 48];
+            let mut data = Vec::new();
+            data.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            data.extend_from_slice(&0x7264_5253u32.to_le_bytes());
+            data.extend_from_slice(&body);
+            (1u8, data)
+        } else {
+            (0u8, Vec::new())
+        };
+
+        pack_message(
+            &h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count,
+                error_data,
+            },
+        )
+    }
+
+    /// A V3 root referral naming one target per `targets`.
+    fn build_root_referral(namespace: &str, targets: &[&str], header_flags: u32) -> Vec<u8> {
+        let entries: Vec<(&str, &str, &str, u32)> = targets
+            .iter()
+            .map(|t| (namespace, namespace, *t, 600u32))
+            .collect();
+        let payload = crate::client::dfs::tests::pack_dfs_referral_response(
+            (namespace.encode_utf16().count() * 2) as u16,
+            header_flags,
+            &entries,
+        );
+
+        let mut h = Header::new_request(Command::Ioctl);
+        h.flags.set_response();
+        h.credits = 32;
+        pack_message(
+            &h,
+            &crate::msg::ioctl::IoctlResponse {
+                ctl_code: crate::msg::ioctl::FSCTL_DFS_GET_REFERRALS,
+                file_id: FileId::SENTINEL,
+                flags: crate::msg::ioctl::SMB2_0_IOCTL_IS_FSCTL,
+                output_data: payload,
+            },
+        )
+    }
+
+    fn build_ioctl_refusal(status: NtStatus) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Ioctl);
+        h.flags.set_response();
+        h.credits = 32;
+        h.status = status;
+        pack_message(
+            &h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        )
+    }
+
+    /// The headline: a namespace root is not a share on the server answering
+    /// its name, so `TREE_CONNECT` is refused and only a referral can say
+    /// where the storage actually is. Before this, the path could not be
+    /// opened at all.
+    #[tokio::test]
+    async fn a_namespace_root_resolves_to_the_target_the_referral_names() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        // The share the caller named isn't one: STATUS_BAD_NETWORK_NAME.
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        // IPC$ for the referral, then the referral itself. Samba's shape:
+        // ServerType 0 and StorageServers alone.
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        mock.queue_response(build_root_referral(
+            r"\test-server\aleu",
+            &[r"\test-server\aleu_dfs"],
+            0x02,
+        ));
+        // And the tree connect to the target share.
+        mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
+
+        let tree = client
+            .connect_share("aleu")
+            .await
+            .expect("a namespace root must resolve");
+
+        assert_eq!(tree.tree_id, TreeId(9));
+        assert_eq!(tree.share_name, "aleu_dfs");
+        assert_eq!(
+            tree.dfs_origin,
+            Some(DfsOrigin {
+                requested: r"\\test-server\aleu".to_string(),
+                target: r"\\test-server\aleu_dfs".to_string(),
+            }),
+            "the caller's own name for the namespace has to survive the redirect"
+        );
+    }
+
+    /// ❌ A failed referral must not replace the original error. The
+    /// overwhelmingly common cause of `STATUS_BAD_NETWORK_NAME` is a typo, and
+    /// telling that person about DFS is worse than telling them nothing.
+    #[tokio::test]
+    async fn a_mistyped_share_name_still_reports_the_missing_share() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        // No namespace by that name either.
+        mock.queue_response(build_ioctl_refusal(NtStatus::NOT_FOUND));
+
+        let err = client.connect_share("shrae").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Protocol {
+                    status: NtStatus::BAD_NETWORK_NAME,
+                    command: Command::TreeConnect
+                }
+            ),
+            "expected the original refusal, got {err:?}"
+        );
+    }
+
+    /// A referral that answers with no targets at all is the same story.
+    #[tokio::test]
+    async fn an_empty_referral_reports_the_missing_share() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        mock.queue_response(build_root_referral(r"\test-server\aleu", &[], 0x02));
+
+        let err = client.connect_share("aleu").await.unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Protocol {
+                status: NtStatus::BAD_NETWORK_NAME,
+                ..
+            }
+        ));
+    }
+
+    /// The one outcome that is genuinely about DFS: the namespace is real, we
+    /// found it, and its storage is out of reach. No other error says that.
+    #[tokio::test]
+    async fn a_namespace_whose_targets_are_all_down_says_exactly_that() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        mock.queue_response(build_root_referral(
+            r"\test-server\aleu",
+            &[r"\test-server\one", r"\test-server\two"],
+            0x02,
+        ));
+        // Both targets refuse.
+        mock.queue_response(build_tree_connect_refusal(NtStatus::ACCESS_DENIED, false));
+        mock.queue_response(build_tree_connect_refusal(NtStatus::ACCESS_DENIED, false));
+
+        let err = client.connect_share("aleu").await.unwrap_err();
+        match err {
+            Error::DfsNoReachableTarget {
+                namespace,
+                target_count,
+                ..
+            } => {
+                assert_eq!(namespace, r"\\test-server\aleu");
+                assert_eq!(target_count, 2);
+            }
+            other => panic!("expected DfsNoReachableTarget, got {other:?}"),
+        }
+    }
+
+    /// § 3.1.4.1 step 2: the second connect goes straight to the target, so
+    /// the refused TREE_CONNECT and the referral are paid once per TTL rather
+    /// than once per connect.
+    #[tokio::test]
+    async fn a_known_namespace_skips_the_refused_tree_connect() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        mock.queue_response(build_root_referral(
+            r"\test-server\aleu",
+            &[r"\test-server\aleu_dfs"],
+            0x02,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
+
+        client.connect_share("aleu").await.unwrap();
+        let after_first = mock.sent_count();
+
+        mock.queue_response(build_tree_connect_response(TreeId(10), ShareType::Disk));
+        let tree = client.connect_share("aleu").await.unwrap();
+
+        assert_eq!(tree.tree_id, TreeId(10));
+        assert!(tree.dfs_origin.is_some());
+        assert_eq!(
+            mock.sent_count() - after_first,
+            1,
+            "a cached namespace should cost one tree connect, nothing else"
+        );
+    }
+
+    /// `STATUS_BAD_NETWORK_NAME` with an `SMB2_ERROR_ID_SHARE_REDIRECT`
+    /// context is scale-out cluster redirection (MS-SMB2 § 2.2.2.2.2), an
+    /// unrelated mechanism reusing the same status. Chasing a DFS referral
+    /// for it would be nonsense, so it never gets one.
+    #[tokio::test]
+    async fn a_cluster_redirect_is_not_mistaken_for_a_namespace() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(NtStatus::BAD_NETWORK_NAME, true));
+        let before = mock.sent_count();
+
+        let err = client.connect_share("clustered").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::ShareRedirected { share } if share == "clustered"),
+            "expected ShareRedirected, got {err:?}"
+        );
+        assert_eq!(
+            mock.sent_count() - before,
+            1,
+            "no referral should be sent for a cluster redirect"
+        );
+    }
+
+    /// A server that never advertised `SMB2_GLOBAL_CAP_DFS` is not asked for
+    /// a referral, so a plain NAS pays nothing when someone mistypes a share.
+    #[tokio::test]
+    async fn a_server_without_cap_dfs_is_never_asked_for_a_referral() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        client.conn.set_test_params(NegotiatedParams {
+            dialect: Dialect::Smb3_1_1,
+            max_read_size: 65536,
+            max_write_size: 65536,
+            max_transact_size: 65536,
+            server_guid: Guid::ZERO,
+            signing_required: false,
+            capabilities: Capabilities::default(), // no DFS
+            gmac_negotiated: false,
+            cipher: None,
+            compression_supported: false,
+        });
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        let before = mock.sent_count();
+
+        let err = client.connect_share("aleu").await.unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Protocol {
+                status: NtStatus::BAD_NETWORK_NAME,
+                ..
+            }
+        ));
+        assert_eq!(mock.sent_count() - before, 1, "no referral round trip");
+    }
+
+    /// § 3.1.5.4.5: ReferralServers set with StorageServers clear means the
+    /// target lives in another namespace, so it is re-resolved rather than
+    /// connected.
+    #[tokio::test]
+    async fn an_interlink_is_resolved_again_rather_than_connected() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        // R set, S clear: an interlink pointing at a second namespace.
+        mock.queue_response(build_root_referral(
+            r"\test-server\aleu",
+            &[r"\test-server\elsewhere"],
+            0x01,
+        ));
+        // The second namespace resolves normally.
+        mock.queue_response(build_root_referral(
+            r"\test-server\elsewhere",
+            &[r"\test-server\real_share"],
+            0x02,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(9), ShareType::Disk));
+
+        let tree = client.connect_share("aleu").await.unwrap();
+        assert_eq!(tree.share_name, "real_share");
+        assert_eq!(
+            tree.dfs_origin.unwrap().requested,
+            r"\\test-server\aleu",
+            "the caller's name survives however many hops it took"
+        );
+    }
+
+    /// A namespace that refers to itself would resolve forever. It stops at
+    /// `MAX_DFS_HOPS` with an error naming the path, not a hang.
+    #[tokio::test]
+    async fn a_namespace_that_refers_to_itself_stops() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        // An interlink naming its own namespace. The cache answers every hop
+        // after the first, so this is one frame and eight hops.
+        mock.queue_response(build_root_referral(
+            r"\test-server\aleu",
+            &[r"\test-server\aleu"],
+            0x01,
+        ));
+
+        let err = client.connect_share("aleu").await.unwrap_err();
+        match err {
+            Error::DfsTooManyReferrals { namespace, hops } => {
+                assert_eq!(namespace, r"\\test-server\aleu");
+                assert_eq!(hops, MAX_DFS_HOPS);
+            }
+            other => panic!("expected DfsTooManyReferrals, got {other:?}"),
+        }
     }
 
     /// A `Tree` outlives the pool entry it was resolved on, and using it then
@@ -1910,6 +2535,7 @@ mod tests {
             server: "test-server:445".to_string(),
             is_dfs: false,
             encrypt_data: true,
+            dfs_origin: None,
         };
 
         activate_share_encryption(client.connection_mut(), &keyless, &tree);

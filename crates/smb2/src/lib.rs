@@ -86,7 +86,9 @@ pub use client::copy::{
 };
 
 // Tree and file types
-pub use client::tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
+pub use client::tree::{
+    DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
+};
 
 // Pipeline
 pub use client::pipeline::{Op, OpResult, Pipeline};

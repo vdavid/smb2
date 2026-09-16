@@ -243,6 +243,10 @@ pub(crate) struct ResolvedPath {
     /// Remaining path within the share (may be empty), in the caller's own
     /// case.
     pub remaining_path: String,
+    /// The referral points into another DFS namespace, so this target is a
+    /// path to resolve again rather than somewhere to connect (MS-DFSC
+    /// § 3.1.5.4.5).
+    pub interlink: bool,
     /// Which cache entry this came from, and which of its targets, so
     /// [`DfsResolver::note_target_worked`] can record the `TargetHint`
     /// without a second lookup.
@@ -430,6 +434,7 @@ impl DfsResolver {
                     port: 445,
                     share: target.share.clone(),
                     remaining_path: full_remaining,
+                    interlink: entry.interlink,
                     cache_key: entry.dfs_path_prefix.clone(),
                     target_index,
                 }
@@ -651,7 +656,7 @@ fn parse_unc_target(network_address: &str) -> Option<DfsTarget> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{build_tree_connect_response, setup_connection};
@@ -697,7 +702,7 @@ mod tests {
     /// Pack a known DFS referral response into bytes.
     ///
     /// Builds a V3 referral with the given entries.
-    fn pack_dfs_referral_response(
+    pub(crate) fn pack_dfs_referral_response(
         path_consumed: u16,
         header_flags: u32,
         entries: &[(&str, &str, &str, u32)], // (dfs_path, alt_path, net_addr, ttl)
@@ -780,7 +785,7 @@ mod tests {
     }
 
     /// Encode a string as null-terminated UTF-16LE bytes.
-    fn encode_null_utf16(s: &str) -> Vec<u8> {
+    pub(crate) fn encode_null_utf16(s: &str) -> Vec<u8> {
         let mut out = Vec::new();
         for cu in s.encode_utf16() {
             out.extend_from_slice(&cu.to_le_bytes());
