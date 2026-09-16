@@ -139,8 +139,17 @@ struct ClientReviver {
 
 impl ClientReviver {
     fn from_config(config: &ClientConfig) -> Self {
+        Self::for_addr(config, config.addr.clone())
+    }
+
+    /// A reviver for a server other than the one the client was built for.
+    ///
+    /// A DFS target lives at its own address with its own session, so it needs
+    /// its own reviver; `config.addr` would dial the namespace server back.
+    /// Everything else (credentials, timeout, compression) is the client's.
+    fn for_addr(config: &ClientConfig, addr: String) -> Self {
         Self {
-            addr: config.addr.clone(),
+            addr,
             timeout: config.timeout,
             compression: config.compression,
             username: config.username.clone(),
@@ -207,8 +216,11 @@ fn activate_share_encryption(conn: &mut Connection, session: &Session, tree: &Tr
 pub(crate) struct ConnectionEntry {
     /// The connection to the server.
     pub conn: Connection,
-    /// The authenticated session on this connection.
-    pub session: Session,
+    /// The session as of the last authentication on this connection. Behind
+    /// an `Arc` for the same reason the primary's is: a revival can establish
+    /// a new one behind this client's back, and share encryption derives from
+    /// the live keys.
+    pub session: std::sync::Arc<Session>,
 }
 
 /// High-level SMB2 client with reconnection support.
@@ -617,8 +629,28 @@ impl SmbClient {
         )
         .await?;
 
-        self.extra_connections
-            .insert(target_addr.to_string(), ConnectionEntry { conn, session });
+        // Arm it the same way the primary is. On a namespace root the target
+        // connection carries *all* of the user's traffic, so leaving it
+        // unrevivable meant `auto_reconnect` silently did not cover the only
+        // connection that mattered. The reviver is built for this address, not
+        // `config.addr`, which would dial the namespace server back.
+        if self.config.auto_reconnect {
+            conn.set_reviver(Some(std::sync::Arc::new(ClientReviver::for_addr(
+                &self.config,
+                target_addr.to_string(),
+            ))));
+        }
+        // And it inherits the bounds the consumer set on the primary, rather
+        // than silently falling back to the defaults.
+        conn.set_reconnect_policy(self.conn.reconnect_policy());
+
+        self.extra_connections.insert(
+            target_addr.to_string(),
+            ConnectionEntry {
+                conn,
+                session: std::sync::Arc::new(session),
+            },
+        );
         Ok(())
     }
 
@@ -666,29 +698,60 @@ impl SmbClient {
     /// when a request burned its whole deadline on a connection that put
     /// nothing at all on the wire — and it leaves the connection marked dead,
     /// which is what gives `reconnect_if_needed` something to revive.
-    fn session_is_gone(&self, err: &Error) -> bool {
+    /// Asked of the connection the tree actually lives on, which for a DFS
+    /// target is not the primary one.
+    fn session_is_gone(&self, tree: &Tree, err: &Error) -> bool {
         self.config.auto_reconnect
-            && self.conn.can_reconnect()
             && matches!(err, Error::Disconnected | Error::ServerUnresponsive { .. })
+            && self
+                .connection_for_tree_ref(tree)
+                .is_some_and(|conn| conn.can_reconnect())
     }
 
-    /// Bring the connection back and re-establish `tree` on the new session.
-    ///
-    /// Only for trees on the primary connection: a DFS extra connection has
-    /// its own socket and its own session, and reviving the primary says
-    /// nothing about it.
-    async fn recover_tree(&mut self, tree: &mut Tree) -> Result<()> {
-        if tree.server != self.primary_server {
-            return Err(Error::Disconnected);
+    /// The connection that owns `tree`, or `None` when this client has none
+    /// for it.
+    fn connection_for_tree_ref(&self, tree: &Tree) -> Option<&Connection> {
+        if tree.server == self.primary_server {
+            Some(&self.conn)
+        } else {
+            self.extra_connections.get(&tree.server).map(|e| &e.conn)
         }
-        self.conn.reconnect_if_needed().await?;
-        self.refresh_session();
+    }
+
+    /// Bring the tree's own connection back and re-establish `tree` on the new
+    /// session.
+    ///
+    /// Works for a DFS target as well as the primary. A namespace root makes
+    /// the *target* connection the one carrying all of the user's traffic, so
+    /// "only the primary recovers" meant the connection that mattered did not.
+    /// Reviving one says nothing about the other: each has its own socket and
+    /// its own session, and only the tree's own is touched.
+    async fn recover_tree(&mut self, tree: &mut Tree) -> Result<()> {
         let share = tree.share_name.clone();
-        let fresh = self.connect_share(&share).await?;
-        // In place, exactly as the DFS redirect does: the caller keeps using
-        // the `&mut Tree` it passed in, now pointing at the new session's
-        // tree id.
-        *tree = fresh;
+
+        if tree.server == self.primary_server {
+            self.conn.reconnect_if_needed().await?;
+            self.refresh_session();
+            // In place, exactly as the DFS redirect does: the caller keeps
+            // using the `&mut Tree` it passed in, now pointing at the new
+            // session's tree id.
+            *tree = self.connect_share(&share).await?;
+            return Ok(());
+        }
+
+        let addr = tree.server.clone();
+        let entry = self
+            .extra_connections
+            .get_mut(&addr)
+            .ok_or(Error::Disconnected)?;
+        entry.conn.reconnect_if_needed().await?;
+        // Adopt whatever session the revival established. ❌ Skipping this is
+        // not cosmetic: `ensure_tree` activates share encryption from these
+        // keys, and the dead session's keys decrypt nothing.
+        if let Some(current) = entry.conn.current_session() {
+            entry.session = current;
+        }
+        *tree = self.ensure_tree(&addr, &share).await?;
         Ok(())
     }
 
@@ -715,7 +778,7 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.list_directory(conn, &new_path).await
             }
-            Err(e) if self.session_is_gone(&e) => {
+            Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.list_directory(conn, path).await
@@ -736,7 +799,7 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.read_file(conn, &new_path).await
             }
-            Err(e) if self.session_is_gone(&e) => {
+            Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.read_file(conn, path).await
@@ -761,7 +824,7 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.read_file_compound(conn, &new_path).await
             }
-            Err(e) if self.session_is_gone(&e) => {
+            Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.read_file_compound(conn, path).await
@@ -782,7 +845,7 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.read_file_pipelined(conn, &new_path).await
             }
-            Err(e) if self.session_is_gone(&e) => {
+            Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.read_file_pipelined(conn, path).await
@@ -871,7 +934,7 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.fs_info(conn).await
             }
-            Err(e) if self.session_is_gone(&e) => {
+            Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.fs_info(conn).await
@@ -924,7 +987,7 @@ impl SmbClient {
                 let conn = self.connection_for_tree(tree);
                 tree.stat(conn, &new_path).await
             }
-            Err(e) if self.session_is_gone(&e) => {
+            Err(e) if self.session_is_gone(tree, &e) => {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.stat(conn, path).await
@@ -1630,9 +1693,99 @@ mod tests {
             addr.to_string(),
             ConnectionEntry {
                 conn,
-                session: session_with_keys(SessionId(0x99)),
+                session: std::sync::Arc::new(session_with_keys(SessionId(0x99))),
             },
         );
+    }
+
+    fn a_dfs_target_tree(addr: &str, share: &str) -> Tree {
+        Tree {
+            tree_id: TreeId(5),
+            share_name: share.to_string(),
+            server: addr.to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        }
+    }
+
+    /// `auto_reconnect` has to cover the connection the tree actually lives
+    /// on. On a namespace root that is the *target* connection, carrying all
+    /// of the user's traffic; asking the primary about it said "this is
+    /// revivable" when it was not, and "this is not" when it was.
+    #[tokio::test]
+    async fn liveness_is_judged_on_the_trees_own_connection() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        client.config.auto_reconnect = true;
+        // The primary is armed; the DFS target is not.
+        client
+            .conn
+            .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x1)))));
+
+        let target_mock = Arc::new(MockTransport::new());
+        pool_extra_connection(&mut client, "dfs-target:445", &target_mock);
+
+        let target_tree = a_dfs_target_tree("dfs-target:445", "secret");
+        assert!(
+            !client.session_is_gone(&target_tree, &Error::Disconnected),
+            "the primary's reviver says nothing about the target connection"
+        );
+
+        // Arm the target, and it becomes recoverable.
+        client.extra_connections["dfs-target:445"]
+            .conn
+            .set_reviver(Some(Arc::new(MockReviver::new(SessionId(0x2)))));
+        assert!(client.session_is_gone(&target_tree, &Error::Disconnected));
+
+        // A tree on a server this client has no connection for is never
+        // "recoverable", whatever the primary says.
+        let stranger = a_dfs_target_tree("somewhere-else:445", "secret");
+        assert!(!client.session_is_gone(&stranger, &Error::Disconnected));
+    }
+
+    /// `recover_tree` revives the DFS target's own connection and
+    /// re-establishes the tree on it. It used to refuse outright, so a
+    /// namespace root's session dying was unrecoverable.
+    #[tokio::test]
+    async fn a_dfs_target_tree_recovers_on_its_own_connection() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        let target_mock = Arc::new(MockTransport::new());
+        pool_extra_connection(&mut client, "dfs-target:445", &target_mock);
+
+        // The revived connection answers the re-tree-connect with a new id.
+        let reviver = Arc::new(MockReviver::answering_with(
+            SessionId(0xBEEF),
+            vec![build_tree_connect_response(TreeId(77), ShareType::Disk)],
+        ));
+
+        let entry = client
+            .extra_connections
+            .get_mut("dfs-target:445")
+            .expect("just pooled");
+        entry.conn.set_reviver(Some(
+            Arc::clone(&reviver) as Arc<dyn connection::SessionReviver>
+        ));
+        entry.conn.mark_dead();
+
+        let mut tree = a_dfs_target_tree("dfs-target:445", "secret");
+        client
+            .recover_tree(&mut tree)
+            .await
+            .expect("a DFS target tree must be recoverable");
+
+        assert_eq!(
+            tree.tree_id,
+            TreeId(77),
+            "tree re-established on the new session"
+        );
+        assert_eq!(tree.server, "dfs-target:445", "still routed to the target");
+        assert!(!client.extra_connections["dfs-target:445"]
+            .conn
+            .is_disconnected());
+        // The primary was not touched.
+        assert_eq!(client.session().session_id, SessionId(0x77));
     }
 
     /// A DFS target share that asks for encryption gets it.
@@ -1753,6 +1906,9 @@ mod tests {
     struct MockReviver {
         session_id: SessionId,
         dialed: std::sync::atomic::AtomicUsize,
+        /// Queued behind the negotiate + session-setup conversation, for a
+        /// test whose caller does more on the revived connection.
+        after_setup: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     impl MockReviver {
@@ -1760,6 +1916,15 @@ mod tests {
             Self {
                 session_id,
                 dialed: std::sync::atomic::AtomicUsize::new(0),
+                after_setup: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Also answer `responses`, in order, once the revived session is up.
+        fn answering_with(session_id: SessionId, responses: Vec<Vec<u8>>) -> Self {
+            Self {
+                after_setup: std::sync::Mutex::new(responses),
+                ..Self::new(session_id)
             }
         }
     }
@@ -1777,6 +1942,9 @@ mod tests {
             let mock = Arc::new(MockTransport::new());
             mock.enable_auto_rewrite_msg_id();
             queue_negotiate_and_session(&mock, self.session_id);
+            for response in self.after_setup.lock().unwrap().drain(..) {
+                mock.queue_response(response);
+            }
             Ok((Box::new(mock.clone()), Box::new(mock)))
         }
 
