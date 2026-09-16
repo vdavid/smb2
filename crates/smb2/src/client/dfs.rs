@@ -32,20 +32,27 @@ use crate::msg::ioctl::{
     IoctlRequest, IoctlResponse, FSCTL_DFS_GET_REFERRALS, SMB2_0_IOCTL_IS_FSCTL,
 };
 use crate::msg::tree_connect::{TreeConnectRequest, TreeConnectRequestFlags, TreeConnectResponse};
-use crate::msg::tree_disconnect::TreeDisconnectRequest;
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::status::NtStatus;
 use crate::types::{Command, FileId, TreeId};
 use crate::Error;
 
-/// Maximum output buffer size for DFS referral responses (8 KiB).
+/// Output buffer a referral asks for first (8 KiB).
+///
+/// Enough for any ordinary namespace. A root with many targets overflows it,
+/// which is what [`DFS_RETRY_OUTPUT_RESPONSE`] is for.
 const DFS_MAX_OUTPUT_RESPONSE: u32 = 8192;
+
+/// What a referral asks for on the retry after `STATUS_BUFFER_OVERFLOW`
+/// (64 KiB), per MS-DFSC § 3.1.5.4 and MS-SMB2 § 3.3.5.15.2.
+const DFS_RETRY_OUTPUT_RESPONSE: u32 = 64 * 1024;
 
 /// Send a DFS referral request and return the parsed response.
 ///
-/// Connects to IPC$ (or reuses an existing tree), sends
-/// `FSCTL_DFS_GET_REFERRALS` via IOCTL with `FileId::SENTINEL`, and
-/// parses the response.
+/// Reuses the connection's IPC$ tree, connecting one the first time
+/// (MS-SMB2 § 3.2.4.20.3 lets a referral ride any existing tree connect and
+/// only asks for a fresh IPC$ when none exists), then sends
+/// `FSCTL_DFS_GET_REFERRALS` via IOCTL with `FileId::SENTINEL`.
 ///
 /// The `path` should be a UNC-style path with a single leading backslash
 /// (for example, `\server\share\dir`).
@@ -53,16 +60,55 @@ pub(crate) async fn get_dfs_referral(
     conn: &mut Connection,
     path: &str,
 ) -> Result<RespGetDfsReferral> {
-    // 1. Tree-connect to IPC$
+    let tree_id = ensure_ipc_tree(conn).await?;
+
+    match referral_ioctl(conn, tree_id, path).await {
+        // The cached tree outlived the server's idea of it. Drop it, connect
+        // a fresh one, and try once more; a stale id would otherwise turn
+        // every later referral into this same error.
+        Err(Error::Protocol {
+            status: NtStatus::NETWORK_NAME_DELETED,
+            ..
+        }) => {
+            debug!("dfs: IPC$ tree went away, reconnecting it");
+            conn.set_cached_ipc_tree(None);
+            let tree_id = ensure_ipc_tree(conn).await?;
+            referral_ioctl(conn, tree_id, path).await
+        }
+        other => other,
+    }
+}
+
+/// One referral IOCTL, growing the output buffer once if the server says the
+/// first one was too small.
+async fn referral_ioctl(
+    conn: &mut Connection,
+    tree_id: TreeId,
+    path: &str,
+) -> Result<RespGetDfsReferral> {
+    match send_dfs_ioctl(conn, tree_id, path, DFS_MAX_OUTPUT_RESPONSE).await {
+        Err(Error::Protocol {
+            status: NtStatus::BUFFER_OVERFLOW,
+            ..
+        }) => {
+            debug!(
+                "dfs: referral for {:?} overflowed {} bytes, retrying with {}",
+                path, DFS_MAX_OUTPUT_RESPONSE, DFS_RETRY_OUTPUT_RESPONSE
+            );
+            send_dfs_ioctl(conn, tree_id, path, DFS_RETRY_OUTPUT_RESPONSE).await
+        }
+        other => other,
+    }
+}
+
+/// The connection's IPC$ tree, connecting one on first use.
+async fn ensure_ipc_tree(conn: &mut Connection) -> Result<TreeId> {
+    if let Some(tree_id) = conn.cached_ipc_tree() {
+        return Ok(tree_id);
+    }
     let tree_id = tree_connect_ipc(conn).await?;
-
-    // Send the IOCTL, then clean up regardless of outcome
-    let result = send_dfs_ioctl(conn, tree_id, path).await;
-
-    // Tree-disconnect IPC$ (best-effort -- don't mask the real error)
-    let _ = tree_disconnect(conn, tree_id).await;
-
-    result
+    conn.set_cached_ipc_tree(Some(tree_id));
+    Ok(tree_id)
 }
 
 /// Connect to the IPC$ share, returning the tree ID.
@@ -108,6 +154,7 @@ async fn send_dfs_ioctl(
     conn: &mut Connection,
     tree_id: TreeId,
     path: &str,
+    max_output_response: u32,
 ) -> Result<RespGetDfsReferral> {
     // Build the referral request payload
     let referral_req = ReqGetDfsReferral {
@@ -129,7 +176,7 @@ async fn send_dfs_ioctl(
         ctl_code: FSCTL_DFS_GET_REFERRALS,
         file_id: FileId::SENTINEL,
         max_input_response: 0,
-        max_output_response: DFS_MAX_OUTPUT_RESPONSE,
+        max_output_response,
         flags: SMB2_0_IOCTL_IS_FSCTL,
         input_data,
     };
@@ -165,24 +212,6 @@ async fn send_dfs_ioctl(
     );
 
     Ok(referral_resp)
-}
-
-/// Disconnect from a tree.
-async fn tree_disconnect(conn: &mut Connection, tree_id: TreeId) -> Result<()> {
-    let body = TreeDisconnectRequest;
-    let frame = conn
-        .execute(Command::TreeDisconnect, &body, Some(tree_id))
-        .await?;
-
-    if frame.header.status != NtStatus::SUCCESS {
-        return Err(Error::Protocol {
-            status: frame.header.status,
-            command: Command::TreeDisconnect,
-        });
-    }
-
-    debug!("dfs: disconnected from IPC$");
-    Ok(())
 }
 
 // ── DFS resolver types ───────────────────────────────────────────────
@@ -630,7 +659,6 @@ mod tests {
     use crate::msg::header::{ErrorResponse, Header};
     use crate::msg::ioctl::IoctlResponse as IoctlResp;
     use crate::msg::tree_connect::ShareType;
-    use crate::msg::tree_disconnect::TreeDisconnectResponse;
     use crate::transport::MockTransport;
     use crate::types::TreeId;
     use std::sync::Arc;
@@ -664,14 +692,6 @@ mod tests {
         };
 
         pack_message(&h, &body)
-    }
-
-    /// Build a TREE_DISCONNECT response.
-    fn build_tree_disconnect_response() -> Vec<u8> {
-        let mut h = Header::new_request(Command::TreeDisconnect);
-        h.flags.set_response();
-        h.credits = 32;
-        pack_message(&h, &TreeDisconnectResponse)
     }
 
     /// Pack a known DFS referral response into bytes.
@@ -796,10 +816,9 @@ mod tests {
             ],
         );
 
-        // Queue responses: TreeConnect, IOCTL, TreeDisconnect
+        // Queue responses: TreeConnect, IOCTL
         mock.queue_response(build_tree_connect_response(tree_id, ShareType::Pipe));
         mock.queue_response(build_ioctl_response(referral_bytes));
-        mock.queue_response(build_tree_disconnect_response());
 
         let resp = get_dfs_referral(&mut conn, r"\domain\dfs\docs")
             .await
@@ -817,8 +836,73 @@ mod tests {
         assert_eq!(resp.entries[1].target_address(), Some(r"\server2\share"));
         assert_eq!(resp.entries[1].ttl(), 300);
 
-        // Should have sent 3 messages: TreeConnect, IOCTL, TreeDisconnect
+        // TreeConnect + IOCTL. The IPC$ tree is kept, not torn down.
+        assert_eq!(mock.sent_count(), 2);
+        assert_eq!(conn.cached_ipc_tree(), Some(tree_id));
+    }
+
+    /// MS-SMB2 § 3.2.4.20.3 lets a referral ride an existing tree connect, so
+    /// only the first one pays for IPC$. Three frames per referral become one.
+    #[tokio::test]
+    async fn dfs_referral_reuses_the_ipc_tree() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        let referral = |target: &str| {
+            pack_dfs_referral_response(16, 0x02, &[(r"\domain\dfs", r"\domain\dfs", target, 600)])
+        };
+
+        mock.queue_response(build_tree_connect_response(TreeId(99), ShareType::Pipe));
+        mock.queue_response(build_ioctl_response(referral(r"\server1\share")));
+        mock.queue_response(build_ioctl_response(referral(r"\server2\share")));
+
+        get_dfs_referral(&mut conn, r"\domain\dfs").await.unwrap();
+        let second = get_dfs_referral(&mut conn, r"\domain\dfs").await.unwrap();
+
+        assert_eq!(second.entries[0].target_address(), Some(r"\server2\share"));
+        assert_eq!(mock.sent_count(), 3, "second referral should be one frame");
+    }
+
+    /// § 3.1.5.4: a referral that overflows the buffer is retried once with a
+    /// bigger one. A namespace with many root targets outgrows 8 KiB, and the
+    /// old code turned that into a hard error.
+    #[tokio::test]
+    async fn dfs_referral_retries_on_buffer_overflow() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+
+        mock.queue_response(build_tree_connect_response(TreeId(99), ShareType::Pipe));
+        mock.queue_response(build_ioctl_error_response(NtStatus::BUFFER_OVERFLOW));
+        mock.queue_response(build_ioctl_response(pack_dfs_referral_response(
+            16,
+            0x02,
+            &[(r"\domain\dfs", r"\domain\dfs", r"\server\share", 600)],
+        )));
+
+        let resp = get_dfs_referral(&mut conn, r"\domain\dfs").await.unwrap();
+        assert_eq!(resp.entries[0].target_address(), Some(r"\server\share"));
         assert_eq!(mock.sent_count(), 3);
+    }
+
+    /// A cached tree id the session no longer has would otherwise poison
+    /// every later referral with the same error.
+    #[tokio::test]
+    async fn dfs_referral_reconnects_a_deleted_ipc_tree() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        conn.set_cached_ipc_tree(Some(TreeId(7)));
+
+        mock.queue_response(build_ioctl_error_response(NtStatus::NETWORK_NAME_DELETED));
+        mock.queue_response(build_tree_connect_response(TreeId(42), ShareType::Pipe));
+        mock.queue_response(build_ioctl_response(pack_dfs_referral_response(
+            16,
+            0x02,
+            &[(r"\domain\dfs", r"\domain\dfs", r"\server\share", 600)],
+        )));
+
+        let resp = get_dfs_referral(&mut conn, r"\domain\dfs").await.unwrap();
+        assert_eq!(resp.entries[0].target_address(), Some(r"\server\share"));
+        assert_eq!(conn.cached_ipc_tree(), Some(TreeId(42)));
     }
 
     #[tokio::test]
@@ -828,10 +912,9 @@ mod tests {
 
         let tree_id = TreeId(99);
 
-        // Queue responses: TreeConnect, IOCTL error, TreeDisconnect
+        // Queue responses: TreeConnect, IOCTL error
         mock.queue_response(build_tree_connect_response(tree_id, ShareType::Pipe));
         mock.queue_response(build_ioctl_error_response(NtStatus::NOT_FOUND));
-        mock.queue_response(build_tree_disconnect_response());
 
         let result = get_dfs_referral(&mut conn, r"\nonexistent\path").await;
 
@@ -845,8 +928,7 @@ mod tests {
             other => panic!("expected Protocol error, got: {other:?}"),
         }
 
-        // Should still send TreeDisconnect even after IOCTL error
-        assert_eq!(mock.sent_count(), 3);
+        assert_eq!(mock.sent_count(), 2);
     }
 
     // ── parse_unc_target tests ───────────────────────────────────────

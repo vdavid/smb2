@@ -1663,6 +1663,13 @@ struct Inner {
     preauth_hasher: StdMutex<PreauthHasher>,
     /// Tree IDs that have DFS capability (auto-set `SMB2_FLAGS_DFS_OPERATIONS`).
     dfs_trees: StdMutex<HashSet<TreeId>>,
+    /// An IPC$ tree kept open for DFS referrals.
+    ///
+    /// MS-SMB2 § 3.2.4.20.3 lets a referral ride any existing tree connect and
+    /// only asks for IPC$ when there is none, so holding one turns every
+    /// referral after the first from three frames into one. Erased with the
+    /// rest of the session on a revival, because the tree id belongs to it.
+    ipc_tree: StdMutex<Option<TreeId>>,
     /// Which tree each oplocked handle belongs to.
     ///
     /// Only durable opens take an oplock, and only so the server will grant
@@ -1756,6 +1763,7 @@ impl Inner {
             compression_requested: AtomicBool::new(true),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
             dfs_trees: StdMutex::new(HashSet::new()),
+            ipc_tree: StdMutex::new(None),
             oplock_trees: StdMutex::new(HashMap::new()),
             metrics: Metrics::default(),
         }
@@ -3547,6 +3555,19 @@ impl Connection {
         self.inner.dfs_trees.lock().unwrap().remove(&tree_id);
     }
 
+    /// The IPC$ tree this connection keeps open for DFS referrals, if any.
+    pub(crate) fn cached_ipc_tree(&self) -> Option<TreeId> {
+        *self.inner.ipc_tree.lock().unwrap()
+    }
+
+    /// Remember (or, with `None`, forget) the IPC$ tree for DFS referrals.
+    ///
+    /// Forget it the moment the server says the tree is gone: a cached id the
+    /// session no longer has turns every later referral into the same error.
+    pub(crate) fn set_cached_ipc_tree(&self, tree_id: Option<TreeId>) {
+        *self.inner.ipc_tree.lock().unwrap() = tree_id;
+    }
+
     fn should_set_dfs_flag(&self, tree_id: Option<TreeId>) -> bool {
         tree_id.is_some_and(|id| self.inner.dfs_trees.lock().unwrap().contains(&id))
     }
@@ -4486,6 +4507,7 @@ impl Connection {
         *inner.estimated_rtt.lock().unwrap() = None;
         inner.abandoned.lock().unwrap().clear();
         inner.dfs_trees.lock().unwrap().clear();
+        *inner.ipc_tree.lock().unwrap() = None;
         inner.oplock_trees.lock().unwrap().clear();
         inner.compression_enabled.store(false, Ordering::Release);
         // ❌ `send_queue_depth` is deliberately NOT reset: a caller parked
