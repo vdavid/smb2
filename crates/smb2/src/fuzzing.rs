@@ -22,6 +22,8 @@
 //! - [`fuzz_create_request_parse`] / [`fuzz_create_response_parse`]
 //!   -- CreateContext list lives inside these bodies.
 //! - [`fuzz_query_info_response_parse`] -- opaque output buffer sharp edge.
+//! - [`fuzz_error_context_walk`] -- a server-controlled chain of lengths
+//!   whose wrong answer is a wrong classification, not a crash.
 //! - [`fuzz_dfs_referral_response_parse`] -- manual offset arithmetic,
 //!   obvious fuzzing target.
 //! - [`fuzz_name_round_trip`] -- the private-use-area filename mapping. The
@@ -184,6 +186,36 @@ pub fn fuzz_query_info_response_parse(data: &[u8]) {
 pub fn fuzz_dfs_referral_response_parse(data: &[u8]) {
     let mut cursor = ReadCursor::new(data);
     let _ = crate::msg::dfs::RespGetDfsReferral::unpack(&mut cursor);
+}
+
+/// Fuzz the SMB2 ERROR Context walk, which decides whether a
+/// `STATUS_BAD_NETWORK_NAME` is a scale-out cluster redirect or a missing
+/// share (MS-SMB2 § 2.2.2.1).
+///
+/// Two reasons it earns a target: the contexts are a server-controlled chain
+/// of lengths that the walk advances by, and a false "yes" would turn a
+/// missing share into an unfollowable redirect, which is a wrong answer rather
+/// than a crash. So this asserts a property too: a claimed context count that
+/// the buffer cannot back must never report a redirect.
+pub fn fuzz_error_context_walk(data: &[u8]) {
+    // The count is a byte in the fixed part; sweep it rather than reading it
+    // out of the fuzzer's bytes, so the walk is exercised past what the
+    // buffer holds.
+    for error_context_count in [0u8, 1, 2, 255] {
+        let resp = crate::msg::header::ErrorResponse {
+            error_context_count,
+            error_data: data.to_vec(),
+        };
+        if resp.is_share_redirect() {
+            // It said yes, so the first 8 bytes of some context in `data` must
+            // really carry the redirect id.
+            assert!(
+                data.len() >= 8,
+                "claimed a share redirect with {} bytes of error data",
+                data.len()
+            );
+        }
+    }
 }
 
 /// Fuzz the private-use-area name mapping in [`crate::name`].

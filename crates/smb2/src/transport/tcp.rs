@@ -6,6 +6,7 @@
 //! encoding in the entire SMB2 protocol.
 
 use async_trait::async_trait;
+use futures_util::future::Either;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error, trace};
 use std::collections::VecDeque;
@@ -228,26 +229,40 @@ pub(crate) async fn dial_staggered(
             remaining
         };
 
-        tokio::select! {
-            biased;
-            Some((index, result)) = in_flight.next(), if !in_flight.is_empty() => {
-                match result {
-                    Ok(stream) => {
-                        debug!(
-                            "tcp: {host} connected on {} ({} of {} address(es) tried)",
-                            addrs[index],
-                            index + 1,
-                            addrs.len()
-                        );
-                        return Ok(stream);
-                    }
-                    Err(e) => {
-                        trace!("tcp: {} refused {host}: {e}", addrs[index]);
-                        attempts[index].error_kind = Some(e.kind());
-                    }
+        // ❌ Not `tokio::select!`: that macro needs tokio's `macros` feature,
+        // which is a dev-dependency here. Turning it into a real dependency
+        // would put a proc macro in every consumer's build for one call site.
+        // (Caught by the fuzz build, which compiles the library without
+        // dev-dependencies. `cargo clippy --all-targets` does not.)
+        if in_flight.is_empty() {
+            tokio::time::sleep(wake_in).await;
+            continue;
+        }
+        let timer = std::pin::pin!(tokio::time::sleep(wake_in));
+        match futures_util::future::select(in_flight.next(), timer).await {
+            // An attempt finished.
+            Either::Left((Some((index, result)), _)) => match result {
+                Ok(stream) => {
+                    debug!(
+                        "tcp: {host} connected on {} ({} of {} address(es) tried)",
+                        addrs[index],
+                        index + 1,
+                        addrs.len()
+                    );
+                    return Ok(stream);
                 }
-            }
-            _ = tokio::time::sleep(wake_in) => {}
+                Err(e) => {
+                    // A fast failure starts the next address immediately: the
+                    // loop pushes it before computing a fresh stagger.
+                    trace!("tcp: {} refused {host}: {e}", addrs[index]);
+                    attempts[index].error_kind = Some(e.kind());
+                }
+            },
+            // The set drained between the emptiness check and the poll.
+            Either::Left((None, _)) => {}
+            // Time to start the next address, or the deadline, depending on
+            // which one `wake_in` was.
+            Either::Right(((), _)) => {}
         }
     }
 

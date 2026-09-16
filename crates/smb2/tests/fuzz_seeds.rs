@@ -489,6 +489,28 @@ fn generate_fuzz_seeds() {
         }),
     );
 
+    // ── fuzz_error_context_walk ─────────────────────────────────────
+    // One context carrying SMB2_ERROR_ID_SHARE_REDIRECT, and one carrying the
+    // default id, so the walk starts from both branches.
+    {
+        let context = |error_id: u32, body_len: usize| -> Vec<u8> {
+            let mut ctx = Vec::new();
+            ctx.extend_from_slice(&(body_len as u32).to_le_bytes());
+            ctx.extend_from_slice(&error_id.to_le_bytes());
+            ctx.resize(ctx.len() + body_len, 0xAB);
+            while ctx.len() % 8 != 0 {
+                ctx.push(0);
+            }
+            ctx
+        };
+        write_seed(
+            "fuzz_error_context_walk",
+            "share_redirect",
+            &context(0x7264_5253, 48),
+        );
+        write_seed("fuzz_error_context_walk", "default", &context(0, 12));
+    }
+
     // ── fuzz_dfs_referral_response_parse ────────────────────────────
     write_seed(
         "fuzz_dfs_referral_response_parse",
