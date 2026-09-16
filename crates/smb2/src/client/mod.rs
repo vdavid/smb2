@@ -447,7 +447,7 @@ impl SmbClient {
         let requested = self.unc_for(share_name);
         if self.config.dfs_enabled && self.dfs_resolver.resolve_from_cache(&requested).is_some() {
             trace!("dfs: {requested:?} is a known namespace, going straight to its targets");
-            return self.connect_namespace(&requested, share_name).await;
+            return self.connect_namespace(&requested).await;
         }
 
         // § 3.1.4.1 step 8 for the ordinary world: tree-connect, and on
@@ -470,7 +470,7 @@ impl SmbClient {
              asking it for a root referral",
             self.primary_server
         );
-        match self.connect_namespace(&requested, share_name).await {
+        match self.connect_namespace(&requested).await {
             Ok(tree) => Ok(tree),
             // ❌ A failed referral must not replace the original error. The
             // overwhelmingly common reason for STATUS_BAD_NETWORK_NAME is a
@@ -488,6 +488,12 @@ impl SmbClient {
     }
 
     /// The UNC path for a share on the primary server, as a referral names it.
+    ///
+    /// `rsplit_once` rather than `split_once`, so a bracketed IPv6 address
+    /// keeps its colons: `[::1]:445` gives `[::1]`. A *portless* address would
+    /// split inside the literal, but one cannot reach here — `ClientConfig`'s
+    /// `addr` goes through `lookup_host`, which refuses an address with no
+    /// port ("invalid port value"), so the client never gets built.
     fn unc_for(&self, share_name: &str) -> String {
         let host = self
             .primary_server
@@ -531,17 +537,28 @@ impl SmbClient {
     /// another namespace, so it is re-resolved rather than connected) up to
     /// [`MAX_DFS_HOPS`], which is what stops a namespace that points at
     /// itself from resolving forever.
-    async fn connect_namespace(&mut self, requested: &str, share_name: &str) -> Result<Tree> {
+    async fn connect_namespace(&mut self, requested: &str) -> Result<Tree> {
         let mut path = requested.to_string();
-        let mut last_error: Option<Error> = None;
-        let mut target_count = 0usize;
 
         for _ in 0..MAX_DFS_HOPS {
             let targets = self.root_referral(&path).await?;
+
+            // The chain ended without naming anywhere to go. ❌ This has to
+            // leave by its own exit: sharing one with the hop limit below
+            // means telling the caller we exhausted eight hops when the chain
+            // simply ran out after two. `DfsResolver::resolve` reports an
+            // error rather than an empty list today, so this is a guard on its
+            // contract rather than a path anything takes.
             if targets.is_empty() {
-                break;
+                return Err(Error::invalid_data(if path == requested {
+                    format!("DFS referral for {requested} named no targets")
+                } else {
+                    format!(
+                        "DFS referral for {requested} followed an interlink to {path}, \
+                         which named no targets"
+                    )
+                }));
             }
-            target_count = targets.len();
 
             // An Interlink means the whole response is a path in another
             // namespace, so there is nothing here to connect to.
@@ -550,6 +567,11 @@ impl SmbClient {
                 trace!("dfs: {requested:?} is an interlink, re-resolving as {path:?}");
                 continue;
             }
+
+            // Past here the hop is decided: every exit below returns, so
+            // nothing after the loop has to work out how we got there.
+            let target_count = targets.len();
+            let mut last_error: Option<Error> = None;
 
             for target in &targets {
                 // A root target is `\\server\share` and nothing more
@@ -601,15 +623,12 @@ impl SmbClient {
             };
         }
 
-        if target_count > 0 {
-            return Err(Error::DfsTooManyReferrals {
-                namespace: requested.to_string(),
-                hops: MAX_DFS_HOPS,
-            });
-        }
-        Err(Error::invalid_data(format!(
-            "no DFS referral for {share_name}"
-        )))
+        // The only way out of that loop is the Interlink `continue`, once per
+        // hop, so reaching here means exactly that and nothing else.
+        Err(Error::DfsTooManyReferrals {
+            namespace: requested.to_string(),
+            hops: MAX_DFS_HOPS,
+        })
     }
 
     /// Ask the server that owns `path` for a referral, resolving from cache
@@ -2319,6 +2338,42 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A chain that ends empty is a chain that ended, not a hop limit that was
+    /// reached. The caller gets the original refusal, and above all not a
+    /// `DfsTooManyReferrals` naming a limit nothing came near.
+    #[tokio::test]
+    async fn an_empty_referral_after_an_interlink_is_not_a_hop_limit_error() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+
+        mock.queue_response(build_tree_connect_refusal(
+            NtStatus::BAD_NETWORK_NAME,
+            false,
+        ));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        // Hop 1: an interlink into a second namespace.
+        mock.queue_response(build_root_referral(
+            r"\test-server\aleu",
+            &[r"\test-server\elsewhere"],
+            0x01,
+        ));
+        // Hop 2: nothing there.
+        mock.queue_response(build_root_referral(r"\test-server\elsewhere", &[], 0x02));
+
+        let err = client.connect_share("aleu").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Protocol {
+                    status: NtStatus::BAD_NETWORK_NAME,
+                    ..
+                }
+            ),
+            "the chain ended after two hops, so the caller should get the \
+             original refusal; got {err:?}"
+        );
     }
 
     /// The one outcome that is genuinely about DFS: the namespace is real, we
