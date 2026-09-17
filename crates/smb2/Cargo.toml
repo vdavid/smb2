@@ -47,7 +47,7 @@ aes = "0.9.1"
 aes-gcm = "0.11.0"
 # ccm has no stable 0.6 yet (newest is 0.6.0-rc.3); revisit and unpin when it ships.
 # It reqs aes ^0.9.0-rc.4 / aead ^0.6.0-rc.10 / cipher ^0.5.0-rc.8, which unify with the stable pins above.
-ccm = "=0.6.0-rc.3"
+ccm = "=0.6.1"
 cmac = "0.8.0"
 digest = "0.11"
 
@@ -63,7 +63,7 @@ sha1 = "0.11"
 getrandom = "0.4"
 
 # Compression
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 
 # Optional: `Serialize` derives on diagnostics types. Off by default.
 serde = { version = "1", optional = true, features = ["derive"] }

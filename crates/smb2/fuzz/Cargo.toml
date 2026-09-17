@@ -13,7 +13,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "=0.4.12"
+libfuzzer-sys = "=0.4.13"
 arbitrary = { version = "=1.4.2", features = ["derive"] }
 
 [dependencies.smb2]
