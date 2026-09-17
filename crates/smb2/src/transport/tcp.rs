@@ -693,18 +693,31 @@ mod tests {
         );
     }
 
-    /// A `ConnectAttempt` per address, saying what each one did. `None` means
-    /// the address ran out of budget rather than failing, which is a different
-    /// thing to know.
+    /// Port 0 is not a port a TCP connection can be made to, and every stack
+    /// rejects it in its own `connect` call without putting a packet on the
+    /// wire: `AddrNotAvailable` on macOS (35 µs), `ConnectionRefused` on Linux
+    /// (71 µs), `WSAEADDRNOTAVAIL` on Windows. Which kind it is varies, so
+    /// tests here assert only that there *is* one.
+    ///
+    /// ❌ **Don't reach for a just-released ephemeral port instead.** It looks
+    /// equivalent and isn't: it assumes the stack answers a closed port with a
+    /// RST promptly, which is a Unix habit rather than a guarantee. Windows CI
+    /// sent no RST inside a 400 ms budget and the attempt was correctly
+    /// recorded as "never finished", failing a test that assumed otherwise.
+    const UNCONNECTABLE: &str = "127.0.0.1:0";
+
+    /// One `ConnectAttempt` per address, in the order they were attempted,
+    /// whatever each one did.
+    ///
+    /// Deliberately asserts nothing about the *kinds*: how fast a given stack
+    /// refuses decides those, and the two tests below pin each kind separately
+    /// by staging it rather than by racing a budget. What is true on every
+    /// platform is that the slots exist, are filled in, and line up with the
+    /// addresses — `attempts` is built from the address list up front, so this
+    /// holds however the attempts finish or don't.
     #[tokio::test]
     async fn every_address_failing_reports_every_address() {
-        // One that refuses immediately (nothing listens on a port we just
-        // released) and one that drops.
-        let released = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            l.local_addr().unwrap()
-        };
-        let addrs = vec![released, BLACKHOLE.parse().unwrap()];
+        let addrs = vec![UNCONNECTABLE.parse().unwrap(), BLACKHOLE.parse().unwrap()];
 
         let opts = ConnectOptions {
             timeout: Duration::from_millis(400),
@@ -713,21 +726,77 @@ mod tests {
         };
         let err = dial_staggered("test", &addrs, &opts, Instant::now() + opts.timeout)
             .await
-            .expect_err("nothing should have connected");
+            .expect_err("neither address can be connected to");
 
         match err {
             Error::ConnectFailed { host, attempts } => {
                 assert_eq!(host, "test");
-                assert_eq!(attempts.len(), 2);
-                assert_eq!(attempts[0].addr, released);
+                assert_eq!(attempts.len(), 2, "one entry per address");
+                assert_eq!(attempts[0].addr, addrs[0]);
+                assert_eq!(attempts[1].addr, addrs[1], "in the order attempted");
+            }
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
+    }
+
+    /// An attempt that failed carries the reason.
+    ///
+    /// The budget is far larger than the failure it is waiting for, so the
+    /// budget can never be what ends this: the only way to reach the
+    /// assertion is the connect failing, and the only way to fail the
+    /// assertion would be connecting to port 0 successfully.
+    #[tokio::test]
+    async fn a_failed_attempt_reports_why() {
+        let addrs = vec![UNCONNECTABLE.parse().unwrap()];
+        let opts = ConnectOptions {
+            timeout: Duration::from_secs(10),
+            ..ConnectOptions::default()
+        };
+
+        let err = dial_staggered("test", &addrs, &opts, Instant::now() + opts.timeout)
+            .await
+            .expect_err("port 0 is not connectable");
+
+        match err {
+            Error::ConnectFailed { attempts, .. } => {
+                assert_eq!(attempts.len(), 1);
                 assert!(
                     attempts[0].error_kind.is_some(),
-                    "a refused connect has a kind"
+                    "an attempt that failed has to say why; got {:?}",
+                    attempts[0]
                 );
-                assert_eq!(attempts[1].addr, BLACKHOLE.parse().unwrap());
+            }
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
+    }
+
+    /// An attempt that never finished reports no reason, because none is
+    /// known — it may still have been on its way.
+    ///
+    /// Staged with a deadline that has already passed rather than raced
+    /// against a slow address: that makes "did not finish" true by
+    /// construction on every platform, instead of depending on how long some
+    /// network takes to not answer.
+    #[tokio::test]
+    async fn an_attempt_that_never_finished_reports_no_reason() {
+        let addrs = vec![BLACKHOLE.parse().unwrap()];
+        let opts = ConnectOptions {
+            timeout: Duration::ZERO,
+            ..ConnectOptions::default()
+        };
+
+        // `Instant::now()` is already in the past by the time the loop reads
+        // the clock, and the clock is monotonic, so there is no budget at all.
+        let err = dial_staggered("test", &addrs, &opts, Instant::now())
+            .await
+            .expect_err("no budget, no connection");
+
+        match err {
+            Error::ConnectFailed { attempts, .. } => {
+                assert_eq!(attempts.len(), 1, "the address is still reported");
                 assert_eq!(
-                    attempts[1].error_kind, None,
-                    "a blackholed address ran out of budget, it did not fail"
+                    attempts[0].error_kind, None,
+                    "nothing is known about an attempt that didn't finish"
                 );
             }
             other => panic!("expected ConnectFailed, got {other:?}"),
