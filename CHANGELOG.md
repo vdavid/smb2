@@ -5,6 +5,17 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.1] - 2026-09-17
+
+### Fixed
+
+- **An IPv6 server kept only its first address group in the UNC path.** Four sites derived a host from a `host:port` address with `split(':')`, which is correct for IPv4 and wrong for every IPv6 form: `[::1]:445` read as `[`, `fe80::1:445` as `fe80`. Two of the four are on the DFS path and are the reason this is a bug rather than a blemish:
+  - `Tree::format_path` builds the `server\share\` prefix a DFS share needs, and the server strips exactly two components off it to recover the local path (MS-SMB2 § 3.2.4.3). With one address group standing in for the host, the second strip ate the caller's first path component, so a DFS share opened the wrong file.
+  - `SmbClient::handle_dfs_redirect` builds the referral UNC, so a referral lookup and the tree connect that followed it could name two different servers.
+  - The other two, `Connection::connect_with` (the UNC path in every `TREE_CONNECT`) and `SmbClient::unc_for` (the DFS referral cache key), disagreed with each other: the latter already split on the last colon and kept the brackets.
+  - All four now share one derivation, which strips a bracketed literal at its bracket and otherwise splits on the last colon **only when the tail parses as a port** — the same reading `ToSocketAddrs` gives the string, so the name always matches what was dialled.
+  - Latent until now because every fixture here is IPv4 and most servers ignore the server half of a `TREE_CONNECT` UNC path. A full `ipv6-literal.net` treatment (the form Windows writes for a UNC path, which cannot contain a colon at all) still wants an IPv6 fixture and stays on the follow-up list.
+
 ## [0.22.0] - 2026-09-16
 
 ### Breaking
