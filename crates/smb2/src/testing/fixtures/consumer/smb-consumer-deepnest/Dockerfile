@@ -1,4 +1,4 @@
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache samba
 COPY smb.conf /etc/samba/smb.conf
 COPY populate.sh /populate.sh
