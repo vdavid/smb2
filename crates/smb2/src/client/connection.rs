@@ -2373,7 +2373,11 @@ impl Connection {
     /// [`connect`](Self::connect) with the connect budget under the caller's
     /// control. See [`ConnectOptions`](crate::transport::ConnectOptions).
     pub async fn connect_with(addr: &str, opts: crate::transport::ConnectOptions) -> Result<Self> {
-        let server_name = addr.split(':').next().unwrap_or(addr).to_string();
+        // ❌ Never `split(':')` here: it reads an IPv6 literal as its first
+        // group (`[::1]:445` → `[`), and this name goes out as the server half
+        // of the UNC path in every TREE_CONNECT. One derivation, shared with
+        // `SmbClient::unc_for`, so the two can't disagree.
+        let server_name = crate::client::host_of(addr).to_string();
         let transport = TcpTransport::connect_with(addr, opts).await?;
         info!("connection: connected to {}", addr);
         let transport = Arc::new(transport);

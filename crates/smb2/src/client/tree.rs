@@ -365,8 +365,11 @@ impl Tree {
     pub(crate) fn format_path(&self, path: &str) -> String {
         let normalized = normalize_path(path);
         if self.is_dfs {
-            // Extract hostname (strip port if present) for the DFS path prefix.
-            let hostname = self.server.split(':').next().unwrap_or(&self.server);
+            // The server strips exactly two components off this, so the host
+            // has to be the WHOLE host. ❌ Never `split(':')`: an IPv6 literal
+            // would arrive as its first group and the server would strip into
+            // the caller's path (`crate::client::host_of`).
+            let hostname = crate::client::host_of(&self.server);
             if normalized.is_empty() {
                 format!("{}\\{}", hostname, self.share_name)
             } else {
@@ -3330,6 +3333,44 @@ mod tests {
     use crate::types::status::NtStatus;
     use crate::types::{Command, TreeId};
     use std::sync::Arc;
+
+    /// The DFS prefix carries the WHOLE host, IPv6 literals included.
+    ///
+    /// MS-SMB2 § 3.2.4.3: the server strips exactly two components off this to
+    /// get the local path. Reading `[fe80::1]:445` as `fe80` left one host
+    /// group where a host belonged, so the server's second strip ate the
+    /// caller's first path component and opened the wrong file. Invisible on
+    /// IPv4, which is every fixture we have.
+    #[test]
+    fn a_dfs_prefix_keeps_a_whole_ipv6_host() {
+        let tree = |server: &str| Tree {
+            tree_id: TreeId(1),
+            share_name: "aleu".to_string(),
+            server: server.to_string(),
+            is_dfs: true,
+            encrypt_data: false,
+            dfs_origin: None,
+        };
+
+        assert_eq!(
+            tree("[fe80::1]:445").format_path("Docs/Report.pdf"),
+            r"fe80::1\aleu\Docs\Report.pdf"
+        );
+        assert_eq!(
+            tree("fe80::1:445").format_path("Docs/Report.pdf"),
+            r"fe80::1\aleu\Docs\Report.pdf"
+        );
+        assert_eq!(
+            tree("lgs-net.com:445").format_path("Docs/Report.pdf"),
+            r"lgs-net.com\aleu\Docs\Report.pdf"
+        );
+        // The share root, where there is no path to eat into.
+        assert_eq!(tree("[::1]:445").format_path(""), r"::1\aleu");
+        // A non-DFS tree sends a share-relative path and no prefix at all.
+        let mut plain = tree("[::1]:445");
+        plain.is_dfs = false;
+        assert_eq!(plain.format_path("Docs/Report.pdf"), r"Docs\Report.pdf");
+    }
 
     fn build_flush_response() -> Vec<u8> {
         let mut h = Header::new_request(Command::Flush);

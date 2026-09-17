@@ -271,6 +271,38 @@ fn activate_share_encryption(conn: &mut Connection, session: &Session, tree: &Tr
 /// answer.
 const MAX_DFS_HOPS: usize = 8;
 
+/// The host half of a `host:port` address, for the places that need a NAME
+/// rather than something to dial: the UNC path in every `TREE_CONNECT` and the
+/// DFS referral cache key.
+///
+/// ❌ Never `split(':')`. That reads `[::1]:445` as `[` and `fe80::1:445` as
+/// `fe80`, and the wrong name then goes out as the server half of the UNC path.
+/// Two sites derived this separately and disagreed, which on a DFS share means
+/// the cache key and the tree-connect path name different servers.
+///
+/// **Matches what `ToSocketAddrs` will actually dial**, which is the whole
+/// point of deriving it here rather than guessing: std splits a bracket-less
+/// address on the LAST colon, so `fe80::1:445` is host `fe80::1` on port 445
+/// even though the same text is also a valid IPv6 address in its own right.
+/// A bracket-less literal with no port is genuinely ambiguous and is read as
+/// carrying a port, exactly as std reads it; one cannot reach here anyway,
+/// since `lookup_host` refuses a portless address ("invalid port value") and
+/// the client is never built.
+pub(crate) fn host_of(addr: &str) -> &str {
+    // A bracketed literal says where it ends, which is what brackets are for.
+    if let Some(host) = addr
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(host, _)| host)
+    {
+        return host;
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        _ => addr,
+    }
+}
+
 /// One `Error::Disconnected` per item, for a batch method that never found a
 /// connection to run on.
 ///
@@ -488,18 +520,8 @@ impl SmbClient {
     }
 
     /// The UNC path for a share on the primary server, as a referral names it.
-    ///
-    /// `rsplit_once` rather than `split_once`, so a bracketed IPv6 address
-    /// keeps its colons: `[::1]:445` gives `[::1]`. A *portless* address would
-    /// split inside the literal, but one cannot reach here — `ClientConfig`'s
-    /// `addr` goes through `lookup_host`, which refuses an address with no
-    /// port ("invalid port value"), so the client never gets built.
     fn unc_for(&self, share_name: &str) -> String {
-        let host = self
-            .primary_server
-            .rsplit_once(':')
-            .map_or(self.primary_server.as_str(), |(host, _)| host);
-        format!(r"\\{host}\{share_name}")
+        format!(r"\\{}\{}", host_of(&self.primary_server), share_name)
     }
 
     /// Whether a refused `TREE_CONNECT` might be a DFS namespace root rather
@@ -884,13 +906,9 @@ impl SmbClient {
         tree: &mut Tree,
         original_path: &str,
     ) -> Result<String> {
-        // Extract hostname (strip port) for UNC path construction.
-        let hostname = tree
-            .server
-            .split(':')
-            .next()
-            .unwrap_or(&tree.server)
-            .to_string();
+        // The referral lookup and the tree-connect path have to name the same
+        // server, so this goes through the one derivation (`host_of`).
+        let hostname = host_of(&tree.server).to_string();
         let share = tree.share_name.clone();
         // Encoded, not just slash-flipped: the referral lookup and the CREATE
         // that follows have to agree on where a component ends, and a `\` that
@@ -3102,5 +3120,53 @@ mod tests {
         // Only disk shares returned.
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].name, "Documents");
+    }
+
+    /// The host half of an address, for the UNC path and the DFS cache key.
+    ///
+    /// Every IPv6 form is here because the old `split(':')` got every one of
+    /// them wrong (`[::1]:445` → `[`, `fe80::1:445` → `fe80`) while looking
+    /// perfectly healthy on IPv4, which is why it survived so long.
+    #[test]
+    fn a_host_is_read_off_an_address_without_eating_an_ipv6_literal() {
+        let cases = [
+            // (address, host)
+            ("192.168.1.111:445", "192.168.1.111"),
+            ("naspolya.local:445", "naspolya.local"),
+            ("lgs-net.com:445", "lgs-net.com"),
+            // Bracketed: the brackets say where the literal ends, and come off.
+            ("[::1]:445", "::1"),
+            ("[2001:db8::5]:445", "2001:db8::5"),
+            // Bracket-less: the port is what follows the LAST colon, which is
+            // how `ToSocketAddrs` reads it, so this agrees with what we dialled.
+            ("fe80::1:445", "fe80::1"),
+            ("2001:db8::5:445", "2001:db8::5"),
+            // No port: nothing to strip.
+            ("naspolya.local", "naspolya.local"),
+            ("[::1]", "::1"),
+        ];
+        for (addr, expected) in cases {
+            assert_eq!(super::host_of(addr), expected, "host of {addr:?}");
+        }
+    }
+
+    /// The UNC path and the address share one derivation, so a DFS cache key
+    /// and the tree-connect path can't name two different servers.
+    #[test]
+    fn the_unc_path_and_the_dialled_address_agree_on_the_server() {
+        for addr in [
+            "192.168.1.111:445",
+            "[::1]:445",
+            "fe80::1:445",
+            "nas.local:445",
+        ] {
+            let host = super::host_of(addr);
+            assert!(
+                !host.contains(':') || !host.starts_with('['),
+                "a bracket survived into the UNC path for {addr:?}: {host:?}"
+            );
+            assert!(!host.is_empty(), "empty host for {addr:?}");
+            assert_ne!(host, "[", "the bracket-only bug is back for {addr:?}");
+        }
     }
 }
