@@ -5,6 +5,25 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-09-22
+
+### Breaking
+
+- **`TransportReceive` gains `receive_progress()`**, with a default that returns `None`, so an existing transport keeps compiling and keeps working. Breaking under this crate's pre-1.0 rules because it is a new method on a public trait. A transport that can see inside a frame should implement it (below); one that can't loses nothing it had before.
+
+### Fixed
+
+- **A large response still arriving over a slow link was mistaken for a dead server.** An 8 MB READ over a ~200 KB/s link spends 40 s on the wire, and TCP delivers in order, so nothing else can arrive meanwhile, ECHO replies included. Only whole frames fed the connection's liveness clock, so the wire read as silent, the keepalive probes as unanswered, and the read ended in `Error::ServerUnresponsive` with the connection torn down under every other caller, while the bytes were landing the whole time. Every inbound byte now counts as the server speaking: a trickling frame keeps the connection provably alive, earns a slow request the alive-connection deadline ceiling, and sends no pointless probes. A frame that stops arriving is silence again, and a dead link is still declared dead.
+  - Known limit: one frame slower than the alive ceiling (6× the response deadline, 3 minutes by default; with the keepalive off, the plain 30 s) still fails that one request with `Error::Timeout`, without tearing the connection down. At an 8 MB `MaxReadSize` that means a link below ~46 KB/s.
+
+### Added
+
+- **`Connection::liveness() -> Liveness`**: whether the server is still there, by the connection's own clocks, as pollable state. `Idle`, `Alive`, `Quiet { silent_for }`, `Unresponsive { silent_for }`, `Disconnected`. `Unresponsive` is exactly the evidence `Error::ServerUnresponsive` rests on (keepalive armed, work outstanding, the wire silent past the liveness window), readable before any request has paid for it, and reading it tears nothing down. Built for a transfer watchdog that must tell a dead link from a slow one.
+- **`Connection::inbound() -> InboundProgress`**: what the server has put on the wire, counted as the bytes land. `bytes_received` (never runs backwards, revivals included) gives a live rate while one large response arrives, `frame` says how far into the current frame the transport is, and `since_last_byte` says whether the server is talking right now. Counts only: a partial frame is unverified, so it's for a rate and for liveness, never a byte bar.
+- Both readings are in `ConnectionDiagnostics` (`inbound`, `liveness`) and its `Display`.
+- **`transport::ReceiveProgress`** (with `ReceiveSnapshot` and `FrameProgress`): the counter a transport updates from its receive path and hands out through `TransportReceive::receive_progress`. `TcpTransport` and `MockTransport` both publish one; the per-read cost in `TcpTransport` is one relaxed add, one clock read, and one relaxed store, with no allocation.
+- **`SmbClient::connection(&self) -> &Connection`**, so a consumer can poll the primary connection without `&mut` (or clone one out and poll that).
+
 ## [0.22.1] - 2026-09-17
 
 ### Fixed

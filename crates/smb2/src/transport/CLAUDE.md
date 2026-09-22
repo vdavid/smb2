@@ -8,6 +8,7 @@ Split transport traits for SMB2 message I/O. Two implementations: TCP and mock.
 |---|---|
 | `mod.rs` | `TransportSend`, `TransportReceive`, `Transport` traits |
 | `tcp.rs` | `TcpTransport` -- direct TCP to port 445, handles framing |
+| `progress.rs` | `ReceiveProgress` -- live byte counts for a frame still arriving |
 | `mock.rs` | `MockTransport` -- FIFO response queue for testing |
 
 ## Split traits
@@ -27,7 +28,26 @@ The blanket impl `Transport` combines both halves. `Connection` stores `Box<dyn 
 - Maximum frame size: 16 MB
 - This is the ONLY big-endian value in SMB2
 
-`TcpTransport::send` prepends the 4-byte header. `TcpTransport::receive` reads the header, then `read_exact` for the payload.
+`TcpTransport::send` prepends the 4-byte header. `TcpTransport::receive` reads the header with `read_exact`, then the
+payload with a counted read loop (below).
+
+## Receive progress: bytes inside a frame are signs of life
+
+`TcpTransport::receive` publishes every socket read to a `ReceiveProgress` (one relaxed add, one clock read, one
+relaxed store) and hands it out once through `TransportReceive::receive_progress`. The connection folds its last-byte
+time into its liveness clock; see `client/CLAUDE.md` § Liveness for why that is load-bearing.
+
+- **The body loop is `read_exact` with a counter in it, and must keep its semantics exactly**: every byte or an error,
+  EOF partway is `Error::Disconnected`, other I/O errors are `Error::Io`, frame-size validation before anything is
+  read. `FrameInProgress` ends the frame on drop, so a failed or cancelled receive never leaves one reported as
+  permanently half in.
+- **Counts only, never data.** A partial frame is unverified (a signature or AEAD tag covers the whole message).
+  `bytes` counts payload, not the 4-byte prefix, so it agrees with `wire_bytes_received` between frames.
+- ❌ **The `Arc<T>` blanket impl in `client/connection.rs` must forward `receive_progress`.** The default answers `None`
+  silently, and `Connection::connect` wraps `TcpTransport` in an `Arc`, so a missing forward quietly puts every TCP
+  connection back to calling a trickling frame silence. The tcp tests caught exactly that.
+- A transport that answers `None` (custom ones, the fault-injection `ScriptedServer`) still works: the receiver task
+  counts whole frames into a counter of its own. `MockTransport` publishes, one whole frame per response.
 
 ## The connect budget is per address, not per name
 
@@ -70,7 +90,8 @@ Phase 2 changed `receive()` from "return `Err(Disconnected)` immediately when th
 
 ## Gotchas
 
-- **Partial TCP reads**: Always use `read_exact` to read the full frame. TCP can deliver partial data in any `read()` call.
+- **Partial TCP reads**: TCP can deliver partial data in any `read()` call, so the body loop runs until the frame is
+  whole. The header still uses `read_exact`.
 - **16 MB max frame**: Reject frames larger than 16 MB to prevent OOM from malicious servers.
 - **Frame may contain multiple messages**: Compound responses arrive in a single frame. The Connection's receiver task splits them by `NextCommand` offsets and routes each sub-response by `MessageId` independently.
 - **`MockTransport::close()` wake-loss**: `notify_waiters()` alone only wakes already-parked waiters; if `close()` fires between `receive()`'s `closed.load()` check and its `notified().await`, the signal is lost. `close()` therefore also calls `notify_one()` to store a permit — next `.notified().await` returns immediately and the loop re-observes `closed=true`. Noticed via code review after Phase 2.
