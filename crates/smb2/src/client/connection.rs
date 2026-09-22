@@ -850,9 +850,12 @@ fn spawn_plumbing(
         old.abort();
     }
 
+    // Before the receiver task exists, so it can't count a frame into the
+    // counter being retired.
+    let feed = inner.adopt_receive_progress(receiver.receive_progress());
     let inner_for_task = Arc::clone(inner);
     let handle = tokio::spawn(async move {
-        receiver_loop(receiver, inner_for_task).await;
+        receiver_loop(receiver, inner_for_task, feed).await;
     });
     if let Some(old) = inner.receiver_task.lock().unwrap().replace(handle) {
         old.abort();
@@ -1172,7 +1175,7 @@ use crate::msg::transform::{
     COMPRESSION_PROTOCOL_ID, SMB2_COMPRESSION_FLAG_NONE, TRANSFORM_PROTOCOL_ID,
 };
 use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
-use crate::transport::{TcpTransport, TransportReceive, TransportSend};
+use crate::transport::{ReceiveProgress, TcpTransport, TransportReceive, TransportSend};
 use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
 use crate::types::{
@@ -1457,6 +1460,21 @@ impl CryptoState {
 /// fallback channel; `execute` / `execute_compound` own their per-call
 /// `oneshot::Receiver`s locally, so there is no per-clone bookkeeping at
 /// all now — `Connection` is just a handle to `Arc<Inner>`.
+/// Where a connection reads its inbound byte counts from.
+///
+/// The counts belong to the TRANSPORT, because only the transport sees a frame
+/// while it is still arriving, and a revival replaces the transport. So the
+/// connection keeps the current one's counter plus what the replaced ones had
+/// counted, which is what lets [`Connection::inbound`] report one total that
+/// never runs backwards.
+struct Inbound {
+    /// The current transport's counter, or one the receiver task keeps from
+    /// whole frames when the transport can't see inside one.
+    progress: Arc<ReceiveProgress>,
+    /// Bytes counted by transports this connection has since replaced.
+    retired_bytes: u64,
+}
+
 struct Inner {
     /// Per-request routing: msg_id → oneshot sender waiting for its response.
     waiters: StdMutex<HashMap<MessageId, Waiter>>,
@@ -1487,6 +1505,9 @@ struct Inner {
     /// has never said anything has not proven anything, and the deadline
     /// extension must never be granted on an assumption.
     last_frame_at: StdMutex<Option<std::time::Instant>>,
+    /// What the server has put on the wire so far, counted as it lands rather
+    /// than when a frame completes. See [`Inbound`].
+    inbound: StdMutex<Inbound>,
     /// When one of this connection's own loops was last scheduled: the
     /// process's liveness clock, as opposed to the server's.
     ///
@@ -1725,6 +1746,10 @@ impl Inner {
             send_tally: SendTally::default(),
             response_timeout: StdMutex::new(Some(RESPONSE_TIMEOUT)),
             last_frame_at: StdMutex::new(None),
+            inbound: StdMutex::new(Inbound {
+                progress: Arc::new(ReceiveProgress::new()),
+                retired_bytes: 0,
+            }),
             last_scheduled_at: StdMutex::new(std::time::Instant::now()),
             keepalive_after: StdMutex::new(Some(KEEPALIVE_AFTER)),
             long_poll_refresh: StdMutex::new(Some(LONG_POLL_REFRESH)),
@@ -1949,11 +1974,60 @@ impl Inner {
         *self.last_frame_at.lock().unwrap() = Some(std::time::Instant::now());
     }
 
+    /// Start reading inbound counts from a new transport's counter, retiring
+    /// the previous one's total so the connection's never runs backwards.
+    ///
+    /// Returns the counter the receiver task has to feed itself, which is a
+    /// fresh one when the transport can't publish its own.
+    fn adopt_receive_progress(
+        &self,
+        published: Option<Arc<ReceiveProgress>>,
+    ) -> Option<Arc<ReceiveProgress>> {
+        let (progress, feed) = match published {
+            Some(progress) => (progress, None),
+            None => {
+                let own = Arc::new(ReceiveProgress::new());
+                (Arc::clone(&own), Some(own))
+            }
+        };
+        let mut inbound = self.inbound.lock().unwrap();
+        inbound.retired_bytes += inbound.progress.snapshot().bytes;
+        inbound.progress = progress;
+        feed
+    }
+
+    /// When the server last put anything on the wire, a byte of a frame still
+    /// arriving included, or `None` if it never has.
+    ///
+    /// **Every inbound byte is a sign of life, not just every whole frame.**
+    /// TCP delivers in order, so while a large response is arriving nothing
+    /// else can: an 8 MB READ at 200 KB/s holds the wire for 40 s, and the
+    /// ECHO replies that would prove the server alive queue up behind it. With
+    /// only whole frames on this clock, that read looked like 40 s of silence
+    /// and ended in `declare_unresponsive` against a server that was talking
+    /// the whole time.
+    ///
+    /// Folds the transport's clock into `last_frame_at` rather than reading it
+    /// alongside, because `last_frame_at` is the one the stall correction and
+    /// a revival adjust. Taking the later of the two keeps both: a corrected
+    /// reading sits ahead of any byte that landed before the stall.
+    fn last_heard(&self) -> Option<std::time::Instant> {
+        let progress = Arc::clone(&self.inbound.lock().unwrap().progress);
+        let byte_at = progress.snapshot().last_byte_at;
+        let mut last = self.last_frame_at.lock().unwrap();
+        if let Some(byte_at) = byte_at {
+            if last.is_none_or(|t| byte_at > t) {
+                *last = Some(byte_at);
+            }
+        }
+        *last
+    }
+
     /// How long since the server last said anything, or `None` if it never
     /// has.
     fn server_silent_for(&self) -> Option<Duration> {
         let now = std::time::Instant::now();
-        (*self.last_frame_at.lock().unwrap()).map(|t| now.saturating_duration_since(t))
+        self.last_heard().map(|t| now.saturating_duration_since(t))
     }
 
     /// How long the wire has been quiet while the server had something to
@@ -1976,7 +2050,7 @@ impl Inner {
             let waiters = self.waiters.lock().unwrap();
             waiters.values().filter_map(|w| w.sent_at).min()?
         };
-        let reference = match *self.last_frame_at.lock().unwrap() {
+        let reference = match self.last_heard() {
             Some(spoke) => spoke.max(oldest_sent),
             None => oldest_sent,
         };
@@ -2032,6 +2106,9 @@ impl Inner {
         // clocks legitimately read BEFORE the stall: a request the server had
         // already owed us for 10 s is still 10 s overdue afterwards.
         let shift = |t: &mut std::time::Instant| *t = t.checked_add(stall).unwrap_or(now);
+        // Folds in the latest partial-frame byte first, so the shift starts
+        // from the last thing the server actually said.
+        self.last_heard();
         if let Some(spoke) = self.last_frame_at.lock().unwrap().as_mut() {
             shift(spoke);
         }
@@ -4729,7 +4806,14 @@ impl Connection {
 
 /// Receiver task loop: owns the transport receive half, routes each frame
 /// to its waiter.
-async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inner>) {
+///
+/// `feed` is the counter to record each whole frame into, for a transport that
+/// can't publish its own ([`TransportReceive::receive_progress`] said `None`).
+async fn receiver_loop(
+    transport_recv: Box<dyn TransportReceive>,
+    inner: Arc<Inner>,
+    feed: Option<Arc<ReceiveProgress>>,
+) {
     loop {
         let raw = match transport_recv.receive().await {
             Ok(bytes) => bytes,
@@ -4758,6 +4842,9 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inn
             .metrics
             .wire_bytes_received
             .fetch_add(raw.len() as u64, Ordering::Relaxed);
+        if let Some(feed) = &feed {
+            feed.record_whole_frame(raw.len());
+        }
         // The connection's liveness clock, fed before anything can reject the
         // frame. Even a frame we go on to discard proves the server is
         // processing requests, which is the only thing this clock claims.
@@ -5369,6 +5456,14 @@ impl<T: TransportSend> TransportSend for Arc<T> {
 impl<T: TransportReceive> TransportReceive for Arc<T> {
     async fn receive(&self) -> Result<Vec<u8>> {
         (**self).receive().await
+    }
+
+    // ❌ Don't drop this forward. The default answers `None`, and that isn't
+    // an error anyone sees: `Connection::connect` wraps `TcpTransport` in an
+    // `Arc`, so a missing forward silently puts every TCP connection back to
+    // treating a frame still arriving as silence.
+    fn receive_progress(&self) -> Option<Arc<ReceiveProgress>> {
+        (**self).receive_progress()
     }
 }
 

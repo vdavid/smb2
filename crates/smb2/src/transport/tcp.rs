@@ -12,6 +12,7 @@ use log::{debug, error, trace};
 use std::collections::VecDeque;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -20,7 +21,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::error::{Error, Result};
-use crate::transport::{TransportReceive, TransportSend};
+use crate::transport::{ReceiveProgress, TransportReceive, TransportSend};
 
 /// Maximum frame size we accept (16 MB).
 ///
@@ -121,6 +122,9 @@ pub struct TcpTransport {
     reader: Mutex<OwnedReadHalf>,
     /// The write half of the TCP connection, behind a mutex for `&self` access.
     writer: Mutex<OwnedWriteHalf>,
+    /// What `receive` has read so far, published per socket read. See
+    /// [`ReceiveProgress`].
+    progress: Arc<ReceiveProgress>,
 }
 
 impl TcpTransport {
@@ -174,12 +178,17 @@ impl TcpTransport {
         stream.set_nodelay(true).map_err(Error::Io)?;
 
         debug!("tcp: connected, nodelay=true");
-        let (reader, writer) = stream.into_split();
+        Ok(Self::from_stream(stream))
+    }
 
-        Ok(Self {
+    /// Wrap a connected socket.
+    fn from_stream(stream: TcpStream) -> Self {
+        let (reader, writer) = stream.into_split();
+        Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
-        })
+            progress: Arc::new(ReceiveProgress::new()),
+        }
     }
 }
 
@@ -348,13 +357,10 @@ impl TransportReceive for TcpTransport {
 
         // Read the 4-byte framing header.
         let mut frame_header = [0u8; 4];
-        reader.read_exact(&mut frame_header).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                Error::Disconnected
-            } else {
-                Error::Io(e)
-            }
-        })?;
+        reader
+            .read_exact(&mut frame_header)
+            .await
+            .map_err(read_error)?;
 
         // Validate the first byte is 0x00.
         if frame_header[0] != 0x00 {
@@ -380,18 +386,54 @@ impl TransportReceive for TcpTransport {
 
         trace!("tcp: receiving frame, len={}", msg_len);
 
-        // Read the message body.
+        // Read the message body, publishing each piece as it lands. This is
+        // `read_exact` with a counter in it, and has to keep its semantics
+        // exactly: every byte or an error, EOF partway is `Disconnected`.
         let mut buf = vec![0u8; msg_len];
-        reader.read_exact(&mut buf).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                Error::Disconnected
-            } else {
-                Error::Io(e)
+        let _frame = FrameInProgress::begin(&self.progress, msg_len);
+        let mut filled = 0;
+        while filled < msg_len {
+            let n = reader.read(&mut buf[filled..]).await.map_err(read_error)?;
+            if n == 0 {
+                return Err(Error::Disconnected);
             }
-        })?;
+            filled += n;
+            self.progress.record(n);
+        }
 
         trace!("tcp: received frame, len={}", msg_len);
         Ok(buf)
+    }
+
+    fn receive_progress(&self) -> Option<Arc<ReceiveProgress>> {
+        Some(Arc::clone(&self.progress))
+    }
+}
+
+/// A read error as the connection needs to see it: the peer closing the
+/// socket is `Disconnected`, anything else is the I/O error itself.
+fn read_error(e: std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        Error::Disconnected
+    } else {
+        Error::Io(e)
+    }
+}
+
+/// Marks a frame as arriving for as long as it lives, so a receive that fails
+/// or is dropped partway can't leave a frame reported as permanently half in.
+struct FrameInProgress<'a>(&'a ReceiveProgress);
+
+impl<'a> FrameInProgress<'a> {
+    fn begin(progress: &'a ReceiveProgress, len: usize) -> Self {
+        progress.begin_frame(len);
+        Self(progress)
+    }
+}
+
+impl Drop for FrameInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.end_frame();
     }
 }
 
@@ -473,11 +515,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let (reader, writer) = stream.into_split();
-        let transport = TcpTransport {
-            reader: Mutex::new(reader),
-            writer: Mutex::new(writer),
-        };
+        let transport = TcpTransport::from_stream(stream);
 
         let result = transport.receive().await;
         writer_task.await.unwrap();
@@ -597,22 +635,14 @@ mod tests {
 
         let send_task = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
-            let (reader, writer) = stream.into_split();
-            let transport = TcpTransport {
-                reader: Mutex::new(reader),
-                writer: Mutex::new(writer),
-            };
+            let transport = TcpTransport::from_stream(stream);
 
             let payload = vec![0xFE, 0x53, 0x4D, 0x42, 0xDE, 0xAD];
             transport.send(&payload).await.unwrap();
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let (reader, writer) = stream.into_split();
-        let recv_transport = TcpTransport {
-            reader: Mutex::new(reader),
-            writer: Mutex::new(writer),
-        };
+        let recv_transport = TcpTransport::from_stream(stream);
 
         let received = recv_transport.receive().await.unwrap();
         assert_eq!(received, vec![0xFE, 0x53, 0x4D, 0x42, 0xDE, 0xAD]);
@@ -627,11 +657,7 @@ mod tests {
 
         let send_task = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
-            let (reader, writer) = stream.into_split();
-            let transport = TcpTransport {
-                reader: Mutex::new(reader),
-                writer: Mutex::new(writer),
-            };
+            let transport = TcpTransport::from_stream(stream);
 
             transport.send(&[0x01, 0x02]).await.unwrap();
             transport.send(&[0x03, 0x04, 0x05]).await.unwrap();
@@ -639,11 +665,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let (reader, writer) = stream.into_split();
-        let recv_transport = TcpTransport {
-            reader: Mutex::new(reader),
-            writer: Mutex::new(writer),
-        };
+        let recv_transport = TcpTransport::from_stream(stream);
 
         assert_eq!(recv_transport.receive().await.unwrap(), vec![0x01, 0x02]);
         assert_eq!(
@@ -886,6 +908,84 @@ mod tests {
         assert!(matches!(err, Error::ConnectFailed { ref attempts, .. } if attempts.is_empty()));
     }
 
+    /// A loopback pair: the transport on one end, the raw socket the test
+    /// writes "server" bytes into on the other.
+    async fn transport_and_far_end() -> (Arc<TcpTransport>, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let far_end = TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        (Arc::new(TcpTransport::from_stream(stream)), far_end)
+    }
+
+    /// Wait (bounded) for the transport's counts to satisfy `cond`.
+    async fn progress_reaches(
+        transport: &TcpTransport,
+        what: &str,
+        cond: impl Fn(&crate::transport::ReceiveSnapshot) -> bool,
+    ) -> crate::transport::ReceiveSnapshot {
+        let progress = transport
+            .receive_progress()
+            .expect("tcp publishes progress");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = progress.snapshot();
+            if cond(&snap) {
+                return snap;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bytes_inside_a_frame_are_visible_before_it_completes() {
+        let (transport, mut far_end) = transport_and_far_end().await;
+        let payload: Vec<u8> = (0..=255).cycle().take(10_000).collect();
+        let framed = frame_message(&payload);
+
+        let receiving = {
+            let t = Arc::clone(&transport);
+            tokio::spawn(async move { t.receive().await })
+        };
+        // The prefix and the first 4,000 payload bytes, then nothing.
+        far_end.write_all(&framed[..4 + 4_000]).await.unwrap();
+        let snap = progress_reaches(&transport, "the first piece", |s| s.bytes == 4_000).await;
+        assert_eq!(
+            snap.frame,
+            Some(crate::transport::FrameProgress {
+                received: 4_000,
+                len: 10_000
+            })
+        );
+        assert!(snap.last_byte_at.is_some());
+        assert!(!receiving.is_finished(), "the frame isn't whole yet");
+
+        far_end.write_all(&framed[4 + 4_000..]).await.unwrap();
+        let received = receiving.await.unwrap().unwrap();
+        assert_eq!(received, payload, "counting must not disturb the bytes");
+        let snap = transport.receive_progress().unwrap().snapshot();
+        assert_eq!(
+            snap.bytes, 10_000,
+            "payload only, the length prefix excluded"
+        );
+        assert_eq!(snap.frame, None, "between frames");
+    }
+
+    #[tokio::test]
+    async fn a_frame_cut_off_partway_is_a_disconnect_and_stops_counting_as_in_progress() {
+        let (transport, mut far_end) = transport_and_far_end().await;
+        let framed = frame_message(&[0xAB; 1_000]);
+        far_end.write_all(&framed[..4 + 300]).await.unwrap();
+        far_end.shutdown().await.unwrap();
+
+        let err = transport.receive().await.unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "got {err:?}");
+        let snap = transport.receive_progress().unwrap().snapshot();
+        assert_eq!(snap.bytes, 300);
+        assert_eq!(snap.frame, None, "a dead frame is not still arriving");
+    }
+
     #[tokio::test]
     async fn partial_reads_are_handled_by_read_exact() {
         // This test exercises the read_exact behavior by sending data
@@ -902,21 +1002,13 @@ mod tests {
 
         let send_task = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
-            let (reader, writer) = stream.into_split();
-            let transport = TcpTransport {
-                reader: Mutex::new(reader),
-                writer: Mutex::new(writer),
-            };
+            let transport = TcpTransport::from_stream(stream);
 
             transport.send(&payload_clone).await.unwrap();
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let (reader, writer) = stream.into_split();
-        let recv_transport = TcpTransport {
-            reader: Mutex::new(reader),
-            writer: Mutex::new(writer),
-        };
+        let recv_transport = TcpTransport::from_stream(stream);
 
         let received = recv_transport.receive().await.unwrap();
         assert_eq!(received.len(), payload.len());

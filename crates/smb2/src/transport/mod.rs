@@ -12,10 +12,14 @@
 //! which handles transport setup internally.
 
 pub mod mock;
+pub mod progress;
 pub mod tcp;
 
 pub use mock::MockTransport;
+pub use progress::{FrameProgress, ReceiveProgress, ReceiveSnapshot};
 pub use tcp::{ConnectAttempt, ConnectOptions, TcpTransport};
+
+use std::sync::Arc;
 
 use crate::error::Result;
 use async_trait::async_trait;
@@ -39,6 +43,22 @@ pub trait TransportReceive: Send + Sync {
     /// The buffer may contain multiple compounded responses linked
     /// by NextCommand in the SMB2 headers -- the caller must split them.
     async fn receive(&self) -> Result<Vec<u8>>;
+
+    /// Live counts for what this transport is receiving, published while a
+    /// frame is still arriving, or `None` if it can't see inside a frame.
+    ///
+    /// A connection asks once, when it takes the transport over, and reads the
+    /// counts from then on. They feed its liveness clock, which is why this
+    /// matters beyond a progress display: a large response trickling in over
+    /// a slow link is the server talking, and a transport that returns `None`
+    /// makes it look like silence until the last byte lands. The connection
+    /// then counts whole frames itself, so the totals stay right.
+    ///
+    /// Return the same `Arc` every time. See [`ReceiveProgress`] for what to
+    /// call from the receive path.
+    fn receive_progress(&self) -> Option<Arc<ReceiveProgress>> {
+        None
+    }
 }
 
 /// A combined transport that can both send and receive.

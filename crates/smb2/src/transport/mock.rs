@@ -7,12 +7,12 @@
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
-use crate::transport::{TransportReceive, TransportSend};
+use crate::transport::{ReceiveProgress, TransportReceive, TransportSend};
 
 /// A mock transport that queues responses and records sent messages.
 ///
@@ -46,6 +46,9 @@ pub struct MockTransport {
     /// by `receive()` in auto-rewrite mode to wait for a sent msg_id to
     /// pair with a queued response.
     send_notify: Notify,
+    /// Counts every response handed out, as one whole frame each: a queued
+    /// response has no network under it to arrive gradually.
+    progress: Arc<ReceiveProgress>,
 }
 
 impl MockTransport {
@@ -60,6 +63,7 @@ impl MockTransport {
             auto_rewrite: AtomicBool::new(false),
             pending_sent_msg_ids: Mutex::new(VecDeque::new()),
             send_notify: Notify::new(),
+            progress: Arc::new(ReceiveProgress::new()),
         }
     }
 
@@ -245,6 +249,7 @@ impl TransportReceive for MockTransport {
                 rewrite_msg_ids(&mut data, &mut ids);
                 drop(ids);
                 *self.receive_count.lock().unwrap() += 1;
+                self.progress.record_whole_frame(data.len());
                 return Ok(data);
             }
 
@@ -254,8 +259,13 @@ impl TransportReceive for MockTransport {
                 None => continue,
             };
             *self.receive_count.lock().unwrap() += 1;
+            self.progress.record_whole_frame(data.len());
             return Ok(data);
         }
+    }
+
+    fn receive_progress(&self) -> Option<Arc<ReceiveProgress>> {
+        Some(Arc::clone(&self.progress))
     }
 }
 

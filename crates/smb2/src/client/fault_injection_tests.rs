@@ -2422,3 +2422,222 @@ async fn a_nas_that_actually_rebooted_reports_the_open_as_gone_rather_than_guess
         .expect("a reopen must work");
     assert!(fresh.durable.is_some());
 }
+
+// ── A link that is answering, slowly ───────────────────────────────────────
+//
+// Everything above scripts whole frames, so none of it can express the one
+// shape a slow link produces all day: a response that is ARRIVING. An 8 MB READ
+// over a 200 KB/s link spends 40 s on the wire, and TCP delivers it in order,
+// so every other answer (ECHO replies included) waits behind it. These tests
+// put a real socket under the connection, so the frame really does arrive a
+// piece at a time through `TcpTransport`.
+
+/// How a [`SlowLink`] dribbles out a large response.
+#[derive(Clone, Copy)]
+struct Dribble {
+    /// Bytes per write.
+    piece: usize,
+    /// Pause between writes.
+    gap: Duration,
+    /// Stop after this many pieces and hold the socket open, saying nothing
+    /// more. `None` sends the whole frame.
+    stop_after: Option<usize>,
+}
+
+/// The far end of a loopback socket: a server that answers every request, in
+/// the order it received them, one writer for the whole stream, the way TCP
+/// forces a real one to.
+struct SlowLink {
+    addr: std::net::SocketAddr,
+    echoes: Arc<AtomicUsize>,
+}
+
+impl SlowLink {
+    /// Answer READs with `read_len` bytes of data, dribbled per `dribble`.
+    /// Everything else small is written at once, but only after whatever is
+    /// ahead of it in the stream.
+    async fn start(read_len: usize, dribble: Dribble) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echoes = Arc::new(AtomicUsize::new(0));
+        let seen_echoes = Arc::clone(&echoes);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = stream.into_split();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+            tokio::spawn(async move {
+                while let Some(body) = rx.recv().await {
+                    let mut framed = Vec::with_capacity(body.len() + 4);
+                    framed.push(0);
+                    framed.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+                    framed.extend_from_slice(&body);
+                    if framed.len() <= dribble.piece {
+                        if writer.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    for (i, piece) in framed.chunks(dribble.piece).enumerate() {
+                        if dribble.stop_after == Some(i) {
+                            // Hold the socket open and never finish the frame.
+                            std::future::pending::<()>().await;
+                        }
+                        if writer.write_all(piece).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(dribble.gap).await;
+                    }
+                }
+            });
+
+            loop {
+                let mut len = [0u8; 4];
+                if reader.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let len = u32::from_be_bytes(len) as usize;
+                let mut request = vec![0u8; len];
+                if reader.read_exact(&mut request).await.is_err() {
+                    return;
+                }
+                let Ok(header) = Header::unpack(&mut ReadCursor::new(&request)) else {
+                    continue;
+                };
+                let mut h = Header::new_request(header.command);
+                h.flags.set_response();
+                h.message_id = header.message_id;
+                h.credits = 8;
+                let response = match header.command {
+                    Command::Echo => {
+                        seen_echoes.fetch_add(1, Ordering::Relaxed);
+                        pack_message(&h, &EchoResponse)
+                    }
+                    Command::Read => pack_message(
+                        &h,
+                        &crate::msg::read::ReadResponse {
+                            data_offset: 0x50,
+                            data_remaining: 0,
+                            flags: 0,
+                            data: vec![0x5A; read_len],
+                        },
+                    ),
+                    _ => continue,
+                };
+                if tx.send(response).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { addr, echoes }
+    }
+
+    /// A connection to this link, tuned to the scaled-down timings.
+    async fn connect(&self) -> Connection {
+        let mut conn = Connection::connect(&self.addr.to_string(), TEST_BUDGET)
+            .await
+            .expect("loopback connect");
+        conn.set_credits(512);
+        conn.set_session_id(SessionId(0x5E55));
+        conn.set_response_timeout(Some(BASE_DEADLINE));
+        conn.set_keepalive(Some(KEEPALIVE));
+        conn
+    }
+}
+
+/// Issue a READ of `length` bytes on its own task.
+fn spawn_read(
+    conn: &Connection,
+    length: u32,
+) -> tokio::task::JoinHandle<Result<crate::client::Frame>> {
+    let c = conn.clone();
+    tokio::spawn(async move {
+        let req = crate::msg::read::ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length,
+            offset: 0,
+            file_id: crate::types::FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            minimum_count: 0,
+            channel: 0,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
+        c.execute(Command::Read, &req, Some(TreeId(1))).await
+    })
+}
+
+/// The bug a slow link used to hit on every large read: bytes arriving the
+/// whole time, and the client calling the server dead anyway.
+///
+/// The response takes well over the silence budget to arrive but is moving
+/// every few milliseconds. Only whole frames used to count as the server
+/// speaking, so the wire read as silent from the moment the READ went out; the
+/// ECHO probes that should have proved otherwise were stuck behind the very
+/// frame they were asking about, and the read ended in `ServerUnresponsive`
+/// with the connection torn down underneath every other caller.
+#[tokio::test]
+async fn a_response_still_arriving_is_not_silence() {
+    const READ_LEN: usize = 320 * 1024;
+    // 40 pieces 25 ms apart: about a second on the wire, well past the
+    // 600 ms silence budget, and never more than 25 ms without a byte.
+    let link = SlowLink::start(
+        READ_LEN,
+        Dribble {
+            piece: 8 * 1024,
+            gap: Duration::from_millis(25),
+            stop_after: None,
+        },
+    )
+    .await;
+    let conn = link.connect().await;
+
+    let started = Instant::now();
+    let outcome = finish(spawn_read(&conn, READ_LEN as u32), "the read").await;
+    let took = started.elapsed();
+
+    assert!(
+        outcome.is_ok(),
+        "the response was arriving the whole time, so the read must succeed; got {outcome:?} \
+         after {took:?}"
+    );
+    assert!(
+        took > BASE_DEADLINE,
+        "the frame should outlast the silence budget, or this test proves nothing ({took:?})"
+    );
+    assert!(!conn.diagnostics().disconnected);
+    assert_eq!(conn.metrics().response_timeouts, 0);
+}
+
+/// The guard on the other side: bytes that STOP are silence again. A server
+/// that dies halfway through a frame must still be declared dead, or counting
+/// partial frames would have traded a false death for a hang.
+#[tokio::test]
+async fn a_response_that_stops_halfway_is_still_a_death() {
+    const READ_LEN: usize = 320 * 1024;
+    let link = SlowLink::start(
+        READ_LEN,
+        Dribble {
+            piece: 8 * 1024,
+            gap: Duration::from_millis(10),
+            stop_after: Some(8),
+        },
+    )
+    .await;
+    let conn = link.connect().await;
+
+    let outcome = finish(spawn_read(&conn, READ_LEN as u32), "the read").await;
+    assert!(
+        matches!(outcome, Err(Error::ServerUnresponsive { .. })),
+        "a frame that stopped arriving is a dead link, got {outcome:?}"
+    );
+    assert!(
+        link.echoes.load(Ordering::Relaxed) >= 1,
+        "the verdict has to rest on probes"
+    );
+}
