@@ -29,8 +29,8 @@ pub use connection::{
 };
 pub use diagnostics::{
     ClientInfo, ClientMetricsSnapshot, CompressionInfo, ConnectionDiagnostics, CreditInfo,
-    DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
-    SessionDiagnostics, SigningInfo,
+    DfsCacheEntry, Diagnostics, EncryptionInfo, InboundProgress, Liveness, MetricsSnapshot,
+    NegotiatedSummary, SessionDiagnostics, SigningInfo,
 };
 pub use durable::{DurableHandle, DurableOpen};
 pub use pipeline::{Op, OpResult, Pipeline};
@@ -854,6 +854,18 @@ impl SmbClient {
             extra_connections,
             dfs_cache: self.dfs_resolver.cache_entries(),
         }
+    }
+
+    /// The primary connection, for reading its state without `&mut`.
+    ///
+    /// What a watchdog or a status display polls:
+    /// [`Connection::liveness`] and [`Connection::inbound`] take `&self`. A
+    /// `clone()` of it is cheap and shares everything, so a consumer that
+    /// keeps the client behind a lock can clone one out once and poll that.
+    /// DFS cross-server connections are separate; see
+    /// [`diagnostics`](Self::diagnostics) for all of them.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     /// Get a mutable reference to the underlying connection.

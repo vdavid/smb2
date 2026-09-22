@@ -19,9 +19,11 @@
 //! ## Snapshot lock order
 //!
 //! The snapshot acquires these locks, one at a time, in this order, never
-//! across an `.await`: `crypto → waiters → dfs_trees → estimated_rtt`.
+//! across an `.await`: `crypto → waiters → dfs_trees → estimated_rtt`,
+//! then, for the `inbound` and `liveness` readings, `inbound →
+//! last_frame_at` and `keepalive_after → waiters → inbound → last_frame_at`.
 //! Each is held only as long as it takes to copy primitives out and
-//! release. `params` is an `OnceLock` (wait-free read). `preauth_hasher`
+//! release, and none is held while another is taken. `params` is an `OnceLock` (wait-free read). `preauth_hasher`
 //! and `receiver_task` are not touched by the snapshot.
 //!
 //! If you add a field that touches a new lock, **extend** this order, don't
@@ -128,6 +130,114 @@ pub struct ConnectionDiagnostics {
     /// Empty on a healthy idle connection. A long-lived entry here is the
     /// signature of a hung request; see [`OutstandingRequest`].
     pub outstanding: Vec<OutstandingRequest>,
+    /// What the server has put on the wire, a frame still arriving included.
+    /// Same reading as [`Connection::inbound`](crate::client::Connection::inbound).
+    pub inbound: InboundProgress,
+    /// Whether the server is still there, by the connection's own clocks.
+    /// Same reading as [`Connection::liveness`](crate::client::Connection::liveness).
+    pub liveness: Liveness,
+}
+
+/// What the server has put on the wire so far, counted as the bytes land
+/// rather than when a frame completes. Read with
+/// [`Connection::inbound`](crate::client::Connection::inbound).
+///
+/// Two things a consumer can get from it that whole-frame counters can't give:
+/// a live **rate** while one large response is arriving (poll
+/// `bytes_received` and divide by the time between polls), and whether the
+/// server is **talking at all** right now (`since_last_byte`), which is what
+/// separates a slow link from a dead one.
+///
+/// ❌ Not data you have. Bytes in a frame still arriving are unverified (a
+/// signature or an AEAD tag covers the whole message), so this is for a rate
+/// and for liveness. A byte bar that counted them would have to roll back if
+/// the frame then failed verification.
+///
+/// Connection-wide: every request on the connection shares the one inbound
+/// stream, so with several in flight the rate is theirs together.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct InboundProgress {
+    /// Payload bytes received over the connection's whole life, revivals
+    /// included, the part of a frame still arriving included. Never runs
+    /// backwards.
+    ///
+    /// Excludes the 4-byte frame prefixes, so once no frame is partway in it
+    /// agrees with [`MetricsSnapshot::wire_bytes_received`]. It moves mid-frame
+    /// only when the transport can see inside a frame
+    /// ([`TransportReceive::receive_progress`](crate::transport::TransportReceive::receive_progress));
+    /// `TcpTransport` can.
+    pub bytes_received: u64,
+    /// The frame currently arriving, or `None` between frames.
+    pub frame: Option<crate::transport::FrameProgress>,
+    /// How long since the server last put a byte on the wire, or `None` if it
+    /// hasn't since this session was established.
+    ///
+    /// The same clock [`liveness`](crate::client::Connection::liveness) reads,
+    /// so time this process spent unscheduled (a system sleep, App Nap) is
+    /// taken off it: silence nobody was listening to isn't the server's.
+    pub since_last_byte: Option<Duration>,
+}
+
+/// Whether the server is still there, by the connection's own clocks. Read
+/// with [`Connection::liveness`](crate::client::Connection::liveness).
+///
+/// A reading, never an action: asking tears nothing down and fails nothing.
+/// What acts on the same clocks is the response deadline, which fails a
+/// request with [`Error::ServerUnresponsive`](crate::Error::ServerUnresponsive)
+/// once it has run out of budget on a connection reading [`Unresponsive`](Self::Unresponsive).
+/// This is how a consumer (a transfer watchdog, a status indicator) sees the
+/// same thing BEFORE any request pays for it.
+///
+/// Every byte the server sends counts as it lands, a frame still arriving
+/// included: TCP delivers in order, so a large response trickling in over a
+/// slow link holds the wire, and everything queued behind it (ECHO replies
+/// included) waits. Reading only whole frames would call that link dead.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum Liveness {
+    /// Nothing on the wire is waiting for an answer, so there is nothing the
+    /// server could be silent about.
+    ///
+    /// Requests still queued for the socket don't count: the server can't
+    /// answer what it hasn't been asked, and a socket that won't take them is
+    /// the send deadline's to report
+    /// ([`Error::SendTimeout`](crate::Error::SendTimeout)).
+    Idle,
+    /// The server put a byte on the wire within the liveness window, three
+    /// keepalive thresholds (15 s at the default 5 s).
+    ///
+    /// With the keepalive armed, this is also what earns a request that runs
+    /// past its response deadline the longer, alive-connection ceiling.
+    Alive,
+    /// Work is outstanding and the wire has been quiet for `silent_for`,
+    /// which proves nothing either way: either not for long enough yet, or
+    /// the keepalive is off, and without probes a quiet connection is only
+    /// quiet. It never becomes [`Unresponsive`](Self::Unresponsive) with the
+    /// keepalive off.
+    Quiet {
+        /// How long, measured from the later of the server's last byte and
+        /// the oldest unanswered request reaching the wire.
+        silent_for: Duration,
+    },
+    /// The keepalive is armed, work is outstanding, and the server has put
+    /// nothing at all on the wire for `silent_for`, past the liveness window,
+    /// ECHO replies included.
+    ///
+    /// The verdict [`Error::ServerUnresponsive`](crate::Error::ServerUnresponsive)
+    /// rests on. It isn't final while you read it (a byte arriving turns it
+    /// back into [`Alive`](Self::Alive)), and a slow operation on a loaded
+    /// server can't produce it, because answering a probe needs no disk.
+    Unresponsive {
+        /// Measured the same way as [`Quiet`](Self::Quiet)'s.
+        silent_for: Duration,
+    },
+    /// The connection has been torn down. Revive it with
+    /// [`Connection::reconnect_if_needed`](crate::client::Connection::reconnect_if_needed),
+    /// or it stays this way.
+    Disconnected,
 }
 
 /// Snapshot of [`NegotiatedParams`](crate::client::NegotiatedParams) for
@@ -652,10 +762,32 @@ fn fmt_connection_body(c: &ConnectionDiagnostics, f: &mut fmt::Formatter<'_>) ->
             m.reconnects_succeeded, m.reconnects_failed, m.reconnect_attempts,
         )?;
     }
+    writeln!(
+        f,
+        "  inbound: {} bytes{} · {}",
+        c.inbound.bytes_received,
+        match c.inbound.frame {
+            Some(frame) => format!(" (frame arriving: {} of {})", frame.received, frame.len),
+            None => String::new(),
+        },
+        fmt_liveness(&c.liveness),
+    )?;
     if c.disconnected {
         writeln!(f, "  status: DISCONNECTED")?;
     }
     Ok(())
+}
+
+fn fmt_liveness(l: &Liveness) -> String {
+    match l {
+        Liveness::Idle => "idle".to_string(),
+        Liveness::Alive => "alive".to_string(),
+        Liveness::Quiet { silent_for } => format!("quiet for {silent_for:.1?}"),
+        Liveness::Unresponsive { silent_for } => {
+            format!("UNRESPONSIVE for {silent_for:.1?}")
+        }
+        Liveness::Disconnected => "disconnected".to_string(),
+    }
 }
 
 fn fmt_signing(s: &SigningInfo) -> String {

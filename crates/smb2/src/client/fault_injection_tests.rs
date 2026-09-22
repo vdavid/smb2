@@ -2641,3 +2641,114 @@ async fn a_response_that_stops_halfway_is_still_a_death() {
         "the verdict has to rest on probes"
     );
 }
+
+/// What a consumer polling the connection sees while that happens: bytes
+/// moving inside a frame that hasn't finished, and a server that reads as
+/// alive rather than as quiet.
+#[tokio::test]
+async fn a_frame_still_arriving_shows_up_in_the_readings() {
+    use crate::client::diagnostics::Liveness;
+
+    const READ_LEN: usize = 640 * 1024;
+    let link = SlowLink::start(
+        READ_LEN,
+        Dribble {
+            piece: 8 * 1024,
+            gap: Duration::from_millis(25),
+            stop_after: None,
+        },
+    )
+    .await;
+    let conn = link.connect().await;
+    assert_eq!(conn.liveness(), Liveness::Idle, "nothing asked yet");
+
+    let read = spawn_read(&conn, READ_LEN as u32);
+    // The READ response is the only frame big enough to be seen partway in.
+    let reader = conn.clone();
+    wait_until("the response to be partway in", || {
+        reader
+            .inbound()
+            .frame
+            .is_some_and(|f| f.received > 0 && f.received < f.len)
+    })
+    .await;
+    let first = conn.inbound().bytes_received;
+    let reader = conn.clone();
+    wait_until("more of it to land", || {
+        let now = reader.inbound();
+        now.bytes_received > first && now.frame.is_some()
+    })
+    .await;
+    let reader = conn.clone();
+    wait_until("the connection to read as alive mid-frame", || {
+        reader.liveness() == Liveness::Alive
+    })
+    .await;
+
+    finish(read, "the read").await.expect("the read completes");
+    let done = conn.inbound();
+    assert_eq!(done.frame, None, "between frames");
+    assert_eq!(
+        done.bytes_received,
+        conn.metrics().wire_bytes_received,
+        "once nothing is partway in, the live count agrees with the whole-frame one"
+    );
+    assert!(done.since_last_byte.is_some());
+}
+
+/// The reading a transfer watchdog needs: a dead link called dead while the
+/// request is still waiting, rather than only after it has burned its deadline
+/// and taken the connection down with it.
+#[tokio::test]
+async fn a_dead_link_reads_unresponsive_before_any_request_pays_for_it() {
+    use crate::client::diagnostics::Liveness;
+
+    let server = ScriptedServer::new(Answer::Nothing);
+    let conn = connect(&server);
+    // Far more budget than the liveness window, so the reading has to arrive
+    // while the write is still waiting.
+    conn.set_response_timeout(Some(BASE_DEADLINE * 10));
+
+    let write = spawn_write(&conn);
+    let reader = conn.clone();
+    wait_until("the connection to read as unresponsive", || {
+        matches!(reader.liveness(), Liveness::Unresponsive { .. })
+    })
+    .await;
+    assert!(
+        !write.is_finished(),
+        "reading the verdict must not act on it"
+    );
+    assert!(
+        !conn.diagnostics().disconnected,
+        "reading the verdict must not tear anything down"
+    );
+    assert_eq!(conn.metrics().response_timeouts, 0);
+    write.abort();
+}
+
+/// With the keepalive off, silence is only silence: nothing is asking the
+/// server a question it could answer without a disk, so no amount of it is
+/// evidence of death.
+#[tokio::test]
+async fn with_the_keepalive_off_a_quiet_link_never_reads_unresponsive() {
+    use crate::client::diagnostics::Liveness;
+
+    let server = ScriptedServer::new(Answer::Nothing);
+    let conn = connect(&server);
+    conn.set_keepalive(None);
+    conn.set_response_timeout(Some(BASE_DEADLINE * 10));
+
+    let write = spawn_write(&conn);
+    // Well past the liveness window the keepalive would have used.
+    tokio::time::sleep(KEEPALIVE * 6).await;
+    let reading = conn.liveness();
+    assert!(
+        matches!(reading, Liveness::Quiet { .. }),
+        "expected a quiet link with no verdict, got {reading:?}"
+    );
+    write.abort();
+
+    conn.mark_dead();
+    assert_eq!(conn.liveness(), Liveness::Disconnected);
+}

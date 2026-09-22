@@ -104,8 +104,8 @@ pub use client::session::Session;
 // `Connection::diagnostics()`.
 pub use client::diagnostics::{
     ClientInfo, ClientMetricsSnapshot, CompressionInfo, ConnectionDiagnostics, CreditInfo,
-    DfsCacheEntry, Diagnostics, EncryptionInfo, MetricsSnapshot, NegotiatedSummary,
-    SessionDiagnostics, SigningInfo,
+    DfsCacheEntry, Diagnostics, EncryptionInfo, InboundProgress, Liveness, MetricsSnapshot,
+    NegotiatedSummary, SessionDiagnostics, SigningInfo,
 };
 
 // File watching

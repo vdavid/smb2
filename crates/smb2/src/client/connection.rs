@@ -2133,6 +2133,20 @@ impl Inner {
         Some(stall)
     }
 
+    /// Has this connection's own cadence been missed, so the clocks may still
+    /// be carrying a stall nobody has corrected yet?
+    ///
+    /// The read-only half of [`forgive_scheduling_stall`](Self::forgive_scheduling_stall),
+    /// for a reader that must not move the witness itself.
+    fn loops_are_behind(&self) -> bool {
+        let after = (*self.keepalive_after.lock().unwrap()).unwrap_or(KEEPALIVE_AFTER);
+        let witness = *self.last_scheduled_at.lock().unwrap();
+        std::time::Instant::now()
+            .saturating_duration_since(witness)
+            .saturating_sub(Self::keepalive_tick(after))
+            >= after
+    }
+
     /// How often the keepalive loop wakes to check the liveness clock.
     ///
     /// Derived from the probe threshold rather than configured separately: the
@@ -3765,6 +3779,64 @@ impl Connection {
         out
     }
 
+    /// What the server has put on the wire so far, counted as the bytes land,
+    /// a frame still arriving included.
+    ///
+    /// For a live rate while one large response arrives, and for whether the
+    /// server is talking at all right now. Cheap: a lock or two held only long
+    /// enough to copy a few numbers out. See
+    /// [`InboundProgress`](crate::client::diagnostics::InboundProgress) for
+    /// what each field means and why none of it is data you have.
+    pub fn inbound(&self) -> crate::client::diagnostics::InboundProgress {
+        let (snapshot, retired) = {
+            let inbound = self.inner.inbound.lock().unwrap();
+            (inbound.progress.snapshot(), inbound.retired_bytes)
+        };
+        crate::client::diagnostics::InboundProgress {
+            bytes_received: retired + snapshot.bytes,
+            frame: snapshot.frame,
+            since_last_byte: self.inner.server_silent_for(),
+        }
+    }
+
+    /// Whether the server is still there, by this connection's own clocks,
+    /// right now.
+    ///
+    /// Pollable, and it never acts: reading it tears nothing down. It is the
+    /// same evidence the response deadline acts on, so
+    /// [`Liveness::Unresponsive`](crate::client::diagnostics::Liveness::Unresponsive)
+    /// here is what a request that runs out of budget would turn into
+    /// [`Error::ServerUnresponsive`], readable before any request has paid for
+    /// it. See [`Liveness`](crate::client::diagnostics::Liveness).
+    pub fn liveness(&self) -> crate::client::diagnostics::Liveness {
+        use crate::client::diagnostics::Liveness;
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Liveness::Disconnected;
+        }
+        let Some(silent_for) = self.inner.quiet_for() else {
+            return Liveness::Idle;
+        };
+        // A poll that lands right after this process was frozen would read
+        // the freeze as the server's silence. The wait loops correct for that
+        // before they read a clock, and until one of them has run, the
+        // verdict is withheld. ❌ Don't call `forgive_scheduling_stall` from
+        // here instead: this runs on the consumer's thread, and resetting the
+        // shared witness from a thread that kept running would hide a starved
+        // runtime from the loops that have to notice it.
+        if let Some(silent_for) = self.inner.unresponsive_for() {
+            if !self.inner.loops_are_behind() {
+                return Liveness::Unresponsive { silent_for };
+            }
+        }
+        let window = (*self.inner.keepalive_after.lock().unwrap())
+            .unwrap_or(KEEPALIVE_AFTER)
+            .saturating_mul(LIVENESS_WINDOW_PROBES);
+        match self.inner.server_silent_for() {
+            Some(heard) if heard < window => Liveness::Alive,
+            _ => Liveness::Quiet { silent_for },
+        }
+    }
+
     /// Await a response, giving up if the server goes silent.
     ///
     /// The deadline measures silence, not elapsed time: every interim
@@ -4719,8 +4791,9 @@ impl Connection {
     ///
     /// **Lock order.** Internally takes the `crypto`, `waiters`,
     /// `dfs_trees`, and `estimated_rtt` locks one at a time, in that
-    /// order, and only as long as it takes to copy primitives out. No
-    /// lock is held across an `.await`.
+    /// order, then the ones [`inbound`](Self::inbound) and
+    /// [`liveness`](Self::liveness) read, and each only as long as it takes to
+    /// copy primitives out. No lock is held across an `.await`.
     pub fn diagnostics(&self) -> crate::client::diagnostics::ConnectionDiagnostics {
         use crate::client::diagnostics::{
             CompressionInfo, ConnectionDiagnostics, CreditInfo, EncryptionInfo, NegotiatedSummary,
@@ -4797,6 +4870,8 @@ impl Connection {
             session: None, // populated by SmbClient when assembling the full tree
             metrics: self.metrics(),
             outstanding: self.outstanding_requests(),
+            inbound: self.inbound(),
+            liveness: self.liveness(),
         }
     }
 }
@@ -8067,6 +8142,46 @@ mod tests {
 // transport's write half forever and every later request queued behind it.
 // Nothing fired, because every deadline the crate had bounds the wait for a
 // RESPONSE, and these requests never reached the wire to be answered.
+#[cfg(test)]
+mod inbound_tests {
+    use super::*;
+    use crate::transport::MockTransport;
+
+    /// A revival swaps the transport, and with it the counter the bytes were
+    /// counted in. A rate computed across that must not see the total drop.
+    #[tokio::test]
+    async fn the_inbound_total_never_runs_backwards_across_a_new_transport() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(Arc::clone(&mock)),
+            Box::new(Arc::clone(&mock)),
+            "inbound-test",
+        );
+        conn.set_credits(64);
+        let mut h = Header::new_request(Command::Echo);
+        h.flags.set_response();
+        h.credits = 1;
+        mock.queue_response(pack_message(&h, &crate::msg::echo::EchoResponse));
+        conn.execute(Command::Echo, &EchoRequest, None)
+            .await
+            .expect("echo");
+
+        let before = conn.inbound().bytes_received;
+        assert!(before > 0, "the answer was counted");
+        assert_eq!(before, conn.metrics().wire_bytes_received);
+
+        // What `spawn_plumbing` does with a revived transport's counter.
+        conn.inner
+            .adopt_receive_progress(Some(Arc::new(ReceiveProgress::new())));
+        assert_eq!(
+            conn.inbound().bytes_received,
+            before,
+            "the replaced transport's bytes are retired, not forgotten"
+        );
+    }
+}
+
 #[cfg(test)]
 mod send_path_liveness_tests {
     use super::*;
