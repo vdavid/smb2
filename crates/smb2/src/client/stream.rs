@@ -19,7 +19,7 @@ use crate::client::connection::{
     reserve_write_budget_or_drain, Connection, Frame, WaiterGuard, WriteBudgetStep,
 };
 use crate::client::credits;
-use crate::client::read_ahead::{Dispatch, Window};
+use crate::client::read_ahead::{Dispatch, LinkHint, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
 use crate::client::tree::Tree;
 use crate::error::Result;
@@ -397,16 +397,24 @@ impl<'a> FileDownload<'a> {
         }
         self.bytes_received += u64::from(got);
         let in_flight_bytes = self.in_flight_bytes;
-        self.window()
-            .on_delivery(Instant::now(), head.dispatched_at, got, in_flight_bytes);
+        let window = self.window();
+        window.on_delivery(Instant::now(), head.dispatched_at, got, in_flight_bytes);
+        if let Some(rate) = window.rate_to_share() {
+            self.conn.note_read_rate(rate);
+        }
         Ok(Some(data))
     }
 
     fn window(&mut self) -> &mut Window {
         let (read_ahead, chunk) = (self.read_ahead, self.chunk_size);
-        let rtt = self.conn.estimated_rtt();
-        self.window
-            .get_or_insert_with(|| Window::new(read_ahead, chunk, rtt))
+        let conn = &*self.conn;
+        self.window.get_or_insert_with(|| {
+            let hint = LinkHint {
+                rtt: conn.estimated_rtt(),
+                rate: conn.read_rate_hint(),
+            };
+            Window::new(read_ahead, chunk, hint)
+        })
     }
 
     /// Nothing past this point exists: drop what's still requested (the

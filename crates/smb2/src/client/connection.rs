@@ -168,6 +168,15 @@ impl Drop for WaiterGuard {
 const STALE_WAITER_SWEEP: std::time::Duration = std::time::Duration::from_secs(10);
 const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long a download's measured rate seeds the next download's window.
+///
+/// Long enough to span the gaps in a folder copy (the consumer writing one
+/// file locally before opening the next), short enough that a link which
+/// changed since (Wi-Fi roaming, a VPN coming up) is measured afresh. A stale
+/// hint costs at most one window at the start of one download: the first
+/// delivery replaces it with a measurement.
+const READ_RATE_HINT_TTL: Duration = Duration::from_secs(30);
+
 /// How often a send parked on credits rechecks whether anything is still
 /// outstanding. Short enough that "the last response landed while we waited"
 /// surfaces quickly, long enough to cost nothing.
@@ -1674,6 +1683,11 @@ struct Inner {
     params: StdMutex<Option<NegotiatedParams>>,
     /// Estimated round-trip time measured during negotiate.
     estimated_rtt: StdMutex<Option<Duration>>,
+    /// The last delivery rate a download measured on this connection, in
+    /// bytes per second, and when. Seeds the next download's read-ahead
+    /// window, so a folder of 1 MiB files doesn't pay a round trip per file
+    /// to rediscover the link. See [`READ_RATE_HINT_TTL`].
+    read_rate_hint: StdMutex<Option<(tokio::time::Instant, f64)>>,
     /// Whether compression is active on this connection (negotiated).
     compression_enabled: AtomicBool,
     /// Whether the client wants compression (from config).
@@ -1784,6 +1798,7 @@ impl Inner {
             server_name,
             params: StdMutex::new(None),
             estimated_rtt: StdMutex::new(None),
+            read_rate_hint: StdMutex::new(None),
             compression_enabled: AtomicBool::new(false),
             compression_requested: AtomicBool::new(true),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
@@ -2660,6 +2675,20 @@ impl Connection {
     /// Get the estimated round-trip time.
     pub fn estimated_rtt(&self) -> Option<Duration> {
         *self.inner.estimated_rtt.lock().unwrap()
+    }
+
+    /// The delivery rate the last download on this connection measured, if
+    /// it's recent enough to still describe the link.
+    pub(crate) fn read_rate_hint(&self) -> Option<f64> {
+        let hint = *self.inner.read_rate_hint.lock().unwrap();
+        hint.filter(|(at, _)| at.elapsed() < READ_RATE_HINT_TTL)
+            .map(|(_, rate)| rate)
+    }
+
+    /// Record a download's measured delivery rate for the next one.
+    pub(crate) fn note_read_rate(&self, bytes_per_sec: f64) {
+        *self.inner.read_rate_hint.lock().unwrap() =
+            Some((tokio::time::Instant::now(), bytes_per_sec));
     }
 
     /// Get the negotiated parameters, or `None` before NEGOTIATE has run.

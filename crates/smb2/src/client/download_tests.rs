@@ -364,3 +364,27 @@ async fn adaptive_sends_the_next_read_shortly_before_the_head_lands_on_a_slow_li
         vec![(0, CHUNK), (65536, CHUNK), (131072, CHUNK), (196608, CHUNK)]
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_next_download_on_a_connection_starts_with_the_window_the_last_one_measured() {
+    let mock = Arc::new(MockTransport::new());
+    for i in 1..=4u8 {
+        mock.queue_response(build_read_response(chunk_of(i)));
+    }
+    mock.queue_response(build_close_response());
+    let mut conn = setup_connection(&mock);
+    conn.set_estimated_rtt(Some(Duration::from_millis(60)));
+    let tree = test_tree();
+    FileDownload::new(&tree, &mut conn, test_file_id(), 4 * 65536, CHUNK)
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(sent_reads(&mock).len(), 4);
+
+    // A two-chunk file next: both READs go out before either is answered,
+    // instead of the second waiting a round trip for the first.
+    let mut second = FileDownload::new(&tree, &mut conn, test_file_id(), 2 * 65536, CHUNK);
+    let first = tokio::time::timeout(Duration::from_millis(50), second.next_chunk()).await;
+    assert!(first.is_err());
+    assert_eq!(sent_reads(&mock).len(), 6);
+}

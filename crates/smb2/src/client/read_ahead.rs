@@ -148,6 +148,16 @@ pub(crate) enum Dispatch {
     AfterHead,
 }
 
+/// What the connection already knows about the link when a download starts.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LinkHint {
+    /// The NEGOTIATE round trip, if one was measured.
+    pub(crate) rtt: Option<Duration>,
+    /// The delivery rate a recent download on the same connection measured,
+    /// in bytes per second.
+    pub(crate) rate: Option<f64>,
+}
+
 /// The read-ahead controller for one download.
 ///
 /// The download reports every READ it sends and every chunk it delivers; in
@@ -162,8 +172,7 @@ pub(crate) enum Dispatch {
 pub(crate) struct Window {
     policy: ReadAhead,
     max_in_flight: u64,
-    /// The connection's NEGOTIATE round trip, if it measured one.
-    rtt_seed: Option<Duration>,
+    hint: LinkHint,
     /// The fastest dispatch-to-delivery time seen, an upper bound on the RTT.
     fastest_read: Option<Duration>,
     /// `(when, total bytes delivered by then)`, oldest first. The first entry
@@ -176,12 +185,12 @@ pub(crate) struct Window {
 }
 
 impl Window {
-    pub(crate) fn new(policy: ReadAhead, chunk_size: u32, rtt_seed: Option<Duration>) -> Self {
+    pub(crate) fn new(policy: ReadAhead, chunk_size: u32, hint: LinkHint) -> Self {
         Self {
             policy,
             // A chunk bigger than the cap still gets one READ in flight.
             max_in_flight: ADAPTIVE_MAX_IN_FLIGHT.max(u64::from(chunk_size)),
-            rtt_seed,
+            hint,
             fastest_read: None,
             deliveries: VecDeque::with_capacity(RATE_SAMPLES + 1),
             delivered: 0,
@@ -214,8 +223,9 @@ impl Window {
             return Dispatch::AfterHead;
         }
         let (Some(rate), Some(target)) = (self.rate(), self.target()) else {
-            // Nothing measured yet: one READ until the first one tells us
-            // something. Two would already double what a slow link queues.
+            // Nothing measured and nothing known: one READ until the first one
+            // tells us something. Two would already double what a slow link
+            // queues.
             return Dispatch::AfterHead;
         };
         let unarrived = self.unarrived_at(now, rate);
@@ -263,8 +273,24 @@ impl Window {
         }
     }
 
-    /// Delivery rate over the recent deliveries, in bytes per second.
+    /// Delivery rate over the recent deliveries, in bytes per second. Before
+    /// the first delivery, the connection's hint stands in.
     pub(crate) fn rate(&self) -> Option<f64> {
+        self.measured_rate().or(self.hint.rate)
+    }
+
+    /// The rate worth handing to the next download on this connection: one
+    /// measured over at least two deliveries. A single READ's rate is mostly
+    /// its round trip, and recording it after every small file would keep
+    /// dragging the hint down to that.
+    pub(crate) fn rate_to_share(&self) -> Option<f64> {
+        if self.deliveries.len() < 3 {
+            return None;
+        }
+        self.measured_rate()
+    }
+
+    fn measured_rate(&self) -> Option<f64> {
         let (&(first_at, first), &(last_at, last)) =
             (self.deliveries.front()?, self.deliveries.back()?);
         if last <= first {
@@ -278,7 +304,7 @@ impl Window {
 
     /// The round trip the target budgets for.
     pub(crate) fn rtt(&self) -> Duration {
-        match (self.rtt_seed, self.fastest_read) {
+        match (self.hint.rtt, self.fastest_read) {
             (Some(seed), Some(fastest)) => seed.min(fastest),
             (Some(rtt), None) | (None, Some(rtt)) => rtt,
             (None, None) => Duration::ZERO,
@@ -400,7 +426,14 @@ mod tests {
     }
 
     fn adaptive(rtt_seed: Duration) -> Window {
-        Window::new(ReadAhead::Adaptive, CHUNK, Some(rtt_seed))
+        Window::new(
+            ReadAhead::Adaptive,
+            CHUNK,
+            LinkHint {
+                rtt: Some(rtt_seed),
+                rate: None,
+            },
+        )
     }
 
     #[test]
@@ -419,14 +452,14 @@ mod tests {
 
     #[test]
     fn a_fixed_window_ignores_the_link() {
-        let w = Window::new(ReadAhead::Fixed(3), CHUNK, None);
+        let w = Window::new(ReadAhead::Fixed(3), CHUNK, LinkHint::default());
         let now = Instant::now();
         assert_eq!(w.decide(now, 2, 2 * u64::from(CHUNK), CHUNK), Dispatch::Now);
         assert_eq!(
             w.decide(now, 3, 3 * u64::from(CHUNK), CHUNK),
             Dispatch::AfterHead
         );
-        let seq = Window::new(ReadAhead::Fixed(0), CHUNK, None);
+        let seq = Window::new(ReadAhead::Fixed(0), CHUNK, LinkHint::default());
         assert_eq!(seq.decide(now, 1, 1, CHUNK), Dispatch::AfterHead);
     }
 
@@ -617,8 +650,63 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_from_the_last_download_opens_the_window_before_the_first_answer() {
+        // A 1 MiB file at +60 ms: without a hint its second READ waits for the
+        // first answer, a whole round trip.
+        let hint = LinkHint {
+            rtt: Some(60 * MS),
+            rate: Some(30e6),
+        };
+        let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint);
+        let now = Instant::now();
+        w.on_dispatch(now, CHUNK);
+        assert_eq!(w.decide(now, 1, u64::from(CHUNK), CHUNK), Dispatch::Now);
+
+        // A slow link's hint keeps it at one.
+        let slow = LinkHint {
+            rtt: Some(60 * MS),
+            rate: Some(375e3),
+        };
+        let mut w = Window::new(ReadAhead::Adaptive, CHUNK, slow);
+        w.on_dispatch(now, CHUNK);
+        assert!(matches!(
+            w.decide(now, 1, u64::from(CHUNK), CHUNK),
+            Dispatch::At(_)
+        ));
+    }
+
+    #[test]
+    fn a_stale_hint_gives_way_to_the_first_measurement() {
+        // The hint says fast; the link is now slow. The first delivery is
+        // what counts from then on.
+        let hint = LinkHint {
+            rtt: Some(60 * MS),
+            rate: Some(50e6),
+        };
+        let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint);
+        let t0 = Instant::now();
+        w.on_dispatch(t0, CHUNK);
+        let t1 = t0 + Duration::from_millis(1_460);
+        w.on_delivery(t1, t0, CHUNK, 0);
+        let rate = w.rate().unwrap();
+        assert!((350e3..370e3).contains(&rate), "rate {rate}");
+    }
+
+    #[test]
+    fn only_a_multi_chunk_measurement_is_shared() {
+        let mut w = adaptive(60 * MS);
+        let t0 = Instant::now();
+        w.on_dispatch(t0, CHUNK);
+        w.on_delivery(t0 + 70 * MS, t0, CHUNK, 0);
+        assert_eq!(w.rate_to_share(), None, "one READ is mostly its round trip");
+        w.on_dispatch(t0 + 70 * MS, CHUNK);
+        w.on_delivery(t0 + 140 * MS, t0 + 70 * MS, CHUNK, 0);
+        assert!(w.rate_to_share().is_some());
+    }
+
+    #[test]
     fn a_chunk_bigger_than_the_cap_still_gets_one_read() {
-        let w = Window::new(ReadAhead::Adaptive, 8 << 20, None);
+        let w = Window::new(ReadAhead::Adaptive, 8 << 20, LinkHint::default());
         assert_eq!(w.decide(Instant::now(), 0, 0, 8 << 20), Dispatch::Now);
     }
 }
