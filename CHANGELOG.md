@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.3] - 2026-09-23
+
+### Added
+
+- **`Tree::write_file_compound_exclusive` / `SmbClient::write_file_compound_exclusive`**: the one-round-trip CREATE+WRITE+FLUSH+CLOSE write for a name that must be new. If the name exists, the server refuses the whole write with `ErrorKind::AlreadyExists` and the existing file stays exactly as it was. Use it when you checked that a name was free and then write: `write_file_compound` replaces whatever is there, including a file someone else put there in between. It's the compound counterpart of `create_file_writer_exclusive`.
+
 ## [0.24.2] - 2026-09-23
 
 ### Added
