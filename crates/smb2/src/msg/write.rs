@@ -9,6 +9,13 @@ use crate::types::FileId;
 use crate::Error;
 
 /// Write flag: server performs write-through (SMB 2.1+).
+///
+/// ❌ Not on its own on 3.0.2 / 3.1.1: there the server MUST refuse it with
+/// `STATUS_INVALID_PARAMETER` unless [`SMB2_WRITEFLAG_WRITE_UNBUFFERED`] is
+/// set too or the open carries `FILE_NO_INTERMEDIATE_BUFFERING` (MS-SMB2
+/// § 3.3.5.13). Windows Server 2022 does exactly that (2026-09-23). To make
+/// written data durable, send a FLUSH instead, which is what the write paths
+/// here do.
 pub const SMB2_WRITEFLAG_WRITE_THROUGH: u32 = 0x0000_0001;
 
 /// Write flag: file buffering is not performed (SMB 3.0.2+).
