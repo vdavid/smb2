@@ -1774,6 +1774,18 @@ struct Inner {
     /// at. Kept apart from the download rate because most links are
     /// asymmetric, a home uplink often ten times slower than its downlink.
     write_rate_hint: StdMutex<Option<(tokio::time::Instant, f64)>>,
+    /// Whether this server refuses a FLUSH that isn't last in its compound.
+    ///
+    /// Windows (Vista / Server 2008 and later) fails any compounded operation
+    /// that needs asynchronous processing with `STATUS_INTERNAL_ERROR` unless
+    /// it is last in the chain (MS-SMB2 § 3.3.5.2.7, product behavior note
+    /// 266), and a FLUSH always does, so the one-frame CREATE + WRITE + FLUSH +
+    /// CLOSE write never persisted anything there. Samba and the QNAP flush it
+    /// fine. Learned from the first refusal rather than guessed from the
+    /// server, since nothing in NEGOTIATE says which it is; see
+    /// `Tree::write_file_compound`. Erased on a revival with the rest of what
+    /// the old server told us.
+    flush_must_end_compound: AtomicBool,
     /// Whether compression is active on this connection (negotiated).
     compression_enabled: AtomicBool,
     /// Whether the client wants compression (from config).
@@ -1887,6 +1899,7 @@ impl Inner {
             estimated_rtt: StdMutex::new(None),
             read_rate_hint: StdMutex::new(None),
             write_rate_hint: StdMutex::new(None),
+            flush_must_end_compound: AtomicBool::new(false),
             compression_enabled: AtomicBool::new(false),
             compression_requested: AtomicBool::new(true),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
@@ -3116,6 +3129,19 @@ impl Connection {
     pub fn compound_write_limit(&self) -> u64 {
         let max_write = self.params().map_or(65536, |p| p.max_write_size);
         self.fundable_payload(u64::from(max_write), 3)
+    }
+
+    /// Whether this server has refused a FLUSH that wasn't last in its
+    /// compound, so a one-frame write has to end its chain on the FLUSH.
+    pub(crate) fn flush_must_end_compound(&self) -> bool {
+        self.inner.flush_must_end_compound.load(Ordering::Acquire)
+    }
+
+    /// Record that this server refuses a FLUSH that isn't last in its compound.
+    pub(crate) fn note_flush_must_end_compound(&self) {
+        self.inner
+            .flush_must_end_compound
+            .store(true, Ordering::Release);
     }
 
     /// `max` bytes, lowered to what half the window funds once the server has
@@ -5070,6 +5096,9 @@ impl Connection {
         *inner.ipc_tree.lock().unwrap() = None;
         inner.oplock_trees.lock().unwrap().clear();
         inner.compression_enabled.store(false, Ordering::Release);
+        inner
+            .flush_must_end_compound
+            .store(false, Ordering::Release);
         // ❌ `send_queue_depth` is deliberately NOT reset: a caller parked
         // between its increment and its decrement would underflow the gauge
         // into a nonsense number. It drains on its own.

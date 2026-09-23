@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`write_file` flushes on Windows servers now.** It sends CREATE, WRITE, FLUSH, and CLOSE in one frame, and Windows refuses a FLUSH there that isn't last in the chain (`STATUS_INTERNAL_ERROR`), so a small file written to Windows was never flushed to disk, without any error. Now the first write on a connection notices the refusal and flushes that file again, and later writes to that server end the chain on the FLUSH and close separately, which costs one extra round trip per file on Windows only. Samba and NAS servers keep the one-round-trip write.
+
 ## [0.25.1] - 2026-09-23
 
 ### Fixed

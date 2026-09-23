@@ -1311,6 +1311,11 @@ impl Tree {
     /// Best for files that fit in MaxWriteSize. For larger files, use
     /// [`write_file_pipelined`](Self::write_file_pipelined).
     ///
+    /// Windows refuses a FLUSH that isn't last in its compound, so there the
+    /// first write on a connection flushes its file again in a chain of its
+    /// own, and later ones end the chain on the FLUSH and close separately
+    /// (2 round-trips). Either way, the data is flushed when this returns.
+    ///
     /// Creates the file, or REPLACES whatever holds the name (`FileOverwriteIf`).
     /// When the name must be new, use
     /// [`write_file_compound_exclusive`](Self::write_file_compound_exclusive).
@@ -1415,7 +1420,11 @@ impl Tree {
             file_id: FileId::SENTINEL,
         };
 
-        // Send as 4-way compound.
+        // One frame, and normally all four ops in it. A server that refuses a
+        // FLUSH anywhere but last (Windows) gets the chain cut after the FLUSH
+        // and a standalone CLOSE instead: one more round trip, and the only
+        // shape in which it persists the data at all.
+        let flush_last = conn.flush_must_end_compound();
         let ops = [
             CompoundOp {
                 command: Command::Create,
@@ -1443,18 +1452,19 @@ impl Tree {
             },
         ];
 
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
+        let ops = if flush_last { &ops[..3] } else { &ops[..] };
+
+        let responses = all_or_first_err(conn.execute_compound(ops).await?, ops.len())?;
 
         let create_header = &responses[0].header;
         let create_body = &responses[0].body;
         let write_header = &responses[1].header;
         let write_body = &responses[1].body;
         let flush_header = &responses[2].header;
-        let close_header = &responses[3].header;
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
-            // CREATE failed -- all four fail (cascaded). No handle to clean up.
+            // CREATE failed -- the rest fail too (cascaded). No handle to clean up.
             return Err(Error::Protocol {
                 status: create_header.status,
                 command: Command::Create,
@@ -1467,8 +1477,8 @@ impl Tree {
 
         // Check WRITE response.
         if write_header.status != NtStatus::SUCCESS {
-            // WRITE failed. FLUSH and CLOSE also failed in the compound (cascaded).
-            // Issue a standalone CLOSE to clean up the handle.
+            // WRITE failed, and what followed it in the compound with it
+            // (cascaded). Issue a standalone CLOSE to clean up the handle.
             debug!(
                 "tree: compound WRITE failed ({:?}), issuing standalone CLOSE",
                 write_header.status
@@ -1484,23 +1494,43 @@ impl Tree {
         let write_resp = WriteResponse::unpack(&mut cursor)?;
         let bytes_written = write_resp.count as u64;
 
-        // Check FLUSH response. If it failed but WRITE succeeded,
-        // the data might not be persisted yet but the write did happen.
-        if flush_header.status != NtStatus::SUCCESS {
-            debug!(
-                "tree: compound FLUSH returned {:?} (data written but may not be persisted)",
-                flush_header.status,
-            );
-        }
+        if flush_last {
+            if flush_header.status != NtStatus::SUCCESS {
+                debug!(
+                    "tree: compound FLUSH returned {:?} (data written but may not be persisted)",
+                    flush_header.status,
+                );
+            }
+            if let Err(e) = self.close_handle(conn, file_id).await {
+                debug!("tree: CLOSE after the compound write failed: {e} (data already written)");
+            }
+        } else {
+            if flush_header.status == NtStatus::INTERNAL_ERROR {
+                // Windows: a FLUSH needs async processing, so it fails unless
+                // it's last in its chain. The handle is already closed, so
+                // reopen the file and flush it in a chain that ends on the
+                // FLUSH, and write that way on this connection from now on.
+                debug!("tree: server refuses a FLUSH inside a compound, flushing last from now on");
+                conn.note_flush_must_end_compound();
+                self.reflush(conn, &normalized).await;
+            } else if flush_header.status != NtStatus::SUCCESS {
+                // The data might not be persisted yet, but the write did happen.
+                debug!(
+                    "tree: compound FLUSH returned {:?} (data written but may not be persisted)",
+                    flush_header.status,
+                );
+            }
 
-        // Check CLOSE response. If it failed but CREATE and WRITE succeeded,
-        // the handle might still be open, but there's nothing we can do
-        // since we already have the data written.
-        if close_header.status != NtStatus::SUCCESS {
-            debug!(
-                "tree: compound CLOSE returned {:?} (non-fatal, data already written)",
-                close_header.status,
-            );
+            // Check CLOSE response. If it failed but CREATE and WRITE succeeded,
+            // the handle might still be open, but there's nothing we can do
+            // since we already have the data written.
+            let close_header = &responses[3].header;
+            if close_header.status != NtStatus::SUCCESS {
+                debug!(
+                    "tree: compound CLOSE returned {:?} (non-fatal, data already written)",
+                    close_header.status,
+                );
+            }
         }
 
         debug!(
@@ -1508,6 +1538,73 @@ impl Tree {
             bytes_written
         );
         Ok(bytes_written)
+    }
+
+    /// Flush a file this call has just written and closed: a CREATE (open
+    /// only) and a FLUSH, the FLUSH last so a server that processes it
+    /// asynchronously accepts it, then a standalone CLOSE.
+    ///
+    /// `wire_path` is already formatted. Best effort like the FLUSH it redoes:
+    /// the data is written either way, so a failure here is logged, not raised.
+    async fn reflush(&self, conn: &mut Connection, wire_path: &str) {
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_WRITE_DATA | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            // Open only: another writer may have removed or renamed the file
+            // since, and flushing must never create one in its place.
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_NON_DIRECTORY_FILE,
+            name: wire_path.to_string(),
+            create_contexts: vec![],
+        };
+        let flush_req = FlushRequest {
+            file_id: FileId::SENTINEL,
+        };
+        let ops = [
+            CompoundOp::new(Command::Create, &create_req, Some(self.tree_id)),
+            CompoundOp::new(Command::Flush, &flush_req, Some(self.tree_id)),
+        ];
+        let responses = conn
+            .execute_compound(&ops)
+            .await
+            .and_then(|responses| all_or_first_err(responses, ops.len()));
+        let responses = match responses {
+            Ok(responses) => responses,
+            Err(e) => {
+                debug!("tree: re-flush failed: {e} (data written but may not be persisted)");
+                return;
+            }
+        };
+        if responses[0].header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: re-flush could not reopen the file: {:?} (data written but may not be persisted)",
+                responses[0].header.status
+            );
+            return;
+        }
+        if responses[1].header.status != NtStatus::SUCCESS {
+            debug!(
+                "tree: re-flush returned {:?} (data written but may not be persisted)",
+                responses[1].header.status
+            );
+        }
+        match CreateResponse::unpack(&mut ReadCursor::new(&responses[0].body)) {
+            Ok(created) => {
+                if let Err(e) = self.close_handle(conn, created.file_id).await {
+                    debug!("tree: CLOSE after the re-flush failed: {e}");
+                }
+            }
+            Err(e) => debug!("tree: re-flush CREATE response unreadable: {e}"),
+        }
     }
 
     /// Write data to a file (create or overwrite).
@@ -6600,6 +6697,142 @@ mod tests {
         })
         .collect();
         build_compound_response_frame(&replies)
+    }
+
+    /// Every sub-request's command in a sent frame, in order.
+    fn compound_commands(frame: &[u8]) -> Vec<Command> {
+        let mut commands = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut cursor = ReadCursor::new(&frame[offset..]);
+            let header = Header::unpack(&mut cursor).unwrap();
+            commands.push(header.command);
+            if header.next_command == 0 {
+                break;
+            }
+            offset += header.next_command as usize;
+        }
+        commands
+    }
+
+    /// A reply carrying only `status`, for `command`.
+    fn build_status_reply(command: Command, status: NtStatus) -> Vec<u8> {
+        let mut h = Header::new_request(command);
+        h.flags.set_response();
+        h.credits = 32;
+        h.status = status;
+        pack_message(
+            &h,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        )
+    }
+
+    /// What Windows answers the four-op write: the FLUSH needed async
+    /// processing and wasn't last, so it failed, and everything else worked.
+    fn build_windows_write_compound_reply(file_id: FileId, written: u32) -> Vec<u8> {
+        build_compound_response_frame(&[
+            build_create_response(file_id, 0),
+            build_write_response(written),
+            build_status_reply(Command::Flush, NtStatus::INTERNAL_ERROR),
+            build_close_response(),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_compound_flush_windows_refuses_is_redone_last_in_its_own_chain() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let written_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        let reopened_id = FileId {
+            persistent: 3,
+            volatile: 4,
+        };
+        mock.queue_response(build_windows_write_compound_reply(written_id, 3));
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(reopened_id, 3),
+            build_flush_response(),
+        ]));
+        mock.queue_response(build_close_response());
+
+        let written = tree
+            .write_file_compound(&mut conn, "flushed.txt", b"abc")
+            .await
+            .unwrap();
+
+        assert_eq!(written, 3);
+        // TreeConnect, the write, the re-flush, and its CLOSE.
+        assert_eq!(mock.sent_count(), 4);
+        let reflush = mock.sent_message(2).unwrap();
+        assert_eq!(
+            compound_commands(&reflush),
+            vec![Command::Create, Command::Flush],
+            "the FLUSH has to be last, or Windows refuses it again"
+        );
+        assert_eq!(
+            compound_create_disposition(&mock, 2),
+            CreateDisposition::FileOpen,
+            "the re-flush must open the file just written, never create or replace one"
+        );
+        let close = mock.sent_message(3).unwrap();
+        let mut cursor = ReadCursor::new(&close);
+        assert_eq!(Header::unpack(&mut cursor).unwrap().command, Command::Close);
+        assert_eq!(
+            CloseRequest::unpack(&mut cursor).unwrap().file_id,
+            reopened_id
+        );
+    }
+
+    #[tokio::test]
+    async fn once_windows_refuses_a_compound_flush_the_connection_writes_with_flush_last() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let id = |n| FileId {
+            persistent: n,
+            volatile: n,
+        };
+        mock.queue_response(build_windows_write_compound_reply(id(1), 3));
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(id(2), 3),
+            build_flush_response(),
+        ]));
+        mock.queue_response(build_close_response());
+        tree.write_file_compound(&mut conn, "first.txt", b"abc")
+            .await
+            .unwrap();
+
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(id(5), 0),
+            build_write_response(5),
+            build_flush_response(),
+        ]));
+        mock.queue_response(build_close_response());
+        let written = tree
+            .write_file_compound(&mut conn, "second.txt", b"hello")
+            .await
+            .unwrap();
+
+        assert_eq!(written, 5);
+        assert_eq!(mock.sent_count(), 6);
+        assert_eq!(
+            compound_commands(&mock.sent_message(4).unwrap()),
+            vec![Command::Create, Command::Write, Command::Flush]
+        );
+        let close = mock.sent_message(5).unwrap();
+        let mut cursor = ReadCursor::new(&close);
+        assert_eq!(Header::unpack(&mut cursor).unwrap().command, Command::Close);
+        assert_eq!(CloseRequest::unpack(&mut cursor).unwrap().file_id, id(5));
     }
 
     #[tokio::test]

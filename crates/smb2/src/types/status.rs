@@ -167,6 +167,11 @@ nt_status_codes! {
     /// Insufficient system resources exist to complete the API.
     INSUFFICIENT_RESOURCES = 0xC000_009A, "STATUS_INSUFFICIENT_RESOURCES";
 
+    /// An internal error occurred. Windows also answers a compounded operation
+    /// that needed asynchronous processing this way, unless it was last in the
+    /// chain (MS-SMB2 § 3.3.5.2.7, product behavior note 266).
+    INTERNAL_ERROR = 0xC000_00E5, "STATUS_INTERNAL_ERROR";
+
     /// The file that was specified as a target is a directory.
     FILE_IS_A_DIRECTORY = 0xC000_00BA, "STATUS_FILE_IS_A_DIRECTORY";
 
@@ -417,6 +422,7 @@ mod tests {
             NtStatus::PASSWORD_MUST_CHANGE,
             NtStatus::ACCOUNT_LOCKED_OUT,
             NtStatus::INSUFFICIENT_RESOURCES,
+            NtStatus::INTERNAL_ERROR,
             NtStatus::FILE_IS_A_DIRECTORY,
             NtStatus::NOT_SUPPORTED,
             NtStatus::BAD_NETWORK_PATH,
