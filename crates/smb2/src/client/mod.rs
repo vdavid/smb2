@@ -2043,11 +2043,15 @@ mod tests {
             SessionFlags(0),
         ));
 
+        // A guest session, so signing stays off: every canned response below
+        // arrives unsigned, and a signed session rejects those (MS-SMB2
+        // § 3.2.5.1.3). These tests exercise routing, DFS, and reconnects,
+        // not signing.
         mock.queue_response(build_session_setup_response(
             NtStatus::SUCCESS,
             session_id,
             vec![],
-            SessionFlags(0),
+            SessionFlags(SessionFlags::IS_GUEST),
         ));
     }
 

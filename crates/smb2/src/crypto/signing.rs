@@ -9,6 +9,7 @@
 //! Reference: MS-SMB2 sections 3.1.4.1 (signing) and 3.1.5.1 (verification).
 
 use log::{error, trace};
+use subtle::ConstantTimeEq;
 
 use crate::types::Dialect;
 use crate::Error;
@@ -158,8 +159,10 @@ pub fn verify_signature(
     // nonce must have role bit = 1 (server).
     let expected_sig = compute_signature(&buf, key, algorithm, message_id, is_cancel, true)?;
 
-    // Step 4: compare.
-    if received_sig != expected_sig {
+    // Step 4: compare, in constant time. `!=` on arrays stops at the first
+    // differing byte, which tells a forger timing a verifier how many leading
+    // bytes of a guess were right.
+    if !bool::from(received_sig.ct_eq(&expected_sig)) {
         error!(
             "signing: verification failed, msg_id={}, algo={:?}, got={:02x}{:02x}{:02x}{:02x}..., want={:02x}{:02x}{:02x}{:02x}...",
             message_id, algorithm,
@@ -544,6 +547,24 @@ mod tests {
 
         let result = verify_signature(&msg, &key, SigningAlgorithm::AesCmac, 0, false);
         assert!(result.is_err());
+    }
+
+    /// A forged signature is refused wherever it goes wrong, including in its
+    /// last byte. Guards the constant-time comparison against a rewrite that
+    /// checks only part of the tag.
+    #[test]
+    fn a_signature_wrong_in_any_single_byte_is_rejected() {
+        let mut signed = make_test_message(b"cmac forged tag");
+        let key = [0x55; 16];
+        sign_message(&mut signed, &key, SigningAlgorithm::AesCmac, 0, false).unwrap();
+        for i in 0..SIGNATURE_LEN {
+            let mut forged = signed.clone();
+            forged[SIGNATURE_OFFSET + i] ^= 0x01;
+            assert!(
+                verify_signature(&forged, &key, SigningAlgorithm::AesCmac, 0, false).is_err(),
+                "a tag differing only in byte {i} must not verify"
+            );
+        }
     }
 
     #[test]

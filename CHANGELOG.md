@@ -5,6 +5,13 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **A signed session no longer accepts an unsigned response.** The client verified a response's signature only when the response itself claimed to be signed, so someone on the network path could clear the `SMB2_FLAGS_SIGNED` bit and rewrite file contents, listings, or metadata without any error. Now every response on a signed session is verified, except the two kinds MS-SMB2 § 3.2.5.1.3 exempts (interim `STATUS_PENDING` responses and oplock break notifications). A stripped or forged response fails with the same error as a bad signature and ticks `signature_failures`. Thanks to [@rwbh](https://github.com/rwbh) for the report, the proof of concept, and the suggested fix ([#5](https://github.com/vdavid/smb2/issues/5)).
+- **Signatures are compared in constant time**, so a verifier's timing no longer reveals how many leading bytes of a forged signature were right. Also from [#5](https://github.com/vdavid/smb2/issues/5).
+
 ## [0.24.4] - 2026-09-23
 
 ### Fixed

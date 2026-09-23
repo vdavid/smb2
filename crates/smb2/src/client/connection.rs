@@ -5578,37 +5578,36 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
         return Ok(SubFrameAction::Skip);
     }
 
-    // Verify signature if signing is active and not encrypted.
+    // Verify signature if signing is active and not encrypted. Oplock breaks
+    // and interim STATUS_PENDING frames have already returned above: they are the only
+    // exemptions MS-SMB2 § 3.2.5.1.3 allows. ❌ Never gate on the header's
+    // `SMB2_FLAGS_SIGNED`: that bit arrives in the same untrusted bytes as the
+    // payload, so an on-path attacker clears it and rewrites the response.
+    // An unsigned frame carries a zero signature and fails verification here.
     let (should_sign, signing_key, signing_algorithm) = {
         let c = inner.crypto.lock().unwrap();
         (c.should_sign, c.signing_key.clone(), c.signing_algorithm)
     };
     if should_sign && !was_encrypted && sub.len() >= Header::SIZE {
-        let flags = u32::from_le_bytes(sub[16..20].try_into().unwrap());
-        let is_signed = (flags & HeaderFlags::SIGNED) != 0;
-        let status = u32::from_le_bytes(sub[8..12].try_into().unwrap());
-        let is_pending = status == NtStatus::PENDING.0;
-        if is_signed && !is_pending {
-            // The `is_cancel` bit is part of the AES-GMAC nonce (MS-SMB2
-            // § 3.1.4.1), so a frame whose command is CANCEL has to be verified
-            // with it set or the MAC can never match. In practice that means
-            // the error response a server sends when it REJECTS a cancel — the
-            // one frame that says the cancel did not take.
-            let is_cancel = header.command == Command::Cancel;
-            if let (Some(key), Some(algo)) = (signing_key, signing_algorithm) {
-                if let Err(e) =
-                    signing::verify_signature(sub, &key, algo, header.message_id.0, is_cancel)
-                {
-                    inner
-                        .metrics
-                        .signature_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "recv: sub-frame produced error for msg_id={}, reason=signature verify failed: {}",
-                        header.message_id.0, e
-                    );
-                    return Ok(SubFrameAction::Route(header.message_id, Err(e)));
-                }
+        // The `is_cancel` bit is part of the AES-GMAC nonce (MS-SMB2
+        // § 3.1.4.1), so a frame whose command is CANCEL has to be verified
+        // with it set or the MAC can never match. In practice that means
+        // the error response a server sends when it REJECTS a cancel — the
+        // one frame that says the cancel did not take.
+        let is_cancel = header.command == Command::Cancel;
+        if let (Some(key), Some(algo)) = (signing_key, signing_algorithm) {
+            if let Err(e) =
+                signing::verify_signature(sub, &key, algo, header.message_id.0, is_cancel)
+            {
+                inner
+                    .metrics
+                    .signature_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "recv: sub-frame produced error for msg_id={}, reason=signature verify failed: {}",
+                    header.message_id.0, e
+                );
+                return Ok(SubFrameAction::Route(header.message_id, Err(e)));
             }
         }
     }
@@ -8069,6 +8068,72 @@ mod tests {
             "the cancel bit has to be part of the check, got {action:?}"
         );
         assert_eq!(conn.metrics().signature_failures, 1);
+    }
+
+    /// Whether a response is signed is the server's claim, carried in the very
+    /// bytes an on-path attacker controls. Clearing `SMB2_FLAGS_SIGNED` and
+    /// rewriting the payload must not get a response past verification
+    /// (MS-SMB2 § 3.2.5.1.3 verifies every response on a signed session, with
+    /// no exception for an unset flag). Reported in #5 with a proxy that did
+    /// exactly this to a READ.
+    #[tokio::test]
+    async fn an_unsigned_response_on_a_signed_session_is_rejected() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.activate_signing(vec![0xAB; 16], SigningAlgorithm::AesCmac);
+        let _guard = conn.register_waiter(MessageId(7), Command::Echo).unwrap();
+
+        let mut h = Header::new_request(Command::Echo);
+        h.flags.set_response();
+        h.message_id = MessageId(7);
+        h.status = NtStatus::SUCCESS;
+        let stripped = pack_message(&h, &crate::msg::echo::EchoResponse);
+
+        let action = prepare_sub_frame(&stripped, false, &conn.inner).unwrap();
+        assert!(
+            matches!(action, SubFrameAction::Route(_, Err(_))),
+            "an unsigned response on a signed session must be refused, got {action:?}"
+        );
+        assert_eq!(conn.metrics().signature_failures, 1);
+    }
+
+    /// The two frames the spec exempts from verification still pass unsigned:
+    /// an interim STATUS_PENDING (the final response carries the signature)
+    /// and an unsolicited oplock break (MessageId 0xFFFF_FFFF_FFFF_FFFF).
+    #[tokio::test]
+    async fn pending_and_oplock_breaks_stay_exempt_from_signing() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.activate_signing(vec![0xAB; 16], SigningAlgorithm::AesCmac);
+        let _guard = conn.register_waiter(MessageId(7), Command::Read).unwrap();
+
+        let mut pending = Header::new_request(Command::Read);
+        pending.flags.set_response();
+        pending.message_id = MessageId(7);
+        pending.status = NtStatus::PENDING;
+        let body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+        let action = prepare_sub_frame(&pack_message(&pending, &body), false, &conn.inner).unwrap();
+        assert!(matches!(action, SubFrameAction::Skip), "got {action:?}");
+
+        let mut brk = Header::new_request(Command::OplockBreak);
+        brk.flags.set_response();
+        brk.message_id = MessageId::UNSOLICITED;
+        brk.status = NtStatus::SUCCESS;
+        let action = prepare_sub_frame(&pack_message(&brk, &body), false, &conn.inner).unwrap();
+        assert!(matches!(action, SubFrameAction::Skip), "got {action:?}");
+
+        assert_eq!(conn.metrics().signature_failures, 0);
     }
 
     // ── Encryption tests ─────────────────────────────────────────────

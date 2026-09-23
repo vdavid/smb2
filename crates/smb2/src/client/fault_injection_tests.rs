@@ -1369,18 +1369,19 @@ async fn a_revival_leaves_no_state_belonging_to_the_dead_session() {
     let conn = connect_to(&nas);
 
     // Stage state that must not survive: signing keys, DFS trees, a message-id
-    // sequence well past zero, and a wide-open credit window.
+    // sequence well past zero, and a wide-open credit window. The keys go in
+    // after the warm-up write, whose answer this fake NAS doesn't sign.
     let mut staged = conn.clone();
-    staged.activate_signing(
-        vec![0xAB; 16],
-        crate::crypto::signing::SigningAlgorithm::AesCmac,
-    );
     staged.register_dfs_tree(TreeId(7));
     conn.note_read_rate(50e6);
     assert!(finish(spawn_write(&conn), "the warm-up write")
         .await
         .is_ok());
     assert!(conn.next_message_id() > 0);
+    staged.activate_signing(
+        vec![0xAB; 16],
+        crate::crypto::signing::SigningAlgorithm::AesCmac,
+    );
 
     nas.goes_away();
     let _ = finish(spawn_write(&conn), "the stranded write").await;
