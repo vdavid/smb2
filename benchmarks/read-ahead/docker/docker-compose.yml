@@ -9,5 +9,10 @@ services:
       - "${BIND_ADDR:-127.0.0.1}:${SMB_BENCH_PORT:-17445}:445"
     cap_add:
       - NET_ADMIN
+    # Linux restarts slow start on a connection idle past its RTO. The grid
+    # sets BENCH_SLOW_START_AFTER_IDLE=0, because each candidate's connection
+    # sits idle while the others run, which a folder copy's never does.
+    sysctls:
+      net.ipv4.tcp_slow_start_after_idle: ${BENCH_SLOW_START_AFTER_IDLE:-1}
     # Roughly a 4-core NAS CPU; keeps a background writer from being free.
     cpus: 2

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use smb2::SmbClient;
 
-use crate::{arg, connect, fnv, median, share, spawn_load};
+use crate::{arg, connect, fnv, median, share, spawn_load, tuning};
 
 /// How a variant writes the file.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -164,14 +164,25 @@ pub async fn run(args: &[String]) {
     let runs: usize = arg(args, "--runs", "3").parse().unwrap();
     let out = arg(args, "--out", "upload.csv");
     let sizes: Vec<u64> = arg(args, "--sizes", "1048576,8388608,104857600").split(',').map(|s| s.parse().unwrap()).collect();
-    let variants: Vec<(String, Variant)> = arg(args, "--variants", "default,compound")
+    // (name, variant, tuning): `auto:wmax16` is `auto` under the `wmax16` tuning.
+    let variants: Vec<(String, Variant, Option<String>)> = arg(args, "--variants", "default,compound")
         .split(',')
-        .map(|s| (s.to_string(), Variant::parse(s)))
+        .map(|s| {
+            let (base, t) = tuning::split(s);
+            (s.to_string(), Variant::parse(base), t.map(str::to_string))
+        })
         .collect();
 
-    let mut client = connect(&addr).await;
-    let tree = Arc::new(client.connect_share(&share()).await.expect("share"));
-    let max_write = client.params().map(|p| p.max_write_size).unwrap_or(0);
+    // A connection per tuning, as for downloads; untuned variants share one.
+    let mut conns: BTreeMap<String, (SmbClient, Arc<smb2::Tree>)> = BTreeMap::new();
+    for t in variants.iter().map(|(_, _, t)| t.clone().unwrap_or_default()) {
+        if !conns.contains_key(&t) {
+            let mut c = connect(&addr).await;
+            let tree = Arc::new(c.connect_share(&share()).await.expect("share"));
+            conns.insert(t, (c, tree));
+        }
+    }
+    let max_write = conns.values().next().unwrap().0.params().map(|p| p.max_write_size).unwrap_or(0);
     eprintln!("max_write_size={max_write}");
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -202,9 +213,16 @@ pub async fn run(args: &[String]) {
         .collect();
     for run in 0..runs {
         for (&size, data) in &files {
-            let path = format!("up/u_{size}.bin");
-            for (name, v) in &variants {
-                let Some(s) = measure(&mut client, &tree, &path, data, *v).await else {
+            // Tuned variants rotate per run, so no candidate always follows
+            // the same one. Each writes its own file.
+            let offset = if conns.len() > 1 { run } else { 0 };
+            for i in 0..variants.len() {
+                let (name, v, tuned) = &variants[(i + offset) % variants.len()];
+                tuning::apply(tuned.as_deref());
+                let (client, tree) = conns.get_mut(tuned.as_deref().unwrap_or("")).unwrap();
+                let tag = tuned.as_deref().map_or(String::new(), |t| format!("_{t}"));
+                let path = format!("up/u_{size}{tag}.bin");
+                let Some(s) = measure(client, tree, &path, data, *v).await else {
                     continue;
                 };
                 // Read it back: a wrong write fails the run.
@@ -212,7 +230,7 @@ pub async fn run(args: &[String]) {
                 let back = tree.read_file_pipelined(&mut c, &path).await.expect("read back");
                 assert_eq!(fnv(&back, 0), fnv(data, 0), "{name} wrote different bytes to {path}");
                 let cancel = if size >= 8 << 20 && v.put == Put::Stream {
-                    cancel_cost(&mut client, &tree, "up/cancelled.bin", data, *v).await.as_secs_f64() * 1000.0
+                    cancel_cost(client, tree, &format!("up/cancelled{tag}.bin"), data, *v).await.as_secs_f64() * 1000.0
                 } else {
                     f64::NAN
                 };

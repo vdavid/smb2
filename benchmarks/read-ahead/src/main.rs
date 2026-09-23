@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use smb2::{ClientConfig, FileDownload, ReadAhead, SmbClient};
 
+mod score;
+mod tuning;
 mod upload;
 
 /// Share, username, and password, from `SMB_BENCH_SHARE` / `SMB_BENCH_USER` /
@@ -270,10 +272,14 @@ async fn run(args: &[String]) {
         .split(',')
         .map(|s| s.parse().unwrap())
         .collect();
-    let variants: Vec<(String, Variant)> =
+    // (name, variant, tuning): `auto:wmax16` is `auto` under the `wmax16` tuning.
+    let variants: Vec<(String, Variant, Option<String>)> =
         arg(args, "--variants", "baseline,seq512,ra512x4,ra512x8,ra512x16,ra512x32")
             .split(',')
-            .map(|s| (s.to_string(), Variant::parse(s)))
+            .map(|s| {
+                let (base, t) = tuning::split(s);
+                (s.to_string(), Variant::parse(base), t.map(str::to_string))
+            })
             .collect();
 
     let mut client = connect(&addr).await;
@@ -315,11 +321,27 @@ async fn run(args: &[String]) {
     if new_file {
         writeln!(f, "rtt_ms,load,size,variant,chunk,window,run,wall_ms,mbps,deliveries,ttfc_ms,max_gap_ms,peak_in_flight,bytes,checksum,probe_p50_ms,probe_max_ms,cancel_stat_ms,last_chunk_ms").unwrap();
     }
+    // Each tuning gets a connection of its own, so what one candidate learned
+    // (rate, headroom) never seeds another. Untuned variants share the first.
+    let mut conns: BTreeMap<String, (SmbClient, smb2::Tree)> = BTreeMap::new();
+    for t in variants.iter().filter_map(|(_, _, t)| t.clone()) {
+        if !conns.contains_key(&t) {
+            let mut c = connect(&addr).await;
+            let tr = c.connect_share(&share()).await.expect("share");
+            conns.insert(t, (c, tr));
+        }
+    }
+    conns.insert(String::new(), (client, tree));
     let mut reference: BTreeMap<u64, u64> = BTreeMap::new();
     for run in 0..runs {
         for &size in &sizes {
             let path = format!("bench/f_{size}.bin");
-            for (name, v) in &variants {
+            // Tuned variants rotate per run, so no candidate always follows the
+            // same one; untuned ones keep their order (see `adaptive-cold`).
+            let offset = if conns.len() > 1 { run } else { 0 };
+            for i in 0..variants.len() {
+                let (name, v, tuned) = &variants[(i + offset) % variants.len()];
+                tuning::apply(tuned.as_deref());
                 let mut fresh = if v.cold {
                     let mut c = connect(&addr).await;
                     let t = c.connect_share(&share()).await.expect("share");
@@ -329,7 +351,10 @@ async fn run(args: &[String]) {
                 };
                 let (c, t) = match fresh {
                     Some((ref mut c, ref t)) => (c, t),
-                    None => (&mut client, &tree),
+                    None => {
+                        let (c, t) = conns.get_mut(tuned.as_deref().unwrap_or("")).unwrap();
+                        (c, &*t)
+                    }
                 };
                 let s = measure(c, t, &path, size, *v).await;
                 let cancel = if size >= 8 << 20 && v.fetch == Fetch::Stream {
@@ -452,6 +477,7 @@ async fn main() {
         Some("summarize") => summarize(&args[2]),
         Some("upload") => upload::run(&args).await,
         Some("summarize-upload") => upload::summarize(&args[2]),
-        _ => eprintln!("usage: read-ahead-bench run [--addr A] [--rtt-ms N] [--load-writers N] [--runs N] [--out F] [--sizes a,b] [--variants v,w] | summarize F | upload [same flags] | summarize-upload F"),
+        Some("score") => score::run(&args[2..]),
+        _ => eprintln!("usage: read-ahead-bench run [--addr A] [--rtt-ms N] [--load-writers N] [--runs N] [--out F] [--sizes a,b] [--variants v,w] | summarize F | upload [same flags] | summarize-upload F | score [--detail] F... (variants take a `:<tuning>` suffix; tunings: {})", tuning::NAMES),
     }
 }

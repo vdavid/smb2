@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-smb2 = { path = "../../crates/smb2" }
+smb2 = { path = "../../crates/smb2", features = ["__bench-tuning"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # Standalone: this sits under the main clone when checked out as a worktree.

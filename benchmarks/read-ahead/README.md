@@ -9,8 +9,22 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
 - `./run.sh OUT.csv [runs] [links] [writers]`: builds and starts the container (published on `127.0.0.1:17445`,
   override with `SMB_BENCH_PORT`), writes random test files (the default sizes plus any in `SIZES`), then for each link runs every size × variant with no load
   and with `writers` background writer connections hammering the same share. A link is `<delay ms>` or
-  `<delay ms>@<netem rate>`, for example `"0 5 60"` or `"60@3mbit"`. Env: `VARIANTS`, `SIZES`, `LOADS` (for example
-  `LOADS=0`). Tears the container down on exit.
+  `<delay ms>[@<netem rate>][~<jitter ms>][+stall]`, for example `"0 5 60"`, `"60@3mbit"`, `"20@240mbit~10"`, or
+  `"5@240mbit+stall"`. Jitter is netem's normal distribution, always with a rate (an uncapped link gets
+  `rate 100gbit`), because without one netem reorders packets and the run turns into a TCP reordering test. `+stall`
+  freezes every `smbd` for `STALL_MS` (150) every `STALL_EVERY_MS` (1,000) via `docker/stall.sh`. Every shaped link
+  queues up to 100,000 packets instead of dropping. Env: `VARIANTS`, `SIZES`, `LOADS` (for example `LOADS=0`),
+  `BENCH_PROJECT` and `SMB_BENCH_PORT` (to run beside another copy), `BENCH_SLOW_START_AFTER_IDLE=0` (the container's
+  TCP keeps its window across idle periods). Tears the container down on exit.
+- `./grid.sh OUT_DIR GROUP...`: the tuning grid behind `results/self-tuning.md`. It runs every candidate in `TUNINGS`
+  as `auto:<tuning>` on the group's links, on its own container (`smb2-ra-grid`, port 17545) with slow start after
+  idle off. Groups: `d30 d3 d300 dfree djitter djitter3 dstall dstall3 dload up30 up3`, each under ten minutes.
+- `./target/release/read-ahead-bench score [--detail] [--control PATTERN]... CSV...`: minimax-regret tables over
+  download and upload CSVs (the scoring is defined in `src/score.rs` and `results/self-tuning.md`).
+- **Tuning candidates**: any variant takes a `:<tuning>` suffix (`auto:wmax16-n25`, `adaptive:ref`) and then runs with
+  that tuning (the bench builds smb2 with the unstable `__bench-tuning` feature) on a connection of its own, so what one
+  candidate learns never seeds another. Tuned variants rotate their order every run. Names are in `src/tuning.rs`:
+  `shipping` is what the build ships, `ref` is 0.25.1's behavior (fixed 250 ms headroom, delivery-paced rate).
 - `./target/release/read-ahead-bench summarize OUT.csv`: median tables in Markdown.
 - Variants:
   - `baseline`: sequential, chunk = `MaxReadSize` (what `Tree::download` did before 0.24.0).
@@ -60,3 +74,6 @@ SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>
   `adaptive` at +60 and +200 ms, 2026-09-23.
 - `adaptive-uploads.md`: the adaptive write-behind window (0.25.0) against 0.24.4's fixed 32-WRITE window, fixed
   512 KiB windows, and the compound write with and without `quick_write_limit`, on shaped uplinks, 2026-09-23.
+- `self-tuning.md`: ten headroom and rate candidates on a grid of 28 shaped links (RTT, bandwidth, jitter, server
+  stalls, background writers, uploads), picked by minimax regret, 2026-09-24. Samba 4.23 on Alpine 3.24. Has the
+  real-NAS validation command.
