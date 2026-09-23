@@ -5,7 +5,7 @@ The evidence behind `Tree::download`'s default since 0.24.0: 512 KiB chunks and 
 against a local Samba in Docker, with latency and bandwidth injected by `tc netem` on the container's egress.
 
 - `./run.sh OUT.csv [runs] [links] [writers]`: builds and starts the container (published on `127.0.0.1:17445`,
-  override with `SMB_BENCH_PORT`), writes random test files, then for each link runs every size × variant with no load
+  override with `SMB_BENCH_PORT`), writes random test files (the default sizes plus any in `SIZES`), then for each link runs every size × variant with no load
   and with `writers` background writer connections hammering the same share. A link is `<delay ms>` or
   `<delay ms>@<netem rate>`, for example `"0 5 60"` or `"60@3mbit"`. Env: `VARIANTS`, `SIZES`, `LOADS` (for example
   `LOADS=0`). Tears the container down on exit.
@@ -17,8 +17,10 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
   - `adaptive-cold`: the same on a fresh connection. Its numbers are mostly TCP slow start, and the idle it leaves on
     the shared connection makes the variant after it pay slow start again (Linux restarts it after an idle period), so
     run it on its own.
+  - `compound`: one compound CREATE + READ + CLOSE (`read_file_compound_sized`), the single-READ alternative.
+  - `auto`: `compound` when the file fits `Connection::quick_read_limit`, `adaptive` otherwise.
   - `seq<KiB>`: sequential. `ra<KiB>x<W>`: a fixed window of W READs.
-- Per run: wall time from CREATE to CLOSE, chunk count, time to first chunk, the longest gap between deliveries, peak
+- Per run: wall time from CREATE to the CLOSE's answer, time to the last chunk (when a consumer has every byte), chunk count, time to first chunk, the longest gap between deliveries, peak
   bytes in flight, the p50/max latency of a `stat` issued every 20 ms on a clone of the same connection during the
   download, and (8 MiB+ files) the latency of a `stat` right after dropping a download at 25%.
 - Every run's bytes are checksummed and compared across variants, so a wrong read fails the run.
@@ -34,3 +36,5 @@ SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>
   cap, and showed no fixed window works on both fast and slow links. `load-writers.txt` is what the background writers
   managed on each link.
 - `adaptive.md`: the adaptive default against the fixed windows on the key links, 2026-09-23.
+- `close-and-quick-read.md`: the last chunk no longer waiting for the CLOSE (0.24.2), and `auto` against `compound` and
+  `adaptive` at +60 and +200 ms, 2026-09-23.

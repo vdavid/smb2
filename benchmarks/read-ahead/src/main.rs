@@ -18,8 +18,21 @@ fn share() -> String {
     std::env::var("SMB_BENCH_SHARE").unwrap_or_else(|_| "public".to_string())
 }
 
+/// How a variant fetches the file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fetch {
+    /// A `FileDownload` with the variant's chunk and window.
+    Stream,
+    /// One compound CREATE + READ + CLOSE (`read_file_compound_sized`).
+    Compound,
+    /// Compound when the file fits `Connection::quick_read_limit`, the
+    /// adaptive stream otherwise: what a consumer using the limit gets.
+    Auto,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Variant {
+    fetch: Fetch,
     /// `None` means "the server's MaxReadSize", which is what `Tree::download` used before 0.24.
     chunk: Option<u32>,
     read_ahead: ReadAhead,
@@ -31,23 +44,32 @@ struct Variant {
 
 impl Variant {
     fn parse(s: &str) -> Variant {
+        let stream = Fetch::Stream;
         if s == "baseline" {
-            return Variant { chunk: None, read_ahead: ReadAhead::SEQUENTIAL, cold: false };
+            return Variant { fetch: stream, chunk: None, read_ahead: ReadAhead::SEQUENTIAL, cold: false };
         }
-        if s == "adaptive" || s == "adaptive-cold" {
+        if s == "adaptive" || s == "adaptive-cold" || s == "compound" || s == "auto" {
             // What `Tree::download` does since 0.24.
-            return Variant { chunk: Some(smb2::DOWNLOAD_CHUNK_SIZE), read_ahead: ReadAhead::Adaptive, cold: s == "adaptive-cold" };
+            let fetch = match s {
+                "compound" => Fetch::Compound,
+                "auto" => Fetch::Auto,
+                _ => stream,
+            };
+            return Variant { fetch, chunk: Some(smb2::DOWNLOAD_CHUNK_SIZE), read_ahead: ReadAhead::Adaptive, cold: s == "adaptive-cold" };
         }
         if let Some(k) = s.strip_prefix("seq") {
-            return Variant { chunk: Some(k.parse::<u32>().unwrap() * 1024), read_ahead: ReadAhead::SEQUENTIAL, cold: false };
+            return Variant { fetch: stream, chunk: Some(k.parse::<u32>().unwrap() * 1024), read_ahead: ReadAhead::SEQUENTIAL, cold: false };
         }
-        let rest = s.strip_prefix("ra").expect("variant: baseline | adaptive | seq<KiB> | ra<KiB>x<W>");
+        let rest = s.strip_prefix("ra").expect("variant: baseline | adaptive | compound | auto | seq<KiB> | ra<KiB>x<W>");
         let (k, w) = rest.split_once('x').unwrap();
-        Variant { chunk: Some(k.parse::<u32>().unwrap() * 1024), read_ahead: ReadAhead::Fixed(w.parse().unwrap()), cold: false }
+        Variant { fetch: stream, chunk: Some(k.parse::<u32>().unwrap() * 1024), read_ahead: ReadAhead::Fixed(w.parse().unwrap()), cold: false }
     }
 
     /// The CSV's `window` column.
     fn window_label(&self) -> String {
+        if self.fetch == Fetch::Compound {
+            return "compound".to_string();
+        }
         match self.read_ahead {
             ReadAhead::Fixed(w) => w.to_string(),
             _ => "adaptive".to_string(),
@@ -56,7 +78,10 @@ impl Variant {
 }
 
 struct Sample {
+    /// CREATE to the CLOSE's answer (the `None` from `next_chunk`).
     wall: Duration,
+    /// CREATE to the last chunk in hand: when a consumer has every byte.
+    last_chunk: Duration,
     deliveries: usize,
     ttfc: Duration,
     max_gap: Duration,
@@ -94,7 +119,7 @@ async fn connect(addr: &str) -> SmbClient {
     .expect("connect")
 }
 
-async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, v: Variant) -> Sample {
+async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, size_hint: u64, v: Variant) -> Sample {
     let max_read = client.params().map(|p| p.max_read_size).unwrap_or(65536);
     let chunk = v.chunk.unwrap_or(max_read).min(max_read);
     let conn = client.connection_mut();
@@ -116,24 +141,38 @@ async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, v: Varia
         })
     };
 
+    let compound = match v.fetch {
+        Fetch::Compound => true,
+        Fetch::Auto => size_hint <= conn.quick_read_limit(),
+        Fetch::Stream => false,
+    };
     let t0 = Instant::now();
-    let (fid, size) = tree.open_file(conn, path).await.expect("open");
-    let mut dl = FileDownload::new(tree, conn, fid, size, chunk).with_read_ahead(v.read_ahead);
     let mut chunks = Vec::new();
     let mut last = t0;
     let mut ttfc = None;
     let mut max_gap = Duration::ZERO;
-    while let Some(c) = dl.next_chunk().await {
-        let c = c.expect("chunk");
-        let now = Instant::now();
-        ttfc.get_or_insert(now - t0);
-        max_gap = max_gap.max(now - last);
-        last = now;
-        chunks.push(c);
-    }
+    let peak = if compound {
+        let data = tree.read_file_compound_sized(conn, path, size_hint).await.expect("compound read");
+        last = Instant::now();
+        ttfc = Some(last - t0);
+        max_gap = last - t0;
+        let n = data.len() as u64;
+        chunks.push(data);
+        n
+    } else {
+        let (fid, size) = tree.open_file(conn, path).await.expect("open");
+        let mut dl = FileDownload::new(tree, conn, fid, size, chunk).with_read_ahead(v.read_ahead);
+        while let Some(c) = dl.next_chunk().await {
+            let c = c.expect("chunk");
+            let now = Instant::now();
+            ttfc.get_or_insert(now - t0);
+            max_gap = max_gap.max(now - last);
+            last = now;
+            chunks.push(c);
+        }
+        dl.peak_in_flight_bytes()
+    };
     let wall = t0.elapsed();
-    let peak = dl.peak_in_flight_bytes();
-    drop(dl);
     stop.store(true, Ordering::Relaxed);
     let mut lat = probe.await.unwrap();
     lat.sort();
@@ -148,6 +187,7 @@ async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, v: Varia
     }
     Sample {
         wall,
+        last_chunk: last - t0,
         deliveries: chunks.len(),
         ttfc: ttfc.unwrap_or(wall),
         max_gap,
@@ -271,7 +311,7 @@ async fn run(args: &[String]) {
     let new_file = !std::path::Path::new(&out).exists();
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&out).unwrap();
     if new_file {
-        writeln!(f, "rtt_ms,load,size,variant,chunk,window,run,wall_ms,mbps,deliveries,ttfc_ms,max_gap_ms,peak_in_flight,bytes,checksum,probe_p50_ms,probe_max_ms,cancel_stat_ms").unwrap();
+        writeln!(f, "rtt_ms,load,size,variant,chunk,window,run,wall_ms,mbps,deliveries,ttfc_ms,max_gap_ms,peak_in_flight,bytes,checksum,probe_p50_ms,probe_max_ms,cancel_stat_ms,last_chunk_ms").unwrap();
     }
     let mut reference: BTreeMap<u64, u64> = BTreeMap::new();
     for run in 0..runs {
@@ -289,8 +329,8 @@ async fn run(args: &[String]) {
                     Some((ref mut c, ref t)) => (c, t),
                     None => (&mut client, &tree),
                 };
-                let s = measure(c, t, &path, *v).await;
-                let cancel = if size >= 8 << 20 {
+                let s = measure(c, t, &path, size, *v).await;
+                let cancel = if size >= 8 << 20 && v.fetch == Fetch::Stream {
                     cancel_cost(c, t, &path, *v).await.as_secs_f64() * 1000.0
                 } else {
                     f64::NAN
@@ -302,7 +342,7 @@ async fn run(args: &[String]) {
                 let secs = s.wall.as_secs_f64();
                 writeln!(
                     f,
-                    "{rtt},{load_writers},{size},{name},{chunk},{},{run},{:.2},{:.2},{},{:.2},{:.2},{},{},{:x},{:.2},{:.2},{:.2}",
+                    "{rtt},{load_writers},{size},{name},{chunk},{},{run},{:.2},{:.2},{},{:.2},{:.2},{},{},{:x},{:.2},{:.2},{:.2},{:.2}",
                     v.window_label(),
                     secs * 1000.0,
                     size as f64 / 1e6 / secs,
@@ -314,7 +354,8 @@ async fn run(args: &[String]) {
                     s.checksum,
                     s.probe_p50.as_secs_f64() * 1000.0,
                     s.probe_max.as_secs_f64() * 1000.0,
-                    cancel
+                    cancel,
+                    s.last_chunk.as_secs_f64() * 1000.0
                 )
                 .unwrap();
             }
@@ -341,20 +382,20 @@ fn summarize(path: &str) {
     let text = std::fs::read_to_string(path).unwrap();
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap().split(',').collect();
-    let col = |n: &str| header.iter().position(|h| *h == n).unwrap();
+    let col = |n: &str| header.iter().position(|h| *h == n);
     // (rtt, load, size) -> variant order -> column samples
     type Cell = BTreeMap<&'static str, Vec<f64>>;
     let mut groups: BTreeMap<(u64, String, u64, u64), Vec<(String, Cell)>> = BTreeMap::new();
     for line in lines {
         let f: Vec<&str> = line.split(',').collect();
-        let link = f[col("rtt_ms")].to_string();
+        let link = f[col("rtt_ms").unwrap()].to_string();
         let key = (
             link.split('@').next().unwrap().parse().unwrap_or(u64::MAX),
             link,
-            f[col("load")].parse().unwrap(),
-            f[col("size")].parse().unwrap(),
+            f[col("load").unwrap()].parse().unwrap(),
+            f[col("size").unwrap()].parse().unwrap(),
         );
-        let variant = f[col("variant")].to_string();
+        let variant = f[col("variant").unwrap()].to_string();
         let rows = groups.entry(key).or_default();
         let idx = match rows.iter().position(|(v, _)| *v == variant) {
             Some(i) => i,
@@ -363,8 +404,10 @@ fn summarize(path: &str) {
                 rows.len() - 1
             }
         };
-        for name in ["wall_ms", "mbps", "deliveries", "ttfc_ms", "max_gap_ms", "peak_in_flight", "probe_p50_ms", "probe_max_ms", "cancel_stat_ms"] {
-            rows[idx].1.entry(name).or_default().push(f[col(name)].parse().unwrap());
+        for name in ["wall_ms", "last_chunk_ms", "mbps", "deliveries", "ttfc_ms", "max_gap_ms", "peak_in_flight", "probe_p50_ms", "probe_max_ms", "cancel_stat_ms"] {
+            // CSVs from before `last_chunk_ms` existed read as NaN there.
+            let value = col(name).map_or(f64::NAN, |i| f[i].parse().unwrap());
+            rows[idx].1.entry(name).or_default().push(value);
         }
     }
     let human = |b: u64| -> String {
@@ -377,14 +420,15 @@ fn summarize(path: &str) {
             if load == 0 { "none".to_string() } else { format!("{load} writers") },
             human(size)
         );
-        println!("| variant | wall ms | MB/s | chunks | first chunk ms | max gap ms | peak in flight | side stat p50/max ms | stat after cancel ms |");
-        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+        println!("| variant | wall ms | last chunk ms | MB/s | chunks | first chunk ms | max gap ms | peak in flight | side stat p50/max ms | stat after cancel ms |");
+        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for (v, c) in rows {
             let m = |k: &str| median(c[k].clone());
             let cancel = m("cancel_stat_ms");
             println!(
-                "| {v} | {:.1} | {:.1} | {:.0} | {:.1} | {:.1} | {} | {:.0} / {:.0} | {} |",
+                "| {v} | {:.1} | {} | {:.1} | {:.0} | {:.1} | {:.1} | {} | {:.0} / {:.0} | {} |",
                 m("wall_ms"),
+                if m("last_chunk_ms").is_nan() { "n/a".to_string() } else { format!("{:.1}", m("last_chunk_ms")) },
                 m("mbps"),
                 m("deliveries"),
                 m("ttfc_ms"),

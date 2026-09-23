@@ -16,9 +16,12 @@ trap cleanup EXIT
 
 "${COMPOSE[@]}" up -d --build --wait
 C="$("${COMPOSE[@]}" ps -q smb-bench)"
-docker exec "$C" sh -c '
+# The default sizes, plus any in SIZES; the `stat` probe reads f_65536.bin.
+EXTRA="${SIZES:-}"
+FILE_SIZES="65536 386048 1048576 8388608 104857600 ${EXTRA//,/ }"
+docker exec -e FILE_SIZES="$FILE_SIZES" "$C" sh -c '
   mkdir -p /shares/public/bench /shares/public/load && chmod 777 /shares/public/bench /shares/public/load
-  for s in 65536 386048 1048576 8388608 104857600; do
+  for s in $FILE_SIZES; do
     head -c $s /dev/urandom > /shares/public/bench/f_$s.bin
   done
   chmod 666 /shares/public/bench/*'
