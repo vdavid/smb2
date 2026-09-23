@@ -7,22 +7,27 @@
 //! [`FileWriter::finish`] for normal completion, [`FileWriter::abort`] for
 //! fast cancellation), and [`Progress`] for tracking transfer progress.
 
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use futures_util::future::{select, Either};
 use log::{debug, trace};
+use tokio::time::Instant;
 
 use crate::client::connection::{
-    reserve_write_budget_or_drain, Connection, Frame, WriteBudgetStep,
+    reserve_write_budget_or_drain, Connection, Frame, WaiterGuard, WriteBudgetStep,
 };
 use crate::client::credits;
+use crate::client::read_ahead::{Dispatch, Window};
+pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
 use crate::client::tree::Tree;
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
-use crate::types::{Command, FileId};
+use crate::types::{Command, CreditCharge, FileId};
 use crate::Error;
 
 /// Maximum number of pipelined write requests in flight.
@@ -59,11 +64,22 @@ impl Progress {
 /// An in-progress file download that yields chunks without buffering
 /// the entire file in memory.
 ///
-/// Each call to [`next_chunk`](FileDownload::next_chunk) sends one SMB2 READ
-/// request and returns the response data. This is sequential (not pipelined)
-/// but memory-efficient: only one chunk is in memory at a time.
+/// Chunks come back in file order, one per
+/// [`next_chunk`](FileDownload::next_chunk). Underneath, several READs can be
+/// on the wire at once: by default the download sizes that window to the link
+/// ([`ReadAhead::Adaptive`]), so a fast link stays full while a slow one
+/// queues no more than about one chunk ahead of anything else on the
+/// connection. [`with_read_ahead`](Self::with_read_ahead) pins it instead. A
+/// file that fits one chunk costs exactly one READ.
 ///
-/// The file handle is closed when the download completes or is dropped.
+/// At most [`ADAPTIVE_MAX_IN_FLIGHT`](crate::client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT)
+/// bytes (4 MiB) are requested but undelivered at a time, so that is also what
+/// one download buffers at most.
+///
+/// `next_chunk` is cancel-safe: dropping its future (a `select!` arm losing)
+/// loses no data, and the next call picks up where it left off. The file
+/// handle is closed when the last chunk is consumed; a download dropped before
+/// that leaves the handle open until the session ends (there is no async drop).
 ///
 /// # Example
 ///
@@ -91,6 +107,36 @@ pub struct FileDownload<'a> {
     bytes_received: u64,
     chunk_size: u32,
     done: bool,
+    read_ahead: ReadAhead,
+    /// Built on the first READ, so the builder methods can still change what
+    /// it's built from.
+    window: Option<Window>,
+    /// Offset of the next READ to request.
+    next_offset: u64,
+    /// Requested READs in offset order. Chunks are delivered from the front,
+    /// so a response that lands early waits in its guard.
+    in_flight: VecDeque<InFlightRead>,
+    /// Bytes requested but not yet delivered.
+    in_flight_bytes: u64,
+    peak_in_flight_bytes: u64,
+    /// A chunk already taken off the wire but not yet handed out. It waits
+    /// here across the awaits that follow a delivery (the next READs, the
+    /// CLOSE), so a caller that drops `next_chunk` there gets it on the next
+    /// call rather than losing it.
+    ready: Option<Vec<u8>>,
+}
+
+/// One requested READ of a [`FileDownload`].
+///
+/// Dropping it drops the [`WaiterGuard`], which deregisters the waiter; the
+/// late response is then discarded by the receiver task (its credits still
+/// bank).
+struct InFlightRead {
+    offset: u64,
+    len: u32,
+    /// `None` for the remainder of a short read, until it's sent.
+    guard: Option<WaiterGuard>,
+    dispatched_at: Instant,
 }
 
 impl<'a> FileDownload<'a> {
@@ -103,9 +149,12 @@ impl<'a> FileDownload<'a> {
     /// to reuse a handle across multiple readers, or to build a custom
     /// chunk loop with non-default `chunk_size`).
     ///
+    /// `chunk_size` must not exceed the server's `MaxReadSize`. The download
+    /// uses [`ReadAhead::Adaptive`] unless told otherwise.
+    ///
     /// The caller is responsible for making sure `file_id` belongs to `tree`
     /// and was opened with read access. The `FileDownload` will CLOSE the
-    /// handle when the last chunk is consumed or when it is dropped.
+    /// handle when the last chunk is consumed.
     pub fn new(
         tree: &'a Tree,
         conn: &'a mut Connection,
@@ -119,9 +168,58 @@ impl<'a> FileDownload<'a> {
             file_id,
             file_size,
             bytes_received: 0,
-            chunk_size,
+            chunk_size: chunk_size.max(1),
             done: false,
+            read_ahead: ReadAhead::default(),
+            window: None,
+            next_offset: 0,
+            in_flight: VecDeque::new(),
+            in_flight_bytes: 0,
+            peak_in_flight_bytes: 0,
+            ready: None,
         }
+    }
+
+    /// Choose how many READs to keep on the wire. See [`ReadAhead`].
+    ///
+    /// Takes effect from the next READ sent; meant to be called before the
+    /// first [`next_chunk`](Self::next_chunk).
+    #[must_use]
+    pub fn with_read_ahead(mut self, read_ahead: ReadAhead) -> Self {
+        self.read_ahead = read_ahead;
+        self.window = None;
+        self
+    }
+
+    /// Change how many bytes each READ asks for. It must not exceed the
+    /// server's `MaxReadSize`.
+    ///
+    /// Takes effect from the next READ sent; meant to be called before the
+    /// first [`next_chunk`](Self::next_chunk).
+    #[must_use]
+    pub fn with_chunk_size(mut self, chunk_size: u32) -> Self {
+        self.chunk_size = chunk_size.max(1);
+        self.window = None;
+        self
+    }
+
+    /// The read-ahead policy in use.
+    #[must_use]
+    pub fn read_ahead(&self) -> ReadAhead {
+        self.read_ahead
+    }
+
+    /// Bytes each READ asks for.
+    #[must_use]
+    pub fn chunk_size(&self) -> u32 {
+        self.chunk_size
+    }
+
+    /// The most bytes this download has had requested but not yet delivered
+    /// at once. A gauge for tuning; it's also the most it buffered.
+    #[must_use]
+    pub fn peak_in_flight_bytes(&self) -> u64 {
+        self.peak_in_flight_bytes
     }
 
     /// Total file size in bytes.
@@ -147,94 +245,188 @@ impl<'a> FileDownload<'a> {
 
     /// Get the next chunk of data from the server.
     ///
-    /// Returns `None` when the download is complete. Each call sends
-    /// one SMB2 READ request and returns the response data. The file
-    /// handle is automatically closed when the last chunk is consumed.
+    /// Returns `None` when the download is complete. Chunks come in file
+    /// order and are at most the chunk size; a short read from the server
+    /// shows up as a shorter chunk. The file handle is closed when the last
+    /// chunk is consumed. After an error, the download is over: every later
+    /// call returns `None`, and the handle is left open (the connection may
+    /// be what failed).
+    ///
+    /// Cancel-safe: if this future is dropped before it completes, no data is
+    /// lost and the next call continues the download.
     pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>>> {
-        if self.done {
-            return None;
-        }
-
-        let remaining = self.file_size.saturating_sub(self.bytes_received);
-        if remaining == 0 {
-            // Close the handle when we've read everything.
-            let close_result = self.close().await;
-            if let Err(e) = close_result {
-                return Some(Err(e));
+        if self.ready.is_none() {
+            if self.done {
+                return None;
             }
-            return None;
+            match self.receive_next().await {
+                Ok(Some(data)) => self.ready = Some(data),
+                Ok(None) => {
+                    return match self.close().await {
+                        Ok(()) => None,
+                        Err(e) => Some(Err(e)),
+                    };
+                }
+                Err(e) => return Some(Err(self.fail(e))),
+            }
         }
-
-        let this_chunk = remaining.min(self.chunk_size as u64) as u32;
-
-        let req = ReadRequest {
-            padding: 0x50,
-            flags: 0,
-            length: this_chunk,
-            offset: self.bytes_received,
-            file_id: self.file_id,
-            minimum_count: 0,
-            channel: SMB2_CHANNEL_NONE,
-            remaining_bytes: 0,
-            read_channel_info: vec![],
+        // Keep the wire busy while the caller works on this chunk, or close
+        // if it was the last. The chunk waits in `ready` meanwhile.
+        let all_delivered = self.in_flight.is_empty() && self.next_offset >= self.file_size;
+        let after = if all_delivered {
+            self.close().await
+        } else {
+            self.send_reads().await.map(|_| ())
         };
+        if let Err(e) = after {
+            self.ready = None;
+            return Some(Err(self.fail(e)));
+        }
+        self.ready.take().map(Ok)
+    }
 
-        let credit_charge = credits::charge_for_payload(this_chunk as u64);
-        let exec_result = self
-            .conn
-            .execute_with_credits(
-                Command::Read,
-                &req,
-                Some(self.tree.tree_id),
-                crate::types::CreditCharge(credit_charge),
-            )
-            .await;
-
-        match exec_result {
-            Err(e) => {
-                self.done = true;
-                Some(Err(e))
-            }
-            Ok(frame) => {
-                if frame.header.status == NtStatus::END_OF_FILE {
-                    let _ = self.close().await;
-                    return None;
-                }
-
-                if frame.header.status != NtStatus::SUCCESS {
-                    self.done = true;
-                    return Some(Err(Error::Protocol {
-                        status: frame.header.status,
-                        command: Command::Read,
-                    }));
-                }
-
-                let mut cursor = ReadCursor::new(&frame.body);
-                match ReadResponse::unpack(&mut cursor) {
-                    Err(e) => {
-                        self.done = true;
-                        Some(Err(e))
-                    }
-                    Ok(resp) => {
-                        if resp.data.is_empty() {
-                            let _ = self.close().await;
-                            return None;
-                        }
-
-                        self.bytes_received += resp.data.len() as u64;
-
-                        // If this was the last chunk, close the handle.
-                        if self.bytes_received >= self.file_size {
-                            if let Err(e) = self.close().await {
-                                return Some(Err(e));
-                            }
-                        }
-
-                        Some(Ok(resp.data))
+    /// Wait for the chunk at the front, sending READs as the window allows
+    /// meanwhile. `Ok(None)` means there's nothing left to receive.
+    async fn receive_next(&mut self) -> Result<Option<Vec<u8>>> {
+        loop {
+            let send_at = self.send_reads().await?;
+            let Some(head) = self.in_flight.front_mut() else {
+                return Ok(None);
+            };
+            let guard = head
+                .guard
+                .as_mut()
+                .expect("send_reads sends the head before anything behind it");
+            let waiting = self.conn.await_response_in_place(guard, Command::Read);
+            let frame = match send_at {
+                None => waiting.await?,
+                Some(at) => {
+                    let timer = std::pin::pin!(tokio::time::sleep_until(at));
+                    match select(std::pin::pin!(waiting), timer).await {
+                        Either::Left((frame, _)) => frame?,
+                        // The next READ is due before the head has landed.
+                        // The head's response keeps waiting in its guard.
+                        Either::Right(_) => continue,
                     }
                 }
+            };
+            return self.take_head(frame);
+        }
+    }
+
+    /// Send every READ the window allows right now. Returns when the next one
+    /// is due, if that's a time rather than "after the head is delivered".
+    async fn send_reads(&mut self) -> Result<Option<Instant>> {
+        // The rest of a short read goes out first: it's the next chunk due.
+        if let Some(front) = self.in_flight.front_mut() {
+            if front.guard.is_none() {
+                let guard =
+                    send_read(self.conn, self.tree, self.file_id, front.offset, front.len).await?;
+                let now = Instant::now();
+                front.guard = Some(guard);
+                front.dispatched_at = now;
+                let len = front.len;
+                self.window().on_dispatch(now, len);
             }
         }
+        loop {
+            if self.next_offset >= self.file_size {
+                return Ok(None);
+            }
+            let len = (self.file_size - self.next_offset).min(u64::from(self.chunk_size)) as u32;
+            let (reads, bytes) = (self.in_flight.len(), self.in_flight_bytes);
+            match self.window().decide(Instant::now(), reads, bytes, len) {
+                Dispatch::Now => {}
+                Dispatch::At(at) => return Ok(Some(at)),
+                Dispatch::AfterHead => return Ok(None),
+            }
+            let offset = self.next_offset;
+            let guard = send_read(self.conn, self.tree, self.file_id, offset, len).await?;
+            let now = Instant::now();
+            self.in_flight.push_back(InFlightRead {
+                offset,
+                len,
+                guard: Some(guard),
+                dispatched_at: now,
+            });
+            self.next_offset += u64::from(len);
+            self.in_flight_bytes += u64::from(len);
+            self.peak_in_flight_bytes = self.peak_in_flight_bytes.max(self.in_flight_bytes);
+            self.window().on_dispatch(now, len);
+        }
+    }
+
+    /// Take the head READ's response off the queue. Synchronous on purpose:
+    /// from here to handing the chunk out, nothing may be interrupted.
+    fn take_head(&mut self, frame: Frame) -> Result<Option<Vec<u8>>> {
+        let head = self
+            .in_flight
+            .pop_front()
+            .expect("only called with the head's response");
+        self.in_flight_bytes -= u64::from(head.len);
+
+        if frame.header.status == NtStatus::END_OF_FILE {
+            // The file shrank since the CREATE. Nothing past here exists.
+            self.stop_at_eof();
+            return Ok(None);
+        }
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::Read,
+            });
+        }
+        let mut data = ReadResponse::unpack(&mut ReadCursor::new(&frame.body))?.data;
+        if data.is_empty() {
+            self.stop_at_eof();
+            return Ok(None);
+        }
+        data.truncate(head.len as usize);
+        let got = data.len() as u32;
+        if got < head.len {
+            // Short read: the rest is the next chunk due, ahead of anything
+            // already requested. `send_reads` sends it.
+            let rest = head.len - got;
+            self.in_flight.push_front(InFlightRead {
+                offset: head.offset + u64::from(got),
+                len: rest,
+                guard: None,
+                dispatched_at: head.dispatched_at,
+            });
+            self.in_flight_bytes += u64::from(rest);
+        }
+        self.bytes_received += u64::from(got);
+        let in_flight_bytes = self.in_flight_bytes;
+        self.window()
+            .on_delivery(Instant::now(), head.dispatched_at, got, in_flight_bytes);
+        Ok(Some(data))
+    }
+
+    fn window(&mut self) -> &mut Window {
+        let (read_ahead, chunk) = (self.read_ahead, self.chunk_size);
+        let rtt = self.conn.estimated_rtt();
+        self.window
+            .get_or_insert_with(|| Window::new(read_ahead, chunk, rtt))
+    }
+
+    /// Nothing past this point exists: drop what's still requested (the
+    /// responses are discarded as they land) and ask for nothing more.
+    fn stop_at_eof(&mut self) {
+        self.abandon_in_flight();
+        self.next_offset = self.file_size;
+    }
+
+    /// Stop on an error: no more chunks, and no CLOSE (the connection may be
+    /// the thing that failed).
+    fn fail(&mut self, e: Error) -> Error {
+        self.abandon_in_flight();
+        self.done = true;
+        e
+    }
+
+    fn abandon_in_flight(&mut self) {
+        self.in_flight.clear();
+        self.in_flight_bytes = 0;
     }
 
     /// Consume the download and collect all data with a progress callback.
@@ -279,8 +471,40 @@ impl<'a> FileDownload<'a> {
             return Ok(());
         }
         self.done = true;
+        // Any READs still out were sent before the CLOSE, so the server
+        // answers them first; their responses are discarded once the guards
+        // drop here.
+        self.abandon_in_flight();
         self.tree.close_handle(self.conn, self.file_id).await
     }
+}
+
+/// Send one READ and return its guard, once it's on the wire.
+async fn send_read(
+    conn: &Connection,
+    tree: &Tree,
+    file_id: FileId,
+    offset: u64,
+    len: u32,
+) -> Result<WaiterGuard> {
+    let req = ReadRequest {
+        padding: 0x50,
+        flags: 0,
+        length: len,
+        offset,
+        file_id,
+        minimum_count: 0,
+        channel: SMB2_CHANNEL_NONE,
+        remaining_bytes: 0,
+        read_channel_info: vec![],
+    };
+    conn.dispatch_with_credits(
+        Command::Read,
+        &req,
+        Some(tree.tree_id),
+        CreditCharge(credits::charge_for_payload(u64::from(len))),
+    )
+    .await
 }
 
 impl Drop for FileDownload<'_> {

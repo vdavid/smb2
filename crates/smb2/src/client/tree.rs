@@ -1665,8 +1665,20 @@ impl Tree {
     /// `Connection` (see [`Connection::clone`]) can drive concurrent
     /// downloads on one SMB session.
     ///
+    /// Reads in [`DOWNLOAD_CHUNK_SIZE`](crate::DOWNLOAD_CHUNK_SIZE) chunks
+    /// (512 KiB, or `MaxReadSize` if that's smaller) with an adaptive
+    /// read-ahead window ([`ReadAhead::Adaptive`](crate::ReadAhead::Adaptive)):
+    /// full speed on a fast link, and about one chunk queued ahead of anything
+    /// else on a slow one. Chain
+    /// [`with_read_ahead`](FileDownload::with_read_ahead) or
+    /// [`with_chunk_size`](FileDownload::with_chunk_size) on the result to
+    /// change either.
+    ///
     /// For files that fit in one READ (≤ `max_read_size`), prefer
-    /// [`read_file_compound`](Self::read_file_compound) — 1 RTT vs. 3 RTTs.
+    /// [`read_file_compound`](Self::read_file_compound) — 1 RTT vs. 3 RTTs —
+    /// when the link is fast. Its single READ is also the whole file queued
+    /// ahead of everything else on the connection, which on a slow link means
+    /// no progress and a long wait for any other request.
     ///
     /// # Example
     ///
@@ -1686,7 +1698,8 @@ impl Tree {
         path: &str,
     ) -> Result<FileDownload<'a>> {
         let (file_id, file_size) = self.open_file(conn, path).await?;
-        let chunk_size = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        let chunk_size = crate::DOWNLOAD_CHUNK_SIZE.min(max_read);
         Ok(FileDownload::new(
             self, conn, file_id, file_size, chunk_size,
         ))

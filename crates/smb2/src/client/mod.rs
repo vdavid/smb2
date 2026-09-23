@@ -10,10 +10,13 @@ pub mod copy;
 pub(crate) mod credits;
 pub(crate) mod dfs;
 pub mod diagnostics;
+#[cfg(test)]
+mod download_tests;
 pub mod durable;
 #[cfg(test)]
 mod fault_injection_tests;
 pub mod pipeline;
+pub mod read_ahead;
 pub mod session;
 pub mod shares;
 pub mod stream;

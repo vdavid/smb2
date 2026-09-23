@@ -3865,7 +3865,6 @@ impl Connection {
         mut guard: WaiterGuard,
         command: Command,
     ) -> Result<Frame> {
-        let msg_id = guard.msg_id();
         let timeout = *self.inner.response_timeout.lock().unwrap();
         let Some(timeout) = timeout else {
             return guard.recv().await;
@@ -3886,6 +3885,34 @@ impl Connection {
                 ),
             };
         }
+        self.await_response_in_place(&mut guard, command).await
+    }
+
+    /// [`await_response`](Self::await_response) for a guard the caller keeps.
+    ///
+    /// Cancel-safe: dropping this future mid-wait leaves the guard registered
+    /// and its response, when it lands, waiting in the guard. That is what lets
+    /// a read-ahead [`FileDownload`](crate::FileDownload) wait on its head READ
+    /// in a `select` against its own dispatch timer, or be dropped by a
+    /// consumer's `select!`, without losing a chunk. Every call measures the
+    /// same per-request silence clock (it lives in the waiter, not in this
+    /// future), so waiting in several goes loses no deadline; a restart only
+    /// postpones the next check by up to one tick. Not for long polls, which
+    /// have their own bound.
+    pub(crate) async fn await_response_in_place(
+        &self,
+        guard: &mut WaiterGuard,
+        command: Command,
+    ) -> Result<Frame> {
+        let msg_id = guard.msg_id();
+        let timeout = *self.inner.response_timeout.lock().unwrap();
+        let Some(timeout) = timeout else {
+            return guard.recv().await;
+        };
+        debug_assert!(
+            !is_long_poll(command),
+            "long polls wait through await_long_poll"
+        );
         // Bounded even when the connection is healthy: "alive" is a reason for
         // more patience, never for unlimited patience. A server answering ECHO
         // that still has not answered THIS is stalled in a way waiting cannot
@@ -4759,6 +4786,12 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn set_test_params(&mut self, params: NegotiatedParams) {
         *self.inner.params.lock().unwrap() = Some(params);
+    }
+
+    /// Stand in for the round trip NEGOTIATE would have measured.
+    #[cfg(test)]
+    pub(crate) fn set_estimated_rtt(&self, rtt: Option<Duration>) {
+        *self.inner.estimated_rtt.lock().unwrap() = rtt;
     }
 
     #[cfg(test)]

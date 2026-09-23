@@ -74,7 +74,7 @@ fuzzing = []  # Exposes parser entry points for `fuzz/` targets; not for applica
 serde = ["dep:serde"]  # `Serialize` impls on `Diagnostics` types and the protocol enums they embed.
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "test-util"] }
 proptest = "1"
 env_logger = "0.11"
 serde_json = "1"  # JSON round-trip tests for the `serde` feature
