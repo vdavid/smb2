@@ -1,4 +1,4 @@
-//! Read-only commands: `ls`, `stat`, `df`, and `shares`.
+//! Read-only commands: `ls`, `stat`, `realpath`, `df`, and `shares`.
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -137,6 +137,50 @@ pub async fn stat(
     if failures > 0 {
         anyhow::bail!("{failures} of {} paths failed", paths.len());
     }
+    Ok(())
+}
+
+/// Print the path the server stores `target` under: its on-disk casing, with
+/// any 8.3 alias replaced by the long name.
+pub async fn realpath(target: &Target, credentials: &Credentials, as_json: bool) -> Result<()> {
+    let (mut client, mut tree) = pool::connect_all(target, credentials, 1)
+        .await?
+        .pop()
+        .expect("connect_all returns one connection");
+    let resolved = client
+        .resolve(&mut tree, &target.path)
+        .await
+        .with_context(|| format!("resolving {}", target.display()))?;
+    // After a DFS redirect `tree` names the target server and share, which is
+    // what the resolved path is relative to.
+    let (host, port) = match tree.server.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => {
+            (host.to_string(), port.parse().expect("checked"))
+        }
+        _ => (tree.server.clone(), target.port),
+    };
+    let canonical = Target {
+        host,
+        port,
+        share: tree.share_name.clone(),
+        ..target.with_path(&resolved.path)
+    };
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "target": canonical.display(),
+                "share": canonical.share,
+                "path": resolved.path,
+                "isDirectory": resolved.info.is_directory,
+            }))?
+        );
+    } else {
+        println!("{}", canonical.display());
+    }
+
+    let _ = client.disconnect_share(&tree).await;
     Ok(())
 }
 

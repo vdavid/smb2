@@ -115,6 +115,9 @@ enum Commands {
         /// Target like //host/share/path.
         target: String,
     },
+    /// Print the path the server stores a file under (its casing, and long
+    /// names for 8.3 aliases).
+    Realpath { target: String },
     /// Show free space on a share.
     Df { target: String },
     /// List the shares a server offers.
@@ -224,6 +227,9 @@ async fn main() -> Result<()> {
             commands::transfer::put(source, &Target::parse(target)?, &credentials, cli.dry_run)
                 .await
         }
+        Commands::Realpath { target } => {
+            commands::meta::realpath(&Target::parse(target)?, &credentials, cli.json).await
+        }
         Commands::Df { target } => {
             commands::meta::df(&Target::parse(target)?, &credentials, cli.json).await
         }
@@ -308,6 +314,7 @@ mod tests {
             vec!["smb2", "cat", "//host/share/a"],
             vec!["smb2", "get", "//host/share/a"],
             vec!["smb2", "put", "./a", "//host/share/a"],
+            vec!["smb2", "realpath", "//host/share/a"],
             vec!["smb2", "df", "//host/share"],
             vec!["smb2", "shares", "host"],
         ]

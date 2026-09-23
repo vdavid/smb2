@@ -684,6 +684,27 @@ fn cat_prints_the_file_bytes_verbatim() {
     assert_eq!(output.stdout, data);
 }
 
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn realpath_prints_the_name_the_server_stores() {
+    let share = Fixture::new("realpath");
+    share.mkdir("Photos");
+    share.write("Photos/Summer Trip.JPG", b"jpeg");
+    let stored = share.target("Photos/Summer Trip.JPG");
+
+    let asked = share.target("PHOTOS/summer trip.jpg");
+    assert_eq!(ok(&["realpath", &asked]).trim_end(), stored);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&ok(&["--json", "realpath", &asked])).expect("realpath --json");
+    assert_eq!(json["target"], stored.as_str());
+    assert_eq!(json["path"], share.path("Photos/Summer Trip.JPG").as_str());
+    assert_eq!(json["isDirectory"], false);
+
+    let stderr = fails(&["realpath", &share.target("Photos/missing.jpg")]);
+    assert!(stderr.contains("missing.jpg"), "stderr: {stderr}");
+}
+
 /// A download that fails must not leave anything behind. Streaming made this a
 /// live question: the destination is now opened before the bytes arrive, and
 /// the first version of it created an empty file for every failed `get`.

@@ -53,6 +53,7 @@ smb2 df //raspi/PiHDD
 smb2 ls -l //raspi/PiHDD/photos
 smb2 ls -R --json //raspi/PiHDD/photos
 smb2 stat //raspi/PiHDD/photos/IMG_0001.jpg
+smb2 realpath //raspi/PiHDD/PHOTOS/img_0001.JPG  # the name the server stores
 
 # Move bytes
 smb2 cat //raspi/PiHDD/notes.txt
@@ -66,6 +67,8 @@ smb2 mv //raspi/PiHDD/old.txt //raspi/PiHDD/new.txt
 smb2 rm //raspi/PiHDD/junk.txt
 smb2 rmdir //raspi/PiHDD/empty-dir
 ```
+
+`realpath` prints the path the way the server stores it: its casing, and long names in place of 8.3 aliases like `PROGRA~1`. It needs SMB 3.1.1 (Samba, or Windows 10 / Server v1803 and later) and says so when the server can't answer.
 
 `mkdir -p` is happy to find the directory already there, and stops when the name belongs to a file, the way GNU `mkdir -p` does.
 

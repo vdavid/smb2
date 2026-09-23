@@ -45,6 +45,7 @@ Gotcha: `mkdir -p` forces concurrency to 1, since a parent has to exist before i
 - `--dry-run` prints the operations and makes no connection at all. It covers everything that writes: `mkdir`, `rm`, `rmdir`, `mv`, `put`, and `get` (which writes locally). Read-only commands ignore it. `tests/dry_run.rs` holds every one of them to that by aiming at a port nothing listens on, so a command that connects fails the test.
 - `put` picks its destination the way `cp` does: a target written with a trailing separator, or one the server says is already a directory, takes the source's file name inside it; anything else is the full destination path. It stats the target first and refuses to write a file over a directory, since that's how a folder disappears. A dry run can't stat, so it goes on the trailing separator alone.
 - `mkdir` asks what holds a name only after the server reports `OBJECT_NAME_COLLISION`, so a batch that creates fresh directories pays nothing extra. `-p` treats an existing *directory* as done and an existing *file* as a failure, the way GNU `mkdir -p` does; reporting success over a file is what once hid a wrong path until a much later `ls` tripped over it. Plain `mkdir` fails on either.
+- `realpath` is `SmbClient::resolve`: one compound round trip, one connection. After a DFS redirect it prints the target server and share (from the `Tree`, which the redirect updated), since that is what the resolved path is relative to.
 - Every command supports `--json`. Human output is for people, JSON is the contract; if you change a JSON key, that's a breaking change.
 
 ## How bytes move
@@ -82,7 +83,7 @@ server's `MaxReadSize` (8 MB on a stock Samba) is a hard ceiling on what one REA
 
 `cargo test -p smb2-cli` covers parsing, formatting, the transfer destination rules, the `mkdir` collision rules, and which commands accept `-j`, all with no network. `tests/dry_run.rs` runs the built binary against `//127.0.0.1:1/…`, where connecting is refused instantly, which is what makes "`--dry-run` doesn't connect" testable.
 
-`tests/e2e.rs` is the other half: 28 tests that run the built binary against a live Samba fixture and check what
+`tests/e2e.rs` is the other half: 32 tests that run the built binary against a live Samba fixture and check what
 it left on the share, because a command that writes the wrong thing passes every test that never connects. Both
 data-safety bugs this CLI has shipped were caught by hand for exactly that reason. Run it with `just test-cli-e2e`,
 or by hand:

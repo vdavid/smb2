@@ -24,6 +24,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 - **Find out exactly which file the server opened.** `Tree::resolve` and `SmbClient::resolve` return the path as the server stores it, relative to the share: on-disk casing, and 8.3 aliases like `PROGRA~1` replaced by their long names. So a policy you enforce against a path can check the file the server actually picked, in one round trip, even when the parent directory isn't listable. The result also carries what `stat` returns and the file's `FileIdentity` (index number and volume serial) when the server provides one. Servers that can't name a file (SMB 2.x and 3.0.2, Windows before 10 / Server v1803) get an error classified `ErrorKind::Unsupported`, so you can fall back. Thanks to [@rwbh](https://github.com/rwbh) for the idea ([#6](https://github.com/vdavid/smb2/issues/6)).
 - **`FileReader::resolved_path()` and `FileWriter::resolved_path()`** name the file behind an open handle, asked in the same round trip as the open. A check against that name can't race the read or write that follows. `None` when the server can't say; the open works the same either way.
 - **`FileIdentity` is exported from the crate root.**
+- **`smb2 realpath //host/share/path`** (smb2-cli) prints the path the server stores a file under, as `//host/share/<path>`, with `--json` for scripts.
 
 ## [0.24.4] - 2026-09-23
 
