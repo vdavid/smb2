@@ -53,8 +53,8 @@ aes-gcm = "0.11.0"
 ccm = "=0.6.1"
 cmac = "0.8.0"
 digest = "0.11"
-# Constant-time signature comparison; already in the tree through the RustCrypto crates.
-subtle = "2.6"
+# Constant-time signature comparison. RustCrypto's own crate, already in the tree through aes-gcm, ccm, and digest.
+ctutils = "0.4.2"
 
 # NTLM authentication (MS-NLMP)
 md-5 = "0.11"

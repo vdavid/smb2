@@ -8,8 +8,8 @@
 //!
 //! Reference: MS-SMB2 sections 3.1.4.1 (signing) and 3.1.5.1 (verification).
 
+use ctutils::CtEq;
 use log::{error, trace};
-use subtle::ConstantTimeEq;
 
 use crate::types::Dialect;
 use crate::Error;
@@ -162,7 +162,7 @@ pub fn verify_signature(
     // Step 4: compare, in constant time. `!=` on arrays stops at the first
     // differing byte, which tells a forger timing a verifier how many leading
     // bytes of a guess were right.
-    if !bool::from(received_sig.ct_eq(&expected_sig)) {
+    if !received_sig.ct_eq(&expected_sig).to_bool() {
         error!(
             "signing: verification failed, msg_id={}, algo={:?}, got={:02x}{:02x}{:02x}{:02x}..., want={:02x}{:02x}{:02x}{:02x}...",
             message_id, algorithm,
