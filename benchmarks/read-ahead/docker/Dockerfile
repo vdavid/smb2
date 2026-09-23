@@ -1,4 +1,4 @@
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache samba iproute2
 COPY smb.conf /etc/samba/smb.conf
 RUN mkdir -p /shares/public && chmod 777 /shares/public
