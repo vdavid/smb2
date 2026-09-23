@@ -5,6 +5,13 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] - 2026-09-23
+
+### Fixed
+
+- **Dropping a connection now closes its socket.** The task reading from the socket held the connection alive, and only the connection's cleanup could stop that task, so the two kept each other going. The socket, the session on the server, and a keepalive timer firing once a second all stayed until the server hung up. Samba doesn't reap idle sessions by default, so against Samba that was never: a file manager that mounted and unmounted a share ~60 times held 78 open sockets. Now the socket closes the moment the last `Connection` clone (or the `SmbClient` holding it) drops.
+- **A server that hangs up gets the socket closed back right away.** The reading task saw the hang-up and stopped, but the writing task shares the socket and kept waiting for a frame that would never come, so the socket sat in `CLOSE_WAIT` for as long as anyone held the dead connection. Now a connection that's disconnected holds no socket, whatever made it so: a hang-up, a bad frame, a failed write, a server declared unresponsive, or `Connection::mark_dead`. A dead connection still works as one (it reports `Error::Disconnected`), and auto-reconnect revives it on a fresh socket as before.
+
 ## [0.24.0] - 2026-09-23
 
 ### Changed

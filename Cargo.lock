@@ -968,7 +968,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smb2"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "smb2-cli"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "clap",
