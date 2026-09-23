@@ -5,6 +5,23 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.2] - 2026-09-23
+
+### Added
+
+- **`Connection::quick_read_limit()`**: the largest file worth reading in one compound CREATE + READ + CLOSE on this connection right now, in bytes; anything bigger streams better through `Tree::download`. It's what the link moves in 250 ms (the same headroom the adaptive read-ahead window uses), never less than one `DOWNLOAD_CHUNK_SIZE` and never more than `MaxReadSize`. On the read-ahead bench, a consumer choosing by it read a 1 MiB file at +200 ms RTT in 212 ms, where streaming took 422 ms to the last chunk, and a 4 MiB file at +60 ms in 139 ms against 203 ms. It errs toward streaming: at +200 ms it still streams 4 MiB.
+- **`Connection::download_rate_hint()`**: the delivery rate, in bytes per second, that recent downloads on this connection measured, which `quick_read_limit` is built on. `None` until a download of two or more chunks has run, 30 seconds after the last measurement, and after a reconnect.
+
+### Changed
+
+- **A download's last chunk arrives one round trip sooner.** `FileDownload::next_chunk` used to wait for the CLOSE's answer before handing out the last chunk. Now it sends the CLOSE as the last chunk lands and returns the chunk right away: 64–68 ms sooner at +60 ms RTT, 202–210 ms sooner at +200 ms. The call after the last chunk collects the CLOSE's answer, so `None` still means the server has closed the handle, and a CLOSE error still arrives there as `Some(Err(_))`. A consumer that has every byte and doesn't need that confirmation can stop early (for example, when `bytes_received() == size()`): the handle gets closed either way.
+
+### Fixed
+
+- **A download dropped after its last chunk no longer leaks its file handle.** The CLOSE is already on the wire by then.
+- **A CLOSE that couldn't be sent no longer loses the last chunk.** The chunk's data is good, so it's handed out, and the error follows on the next call.
+- **A reconnect forgets the old connection's download rate**, like the rest of its state. The next download used to start its read-ahead window from a rate measured on the dead socket.
+
 ## [0.24.1] - 2026-09-23
 
 ### Fixed
