@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.1] - 2026-09-23
+
+### Fixed
+
+- **A login named `Guest` connects as guest again.** 0.25.0 refused a guest or anonymous session to every login that names an account, `Guest` included, so a consumer that signs in to guest shares as `Guest` (the long-standing way to ask for one) failed with `Error::Auth`. Now `Guest`, in any ASCII case, is a guest login on purpose, exactly like an empty username, which relaxes 0.25.0's breaking change for that one name. Keep using `Guest` if you did: some servers accept the named `Guest` login but refuse an anonymous (empty-username) one. Any other name answered as guest still fails, look-alikes such as `guest1` or `DOMAIN\Guest` included, and a `Guest` login the server answers with a full session (an enabled Windows `Guest` account) is verified like any other account.
+
 ## [0.25.0] - 2026-09-23
 
 ### Breaking
