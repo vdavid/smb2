@@ -1242,6 +1242,7 @@ fn sweep_connection(inner: &Inner) {
 }
 
 use crate::client::credits::{self, CreditPool, CreditReservation};
+use crate::client::read_ahead;
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
@@ -2763,6 +2764,75 @@ impl Connection {
         let hint = *self.inner.read_rate_hint.lock().unwrap();
         hint.filter(|(at, _)| at.elapsed() < READ_RATE_HINT_TTL)
             .map(|(_, rate)| rate)
+    }
+
+    /// How fast downloads on this connection have been moving data lately, in
+    /// bytes per second, or `None` when nothing recent was measured.
+    ///
+    /// Measured by streaming downloads ([`Tree::download`](crate::Tree::download)
+    /// and anything else built on [`FileDownload`](crate::FileDownload)), over
+    /// their last eight chunks, and shared by every clone of this connection.
+    /// What makes it `None`, and how far to trust it otherwise:
+    ///
+    /// - **Only a download of two or more chunks measures it.** One READ's
+    ///   rate is mostly its round trip, so small files and compound reads
+    ///   leave it untouched.
+    /// - **It expires 30 seconds after the last measurement.** A running
+    ///   download refreshes it with every chunk, so it only goes stale when
+    ///   the connection stops downloading. Long enough to span the gaps in a
+    ///   folder copy, short enough that a link that changed since (Wi-Fi
+    ///   roaming, a VPN coming up) is measured afresh.
+    /// - **A reconnect clears it**, since the new socket may run over a
+    ///   different path.
+    /// - **It errs low.** It's what one download achieved, not what the link
+    ///   could carry: a consumer that was slow to take chunks, several
+    ///   downloads sharing the connection, or a download too short to open its
+    ///   window all read lower than the link.
+    ///
+    /// To decide between one compound read and a streamed download, use
+    /// [`quick_read_limit`](Self::quick_read_limit), which is built on this.
+    #[must_use]
+    pub fn download_rate_hint(&self) -> Option<u64> {
+        self.read_rate_hint().map(|rate| rate as u64)
+    }
+
+    /// The largest file worth reading in one READ on this connection right
+    /// now, in bytes: the size cut-off between one compound
+    /// CREATE + READ + CLOSE and a streamed [`Tree::download`](crate::Tree::download).
+    ///
+    /// One READ costs a single round trip, but nothing else on the connection
+    /// moves while it arrives and it reports no progress. A streamed download
+    /// costs about two more round trips (CREATE and the first READ each wait
+    /// for an answer) and never blocks the connection for more than about a
+    /// chunk. So a file is worth one READ when the link moves it in about
+    /// 250 ms, the headroom the adaptive read-ahead window allows:
+    ///
+    /// - With a [`download_rate_hint`](Self::download_rate_hint), it's what the
+    ///   connection moves in 250 ms at that rate.
+    /// - Never less than one [`DOWNLOAD_CHUNK_SIZE`](crate::DOWNLOAD_CHUNK_SIZE)
+    ///   (512 KiB): up to one chunk, a download is one READ anyway, so the
+    ///   compound read is strictly cheaper. That's also the answer with no
+    ///   hint.
+    /// - Never more than the server's `MaxReadSize`, which bounds one READ.
+    ///   Before NEGOTIATE, assumes the 64 KiB every dialect allows.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(conn: &mut smb2::client::Connection, tree: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// let size: u64 = 3 * 1024 * 1024; // from a directory listing
+    /// let data = if size <= conn.quick_read_limit() {
+    ///     tree.read_file_compound_sized(conn, "photo.jpg", size).await?
+    /// } else {
+    ///     tree.download(conn, "photo.jpg").await?.collect().await?
+    /// };
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn quick_read_limit(&self) -> u64 {
+        let max_read = self.params().map_or(65536, |p| p.max_read_size);
+        read_ahead::quick_read_limit(self.read_rate_hint(), max_read)
     }
 
     /// Record a download's measured delivery rate for the next one.
@@ -4809,6 +4879,7 @@ impl Connection {
         *inner.session.lock().unwrap() = None;
         *inner.last_frame_at.lock().unwrap() = None;
         *inner.estimated_rtt.lock().unwrap() = None;
+        *inner.read_rate_hint.lock().unwrap() = None;
         inner.abandoned.lock().unwrap().clear();
         inner.dfs_trees.lock().unwrap().clear();
         *inner.ipc_tree.lock().unwrap() = None;

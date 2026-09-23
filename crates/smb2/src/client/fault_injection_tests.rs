@@ -1359,8 +1359,10 @@ async fn a_frame_built_for_the_dead_session_cannot_reach_the_new_socket() {
 /// Each of these has its own failure mode if it survives a revival: a stale
 /// credit window over-spends the new server's budget (the original 2026-07-31
 /// wedge), a stale message id makes the server drop the connection for a
-/// sequence gap, stale signing keys fail verification on every frame, and
-/// stale negotiated sizes chunk writes against a server that no longer exists.
+/// sequence gap, stale signing keys fail verification on every frame, stale
+/// negotiated sizes chunk writes against a server that no longer exists, and a
+/// stale download rate tells a consumer that one big READ is quick on a link
+/// that may have changed under the revival (Wi-Fi roaming, a VPN coming up).
 #[tokio::test]
 async fn a_revival_leaves_no_state_belonging_to_the_dead_session() {
     let nas = BouncingNas::new(Answer::Everything);
@@ -1374,6 +1376,7 @@ async fn a_revival_leaves_no_state_belonging_to_the_dead_session() {
         crate::crypto::signing::SigningAlgorithm::AesCmac,
     );
     staged.register_dfs_tree(TreeId(7));
+    conn.note_read_rate(50e6);
     assert!(finish(spawn_write(&conn), "the warm-up write")
         .await
         .is_ok());
@@ -1399,6 +1402,11 @@ async fn a_revival_leaves_no_state_belonging_to_the_dead_session() {
     assert!(
         conn.params().is_none(),
         "negotiated sizes belong to the server we were talking to, not this one"
+    );
+    assert_eq!(
+        conn.read_rate_hint(),
+        None,
+        "the dead link's download rate describes a socket that's gone"
     );
     let d = conn.diagnostics();
     assert!(

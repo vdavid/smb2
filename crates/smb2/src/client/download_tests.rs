@@ -1,5 +1,6 @@
 //! `FileDownload` against a mock server: delivery order, short reads, EOF,
-//! errors, the window bound, cancel safety, and the adaptive window's timing.
+//! errors, the window bound, cancel safety, closing, the adaptive window's
+//! timing, and the rate hint a download leaves on its connection.
 //!
 //! The mock answers READs in the order they were sent (FIFO pairing), so a
 //! test controls what each READ gets by the order it queues responses. Tests
@@ -487,4 +488,69 @@ async fn the_next_download_on_a_connection_starts_with_the_window_the_last_one_m
     let first = tokio::time::timeout(Duration::from_millis(50), second.next_chunk()).await;
     assert!(first.is_err());
     assert_eq!(sent_reads(&mock).len(), 6);
+}
+
+// ── The connection's rate hint ─────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn the_rate_hint_sets_the_quick_read_limit_until_it_expires() {
+    let mock = Arc::new(MockTransport::new());
+    let conn = setup_connection_with_max_read(&mock, 8 << 20);
+    assert_eq!(conn.download_rate_hint(), None);
+    assert_eq!(conn.quick_read_limit(), 512 * 1024, "no hint: one chunk");
+
+    conn.note_read_rate(16e6);
+    assert_eq!(conn.download_rate_hint(), Some(16_000_000));
+    assert_eq!(conn.quick_read_limit(), 4_000_000, "250 ms at 16 MB/s");
+
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(conn.download_rate_hint(), Some(16_000_000));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        conn.download_rate_hint(),
+        None,
+        "30 s without a measurement"
+    );
+    assert_eq!(conn.quick_read_limit(), 512 * 1024);
+}
+
+#[tokio::test]
+async fn the_quick_read_limit_stays_within_max_read_size() {
+    let mock = Arc::new(MockTransport::new());
+    let conn = setup_connection(&mock);
+    conn.note_read_rate(1e9);
+    assert_eq!(
+        conn.quick_read_limit(),
+        65536,
+        "one READ carries at most this"
+    );
+}
+
+#[tokio::test]
+async fn only_a_multi_chunk_download_leaves_a_rate_hint() {
+    let mock = Arc::new(MockTransport::new());
+    mock.queue_response(build_read_response(chunk_of(1)));
+    mock.queue_response(build_close_response());
+    for i in 1..=4u8 {
+        mock.queue_response(build_read_response(chunk_of(i)));
+    }
+    mock.queue_response(build_close_response());
+    let mut conn = setup_connection(&mock);
+    let tree = test_tree();
+
+    FileDownload::new(&tree, &mut conn, test_file_id(), 65536, CHUNK)
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        conn.download_rate_hint(),
+        None,
+        "one READ's rate is mostly its round trip"
+    );
+
+    FileDownload::new(&tree, &mut conn, test_file_id(), 4 * 65536, CHUNK)
+        .collect()
+        .await
+        .unwrap();
+    assert!(conn.download_rate_hint().is_some());
 }

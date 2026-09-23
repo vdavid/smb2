@@ -148,6 +148,17 @@ pub(crate) enum Dispatch {
     AfterHead,
 }
 
+/// The largest read worth making as one READ: what the link moves in
+/// [`ADAPTIVE_HEADROOM`] at `rate` bytes/s, never less than one download chunk
+/// and never more than `max_read`. Behind
+/// [`Connection::quick_read_limit`](crate::client::Connection::quick_read_limit),
+/// which documents the reasoning.
+pub(crate) fn quick_read_limit(rate: Option<f64>, max_read: u32) -> u64 {
+    let one_chunk = u64::from(DOWNLOAD_CHUNK_SIZE);
+    let in_headroom = rate.map_or(0, |rate| (rate * ADAPTIVE_HEADROOM.as_secs_f64()) as u64);
+    one_chunk.max(in_headroom).min(u64::from(max_read))
+}
+
 /// What the connection already knows about the link when a download starts.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LinkHint {
@@ -708,5 +719,33 @@ mod tests {
     fn a_chunk_bigger_than_the_cap_still_gets_one_read() {
         let w = Window::new(ReadAhead::Adaptive, 8 << 20, LinkHint::default());
         assert_eq!(w.decide(Instant::now(), 0, 0, 8 << 20), Dispatch::Now);
+    }
+
+    // ── quick_read_limit ───────────────────────────────────────────────
+
+    const EIGHT_MIB: u32 = 8 << 20;
+
+    #[test]
+    fn with_no_rate_one_chunk_is_quick() {
+        assert_eq!(quick_read_limit(None, EIGHT_MIB), u64::from(CHUNK));
+    }
+
+    #[test]
+    fn a_fast_link_makes_what_it_moves_in_the_headroom_quick() {
+        // 16 MB/s moves 4 MB in 250 ms.
+        assert_eq!(quick_read_limit(Some(16e6), EIGHT_MIB), 4_000_000);
+    }
+
+    #[test]
+    fn a_slow_link_still_reads_one_chunk_in_one_go() {
+        // 375 KB/s moves 94 KB in 250 ms, but one chunk is one READ either way.
+        assert_eq!(quick_read_limit(Some(375e3), EIGHT_MIB), u64::from(CHUNK));
+    }
+
+    #[test]
+    fn one_read_never_asks_for_more_than_max_read_size() {
+        assert_eq!(quick_read_limit(Some(1e9), EIGHT_MIB), u64::from(EIGHT_MIB));
+        assert_eq!(quick_read_limit(None, 65536), 65536);
+        assert_eq!(quick_read_limit(Some(16e6), 65536), 65536);
     }
 }
