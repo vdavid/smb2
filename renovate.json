@@ -28,6 +28,17 @@
       "groupName": null
     },
     {
+      "description": "aes 0.9.3 needs rustc 1.89 and our MSRV is 1.85, so crates/smb2/Cargo.toml caps it below 0.9.3. Lift this rule together with that cap when the MSRV moves to 1.89+.",
+      "matchPackageNames": ["aes"],
+      "allowedVersions": "<0.9.3"
+    },
+    {
+      "description": "The MSRV CI job pins the oldest toolchain we support on purpose; bumping it would stop checking the MSRV at all. Move it by hand together with rust-version in Cargo.toml.",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["rust"],
+      "enabled": false
+    },
+    {
       "description": "The SMB benchmark harness is excluded from the workspace because sspi pins digest =0.11.0-rc.5, which conflicts with digest 0.11.2. Independent bumps there can never resolve.",
       "matchFileNames": ["benchmarks/smb/**"],
       "enabled": false
