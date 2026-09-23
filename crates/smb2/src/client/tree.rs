@@ -1725,14 +1725,16 @@ impl Tree {
         ))
     }
 
-    /// Write a file using pipelined I/O with a sliding window.
+    /// Write a file using pipelined I/O.
     ///
-    /// Opens/creates the file, then uses a sliding window to keep the pipe
-    /// full: as each response arrives, the next request is sent immediately.
-    /// Flushes to ensure data is persisted on the server. Much faster than
-    /// sequential [`write_file`](Self::write_file) for large data.
-    ///
-    /// Uses MaxWriteSize chunks to minimize overhead for large payloads.
+    /// Opens/creates the file, then streams it in
+    /// [`UPLOAD_CHUNK_SIZE`](crate::UPLOAD_CHUNK_SIZE) WRITEs (512 KiB, or
+    /// `MaxWriteSize` if that's smaller) with the adaptive write-behind window
+    /// ([`WriteBehind::Adaptive`](crate::WriteBehind::Adaptive)): full speed on
+    /// a fast link, and about one chunk queued ahead of anything else on the
+    /// connection on a slow one. Flushes to ensure data is persisted on the
+    /// server. For a file that fits one frame, [`write_file`](Self::write_file)
+    /// costs one round trip instead.
     pub async fn write_file_pipelined(
         &self,
         conn: &mut Connection,
@@ -1862,10 +1864,11 @@ impl Tree {
     ///
     /// # Performance
     ///
-    /// Uses a sliding window of up to 32 in-flight WRITE requests (same
-    /// approach as [`write_file_pipelined`](Self::write_file_pipelined)),
-    /// so throughput stays high even on high-latency links. Memory usage
-    /// is bounded to the sliding window, not the full file size.
+    /// Paces its WRITEs like [`write_file_pipelined`](Self::write_file_pipelined):
+    /// 512 KiB chunks and the adaptive write-behind window, so throughput stays
+    /// high on a high-latency link and a slow one isn't flooded. Memory is
+    /// bounded by that window (at most 4 MiB in flight) plus one callback
+    /// chunk, not by the file size.
     ///
     /// # When to use which write method
     ///
@@ -5643,9 +5646,9 @@ mod tests {
     #[tokio::test]
     async fn a_write_budget_below_the_pipeline_window_bounds_a_pipelined_write() {
         // 512 KB = 8 chunks of 64 KB, against a budget that holds exactly one.
-        // `MAX_PIPELINE_WINDOW` would keep all 8 outstanding; the budget is the
-        // only thing that can say otherwise, and it has to do it without the
-        // writer parking on budget that its own unpolled frames are holding.
+        // On a link this fast the window would keep all 8 outstanding; the
+        // budget is the only thing that can say otherwise, and it has to do it
+        // without the writer parking on budget its own frames are holding.
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId {
             persistent: 0xF00,
@@ -5750,7 +5753,7 @@ mod tests {
             let req = WriteRequest::unpack(&mut cursor).unwrap();
             assert_eq!(
                 req.offset, expected_offset,
-                "a stashed chunk must go out next, at its own offset"
+                "a chunk held back for budget must go out next, at its own offset"
             );
             assert_eq!(req.data.len(), *size);
             expected_offset += *size as u64;

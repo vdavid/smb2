@@ -997,6 +997,70 @@ async fn guest_write_cancel_midway() {
         .expect("disconnect failed");
 }
 
+/// A `FileWriter` against a real Samba writes 512 KiB WRITEs by default,
+/// leaves the upload rate it measured on the connection, and
+/// `quick_write_limit` follows it within `compound_write_limit`.
+#[tokio::test]
+#[ignore]
+async fn guest_a_writer_paces_and_leaves_an_upload_rate() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    assert_eq!(client.connection().upload_rate_hint(), None);
+    let cold_limit = client.connection().quick_write_limit();
+    assert!(cold_limit <= client.connection().compound_write_limit());
+
+    let test_path = "docker_test_paced_upload.tmp";
+    let test_data: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 241) as u8).collect();
+    let mut writer = client
+        .create_file_writer(&tree, test_path)
+        .await
+        .expect("create_file_writer failed");
+    assert_eq!(writer.write_behind(), smb2::WriteBehind::Adaptive);
+    assert_eq!(
+        writer.chunk_size(),
+        smb2::UPLOAD_CHUNK_SIZE.min(client.params().unwrap().max_write_size)
+    );
+    for piece in test_data.chunks(1024 * 1024) {
+        writer.write_chunk(piece).await.expect("write_chunk failed");
+    }
+    assert!(writer.peak_in_flight_bytes() <= 4 * 1024 * 1024);
+    let written = writer.finish().await.expect("finish failed");
+    assert_eq!(written, test_data.len() as u64);
+
+    let conn = client.connection();
+    assert!(
+        conn.upload_rate_hint().is_some(),
+        "16 WRITEs measure a rate"
+    );
+    assert_eq!(
+        conn.download_rate_hint(),
+        None,
+        "an upload measures one direction"
+    );
+    assert!(conn.quick_write_limit() >= cold_limit.min(u64::from(smb2::UPLOAD_CHUNK_SIZE)));
+    assert!(conn.quick_write_limit() <= conn.compound_write_limit());
+
+    let readback = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(readback, test_data);
+
+    client
+        .delete_file(&mut tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
 // ── fs_info (smb-guest) ──────────────────────────────────────────────
 
 #[tokio::test]

@@ -1,8 +1,10 @@
-# Read-ahead benchmark for `FileDownload`
+# Read-ahead benchmark for `FileDownload`, and its upload twin
 
 The evidence behind `Tree::download`'s default since 0.24.0: 512 KiB chunks and an adaptive read-ahead window
 (`crates/smb2/src/client/read_ahead.rs`). Measures `FileDownload` with different chunk sizes and read-ahead policies
-against a local Samba in Docker, with latency and bandwidth injected by `tc netem` on the container's egress.
+against a local Samba in Docker, with latency and bandwidth injected by `tc netem` on the container's egress. With
+`DIRECTION=up` it measures uploads instead (the evidence behind 0.25.0's adaptive write-behind window,
+`crates/smb2/src/client/write_behind.rs`); see *Uploads* below.
 
 - `./run.sh OUT.csv [runs] [links] [writers]`: builds and starts the container (published on `127.0.0.1:17445`,
   override with `SMB_BENCH_PORT`), writes random test files (the default sizes plus any in `SIZES`), then for each link runs every size × variant with no load
@@ -25,6 +27,24 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
   download, and (8 MiB+ files) the latency of a `stat` right after dropping a download at 25%.
 - Every run's bytes are checksummed and compared across variants, so a wrong read fails the run.
 
+## Uploads
+
+- `DIRECTION=up ./run.sh OUT.csv [runs] [links] [writers]`: the same matrix, but it runs `read-ahead-bench upload` and
+  shapes the container's INGRESS (the client-to-server direction an upload's payload takes), redirected through an ifb
+  device because `netem` only shapes what leaves an interface, with a deep queue (`limit 100000`) so a slow uplink
+  queues instead of dropping. The downlink stays unshaped. `BIN=path/to/read-ahead-bench` runs a prebuilt binary, for
+  example one built against an older smb2 from crates.io in a copy of this directory, to measure the "before".
+- `./target/release/read-ahead-bench summarize-upload OUT.csv`: median tables.
+- Variants: `default` (`FileWriter` as the build under test ships it), `wb<KiB>x<W>` (a fixed window of W WRITEs of
+  that size; `wbmaxx32` is `MaxWriteSize` × 32, the pre-0.25 shape), `compound` (`write_file_compound`, skipped above
+  `compound_write_limit`), and `auto` (`compound` when the file fits `Connection::quick_write_limit`, `default`
+  otherwise).
+- Per run: wall time from CREATE to the CLOSE's answer, WRITE count, peak bytes unconfirmed, the p50/max latency of a
+  `stat` every 20 ms on a clone of the same connection, and (8 MiB+) how long a cancel takes: push a quarter, `abort()`,
+  then a `stat`. Every upload is read back and compared.
+- Background writers on a shaped uplink fill the shared link queue from other connections, which no per-connection
+  window can bound (the side `stat` times out), so use `LOADS=0` on rate-capped links.
+
 Against a real NAS (from a machine that can reach it): `SMB_BENCH_SHARE=<share> SMB_BENCH_USER=<user>
 SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>:445 --rtt-ms real --load-writers 0
 --runs 3 --out nas.csv`. `--prep` uploads the test files to `bench/` (the `stat` probe needs `bench/f_65536.bin`);
@@ -38,3 +58,5 @@ SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>
 - `adaptive.md`: the adaptive default against the fixed windows on the key links, 2026-09-23.
 - `close-and-quick-read.md`: the last chunk no longer waiting for the CLOSE (0.24.2), and `auto` against `compound` and
   `adaptive` at +60 and +200 ms, 2026-09-23.
+- `adaptive-uploads.md`: the adaptive write-behind window (0.25.0) against 0.24.4's fixed 32-WRITE window, fixed
+  512 KiB windows, and the compound write with and without `quick_write_limit`, on shaped uplinks, 2026-09-23.

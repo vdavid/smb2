@@ -49,7 +49,7 @@ impl Variant {
         // `wb<KiB>x<W>`: a fixed window of W WRITEs of that size; `wbmaxx<W>`
         // uses the server's MaxWriteSize.
         let rest = s.strip_prefix("wb").expect("variant: default | compound | auto | wb<KiB|max>x<W>");
-        let (k, w) = rest.split_once('x').unwrap();
+        let (k, w) = rest.rsplit_once('x').unwrap();
         let chunk = if k == "max" { u32::MAX } else { k.parse::<u32>().unwrap() * 1024 };
         Variant { put: Put::Stream, chunk: Some(chunk), window: Some(w.parse().unwrap()) }
     }

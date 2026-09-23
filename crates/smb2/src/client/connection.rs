@@ -314,14 +314,16 @@ const WRITE_BUDGET_UNIT: u64 = 64 * 1024;
 /// connection at once — launched but not yet acknowledged — until a consumer
 /// says otherwise with [`Connection::set_write_budget`].
 ///
-/// This is the bound that `MAX_PIPELINE_WINDOW` alone cannot give. That window
-/// caps one stream at 32 frames; it says nothing about how many streams there
-/// are, so N concurrent uploads multiply it. A file manager copying 10 files at
-/// once over a 1 MiB `MaxWriteSize` reaches 320 MiB of payload queued in this
-/// process, and every byte of it is latency the consumer pays for: on a
-/// 6.7 MB/s link that is ~48 s between handing a chunk over and it reaching the
-/// socket (a 2026-08-26 Cmdr report, measured on the user's own link). Cancel
-/// waits it out, progress reporting runs ahead of it, and the memory is real.
+/// This is the bound a per-upload window alone cannot give. Each upload's
+/// write-behind window (`write_behind.rs`, at most 4 MiB) says nothing about
+/// how many uploads there are, so N concurrent ones multiply it. When that
+/// window was a fixed 32 frames, a file manager copying 10 files at once over
+/// a 1 MiB `MaxWriteSize` reached 320 MiB of payload queued in this process,
+/// and every byte of it was latency the consumer paid for: on a 6.7 MB/s link,
+/// ~48 s between handing a chunk over and it reaching the socket (a 2026-08-26
+/// Cmdr report, measured on the user's own link). Cancel waits it out,
+/// progress reporting runs ahead of it, and the memory is real. A fixed
+/// [`WriteBehind`](crate::WriteBehind) window can still get there.
 ///
 /// 32 MiB, chosen against both ends rather than either:
 ///
@@ -421,10 +423,9 @@ where
 
 /// How many frames may be queued for the writer task before callers block.
 ///
-/// Backpressure, not a buffer: the pipelined loops already cap themselves at
-/// `MAX_PIPELINE_WINDOW` per stream, so this only bites when many streams
-/// pile on at once, and blocking there is better than growing an unbounded
-/// queue of `MaxWriteSize` frames.
+/// Backpressure, not a buffer: each transfer already caps itself with its own
+/// window, so this only bites when many streams pile on at once, and blocking
+/// there is better than growing an unbounded queue of `MaxWriteSize` frames.
 const WRITE_QUEUE_DEPTH: usize = 256;
 
 /// How many abandoned MessageIds to remember for response classification.
@@ -3086,6 +3087,7 @@ impl Connection {
     ///
     /// The size cut-offs this crate hands out already account for it:
     /// [`quick_read_limit`](Self::quick_read_limit),
+    /// [`quick_write_limit`](Self::quick_write_limit),
     /// [`compound_write_limit`](Self::compound_write_limit), and
     /// [`credit_capacity_for`](Self::credit_capacity_for). So do the chunks
     /// every chunked transfer sends.
@@ -4559,13 +4561,14 @@ impl Connection {
     /// connection at once: handed to the crate but not yet acknowledged by the
     /// server.
     ///
-    /// Defaults to 32 MiB. This is the bound `MAX_PIPELINE_WINDOW` cannot give:
-    /// that window caps ONE stream at 32 frames and says nothing about how many
-    /// streams share the connection, so N concurrent uploads multiply it. Ten
-    /// files at a 1 MiB `MaxWriteSize` reach 320 MiB queued in-process, which on
-    /// a 6.7 MB/s link is ~48 s between handing a chunk over and it reaching the
-    /// socket. The consumer pays that in cancel latency, in progress reporting
-    /// that runs ahead of reality, and in plain memory.
+    /// Defaults to 32 MiB. This is the bound a per-upload window cannot give:
+    /// the [`WriteBehind`](crate::WriteBehind) window caps ONE upload and says
+    /// nothing about how many share the connection, so N concurrent uploads
+    /// multiply it. Ten files each keeping 32 WRITEs of a 1 MiB `MaxWriteSize`
+    /// in flight reach 320 MiB queued in-process, which on a 6.7 MB/s link is
+    /// ~48 s between handing a chunk over and it reaching the socket. The
+    /// consumer pays that in cancel latency, in progress reporting that runs
+    /// ahead of reality, and in plain memory.
     ///
     /// The default is sized for a LAN, so move it when your link or your host
     /// is not one:
@@ -6520,7 +6523,7 @@ mod tests {
     #[test]
     fn the_write_budget_is_smaller_than_one_multiplied_pipeline() {
         // The field case this exists for: ten concurrent files, each pipelining
-        // `MAX_PIPELINE_WINDOW` frames at a 1 MiB `MaxWriteSize`, is 320 MiB of
+        // 32 frames at a 1 MiB `MaxWriteSize`, is 320 MiB of
         // payload queued in this process (a 2026-08-26 Cmdr report). The budget
         // has to be a long way under that or it bounds nothing in practice.
         let multiplied = 10 * 32 * 1024 * 1024u64;

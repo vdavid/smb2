@@ -39,6 +39,18 @@
 //! behind them. The adaptive window keeps about `rate × (RTT + 250 ms)` in
 //! flight instead: at least one WRITE, at most
 //! [`ADAPTIVE_MAX_IN_FLIGHT`](crate::client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT).
+//!
+//! Measured against Samba with the uplink shaped (`benchmarks/read-ahead/`,
+//! `results/adaptive-uploads.md`, 2026-09-23), an 8 MiB upload against 0.24:
+//!
+//! - **375 KB/s at +60 ms**: a `stat` on the same connection waits 1.5 s at
+//!   most, down from 23.4 s, and a cancel is answered in 2.0 s, down from
+//!   6.1 s. Same wall time.
+//! - **3 MB/s at +20 ms**: a `stat` waits 370 ms at most, down from 2.9 s.
+//! - **Fast links** keep their throughput: 100 MiB unshaped at 793 MB/s
+//!   (0.24: 637), at +60 ms 45.6 MB/s (49.7), at +200 ms 16.0 MB/s (16.6),
+//!   while the worst `stat` at +200 ms drops from 1.8 s to 416 ms. Doubling the
+//!   cap to 8 MiB bought 2.5% at +200 ms for 50% more queue.
 
 use crate::client::read_ahead::{quick_limit, Pacing};
 
