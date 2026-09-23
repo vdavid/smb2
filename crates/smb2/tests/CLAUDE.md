@@ -183,13 +183,22 @@ For Kerberos end-to-end testing, we use AWS EC2 to spin up a Windows Server with
 - **Profile:** `smb2-agent` (configured in `~/.aws/credentials`)
 - **Region:** `eu-north-1`
 - **IAM user:** `smb2-agent` (account 791732162721)
-- **Permissions:** EC2 lifecycle (run/terminate/describe instances, security groups, key pairs), SSM parameter reads. Scoped to eu-north-1 only.
+- **Permissions:** EC2 lifecycle (run/terminate/describe instances, security groups, key pairs), SSM parameter reads. Scoped to eu-north-1 only. ❌ No `GetConsoleOutput`, no SSM `SendCommand`, no `ModifyInstanceAttribute`: you can't see inside the instance or change its security group after launch, so pass the right `--security-group-ids` at `run-instances`.
 
 **Usage:** Always pass `AWS_PROFILE=smb2-agent` or `--profile smb2-agent` for all AWS CLI calls.
 
-**Important:** Terminate instances when testing is done. David has billing guards but don't leave things running.
+**Important:** Terminate instances when testing is done, then delete the security group. David has billing guards but don't leave things running.
 
-**Test:** `kerberos_auth_against_aws_windows_ad` in `integration.rs` -- connects to a Windows AD DC, authenticates via Kerberos (AS + TGS + AP-REQ), establishes an SMB session, writes and reads a file. Requires env vars: `SMB2_TEST_AWS_AD_IP`, `SMB2_TEST_AWS_AD_HOSTNAME`, and optionally `SMB2_TEST_AWS_AD_SPN`. Tested successfully against Windows Server 2022 with AD DS (2026-04-09).
+**Test:** `kerberos_auth_against_aws_windows_ad` in `integration.rs` -- connects to a Windows AD DC, authenticates via Kerberos (AS + TGS + AP-REQ), establishes an SMB session, writes and reads a file. Requires env vars: `SMB2_TEST_AWS_AD_IP`, `SMB2_TEST_AWS_AD_HOSTNAME` (`SMB2DC` with the script below), and optionally `SMB2_TEST_AWS_AD_SPN`. Passed against Windows Server 2022 AD DS on 2026-09-23, through the final-SESSION_SETUP verification.
+
+**Bringing up the DC, unattended (~6 min):** `tests/aws/windows-ad-dc.ps1` is EC2 user data that renames the machine to `SMB2DC`, promotes it to a DC for `TEST.LOCAL`, and creates `smbtest` / `Kerberos!Test1` plus the `testshare` share.
+
+1. Create a security group allowing TCP 445 and TCP+UDP 88 from your public IP only (`curl -s https://checkip.amazonaws.com`). Descriptions reject apostrophes.
+2. `aws ec2 run-instances --image-id $(aws ssm get-parameter --name /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base --query Parameter.Value --output text) --instance-type t3.medium --security-group-ids <sg> --user-data file://crates/smb2/tests/aws/windows-ad-dc.ps1 --associate-public-ip-address --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=smb2-kerberos-test}]'`
+3. Watch progress with `smb2 cat //<ip>/C$/smb2setup/log.txt -u Administrator` (password `Smb2Admin!2026`, set by the script every boot for exactly this). Ready at `stage2: done`.
+4. Run the test, then terminate the instance and delete the security group.
+
+Gotcha/Why: each reboot in the script is `exit 3010`, never `Restart-Computer`. EC2Launch v2 re-runs user data after a reboot only when the script itself asked for it with 3010; `Restart-Computer` ended the script for good after the rename, and the DC never got promoted (two blind attempts, 2026-09-23).
 
 ## Writing new tests
 

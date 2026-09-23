@@ -1942,12 +1942,14 @@ async fn kerberos_auth_against_docker_kdc() {
     // today: the Docker AD DC was abandoned because Samba's AD DC does not run
     // on macOS (`tests/CLAUDE.md` § AWS integration tests), leaving
     // `smb-kerberos/Dockerfile` orphaned. So this skips rather than fails, and
-    // starts working again the day a service is wired back up.
+    // starts working again the day a service is wired back up. ❌ Don't reuse a
+    // port the compose set serves: this probe would then reach a plain Samba
+    // (10462 is `smb-smallcredits`) and fail Kerberos instead of skipping.
     let mut conn = skip_unless!(
-        Connection::connect("127.0.0.1:10462", Duration::from_secs(5))
+        Connection::connect("127.0.0.1:10463", Duration::from_secs(5))
             .await
             .ok(),
-        "no Kerberos-capable Samba on 127.0.0.1:10462 — the Docker AD DC is not part of the \
+        "no Kerberos-capable Samba on 127.0.0.1:10463 — the Docker AD DC is not part of the \
          compose set; Kerberos is covered against real AD by the AWS tests below"
     );
 
