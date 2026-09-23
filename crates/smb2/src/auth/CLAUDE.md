@@ -100,7 +100,7 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **Target info modification (NTLM)**: The client modifies the server's target info before including it in the client blob.
 - **TGS-REP key usage ambiguity (Kerberos)**: RFC 4120 says key usage 8 for TGS-REP encrypted with session key, but some KDCs use 9. The authenticator tries 8 first, falls back to 9.
 - **KDC_ERR_PREAUTH_REQUIRED handling (Kerberos)**: First AS-REQ without pre-auth gets error 25. The authenticator extracts supported etypes from the e-data (ETYPE-INFO2) and retries with pre-authentication.
-- **DER primitives in `auth::der`**: Core DER encoding/decoding helpers (`der_length`, `der_tlv`, `parse_der_length`, `parse_der_tlv`) live in `auth/der.rs` and are shared by `spnego.rs` and `kerberos/messages.rs`. Type-specific helpers (INTEGER, GeneralString, etc.) stay in their respective modules.
+- **DER primitives in `auth::der`**: Core DER encoding/decoding helpers (`der_length`, `der_tlv`, `parse_der_length`, `parse_der_tlv`) live in `auth/der.rs` and are shared by `spnego.rs`, `kerberos/messages.rs`, and `kerberos/authenticator.rs`. ❌ Don't add a local copy: `authenticator.rs` had one that capped lengths at 64 KiB, and a large-AD AP-REQ (big PAC) passes that (#6). `der_length` encodes any length in minimal long form, and `parse_der_length` reads up to `0x84`. Type-specific helpers (INTEGER, GeneralString, etc.) stay in their respective modules.
 
 ## Kerberos key design decisions (from end-to-end testing)
 

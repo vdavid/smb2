@@ -13,6 +13,7 @@
 use log::{debug, trace};
 use std::time::Duration;
 
+use crate::auth::der::{der_tlv, parse_der_tlv};
 use crate::auth::kerberos::crypto::{
     compute_checksum, etype_from_i32, kerberos_decrypt, kerberos_encrypt, string_to_key_aes,
     string_to_key_rc4, EncryptionType,
@@ -672,34 +673,7 @@ impl KerberosAuthenticator {
 
         let ap_req = encode_ap_req(&service_ticket, &authenticator_enc_data, true);
 
-        // Wrap the AP-REQ in a Kerberos GSS-API initial context token
-        // (RFC 1964): APPLICATION [0] { OID, 0x0100, AP-REQ }.
-        // Windows SPNEGO expects this wrapping in the NegTokenInit mechToken.
-        let gss_mech_token = {
-            // Standard Kerberos OID 1.2.840.113554.1.2.2 (for GSS inner token)
-            let oid_bytes: &[u8] = &OID_KERBEROS[2..]; // skip tag+length
-            let mut inner = Vec::new();
-            inner.push(0x06); // OID tag
-            inner.push(oid_bytes.len() as u8);
-            inner.extend_from_slice(oid_bytes);
-            inner.extend_from_slice(&[0x01, 0x00]); // KRB_AP_REQ token ID
-            inner.extend_from_slice(&ap_req);
-
-            let mut token = Vec::new();
-            token.push(0x60); // APPLICATION [0]
-            if inner.len() < 128 {
-                token.push(inner.len() as u8);
-            } else if inner.len() < 256 {
-                token.push(0x81);
-                token.push(inner.len() as u8);
-            } else {
-                token.push(0x82);
-                token.push((inner.len() >> 8) as u8);
-                token.push((inner.len() & 0xff) as u8);
-            }
-            token.extend_from_slice(&inner);
-            token
-        };
+        let gss_mech_token = wrap_gss_ap_req(&ap_req);
 
         // Wrap in SPNEGO NegTokenInit with MS Kerberos OID.
         let spnego_token = wrap_neg_token_init(&[OID_MS_KERBEROS], &gss_mech_token);
@@ -893,7 +867,7 @@ fn encode_pa_pac_request(include_pac: bool) -> Vec<u8> {
 
 /// Parse METHOD-DATA (SEQUENCE OF PA-DATA) from a KRB-ERROR's e-data.
 fn parse_method_data(data: &[u8]) -> Result<Vec<PaData>> {
-    let (tag, seq_data, _) = parse_der_tlv_local(data)?;
+    let (tag, seq_data, _) = parse_der_tlv(data)?;
     if tag != 0x30 {
         return Err(Error::invalid_data(format!(
             "Kerberos: expected SEQUENCE for METHOD-DATA, got 0x{tag:02x}"
@@ -903,7 +877,7 @@ fn parse_method_data(data: &[u8]) -> Result<Vec<PaData>> {
     let mut entries = Vec::new();
     let mut pos = 0;
     while pos < seq_data.len() {
-        let (entry_tag, entry_data, consumed) = parse_der_tlv_local(&seq_data[pos..])?;
+        let (entry_tag, entry_data, consumed) = parse_der_tlv(&seq_data[pos..])?;
         if entry_tag == 0x30 {
             // PA-DATA SEQUENCE
             let fields = parse_sequence_fields_local(entry_data)?;
@@ -933,7 +907,7 @@ fn parse_method_data(data: &[u8]) -> Result<Vec<PaData>> {
 ///
 /// Returns the first etype we support, preferring AES-256 > AES-128 > RC4.
 fn parse_etype_info2_best(data: &[u8]) -> Option<EncryptionType> {
-    let (tag, seq_data, _) = parse_der_tlv_local(data).ok()?;
+    let (tag, seq_data, _) = parse_der_tlv(data).ok()?;
     if tag != 0x30 {
         return None;
     }
@@ -942,7 +916,7 @@ fn parse_etype_info2_best(data: &[u8]) -> Option<EncryptionType> {
 
     let mut pos = 0;
     while pos < seq_data.len() {
-        let (entry_tag, entry_data, consumed) = parse_der_tlv_local(&seq_data[pos..]).ok()?;
+        let (entry_tag, entry_data, consumed) = parse_der_tlv(&seq_data[pos..]).ok()?;
         if entry_tag == 0x30 {
             let fields = parse_sequence_fields_local(entry_data).ok()?;
             for (ftag, fvalue) in &fields {
@@ -979,56 +953,12 @@ fn parse_etype_info2_best(data: &[u8]) -> Option<EncryptionType> {
 // Minimal DER helpers (local, to avoid depending on messages.rs internals)
 // =========================================================================
 
-/// Parse a DER TLV, returning `(tag, value_slice, total_bytes_consumed)`.
-fn parse_der_tlv_local(data: &[u8]) -> Result<(u8, &[u8], usize)> {
-    if data.is_empty() {
-        return Err(Error::invalid_data("Kerberos: truncated DER TLV"));
-    }
-    let tag = data[0];
-    let (len, len_bytes) = parse_der_length_local(&data[1..])?;
-    let header_len = 1 + len_bytes;
-    let total = header_len + len;
-    if data.len() < total {
-        return Err(Error::invalid_data(format!(
-            "Kerberos: DER TLV truncated: need {total} bytes, have {}",
-            data.len()
-        )));
-    }
-    Ok((tag, &data[header_len..total], total))
-}
-
-/// Parse a DER length field.
-fn parse_der_length_local(data: &[u8]) -> Result<(usize, usize)> {
-    if data.is_empty() {
-        return Err(Error::invalid_data("Kerberos: truncated DER length"));
-    }
-    let first = data[0];
-    if first < 128 {
-        Ok((first as usize, 1))
-    } else if first == 0x81 {
-        if data.len() < 2 {
-            return Err(Error::invalid_data("Kerberos: truncated DER length (0x81)"));
-        }
-        Ok((data[1] as usize, 2))
-    } else if first == 0x82 {
-        if data.len() < 3 {
-            return Err(Error::invalid_data("Kerberos: truncated DER length (0x82)"));
-        }
-        let len = ((data[1] as usize) << 8) | (data[2] as usize);
-        Ok((len, 3))
-    } else {
-        Err(Error::invalid_data(format!(
-            "Kerberos: unsupported DER length encoding: 0x{first:02x}"
-        )))
-    }
-}
-
 /// Parse all TLV elements in a SEQUENCE body.
 fn parse_sequence_fields_local(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
     let mut fields = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
-        let (tag, value, consumed) = parse_der_tlv_local(&data[pos..])?;
+        let (tag, value, consumed) = parse_der_tlv(&data[pos..])?;
         fields.push((tag, value.to_vec()));
         pos += consumed;
     }
@@ -1037,7 +967,7 @@ fn parse_sequence_fields_local(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
 
 /// Parse a DER INTEGER TLV, returning i32.
 fn parse_der_integer_local(data: &[u8]) -> Result<i32> {
-    let (tag, value, _) = parse_der_tlv_local(data)?;
+    let (tag, value, _) = parse_der_tlv(data)?;
     if tag != 0x02 {
         return Err(Error::invalid_data(format!(
             "Kerberos: expected INTEGER (0x02), got 0x{tag:02x}"
@@ -1056,7 +986,7 @@ fn parse_der_integer_local(data: &[u8]) -> Result<i32> {
 
 /// Parse a DER OCTET STRING TLV, returning the raw bytes.
 fn parse_der_octet_string_local(data: &[u8]) -> Result<Vec<u8>> {
-    let (tag, value, _) = parse_der_tlv_local(data)?;
+    let (tag, value, _) = parse_der_tlv(data)?;
     if tag != 0x04 {
         return Err(Error::invalid_data(format!(
             "Kerberos: expected OCTET STRING (0x04), got 0x{tag:02x}"
@@ -1069,23 +999,20 @@ fn parse_der_octet_string_local(data: &[u8]) -> Result<Vec<u8>> {
 // DER encoding helpers
 // =========================================================================
 
-/// Encode a DER length field.
-fn der_length(len: usize) -> Vec<u8> {
-    if len < 128 {
-        vec![len as u8]
-    } else if len < 256 {
-        vec![0x81, len as u8]
-    } else {
-        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
-    }
-}
+/// Wrap an AP-REQ in a Kerberos GSS-API initial context token (RFC 1964):
+/// APPLICATION [0] { OID, 0x0100, AP-REQ }. Windows SPNEGO expects this
+/// wrapping in the NegTokenInit mechToken.
+fn wrap_gss_ap_req(ap_req: &[u8]) -> Vec<u8> {
+    // Standard Kerberos OID 1.2.840.113554.1.2.2 (for GSS inner token)
+    let oid_bytes: &[u8] = &OID_KERBEROS[2..]; // skip tag+length
+    let mut inner = Vec::new();
+    inner.push(0x06); // OID tag
+    inner.push(oid_bytes.len() as u8);
+    inner.extend_from_slice(oid_bytes);
+    inner.extend_from_slice(&[0x01, 0x00]); // KRB_AP_REQ token ID
+    inner.extend_from_slice(ap_req);
 
-/// Wrap data in a DER TLV.
-fn der_tlv(tag: u8, data: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    out.extend_from_slice(&der_length(data.len()));
-    out.extend_from_slice(data);
-    out
+    der_tlv(0x60, &inner) // APPLICATION [0]
 }
 
 /// Encode a context-specific constructed tag.
@@ -1204,6 +1131,19 @@ fn generate_nonce() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GSS wrapper is the outermost layer of the AP-REQ, so it is the
+    /// first to pass 64 KiB when a large-AD PAC fattens the ticket (#6). Its
+    /// length has to describe every byte that follows.
+    #[test]
+    fn a_gss_token_past_64k_declares_its_full_length() {
+        let ap_req = vec![0x6e; 70_000];
+        let token = wrap_gss_ap_req(&ap_req);
+        let (tag, value, total) = crate::auth::der::parse_der_tlv(&token).unwrap();
+        assert_eq!(tag, 0x60);
+        assert_eq!(total, token.len());
+        assert!(value.ends_with(&ap_req));
+    }
     use crate::auth::kerberos::crypto::{
         generate_random_key, kerberos_decrypt, kerberos_encrypt, string_to_key_aes,
     };

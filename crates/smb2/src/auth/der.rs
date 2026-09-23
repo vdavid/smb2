@@ -7,19 +7,22 @@
 
 use crate::Error;
 
-/// Encode a DER length field.
+/// Encode a DER length field (X.690 § 8.1.3).
 ///
 /// - Lengths < 128 are encoded as a single byte.
-/// - Lengths < 256 are encoded as `0x81` followed by one byte.
-/// - Lengths < 65536 are encoded as `0x82` followed by two bytes (big-endian).
+/// - Anything longer is `0x80 | n` followed by the length in `n` big-endian
+///   bytes, as few as it takes. Every `usize` fits, so this can't fail: a
+///   large-AD Kerberos token past 64 KiB gets `0x83`.
 pub(crate) fn der_length(len: usize) -> Vec<u8> {
     if len < 128 {
-        vec![len as u8]
-    } else if len < 256 {
-        vec![0x81, len as u8]
-    } else {
-        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
+        return vec![len as u8];
     }
+    let bytes = len.to_be_bytes();
+    let significant = &bytes[len.leading_zeros() as usize / 8..];
+    let mut out = Vec::with_capacity(1 + significant.len());
+    out.push(0x80 | significant.len() as u8);
+    out.extend_from_slice(significant);
+    out
 }
 
 /// Wrap data in a DER TLV (tag-length-value).
@@ -38,23 +41,19 @@ pub(crate) fn parse_der_length(data: &[u8]) -> Result<(usize, usize), Error> {
     let first = data[0];
     if first < 128 {
         Ok((first as usize, 1))
-    } else if first == 0x81 {
-        if data.len() < 2 {
-            return Err(Error::invalid_data("DER: truncated length (0x81)"));
+    } else if (0x81..=0x84).contains(&first) {
+        // Long form: the low bits say how many length bytes follow. Four is
+        // the most any token this crate handles could need (4 GiB).
+        let n = (first & 0x7f) as usize;
+        if data.len() < 1 + n {
+            return Err(Error::invalid_data(format!(
+                "DER: truncated length (0x{first:02x})"
+            )));
         }
-        Ok((data[1] as usize, 2))
-    } else if first == 0x82 {
-        if data.len() < 3 {
-            return Err(Error::invalid_data("DER: truncated length (0x82)"));
-        }
-        let len = ((data[1] as usize) << 8) | (data[2] as usize);
-        Ok((len, 3))
-    } else if first == 0x83 {
-        if data.len() < 4 {
-            return Err(Error::invalid_data("DER: truncated length (0x83)"));
-        }
-        let len = ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
-        Ok((len, 4))
+        let len = data[1..=n]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | b as usize);
+        Ok((len, 1 + n))
     } else {
         Err(Error::invalid_data(format!(
             "DER: unsupported length encoding: 0x{first:02x}"
@@ -70,7 +69,7 @@ pub(crate) fn parse_der_tlv(data: &[u8]) -> Result<(u8, &[u8], usize), Error> {
     let tag = data[0];
     let (len, len_bytes) = parse_der_length(&data[1..])?;
     let header_len = 1 + len_bytes;
-    let total = header_len + len;
+    let total = header_len.saturating_add(len);
     if data.len() < total {
         return Err(Error::invalid_data(format!(
             "DER: TLV truncated: need {total} bytes, have {}",
@@ -106,6 +105,40 @@ mod tests {
         assert_eq!(der_length(256), vec![0x82, 0x01, 0x00]);
         assert_eq!(der_length(65535), vec![0x82, 0xff, 0xff]);
         assert_eq!(der_length(1000), vec![0x82, 0x03, 0xe8]);
+    }
+
+    /// A Kerberos AP-REQ carries the service ticket and its PAC, which grows
+    /// with group and claim count, so a large-AD token can pass 64 KiB. The
+    /// encoder used to drop the high bits there and declare a much shorter
+    /// value (#6: `der_length(70000)` came out as 4,464).
+    #[test]
+    fn length_past_64k_keeps_every_byte() {
+        assert_eq!(der_length(65536), vec![0x83, 0x01, 0x00, 0x00]);
+        assert_eq!(der_length(70000), vec![0x83, 0x01, 0x11, 0x70]);
+        assert_eq!(der_length(0x0100_0000), vec![0x84, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn every_length_round_trips_through_the_parser() {
+        for len in [
+            0,
+            127,
+            128,
+            255,
+            256,
+            65535,
+            65536,
+            70000,
+            0xFF_FFFF,
+            0x0100_0000,
+        ] {
+            let encoded = der_length(len);
+            assert_eq!(
+                parse_der_length(&encoded).unwrap(),
+                (len, encoded.len()),
+                "length {len}"
+            );
+        }
     }
 
     // =======================================================================
