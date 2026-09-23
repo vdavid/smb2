@@ -7,6 +7,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.25.0] - 2026-09-23
 
+### Breaking
+
+- **A login with a username fails when the server answers it as a guest.** Samba with `map to guest = bad user` does that for a wrong password or an unknown user, and those logins used to connect as guest silently; they now fail with `Error::Auth`. To connect as guest on purpose, leave the username empty. Details under Security below.
+
 ### Security
 
 - **A signed session no longer accepts an unsigned response.** The client verified a response's signature only when the response itself claimed to be signed, so someone on the network path could clear the `SMB2_FLAGS_SIGNED` bit and rewrite file contents, listings, or metadata without any error. Now every response on a signed session is verified, except the two kinds MS-SMB2 § 3.2.5.1.3 exempts (interim `STATUS_PENDING` responses and oplock break notifications). A stripped or forged response fails with the same error as a bad signature and ticks `signature_failures`. Thanks to [@rwbh](https://github.com/rwbh) for the report, the proof of concept, and the suggested fix ([#5](https://github.com/vdavid/smb2/issues/5)).
@@ -42,6 +46,11 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 - **A `FileWriter`'s WRITEs go out when the window releases them.** They used to be queued as futures that nothing polled until the writer next needed room, so a WRITE could sit unsent while the consumer read its next piece.
 - **Kerberos works with tokens larger than 64 KiB.** An AP-REQ carries the service ticket and its PAC, which grows with group and claim count, so a user in many groups on a large Active Directory can pass 64 KiB. The DER encoder dropped the length's high bits there, declared a far shorter value, and the server refused a malformed request with no clear reason. Lengths of any size now encode correctly, including the GSS-API wrapper around the AP-REQ, which had its own copy of the same cap. Thanks to [@rwbh](https://github.com/rwbh) for spotting it ([#6](https://github.com/vdavid/smb2/issues/6)).
 - **A server's credit ceiling survives compound requests.** Servers grant a compound's credits on one of its replies and 0 on the rest, and Samba answers a pipeline at its maximum unevenly, and the client read those as the window shrinking and then growing again. So on a small-window server (Samba with `smb2 max credits = 64`, embedded NAS firmware), any `stat`, compound read, or similar made the client forget where the window stops, and the next `FileWriter` or chunked transfer sized its requests past what the server funds and failed with `CreditStarvation`. The ceiling now holds until the server actually grows the window.
+
+### Dependencies
+
+- **`ccm` is on its stable 0.6 line** (`0.6.1`, and any later 0.6.x), where 0.24.x pinned the exact `0.6.0-rc.3` prerelease, so your tree can share one copy with other crates.
+- **`lz4_flex` 0.13 → 0.14.**
 
 ## [0.24.4] - 2026-09-23
 
