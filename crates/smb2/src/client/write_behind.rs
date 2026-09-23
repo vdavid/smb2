@@ -25,7 +25,11 @@
 //! keeping the connection responsive.
 //!
 //! The rate is kept apart from the download one: an asymmetric link (most
-//! home connections) moves each way at its own speed.
+//! home connections) moves each way at its own speed. So is the learned
+//! headroom (`Window` § Learning the headroom): a confirmation that comes late
+//! means the uplink sat idle or the server's disk held it, and either way the
+//! window keeps more queued to cover the next one. A disk that stalls under
+//! writes is exactly what that is for.
 //!
 //! # Why adaptive is the default
 //!
@@ -36,12 +40,13 @@
 //! by the write budget), so a `stat` on the same connection waited behind all
 //! of it: 23 s on a 375 KB/s uplink behind one 8 MiB file, and a Cmdr user's
 //! 1 MiB frames sat 5–12 s in the send queue with every directory listing
-//! behind them. The adaptive window keeps about `rate × (RTT + 250 ms)` in
+//! behind them. The adaptive window keeps about `rate × (RTT + headroom)` in
 //! flight instead: at least one WRITE, at most
 //! [`ADAPTIVE_MAX_IN_FLIGHT`](crate::client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT).
 //!
 //! Measured against Samba with the uplink shaped (`benchmarks/read-ahead/`,
-//! `results/adaptive-uploads.md`, 2026-09-23), an 8 MiB upload against 0.24:
+//! `results/adaptive-uploads.md`, 2026-09-23), an 8 MiB upload against 0.24,
+//! with the headroom then fixed at 250 ms:
 //!
 //! - **375 KB/s at +60 ms**: a `stat` on the same connection waits 1.5 s at
 //!   most, down from 23.4 s, and a cancel is answered in 2.0 s, down from
@@ -95,13 +100,14 @@ pub const UPLOAD_CHUNK_SIZE: u32 = 512 * 1024;
 pub enum WriteBehind {
     /// Size the window to the link (the default).
     ///
-    /// Keeps about `uplink rate × (RTT + 250 ms)` bytes handed to the
+    /// Keeps about `uplink rate × (RTT + headroom)` bytes handed to the
     /// connection but not yet confirmed by the server: never fewer than one
     /// WRITE, never more than
     /// [`ADAPTIVE_MAX_IN_FLIGHT`](crate::client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT).
     /// The uplink rate is re-measured over the last eight confirmations that
     /// queued behind each other; the RTT is the connection's NEGOTIATE round
-    /// trip or the fastest WRITE so far, whichever is smaller. See the
+    /// trip or the fastest WRITE so far, whichever is smaller; the headroom
+    /// is learned per connection from how late confirmations come. See the
     /// [module docs](crate::client::write_behind).
     #[default]
     Adaptive,
@@ -126,8 +132,8 @@ impl From<WriteBehind> for Pacing {
     }
 }
 
-/// The largest write worth sending as one frame: what the uplink moves in the
-/// adaptive headroom at `rate` bytes/s, never less than one upload chunk and
+/// The largest write worth sending as one frame: what the uplink moves in
+/// `QUICK_FRAME_BUDGET` at `rate` bytes/s, never less than one upload chunk and
 /// never more than `compound_limit` (which wins over the chunk floor, and can
 /// be 0). Behind
 /// [`Connection::quick_write_limit`](crate::client::Connection::quick_write_limit),

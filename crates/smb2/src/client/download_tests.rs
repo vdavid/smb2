@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::client::read_ahead::Window;
 use crate::client::stream::{FileDownload, ReadAhead};
 use crate::client::test_helpers::{
     build_close_error_response, build_close_response, build_read_error_response,
@@ -512,6 +513,60 @@ async fn the_rate_hint_sets_the_quick_read_limit_until_it_expires() {
         "30 s without a measurement"
     );
     assert_eq!(conn.quick_read_limit(), 512 * 1024);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_download_leaves_its_learned_headroom_on_the_connection_until_it_expires() {
+    let mock = Arc::new(MockTransport::new());
+    for i in 1..=4u8 {
+        mock.queue_response(build_read_response(chunk_of(i)));
+    }
+    mock.queue_response(build_close_response());
+    let mut conn = setup_connection(&mock);
+    let tree = test_tree();
+    assert!(conn.read_link_hint().lateness.is_none());
+    FileDownload::new(&tree, &mut conn, test_file_id(), 4 * 65536, CHUNK)
+        .collect()
+        .await
+        .unwrap();
+    assert!(conn.read_link_hint().lateness.is_some());
+    assert!(
+        conn.write_link_hint().lateness.is_none(),
+        "a download says nothing about the other direction"
+    );
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(
+        conn.read_link_hint().lateness.is_none(),
+        "the same 30 s as the rate"
+    );
+}
+
+#[tokio::test]
+async fn a_learned_headroom_leaves_the_quick_read_limit_alone() {
+    // The one-frame cut-off is a latency budget for whatever waits behind
+    // the frame, not a transfer's margin: however small the headroom learned
+    // on a quiet link, 16 MB/s still makes 4 MB one READ.
+    let mock = Arc::new(MockTransport::new());
+    let conn = setup_connection_with_max_read(&mock, 8 << 20);
+    // 64 READs sent together, answered back to back a millisecond apart.
+    let mut window = Window::new(ReadAhead::Adaptive, CHUNK, conn.read_link_hint());
+    let t0 = tokio::time::Instant::now();
+    for _ in 0..64 {
+        window.on_dispatch(t0, CHUNK);
+    }
+    for i in 0..64u64 {
+        let at = t0 + Duration::from_millis(5 + i);
+        window.on_delivery(at, t0, at, CHUNK, (63 - i) * u64::from(CHUNK));
+    }
+    conn.note_read(&window);
+    assert!(
+        window.headroom() < Duration::from_millis(50),
+        "learned {:?}",
+        window.headroom()
+    );
+    conn.note_read_rate(16e6);
+    assert_eq!(conn.quick_read_limit(), 4_000_000);
 }
 
 #[tokio::test]

@@ -65,6 +65,17 @@ pub mod types;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 
+/// The read-ahead tuning, overridable process-wide so `benchmarks/read-ahead/`
+/// can compare candidates. Unstable: behind the `__bench-tuning` feature, not
+/// for applications, and not covered by SemVer.
+#[cfg(feature = "__bench-tuning")]
+#[doc(hidden)]
+pub mod __bench {
+    pub use crate::client::tuning::{
+        set_tuning, Estimator, Headroom, LearnedHeadroom, RateMeasure, Tuning,
+    };
+}
+
 // ── Re-exports: the simple-case imports ────────────────────────────────
 
 // Error types

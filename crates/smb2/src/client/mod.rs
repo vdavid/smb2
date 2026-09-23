@@ -26,6 +26,7 @@ pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 pub mod tree;
+pub(crate) mod tuning;
 #[cfg(test)]
 mod upload_tests;
 pub mod watcher;

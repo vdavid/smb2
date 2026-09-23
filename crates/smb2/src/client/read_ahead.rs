@@ -3,8 +3,11 @@
 //! [`ReadAhead`] is the public knob; `Window` is the controller a
 //! [`FileDownload`](crate::FileDownload) consults before every READ it sends.
 //! Uploads pace through the same controller (`write_behind.rs`), since the
-//! arithmetic doesn't care which way the payload flows. The controller is pure (it takes instants, it never reads a clock or sends
-//! anything), so its behavior is pinned by deterministic tests below.
+//! arithmetic doesn't care which way the payload flows. The controller is pure
+//! (it takes instants, it never reads a clock or sends anything), so its
+//! behavior is pinned by deterministic tests below, against a simulated link
+//! that can reorder, jitter, and freeze answers. Its tunables live in
+//! `client/tuning.rs`.
 //!
 //! # Why adaptive is the default
 //!
@@ -21,12 +24,24 @@
 //!   default of one 8 MiB READ. A cancel waits the same way.
 //!
 //! No fixed window satisfies both, so the default sizes the window to the link:
-//! it keeps about `link rate × (RTT + 250 ms)` bytes requested but not yet
+//! it keeps about `link rate × (RTT + headroom)` bytes requested but not yet
 //! arrived, at least one READ and at most [`ADAPTIVE_MAX_IN_FLIGHT`]. On a fast
 //! link that reaches the cap within a few round trips; on a slow one it stays at
 //! about one chunk, and the next READ goes out shortly before the current one
 //! finishes arriving, so the pipe never idles and nothing queues behind more
-//! than about one chunk plus 250 ms of transfer.
+//! than about one chunk plus the headroom's worth of transfer.
+//!
+//! # The headroom is learned per connection
+//!
+//! The headroom is the margin that absorbs server stalls (a disk seek, a busy
+//! CPU) and link jitter, and it's also the price: roughly how long anything
+//! else on the connection waits beyond the chunk already arriving. No one
+//! value fits every link (0.25.1 shipped a fixed 250 ms), so the window learns
+//! it from how late answers come, on the connection, per direction: tens of
+//! milliseconds on a steady link, more where answers stall, and back down once
+//! they stop. See `Window` § Learning the headroom. The defaults are
+//! provisional until `benchmarks/read-ahead/results/self-tuning.md` settles
+//! them.
 //!
 //! # The rate is the link's, not the transfer's
 //!
@@ -44,6 +59,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use tokio::time::Instant;
+
+use crate::client::tuning::{Estimator, Headroom, LearnedHeadroom, RateMeasure, Tuning};
 
 /// Chunk size [`Tree::download`](crate::Tree::download) uses: one READ's worth,
 /// capped at the server's `MaxReadSize`.
@@ -70,13 +87,16 @@ pub const ADAPTIVE_MAX_IN_FLIGHT: u64 = 4 * 1024 * 1024;
 /// adaptive upload's WRITEs the same way.
 pub(crate) const ADAPTIVE_MAX_REQUESTS: usize = 32;
 
-/// Margin on top of the round trip, in time at the link rate. The shipping
-/// value of [`Tuning::headroom`].
+/// How long a file may hold the connection as one frame: the time budget
+/// behind [`quick_read_limit`] and the upload one-frame cut-off.
 ///
-/// Covers server-side hiccups (a NAS disk seek, a busy CPU) and jitter, so the
-/// pipe stays full. It is also the price: roughly the most anything else on the
-/// connection waits beyond the chunk that is already arriving.
-pub(crate) const ADAPTIVE_HEADROOM: Duration = Duration::from_millis(250);
+/// A product latency budget, not a transfer margin: how long a listing may
+/// wait behind one compound READ or WRITE. It stays fixed while a transfer's
+/// headroom is learned, because the two answer different questions. On a
+/// quiet LAN the learned headroom shrinks to tens of ms, and a cut-off that
+/// shrank with it would stream small files, each costing extra round trips,
+/// to save a listing a wait nobody notices.
+pub(crate) const QUICK_FRAME_BUDGET: Duration = Duration::from_millis(250);
 
 /// How many recent gaps between answers the rate is measured over.
 ///
@@ -126,14 +146,16 @@ const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 pub enum ReadAhead {
     /// Size the window to the link (the default).
     ///
-    /// Keeps about `link rate × (RTT + 250 ms)` bytes requested but not yet
+    /// Keeps about `link rate × (RTT + headroom)` bytes requested but not yet
     /// arrived: never fewer than one READ, never more than
     /// [`ADAPTIVE_MAX_IN_FLIGHT`] requested but not yet delivered. The link
     /// rate is re-measured over the last eight answers that queued behind
     /// each other on the wire, and the RTT is the connection's NEGOTIATE round
-    /// trip or the fastest READ so far, whichever is smaller. See the
-    /// [module docs](crate::client::read_ahead) for the measurements behind
-    /// it.
+    /// trip or the fastest READ so far, whichever is smaller. The headroom is
+    /// learned per connection from how late answers come: tens of
+    /// milliseconds on a steady link, up to 500 ms where answers stall. See
+    /// the [module docs](crate::client::read_ahead) for the measurements
+    /// behind it.
     #[default]
     Adaptive,
     /// Keep exactly this many READs in flight (values below one mean one).
@@ -189,8 +211,8 @@ pub(crate) enum Dispatch {
     AfterHead,
 }
 
-/// The largest read worth making as one READ: what the link moves in the
-/// headroom at `rate` bytes/s, never less than one download chunk and never
+/// The largest read worth making as one READ: what the link moves in
+/// [`QUICK_FRAME_BUDGET`] at `rate` bytes/s, never less than one download chunk and never
 /// more than `max_read`. Behind
 /// [`Connection::quick_read_limit`](crate::client::Connection::quick_read_limit),
 /// which documents the reasoning.
@@ -198,54 +220,11 @@ pub(crate) fn quick_read_limit(rate: Option<f64>, max_read: u32) -> u64 {
     quick_limit(rate, DOWNLOAD_CHUNK_SIZE, u64::from(max_read))
 }
 
-/// What the link moves in the headroom at `rate` bytes/s, at least `chunk`
+/// What the link moves in [`QUICK_FRAME_BUDGET`] at `rate` bytes/s, at least `chunk`
 /// and at most `cap`: the one-frame cut-off in either direction.
 pub(crate) fn quick_limit(rate: Option<f64>, chunk: u32, cap: u64) -> u64 {
-    let headroom = Tuning::current().headroom;
-    let in_headroom = rate.map_or(0, |rate| (rate * headroom.as_secs_f64()) as u64);
-    u64::from(chunk).max(in_headroom).min(cap)
-}
-
-/// The controller's tunables, in one place so a benchmark can compare
-/// candidates against the shipping values.
-///
-/// Every `Window` and both one-frame cut-offs read [`Tuning::current`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Tuning {
-    /// Margin on top of the round trip, in time at the measured rate.
-    pub(crate) headroom: Duration,
-    /// How the rate is measured, for pacing and for the connection's hint.
-    pub(crate) rate: RateMeasure,
-}
-
-impl Tuning {
-    /// What ships.
-    pub(crate) const SHIPPING: Self = Self {
-        headroom: ADAPTIVE_HEADROOM,
-        rate: RateMeasure::LinkCapacity,
-    };
-
-    /// The tuning in effect.
-    pub(crate) fn current() -> Self {
-        Self::SHIPPING
-    }
-}
-
-/// How a [`Window`] measures the rate it paces by and shares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RateMeasure {
-    /// Bytes over time across the last few chunks, timed when the transfer
-    /// took each one, counted from the first request's dispatch. What one
-    /// transfer achieved, which reads far below the link whenever something
-    /// other than the link set the pace: the window while it ramps or sits
-    /// below the bandwidth-delay product, the first round trip, a slow
-    /// consumer. And a consumer catching up after a stall reads it far above.
-    /// Kept as the benchmark's reference point.
-    Deliveries,
-    /// What the link carries, from answers that queued behind each other on
-    /// the wire, timed as they came off it. See [`Window`] § Measuring the
-    /// link.
-    LinkCapacity,
+    let in_budget = rate.map_or(0, |rate| (rate * QUICK_FRAME_BUDGET.as_secs_f64()) as u64);
+    u64::from(chunk).max(in_budget).min(cap)
 }
 
 /// What the connection already knows about the link when a transfer starts.
@@ -260,6 +239,121 @@ pub(crate) struct LinkHint {
     /// The rate a recent transfer the same way on the same connection
     /// measured, in bytes per second.
     pub(crate) rate: Option<f64>,
+    /// How late answers came for recent transfers the same way on the same
+    /// connection: what the learned headroom starts from.
+    pub(crate) lateness: Option<Lateness>,
+}
+
+/// How many peaks [`Lateness`] keeps for its windowed max.
+const PEAK_SLOTS: usize = 16;
+
+/// One lateness sample the windowed max still remembers.
+#[derive(Debug, Clone, Copy)]
+struct Peak {
+    late: Duration,
+    /// When the answer it came from arrived.
+    at: Instant,
+    /// Which answer it was, counting every sample this memory has taken.
+    answer: u64,
+}
+
+/// What a connection has learned about how late answers come, for the
+/// learned headroom. Both estimators are kept up to date whichever one the
+/// tuning picks, so switching tuning never starts from nothing.
+///
+/// `Copy`, so a finished transfer hands it to the connection and the next
+/// transfer carries on from it as if the two were one stream.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Lateness {
+    /// Samples in arrival order whose lateness no later sample has matched:
+    /// the classic sliding-window-maximum queue, so the first one still
+    /// remembered is the max. Oldest first; `peaks[..peak_count]` is live.
+    peaks: [Option<Peak>; PEAK_SLOTS],
+    peak_count: usize,
+    /// Samples taken so far.
+    answers: u64,
+    /// [`Estimator::MeanDeviation`]'s smoothed mean and mean deviation, in
+    /// seconds.
+    mean: f64,
+    deviation: f64,
+}
+
+impl Lateness {
+    /// Nothing learned yet: the headroom is `learned.cold` until samples say
+    /// otherwise.
+    pub(crate) fn cold(learned: &LearnedHeadroom) -> Self {
+        Self {
+            peaks: [None; PEAK_SLOTS],
+            peak_count: 0,
+            answers: 0,
+            mean: learned.cold.as_secs_f64(),
+            deviation: 0.0,
+        }
+    }
+
+    /// One answer, arrived at `at`, came `late` after an ideal full pipe
+    /// would have delivered it.
+    fn observe(&mut self, late: Duration, at: Instant, learned: &LearnedHeadroom) {
+        self.answers += 1;
+        // RFC 6298 § 2.3: the deviation from the old mean first.
+        let sample = late.as_secs_f64();
+        self.deviation += ((sample - self.mean).abs() - self.deviation) / 4.0;
+        self.mean += (sample - self.mean) / 8.0;
+
+        if let Estimator::WindowedMax { answers, span } = learned.estimator {
+            // Forget what fell out of both memories.
+            let expired = |p: &Peak| {
+                self.answers - p.answer > u64::from(answers)
+                    && at.saturating_duration_since(p.at) > span
+            };
+            let live = self.peaks[..self.peak_count]
+                .iter()
+                .flatten()
+                .position(|p| !expired(p))
+                .unwrap_or(self.peak_count);
+            self.peaks.copy_within(live..self.peak_count, 0);
+            self.peak_count -= live;
+        }
+        // A sample at least as late as a newer one can never be the max again.
+        while self.peak_count > 0 && self.peaks[self.peak_count - 1].is_some_and(|p| p.late <= late)
+        {
+            self.peak_count -= 1;
+        }
+        // Full: the newest (and smallest) gives way. That only drops a value
+        // that would have been the max once every older one expired, and only
+        // after 16 samples each smaller than the one before.
+        if self.peak_count == PEAK_SLOTS {
+            self.peak_count -= 1;
+        }
+        self.peaks[self.peak_count] = Some(Peak {
+            late,
+            at,
+            answer: self.answers,
+        });
+        self.peak_count += 1;
+    }
+
+    /// The headroom these samples call for under `learned`.
+    fn headroom(&self, learned: &LearnedHeadroom) -> Duration {
+        let estimate = match learned.estimator {
+            Estimator::WindowedMax { answers, .. } => {
+                let max = self.peaks[0]
+                    .filter(|_| self.peak_count > 0)
+                    .map(|p| p.late);
+                let warm = self.answers >= u64::from(answers);
+                match (max, warm) {
+                    (Some(max), true) => max,
+                    (Some(max), false) => max.max(learned.cold),
+                    (None, _) => learned.cold,
+                }
+            }
+            Estimator::MeanDeviation { k } => {
+                Duration::try_from_secs_f64(self.mean + k * self.deviation)
+                    .unwrap_or(learned.ceiling)
+            }
+        };
+        estimate.clamp(learned.floor, learned.ceiling.max(learned.floor))
+    }
 }
 
 /// One answer, as the rate measurement sees it.
@@ -270,6 +364,8 @@ struct Arrival {
     /// When its frame came off the wire.
     at: Instant,
     len: u32,
+    /// Whether the learned headroom has taken its lateness yet.
+    scored: bool,
 }
 
 /// The pacing controller for one transfer, download or upload.
@@ -330,6 +426,50 @@ struct Arrival {
 /// gaps keeps that small, and it can only bite once a stall outlasts a
 /// chunk's time on the wire, which on the slow links where an overestimate
 /// costs most is seconds.
+///
+/// # Learning the headroom
+///
+/// With [`Headroom::Learned`] (what ships), the margin comes from how late
+/// answers come compared with an ideal full pipe, the same idea as TCP's
+/// retransmit timer learning from measured variation. Each answer is scored
+/// once, and in the order answers came off the wire:
+///
+/// - **Lateness is idle link time.** An answer is due no sooner than a round
+///   trip plus its own time on the wire after its request went out, and no
+///   sooner than its time on the wire after the answer before it. Arriving
+///   later than both means the link sat idle waiting for it. Samba answering
+///   concurrent READs out of order still sends them back to back, so a
+///   reordered burst is on time by construction, and so is a stretch the
+///   window itself paced.
+/// - **Scored only once nothing unheard-of can precede it.** Chunks are
+///   delivered in file order, so the window hears of an answer that arrived
+///   early only once the chunks ahead of it are taken. Scoring an answer
+///   before that would compare it with the wrong neighbor and read every
+///   swapped pair as a chunk's time of lateness. An answer is scored once
+///   every request still in flight went out less than a round trip before it
+///   arrived: none of those can have beaten it.
+/// - **A stall is measured whole.** A stall the backlog already covers leaves
+///   no idle time at all, and one it partly covers shows only the uncovered
+///   part. So a late answer counts its idle time plus how long the answer
+///   before it waited behind others, which is the backlog the stall ate
+///   through first. Without that, the headroom settles just under the stall
+///   it keeps failing to cover. Idle time under a millisecond counts as none.
+/// - **The memory outlasts covered stalls.** Since a covered stall is
+///   invisible, a memory that forgot a stall once it stopped showing would
+///   shrink straight back under it. The windowed max keeps a sample for
+///   `answers` answers or `span` of time, whichever reaches further back.
+///   Until `answers` samples exist, the cold headroom counts as one of them.
+///
+/// The memory ([`Lateness`]) is shared with the next transfer the same way on
+/// the connection, so a folder of small files learns as one stream, and the
+/// cold headroom only applies to a connection's first transfers.
+///
+/// The margin also grows the window while it ramps: before a pair of answers
+/// has queued behind each other, the rate is a lower bound (one READ over its
+/// round trip), and only a second READ sent with the first answer measures
+/// the link. A 30 ms margin sends one only when a chunk crosses the wire in
+/// under 30 ms, so until a full-pipe gap is in hand the margin is at least the
+/// cold headroom.
 #[derive(Debug)]
 pub(crate) struct Window {
     policy: Pacing,
@@ -339,8 +479,16 @@ pub(crate) struct Window {
     /// The fastest dispatch-to-arrival time seen, an upper bound on the RTT.
     fastest_read: Option<Duration>,
     /// Recent answers, oldest arrival first (answers can arrive in another
-    /// order than they're delivered). [`RateMeasure::LinkCapacity`] only.
+    /// order than they're delivered).
     arrivals: VecDeque<Arrival>,
+    /// How late answers come, carried over from the connection.
+    lateness: Lateness,
+    /// Whether this transfer has scored an answer's lateness yet.
+    learned: bool,
+    /// The latest answer scored for lateness, by arrival.
+    last_scored: Option<Arrival>,
+    /// When each request still in flight went out, oldest first.
+    sent_in_flight: VecDeque<Instant>,
     /// `(when, total bytes delivered by then)`, oldest first. The first entry
     /// is the first dispatch, with zero bytes. [`RateMeasure::Deliveries`]
     /// only.
@@ -370,6 +518,15 @@ impl Window {
             hint,
             fastest_read: None,
             arrivals: VecDeque::with_capacity(ARRIVAL_MEMORY + 1),
+            lateness: hint.lateness.unwrap_or_else(|| {
+                Lateness::cold(&match tuning.headroom {
+                    Headroom::Learned(learned) => learned,
+                    Headroom::Fixed(_) => LearnedHeadroom::SHIPPING,
+                })
+            }),
+            learned: false,
+            last_scored: None,
+            sent_in_flight: VecDeque::with_capacity(ADAPTIVE_MAX_REQUESTS),
             deliveries: VecDeque::with_capacity(RATE_SAMPLES + 1),
             delivered: 0,
             unarrived: 0.0,
@@ -425,6 +582,7 @@ impl Window {
         }
         self.drain(now);
         self.unarrived += f64::from(len);
+        self.sent_in_flight.push_back(now);
     }
 
     /// A chunk of `len` bytes, requested at `dispatched_at` and arrived at
@@ -450,27 +608,92 @@ impl Window {
         let took = landed.saturating_duration_since(dispatched_at);
         self.fastest_read = Some(self.fastest_read.map_or(took, |f| f.min(took)));
 
-        match self.tuning.rate {
-            RateMeasure::Deliveries => {
-                self.delivered += u64::from(len);
-                self.deliveries.push_back((now, self.delivered));
-                while self.deliveries.len() > RATE_SAMPLES + 1 {
-                    self.deliveries.pop_front();
-                }
-            }
-            RateMeasure::LinkCapacity => {
-                let arrival = Arrival {
-                    sent: dispatched_at,
-                    at: arrived_at,
-                    len,
-                };
-                let after = self.arrivals.iter().rposition(|a| a.at <= arrived_at);
-                self.arrivals.insert(after.map_or(0, |i| i + 1), arrival);
-                while self.arrivals.len() > ARRIVAL_MEMORY {
-                    self.arrivals.pop_front();
-                }
+        if self.tuning.rate == RateMeasure::Deliveries {
+            self.delivered += u64::from(len);
+            self.deliveries.push_back((now, self.delivered));
+            while self.deliveries.len() > RATE_SAMPLES + 1 {
+                self.deliveries.pop_front();
             }
         }
+        if let Some(i) = self.sent_in_flight.iter().position(|&s| s == dispatched_at) {
+            self.sent_in_flight.remove(i);
+        }
+        if bytes_in_flight == 0 {
+            // Nothing is in flight, whatever went unmatched.
+            self.sent_in_flight.clear();
+        }
+        let arrival = Arrival {
+            sent: dispatched_at,
+            at: arrived_at,
+            len,
+            scored: false,
+        };
+        let after = self.arrivals.iter().rposition(|a| a.at <= arrived_at);
+        self.arrivals.insert(after.map_or(0, |i| i + 1), arrival);
+        while self.arrivals.len() > ARRIVAL_MEMORY {
+            if let Some(oldest) = self.arrivals.pop_front().filter(|a| !a.scored) {
+                self.score(oldest);
+            }
+        }
+        self.settle();
+    }
+
+    /// Score the lateness of every answer nothing unheard-of can still
+    /// precede, in arrival order.
+    fn settle(&mut self) {
+        // No answer can arrive sooner than a round trip after its request, so
+        // nothing still in flight can have come off the wire before this.
+        let horizon = self.sent_in_flight.front().map(|&sent| sent + self.rtt());
+        for i in 0..self.arrivals.len() {
+            let arrival = self.arrivals[i];
+            if arrival.scored {
+                continue;
+            }
+            if horizon.is_some_and(|horizon| arrival.at >= horizon) {
+                break;
+            }
+            self.score(arrival);
+            self.arrivals[i].scored = true;
+        }
+    }
+
+    /// Feed the learned headroom how late `arrival` came against an ideal
+    /// full pipe: no earlier than one round trip and its own time on the
+    /// wire after its request went out, and no earlier than its time on the
+    /// wire after the answer before it. A late answer also counts the backlog
+    /// the stall ate through first (§ Learning the headroom).
+    fn score(&mut self, arrival: Arrival) {
+        let Headroom::Learned(learned) = self.tuning.headroom else {
+            return;
+        };
+        let (rtt, rate) = (self.rtt(), self.rate());
+        // The soonest an answer can land: a round trip plus its own bytes.
+        let soonest = |a: &Arrival| {
+            let on_the_wire = rate.map_or(Duration::ZERO, |rate| {
+                Duration::from_secs_f64(f64::from(a.len) / rate)
+            });
+            (a.sent + rtt + on_the_wire, on_the_wire)
+        };
+        let (mut ideal, on_the_wire) = soonest(&arrival);
+        let mut queued_ahead = Duration::ZERO;
+        if let Some(previous) = self.last_scored {
+            ideal = ideal.max(previous.at + on_the_wire);
+            queued_ahead = previous.at.saturating_duration_since(soonest(&previous).0);
+        }
+        let idle = arrival.at.saturating_duration_since(ideal);
+        let late = if idle < TIMER_RESOLUTION {
+            Duration::ZERO
+        } else {
+            idle + queued_ahead
+        };
+        self.lateness.observe(late, arrival.at, &learned);
+        if self
+            .last_scored
+            .is_none_or(|previous| previous.at <= arrival.at)
+        {
+            self.last_scored = Some(arrival);
+        }
+        self.learned = true;
     }
 
     /// The rate to pace by, in bytes per second. Before the first delivery,
@@ -584,7 +807,31 @@ impl Window {
     /// Bytes the adaptive policy wants on their way, once a rate is known.
     pub(crate) fn target(&self) -> Option<u64> {
         let rate = self.rate()?;
-        Some((rate * (self.rtt() + self.tuning.headroom).as_secs_f64()) as u64)
+        Some((rate * (self.rtt() + self.headroom()).as_secs_f64()) as u64)
+    }
+
+    /// What this transfer learned about how late answers come, for the
+    /// next transfer on the connection.
+    pub(crate) fn lateness_to_share(&self) -> Option<Lateness> {
+        self.learned.then_some(self.lateness)
+    }
+
+    /// The margin on top of the round trip the target budgets for.
+    pub(crate) fn headroom(&self) -> Duration {
+        match self.tuning.headroom {
+            Headroom::Fixed(headroom) => headroom,
+            Headroom::Learned(learned) => {
+                let headroom = self.lateness.headroom(&learned);
+                // Until answers have queued behind each other, the rate is a
+                // lower bound and the margin is what sends the second READ
+                // that measures the link. See § Learning the headroom.
+                if self.full_pipe_rate().is_some() {
+                    headroom
+                } else {
+                    headroom.max(learned.cold)
+                }
+            }
+        }
     }
 
     fn unarrived_at(&self, now: Instant, rate: f64) -> f64 {
@@ -620,13 +867,18 @@ mod tests {
     /// them the way Samba does; each lands half a round trip after its last
     /// byte leaves. The consumer spends `consumer_delay(k)` on chunk `k`
     /// before asking for the next, and the window only hears about a chunk
-    /// when the consumer takes it, as in `FileDownload`. The delays default to
-    /// zero; the `with_*` builders set them.
+    /// when the consumer takes it, as in `FileDownload`. A freeze (a disk
+    /// stall, a busy server CPU) holds back every answer that would have
+    /// been ready during it until it ends; answers already ready keep
+    /// flowing, as from a socket buffer. The delays default to zero and
+    /// there are no freezes; the `with_*` builders set them.
     struct Link {
         rtt: Duration,
         rate: f64,
         server_delay: Box<dyn Fn(usize) -> Duration>,
         consumer_delay: Box<dyn Fn(usize) -> Duration>,
+        /// `(start, length)`, as offsets from the start of the download.
+        freezes: Vec<(Duration, Duration)>,
     }
 
     struct Run {
@@ -637,8 +889,14 @@ mod tests {
         /// The most bytes queued ahead of a request sent at any instant: what a
         /// `stat` on the same connection would have waited behind.
         worst_queue: u64,
+        /// What a request sent right after each READ would have queued behind.
+        queued: Vec<u64>,
         /// Every rate the window offered the connection, one per delivery.
         shared: Vec<f64>,
+        /// When the most READs were first in flight at once.
+        peak_reached_at: Duration,
+        /// The window's headroom after each delivery.
+        headroom: Vec<Duration>,
     }
 
     impl Run {
@@ -665,7 +923,19 @@ mod tests {
                 rate,
                 server_delay: Box::new(|_| Duration::ZERO),
                 consumer_delay: Box::new(|_| Duration::ZERO),
+                freezes: Vec::new(),
             }
+        }
+
+        /// The server freezes for `length` every `every`, first at `every`,
+        /// until `until`.
+        fn with_freezes(mut self, every: Duration, length: Duration, until: Duration) -> Self {
+            let mut start = every;
+            while start < until {
+                self.freezes.push((start, length));
+                start += every;
+            }
+            self
         }
 
         fn with_consumer_delay(mut self, delay: impl Fn(usize) -> Duration + 'static) -> Self {
@@ -706,7 +976,10 @@ mod tests {
                 delivered_at: Vec::new(),
                 peak_reads: 0,
                 worst_queue: 0,
+                queued: Vec::new(),
                 shared: Vec::new(),
+                peak_reached_at: Duration::ZERO,
+                headroom: Vec::new(),
             };
             let bytes_of = |in_flight: &VecDeque<usize>, reads: &[SimRead]| -> u64 {
                 in_flight.iter().map(|&i| u64::from(reads[i].len)).sum()
@@ -730,7 +1003,12 @@ mod tests {
                         Dispatch::At(at) => return Some(at),
                         Dispatch::AfterHead => return None,
                     }
-                    let ready = now + self.rtt / 2 + (self.server_delay)(reads.len());
+                    let mut ready = now + self.rtt / 2 + (self.server_delay)(reads.len());
+                    for &(start, length) in &self.freezes {
+                        if (t0 + start..t0 + start + length).contains(&ready) {
+                            ready = t0 + start + length;
+                        }
+                    }
                     reads.push(SimRead {
                         len,
                         sent: now,
@@ -740,13 +1018,16 @@ mod tests {
                     in_flight.push_back(reads.len() - 1);
                     window.on_dispatch(now, len);
                     next_offset += u64::from(len);
-                    run.peak_reads = run.peak_reads.max(in_flight.len());
+                    if in_flight.len() > run.peak_reads {
+                        run.peak_reads = in_flight.len();
+                        run.peak_reached_at = now - t0;
+                    }
                     // What a request sent now would queue behind on the link.
                     let link_free = self.schedule(reads);
                     let queued = link_free.saturating_duration_since(now + self.rtt / 2);
-                    run.worst_queue = run
-                        .worst_queue
-                        .max((queued.as_secs_f64() * self.rate) as u64);
+                    let queued = (queued.as_secs_f64() * self.rate) as u64;
+                    run.worst_queue = run.worst_queue.max(queued);
+                    run.queued.push(queued);
                 }
             };
             for k in 0.. {
@@ -769,6 +1050,7 @@ mod tests {
                 let left = bytes_of(&in_flight, &reads);
                 window.on_delivery(now, reads[head].sent, arrived, reads[head].len, left);
                 run.delivered_at.push(now - t0);
+                run.headroom.push(window.headroom());
                 if let Some(rate) = window.rate_to_share() {
                     run.shared.push(rate);
                 }
@@ -787,7 +1069,7 @@ mod tests {
             CHUNK,
             LinkHint {
                 rtt: Some(rtt_seed),
-                rate: None,
+                ..LinkHint::default()
             },
         )
     }
@@ -1008,6 +1290,7 @@ mod tests {
         let hint = LinkHint {
             rtt: Some(60 * MS),
             rate: Some(30e6),
+            ..LinkHint::default()
         };
         let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint);
         let now = Instant::now();
@@ -1018,6 +1301,7 @@ mod tests {
         let slow = LinkHint {
             rtt: Some(60 * MS),
             rate: Some(375e3),
+            ..LinkHint::default()
         };
         let mut w = Window::new(ReadAhead::Adaptive, CHUNK, slow);
         w.on_dispatch(now, CHUNK);
@@ -1034,6 +1318,7 @@ mod tests {
         let hint = LinkHint {
             rtt: Some(60 * MS),
             rate: Some(50e6),
+            ..LinkHint::default()
         };
         let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint);
         let t0 = Instant::now();
@@ -1094,7 +1379,7 @@ mod tests {
         };
         let hint = LinkHint {
             rtt: Some(60 * MS),
-            rate: None,
+            ..LinkHint::default()
         };
         let mut w = Window::with_tuning(ReadAhead::Adaptive, CHUNK, hint, tuning);
         let shared = link.download(&mut w, 4 << 20, CHUNK).last_shared();
@@ -1183,6 +1468,359 @@ mod tests {
         let worst = run.shared.iter().copied().fold(0.0, f64::max);
         assert!(not_above(worst, 200e6), "shared {:.1} MB/s", worst / 1e6);
         assert!(run.last_shared() >= 0.8 * 200e6, "{}", run.last_shared());
+    }
+
+    // ── The learned headroom ───────────────────────────────────────────
+
+    /// The shipping learned-headroom parameters.
+    fn learned() -> LearnedHeadroom {
+        match Tuning::SHIPPING.headroom {
+            Headroom::Learned(learned) => learned,
+            Headroom::Fixed(_) => panic!("the learned headroom ships"),
+        }
+    }
+
+    /// An adaptive window with this headroom and the shipping rate measure.
+    fn adaptive_with(headroom: Headroom, rtt_seed: Duration) -> Window {
+        let tuning = Tuning {
+            headroom,
+            ..Tuning::SHIPPING
+        };
+        let hint = LinkHint {
+            rtt: Some(rtt_seed),
+            ..LinkHint::default()
+        };
+        Window::with_tuning(ReadAhead::Adaptive, CHUNK, hint, tuning)
+    }
+
+    /// Deterministic noise: somewhere in `0..=max` for READ `i`.
+    fn noise(i: usize, max: Duration) -> Duration {
+        let x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+        max.mul_f64((x % 1_000) as f64 / 999.0)
+    }
+
+    /// A lateness memory that has seen `answers` answers arrive on time.
+    fn quiet_memory(answers: u32) -> Lateness {
+        let mut memory = Lateness::cold(&learned());
+        let t0 = Instant::now();
+        for i in 0..answers {
+            memory.observe(Duration::ZERO, t0 + MS * i, &learned());
+        }
+        memory
+    }
+
+    /// Every headroom candidate across a grid of simulated links: how long
+    /// each left the pipe idle, and how long a request sent mid-transfer
+    /// waits behind it. A table for choosing parameters, not an assertion;
+    /// the real grid is `benchmarks/read-ahead/`. Run it with
+    /// `cargo test --release -p smb2 --lib compare_headroom_candidates -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "prints a comparison table"]
+    fn compare_headroom_candidates() {
+        type Make = Box<dyn Fn() -> Link>;
+        let s = Duration::from_secs;
+        let windowed = |answers, span| {
+            Headroom::Learned(LearnedHeadroom {
+                estimator: Estimator::WindowedMax { answers, span },
+                ..learned()
+            })
+        };
+        let rfc = |k| {
+            Headroom::Learned(LearnedHeadroom {
+                estimator: Estimator::MeanDeviation { k },
+                ..learned()
+            })
+        };
+        let candidates = [
+            ("fixed 30 ms", Headroom::Fixed(30 * MS)),
+            ("fixed 100 ms", Headroom::Fixed(100 * MS)),
+            ("fixed 250 ms", Headroom::Fixed(250 * MS)),
+            ("shipping", Tuning::SHIPPING.headroom),
+            ("max 16/0 s", windowed(16, Duration::ZERO)),
+            ("max 16/2 s", windowed(16, s(2))),
+            ("max 8/10 s", windowed(8, s(10))),
+            ("rfc k=2", rfc(2.0)),
+            ("rfc k=4", rfc(4.0)),
+        ];
+        let freezing = |rtt, rate, jitter, every, length| -> Make {
+            Box::new(move || {
+                Link::new(rtt, rate)
+                    .with_server_delay(move |i| noise(i, jitter))
+                    .with_freezes(every, length, Duration::from_secs(40))
+            })
+        };
+        let jittered = |rtt, rate, jitter| freezing(rtt, rate, jitter, s(60), Duration::ZERO);
+        let scenarios: [(&str, Duration, f64, u64, Make); 8] = [
+            (
+                "steady, 50 MB/s +20 ms",
+                20 * MS,
+                50e6,
+                256 << 20,
+                jittered(20 * MS, 50e6, Duration::ZERO),
+            ),
+            (
+                "jitter 20 ms, 20 MB/s +20 ms",
+                20 * MS,
+                20e6,
+                128 << 20,
+                jittered(20 * MS, 20e6, 20 * MS),
+            ),
+            (
+                "jitter 60 ms, 20 MB/s +20 ms",
+                20 * MS,
+                20e6,
+                128 << 20,
+                jittered(20 * MS, 20e6, 60 * MS),
+            ),
+            (
+                "150 ms freeze every 1 s, 20 MB/s +20 ms",
+                20 * MS,
+                20e6,
+                160 << 20,
+                freezing(20 * MS, 20e6, 5 * MS, s(1), 150 * MS),
+            ),
+            (
+                "150 ms freeze every 3 s, 20 MB/s +20 ms",
+                20 * MS,
+                20e6,
+                160 << 20,
+                freezing(20 * MS, 20e6, 5 * MS, s(3), 150 * MS),
+            ),
+            (
+                "100 ms freeze every 1 s, 3 MB/s +20 ms",
+                20 * MS,
+                3e6,
+                24 << 20,
+                freezing(20 * MS, 3e6, 20 * MS, s(1), 100 * MS),
+            ),
+            (
+                "200 ms freeze every 2 s, 375 KB/s +60 ms",
+                60 * MS,
+                375e3,
+                8 << 20,
+                freezing(60 * MS, 375e3, 40 * MS, s(2), 200 * MS),
+            ),
+            (
+                "150 ms freeze every 1 s, 50 MB/s +60 ms",
+                60 * MS,
+                50e6,
+                256 << 20,
+                freezing(60 * MS, 50e6, Duration::ZERO, s(1), 150 * MS),
+            ),
+        ];
+        for (scenario, rtt, rate, file, make) in &scenarios {
+            let link_time = *file as f64 / rate + rtt.as_secs_f64();
+            eprintln!("{scenario}: {link_time:.2} s of link time");
+            for (name, headroom) in &candidates {
+                let mut w = adaptive_with(*headroom, *rtt);
+                let run = make().download(&mut w, *file, CHUNK);
+                let took = run.delivered_at.last().unwrap().as_secs_f64();
+                let mut queued = run.queued.clone();
+                queued.sort_unstable();
+                let wait_ms = |q: f64| {
+                    let at = ((queued.len() - 1) as f64 * q) as usize;
+                    queued[at] as f64 / rate * 1e3
+                };
+                eprintln!(
+                    "  {name:13} idle {:5.0} ms   stat waits p50 {:5.0} p90 {:5.0} max {:5.0} ms   ends at {:4.0} ms",
+                    (took - link_time) * 1e3,
+                    wait_ms(0.5),
+                    wait_ms(0.9),
+                    wait_ms(1.0),
+                    w.headroom().as_secs_f64() * 1e3,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_steady_link_learns_a_small_headroom() {
+        // 50 MB/s at +20 ms, answers exactly on time: nothing to absorb, so
+        // the margin (and what a `stat` waits beyond the current chunk)
+        // shrinks to the floor.
+        let link = Link::new(20 * MS, 50e6);
+        let mut w = adaptive(20 * MS);
+        link.download(&mut w, 64 << 20, CHUNK);
+        assert_eq!(w.headroom(), learned().floor);
+    }
+
+    #[test]
+    fn a_noisy_link_learns_a_larger_headroom_and_keeps_the_pipe_full() {
+        // 20 MB/s at +20 ms, answers jittered by up to 5 ms, and the server
+        // freezing for 150 ms every second (a NAS disk seeking). A margin at
+        // the floor idles the link for most of every freeze; the learned one
+        // grows to cover them, and runs within a few percent of 0.25.1's
+        // fixed 250 ms. (At 3 MB/s a chunk takes longer than the freeze, so
+        // whether a freeze shows at all is down to where in a chunk it lands.)
+        let noisy = || {
+            Link::new(20 * MS, 20e6)
+                .with_server_delay(|i| noise(i, 5 * MS))
+                .with_freezes(Duration::from_secs(1), 150 * MS, Duration::from_secs(20))
+        };
+        let file = 160 << 20;
+        let mut learned_window = adaptive(20 * MS);
+        let learned_run = noisy().download(&mut learned_window, file, CHUNK);
+        assert!(
+            learned_window.headroom() >= 100 * MS,
+            "headroom {:?}",
+            learned_window.headroom()
+        );
+        let took = |run: &Run| run.delivered_at.last().unwrap().as_secs_f64();
+        let at_floor = noisy().download(
+            &mut adaptive_with(Headroom::Fixed(learned().floor), 20 * MS),
+            file,
+            CHUNK,
+        );
+        let fixed_250 = noisy().download(
+            &mut adaptive_with(Headroom::Fixed(250 * MS), 20 * MS),
+            file,
+            CHUNK,
+        );
+        let (learned_s, floor_s, fixed_s) = (took(&learned_run), took(&at_floor), took(&fixed_250));
+        assert!(
+            learned_s < floor_s && learned_s <= fixed_s * 1.03,
+            "learned {learned_s:.2} s, floor {floor_s:.2} s, fixed 250 ms {fixed_s:.2} s"
+        );
+    }
+
+    #[test]
+    fn the_headroom_shrinks_once_the_noise_stops() {
+        // The same freezes for the first three seconds, then a quiet link.
+        // Covered freezes leave no trace, so the memory has to outlast the
+        // gaps between them; once the noise stops for longer than that, the
+        // margin goes back to the floor.
+        let link = Link::new(20 * MS, 20e6).with_freezes(
+            Duration::from_secs(1),
+            150 * MS,
+            Duration::from_secs(3),
+        );
+        let mut w = adaptive(20 * MS);
+        let run = link.download(&mut w, 320 << 20, CHUNK);
+        let Estimator::WindowedMax { span, .. } = learned().estimator else {
+            panic!("the windowed max ships");
+        };
+        let quiet_for = *run.delivered_at.last().unwrap() - Duration::from_secs(3);
+        assert!(quiet_for > span, "quiet for {quiet_for:?}, memory {span:?}");
+        let grew_to = run.headroom.iter().max().unwrap();
+        assert!(*grew_to >= 100 * MS, "grew to {grew_to:?}");
+        assert_eq!(w.headroom(), learned().floor);
+    }
+
+    #[test]
+    fn answers_the_server_reorders_are_not_mistaken_for_jitter() {
+        // 10 MB/s at +100 ms, every other READ held 80 ms at the server,
+        // longer than a chunk takes on the wire (52 ms): the answers come off
+        // the wire in swapped pairs, back to back, so the link never idles
+        // and nothing was late. Chunks are delivered in file order, so the
+        // window hears of the earlier answer only after the later one; scored
+        // in that order, each swapped pair reads as a chunk's time of
+        // lateness (52 ms). The connection already knows the link's rate, so
+        // the window opens wide at once: a ramp with only a READ or two out
+        // would genuinely idle the link behind each held one.
+        let link = Link::new(100 * MS, 10e6).with_server_delay(|i| {
+            if i % 2 == 0 {
+                80 * MS
+            } else {
+                Duration::ZERO
+            }
+        });
+        let hint = LinkHint {
+            rtt: Some(100 * MS),
+            rate: Some(10e6),
+            lateness: None,
+        };
+        let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint);
+        link.download(&mut w, 32 << 20, CHUNK);
+        assert!(
+            w.headroom() <= learned().floor + 5 * MS,
+            "headroom {:?}",
+            w.headroom()
+        );
+    }
+
+    #[test]
+    fn a_small_learned_headroom_still_opens_the_window_on_a_distant_fast_link() {
+        // The margin also grows the window while it ramps: the target is
+        // rate × (RTT + headroom), and before the link is measured the rate
+        // is one READ's over its round trip. Only a second READ sent with the
+        // first answer measures the link, and a 30 ms margin sends one only
+        // while a chunk crosses the wire in under 30 ms (at 10 MB/s it takes
+        // 52). A connection that learned 30 ms on a quiet link must ramp as
+        // fast as a fresh one, and on a fast link reach the cap within a few
+        // round trips.
+        for (rtt, rate) in [(60 * MS, 1e9), (200 * MS, 1e9), (200 * MS, 10e6)] {
+            let download = |lateness| {
+                let hint = LinkHint {
+                    rtt: Some(rtt),
+                    rate: None,
+                    lateness,
+                };
+                let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint);
+                Link::new(rtt, rate).download(&mut w, 32 << 20, CHUNK)
+            };
+            let (learned, fresh) = (download(Some(quiet_memory(32))), download(None));
+            let took = |run: &Run| *run.delivered_at.last().unwrap();
+            assert!(
+                took(&learned) <= took(&fresh) + MS,
+                "at {rtt:?}, {rate} B/s: took {:?}, fresh {:?}",
+                took(&learned),
+                took(&fresh)
+            );
+            if rate >= 1e9 {
+                assert_eq!(learned.peak_reads, 8, "at {rtt:?}");
+                assert!(
+                    learned.peak_reached_at <= rtt * 3,
+                    "at {rtt:?}: full window after {:?}",
+                    learned.peak_reached_at
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_learned_headroom_carries_over_to_the_next_transfer() {
+        // A 2 MiB file is four answers, too few to trust on their own: a fresh
+        // window keeps the cold margin through all of it. After a download
+        // that learned the link is quiet, the next file starts from that.
+        let link = Link::new(20 * MS, 50e6);
+        let mut first = adaptive(20 * MS);
+        link.download(&mut first, 16 << 20, CHUNK);
+        let hint = LinkHint {
+            rtt: Some(20 * MS),
+            rate: None,
+            lateness: first.lateness_to_share(),
+        };
+        let mut second = Window::new(ReadAhead::Adaptive, CHUNK, hint);
+        link.download(&mut second, 2 << 20, CHUNK);
+        assert_eq!(second.headroom(), learned().floor);
+
+        let mut fresh = adaptive(20 * MS);
+        link.download(&mut fresh, 2 << 20, CHUNK);
+        assert_eq!(fresh.headroom(), learned().cold);
+    }
+
+    #[test]
+    fn a_noisy_slow_link_still_queues_about_one_chunk() {
+        // 375 KB/s at +60 ms with jitter and freezes: the headroom grows, but
+        // what a `stat` waits behind stays one chunk plus the ceiling.
+        let link = Link::new(60 * MS, 375e3)
+            .with_server_delay(|i| noise(i, 40 * MS))
+            .with_freezes(Duration::from_secs(3), 200 * MS, Duration::from_secs(30));
+        let mut w = adaptive(60 * MS);
+        let run = link.download(&mut w, 8 << 20, CHUNK);
+        let bound = u64::from(CHUNK) + (375e3 * (0.060 + learned().ceiling.as_secs_f64())) as u64;
+        assert!(
+            run.worst_queue <= bound,
+            "queued {} bytes, bound {bound}",
+            run.worst_queue
+        );
+    }
+
+    #[test]
+    fn the_quick_frame_budget_ignores_the_learned_headroom() {
+        // 16 MB/s moves 4 MB in 250 ms, however small the headroom learned.
+        assert_eq!(QUICK_FRAME_BUDGET, 250 * MS);
+        assert_eq!(quick_read_limit(Some(16e6), EIGHT_MIB), 4_000_000);
     }
 
     #[test]

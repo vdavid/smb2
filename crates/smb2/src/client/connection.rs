@@ -209,6 +209,15 @@ const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(1
 /// delivery replaces it with a measurement.
 const RATE_HINT_TTL: Duration = Duration::from_secs(30);
 
+/// What a transfer left on the connection, unless it's older than
+/// [`RATE_HINT_TTL`].
+fn recent<T: Copy>(noted: &StdMutex<Option<(tokio::time::Instant, T)>>) -> Option<T> {
+    let noted = *noted.lock().unwrap();
+    noted
+        .filter(|(at, _)| at.elapsed() < RATE_HINT_TTL)
+        .map(|(_, value)| value)
+}
+
 /// How often a send parked on credits rechecks whether anything is still
 /// outstanding. Short enough that "the last response landed while we waited"
 /// surfaces quickly, long enough to cost nothing.
@@ -1816,6 +1825,12 @@ struct Inner {
     /// `Tree::write_file_compound`. Erased on a revival with the rest of what
     /// the old server told us.
     flush_must_end_compound: AtomicBool,
+    /// How late READ answers came for the last download on this connection,
+    /// and when: what the next download's learned headroom starts from.
+    /// Same expiry and revival rules as the rate. See [`RATE_HINT_TTL`].
+    read_lateness_hint: StdMutex<Option<(tokio::time::Instant, read_ahead::Lateness)>>,
+    /// The same for WRITE confirmations.
+    write_lateness_hint: StdMutex<Option<(tokio::time::Instant, read_ahead::Lateness)>>,
     /// Whether compression is active on this connection (negotiated).
     compression_enabled: AtomicBool,
     /// Whether the client wants compression (from config).
@@ -1930,6 +1945,8 @@ impl Inner {
             read_rate_hint: StdMutex::new(None),
             write_rate_hint: StdMutex::new(None),
             flush_must_end_compound: AtomicBool::new(false),
+            read_lateness_hint: StdMutex::new(None),
+            write_lateness_hint: StdMutex::new(None),
             compression_enabled: AtomicBool::new(false),
             compression_requested: AtomicBool::new(true),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
@@ -2829,9 +2846,7 @@ impl Connection {
     /// The link rate the last download on this connection measured, if it's
     /// recent enough to still describe the link.
     pub(crate) fn read_rate_hint(&self) -> Option<f64> {
-        let hint = *self.inner.read_rate_hint.lock().unwrap();
-        hint.filter(|(at, _)| at.elapsed() < RATE_HINT_TTL)
-            .map(|(_, rate)| rate)
+        recent(&self.inner.read_rate_hint)
     }
 
     /// How fast this connection's link carries downloads, in bytes per
@@ -2876,7 +2891,10 @@ impl Connection {
     /// costs about two more round trips (CREATE and the first READ each wait
     /// for an answer) and never blocks the connection for more than about a
     /// chunk. So a file is worth one READ when the link moves it in about
-    /// 250 ms, the headroom the adaptive read-ahead window allows:
+    /// 250 ms, a fixed budget for how long a listing may wait behind one
+    /// frame. It doesn't follow the read-ahead window's learned headroom: on a
+    /// quiet LAN that shrinks to tens of milliseconds, and a cut-off that
+    /// shrank with it would stream small files at a round trip or two each.
     ///
     /// - With a [`download_rate_hint`](Self::download_rate_hint), it's what the
     ///   connection moves in 250 ms at that rate.
@@ -2918,12 +2936,30 @@ impl Connection {
             Some((tokio::time::Instant::now(), bytes_per_sec));
     }
 
+    /// What the next download on this connection starts from.
+    pub(crate) fn read_link_hint(&self) -> read_ahead::LinkHint {
+        read_ahead::LinkHint {
+            rtt: self.estimated_rtt(),
+            rate: self.read_rate_hint(),
+            lateness: recent(&self.inner.read_lateness_hint),
+        }
+    }
+
+    /// Record what a download's window has learned about the link so far.
+    pub(crate) fn note_read(&self, window: &read_ahead::Window) {
+        if let Some(rate) = window.rate_to_share() {
+            self.note_read_rate(rate);
+        }
+        if let Some(lateness) = window.lateness_to_share() {
+            *self.inner.read_lateness_hint.lock().unwrap() =
+                Some((tokio::time::Instant::now(), lateness));
+        }
+    }
+
     /// The rate the last upload on this connection had its WRITEs confirmed
     /// at, if it's recent enough to still describe the link.
     pub(crate) fn write_rate_hint(&self) -> Option<f64> {
-        let hint = *self.inner.write_rate_hint.lock().unwrap();
-        hint.filter(|(at, _)| at.elapsed() < RATE_HINT_TTL)
-            .map(|(_, rate)| rate)
+        recent(&self.inner.write_rate_hint)
     }
 
     /// How fast this connection's link carries uploads, in bytes per second,
@@ -2966,8 +3002,8 @@ impl Connection {
     /// progress. A streamed upload costs a few more round trips (CREATE, and
     /// the FLUSH and CLOSE after the last WRITE) and never makes the
     /// connection wait behind more than about a chunk. So a file is worth one
-    /// frame when the uplink moves it in about 250 ms, the headroom the
-    /// adaptive write-behind window allows:
+    /// frame when the uplink moves it in about 250 ms, the same fixed budget
+    /// as for reads, whatever headroom the write-behind window has learned:
     ///
     /// - With an [`upload_rate_hint`](Self::upload_rate_hint), it's what the
     ///   connection moves up in 250 ms at that rate.
@@ -3008,6 +3044,26 @@ impl Connection {
     pub(crate) fn note_write_rate(&self, bytes_per_sec: f64) {
         *self.inner.write_rate_hint.lock().unwrap() =
             Some((tokio::time::Instant::now(), bytes_per_sec));
+    }
+
+    /// What the next upload on this connection starts from.
+    pub(crate) fn write_link_hint(&self) -> read_ahead::LinkHint {
+        read_ahead::LinkHint {
+            rtt: self.estimated_rtt(),
+            rate: self.write_rate_hint(),
+            lateness: recent(&self.inner.write_lateness_hint),
+        }
+    }
+
+    /// Record what an upload's window has learned about the link so far.
+    pub(crate) fn note_write(&self, window: &read_ahead::Window) {
+        if let Some(rate) = window.rate_to_share() {
+            self.note_write_rate(rate);
+        }
+        if let Some(lateness) = window.lateness_to_share() {
+            *self.inner.write_lateness_hint.lock().unwrap() =
+                Some((tokio::time::Instant::now(), lateness));
+        }
     }
 
     /// Get the negotiated parameters, or `None` before NEGOTIATE has run.
@@ -5126,6 +5182,8 @@ impl Connection {
         *inner.estimated_rtt.lock().unwrap() = None;
         *inner.read_rate_hint.lock().unwrap() = None;
         *inner.write_rate_hint.lock().unwrap() = None;
+        *inner.read_lateness_hint.lock().unwrap() = None;
+        *inner.write_lateness_hint.lock().unwrap() = None;
         inner.abandoned.lock().unwrap().clear();
         inner.dfs_trees.lock().unwrap().clear();
         *inner.ipc_tree.lock().unwrap() = None;

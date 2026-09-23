@@ -252,11 +252,16 @@ async fn a_writer_leaves_its_upload_rate_on_the_connection() {
     let four = FileWriter::new(test_tree(), conn.clone(), test_file_id(), 64 * KIB);
     upload(four, vec![7; 4 * 64 * 1024]).await.unwrap().unwrap();
     assert!(conn.upload_rate_hint().is_some());
+    assert!(
+        conn.write_link_hint().lateness.is_some(),
+        "and what it learned about lateness"
+    );
     assert_eq!(
         conn.download_rate_hint(),
         None,
         "an upload says nothing about the other direction"
     );
+    assert!(conn.read_link_hint().lateness.is_none());
 }
 
 #[tokio::test(start_paused = true)]

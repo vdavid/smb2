@@ -20,7 +20,7 @@ use crate::client::connection::{
     reserve_write_budget_or_drain, Connection, Frame, WriteBudgetStep,
 };
 use crate::client::credits;
-use crate::client::read_ahead::{Dispatch, LinkHint, Window};
+use crate::client::read_ahead::{Dispatch, Window};
 use crate::client::write_behind::{WriteBehind, UPLOAD_CHUNK_SIZE};
 use crate::error::Result;
 use crate::msg::write::{WriteRequest, WriteResponse};
@@ -309,16 +309,15 @@ impl WritePipe {
 
         let in_flight_bytes = self.in_flight_bytes;
         let now = Instant::now();
-        let window = self.window();
-        window.on_delivery(
+        self.window().on_delivery(
             now,
             landed.dispatched_at,
             landed.arrived_at.unwrap_or(now),
             landed.len,
             in_flight_bytes,
         );
-        if let Some(rate) = window.rate_to_share() {
-            self.conn.note_write_rate(rate);
+        if let Some(window) = &self.window {
+            self.conn.note_write(window);
         }
         Ok(())
     }
@@ -326,12 +325,7 @@ impl WritePipe {
     fn window(&mut self) -> &mut Window {
         let (policy, chunk) = (self.policy, self.chunk_size);
         let conn = &self.conn;
-        self.window.get_or_insert_with(|| {
-            let hint = LinkHint {
-                rtt: conn.estimated_rtt(),
-                rate: conn.write_rate_hint(),
-            };
-            Window::new(policy, chunk, hint)
-        })
+        self.window
+            .get_or_insert_with(|| Window::new(policy, chunk, conn.write_link_hint()))
     }
 }

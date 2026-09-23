@@ -75,6 +75,9 @@ serde = { version = "1", optional = true, features = ["derive"] }
 testing = []  # Enables smb2::testing module for Docker-based test servers
 fuzzing = []  # Exposes parser entry points for `fuzz/` targets; not for applications
 serde = ["dep:serde"]  # `Serialize` impls on `Diagnostics` types and the protocol enums they embed.
+# Unstable and not for applications: exposes `smb2::__bench`, which overrides the read-ahead tuning process-wide so
+# `benchmarks/read-ahead/` can compare candidates. No SemVer promise; it can change or go away in any release.
+__bench-tuning = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "test-util"] }
