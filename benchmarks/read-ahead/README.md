@@ -1,0 +1,36 @@
+# Read-ahead benchmark for `FileDownload`
+
+The evidence behind `Tree::download`'s default since 0.24.0: 512 KiB chunks and an adaptive read-ahead window
+(`crates/smb2/src/client/read_ahead.rs`). Measures `FileDownload` with different chunk sizes and read-ahead policies
+against a local Samba in Docker, with latency and bandwidth injected by `tc netem` on the container's egress.
+
+- `./run.sh OUT.csv [runs] [links] [writers]`: builds and starts the container (published on `127.0.0.1:17445`,
+  override with `SMB_BENCH_PORT`), writes random test files, then for each link runs every size × variant with no load
+  and with `writers` background writer connections hammering the same share. A link is `<delay ms>` or
+  `<delay ms>@<netem rate>`, for example `"0 5 60"` or `"60@3mbit"`. Env: `VARIANTS`, `SIZES`, `LOADS` (for example
+  `LOADS=0`). Tears the container down on exit.
+- `./target/release/read-ahead-bench summarize OUT.csv`: median tables in Markdown.
+- Variants:
+  - `baseline`: sequential, chunk = `MaxReadSize` (what `Tree::download` did before 0.24.0).
+  - `adaptive`: 512 KiB chunks, `ReadAhead::Adaptive` (the default since 0.24.0), on the connection the previous
+    variants used.
+  - `adaptive-cold`: the same on a fresh connection. Its numbers are mostly TCP slow start, and the idle it leaves on
+    the shared connection makes the variant after it pay slow start again (Linux restarts it after an idle period), so
+    run it on its own.
+  - `seq<KiB>`: sequential. `ra<KiB>x<W>`: a fixed window of W READs.
+- Per run: wall time from CREATE to CLOSE, chunk count, time to first chunk, the longest gap between deliveries, peak
+  bytes in flight, the p50/max latency of a `stat` issued every 20 ms on a clone of the same connection during the
+  download, and (8 MiB+ files) the latency of a `stat` right after dropping a download at 25%.
+- Every run's bytes are checksummed and compared across variants, so a wrong read fails the run.
+
+Against a real NAS (from a machine that can reach it): `SMB_BENCH_SHARE=<share> SMB_BENCH_USER=<user>
+SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>:445 --rtt-ms real --load-writers 0
+--runs 3 --out nas.csv`. `--prep` uploads the test files to `bench/` (the `stat` probe needs `bench/f_65536.bin`);
+`--load-writers 2` adds the background writers, which write 32 MiB files to `load/`. Delete both folders afterwards.
+
+`results/` holds the median tables (M1 Max, OrbStack, Samba on Alpine 3.21, container capped at two CPUs):
+
+- `main.md`, `extras.md`, `slow.md`: the fixed-window matrix from 2026-09-22 that chose 512 KiB chunks and the 4 MiB
+  cap, and showed no fixed window works on both fast and slow links. `load-writers.txt` is what the background writers
+  managed on each link.
+- `adaptive.md`: the adaptive default against the fixed windows on the key links, 2026-09-23.

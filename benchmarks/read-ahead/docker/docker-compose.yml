@@ -1,0 +1,13 @@
+# Samba for the read-ahead benchmark. Latency is injected per run with
+# `tc qdisc ... netem` on the container's eth0 (egress, so it delays every
+# response and ACK: the configured delay IS the added RTT).
+services:
+  smb-bench:
+    build:
+      context: .
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${SMB_BENCH_PORT:-17445}:445"
+    cap_add:
+      - NET_ADMIN
+    # Roughly a 4-core NAS CPU; keeps a background writer from being free.
+    cpus: 2

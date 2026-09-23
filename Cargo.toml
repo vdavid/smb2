@@ -6,7 +6,7 @@ members = [
 ]
 # benchmarks/smb excluded: sspi crate pins digest =0.11.0-rc.5 which conflicts with digest 0.11.2.
 # benchmarks/smb-listing excluded to keep it a standalone bench (like benchmarks/smb), independent of the library's lockfile.
-exclude = ["benchmarks/smb", "benchmarks/smb-listing"]
+exclude = ["benchmarks/smb", "benchmarks/smb-listing", "benchmarks/read-ahead"]
 
 [workspace.package]
 edition = "2021"
