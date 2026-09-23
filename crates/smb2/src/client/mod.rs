@@ -79,7 +79,7 @@ pub struct ClientConfig {
     /// Username. For a guest session, leave it empty or use `Guest` (any
     /// ASCII case): the server may then answer with a guest or anonymous
     /// session. Any other name is an account, and a guest or anonymous answer
-    /// to it fails the login with [`Error::Auth`](crate::Error::Auth), since
+    /// to it fails the login with [`Error::Auth`], since
     /// that's what a wrong password on a `map to guest = bad user` Samba, or an
     /// on-path downgrade, looks like. Some servers take the named `Guest` login
     /// but refuse an anonymous one.
