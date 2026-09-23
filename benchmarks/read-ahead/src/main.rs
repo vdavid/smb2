@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 
 use smb2::{ClientConfig, FileDownload, ReadAhead, SmbClient};
 
+mod upload;
+
 /// Share, username, and password, from `SMB_BENCH_SHARE` / `SMB_BENCH_USER` /
 /// `SMB_BENCH_PASS`. Defaults are the guest fixture's.
-fn share() -> String {
+pub(crate) fn share() -> String {
     std::env::var("SMB_BENCH_SHARE").unwrap_or_else(|_| "public".to_string())
 }
 
@@ -94,7 +96,7 @@ struct Sample {
     probe_max: Duration,
 }
 
-fn fnv(data: &[u8], mut h: u64) -> u64 {
+pub(crate) fn fnv(data: &[u8], mut h: u64) -> u64 {
     for b in data {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x100000001b3);
@@ -102,7 +104,7 @@ fn fnv(data: &[u8], mut h: u64) -> u64 {
     h
 }
 
-async fn connect(addr: &str) -> SmbClient {
+pub(crate) async fn connect(addr: &str) -> SmbClient {
     SmbClient::connect(ClientConfig {
         addr: addr.to_string(),
         timeout: Duration::from_secs(10),
@@ -222,7 +224,7 @@ async fn cancel_cost(client: &mut SmbClient, tree: &smb2::Tree, path: &str, v: V
 
 /// Keeps `writers` connections busy writing `block`-sized files to the same
 /// share until `stop` flips. Returns the bytes written.
-fn spawn_load(addr: String, writers: usize, stop: Arc<AtomicBool>) -> Arc<AtomicU64> {
+pub(crate) fn spawn_load(addr: String, writers: usize, stop: Arc<AtomicBool>) -> Arc<AtomicU64> {
     let written = Arc::new(AtomicU64::new(0));
     for i in 0..writers {
         let addr = addr.clone();
@@ -251,7 +253,7 @@ fn spawn_load(addr: String, writers: usize, stop: Arc<AtomicBool>) -> Arc<Atomic
     written
 }
 
-fn arg(args: &[String], name: &str, default: &str) -> String {
+pub(crate) fn arg(args: &[String], name: &str, default: &str) -> String {
     args.iter()
         .position(|a| a == name)
         .map(|i| args[i + 1].clone())
@@ -372,7 +374,7 @@ async fn run(args: &[String]) {
     }
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
+pub(crate) fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     let n = v.len();
     if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
@@ -448,6 +450,8 @@ async fn main() {
     match args.get(1).map(String::as_str) {
         Some("run") => run(&args).await,
         Some("summarize") => summarize(&args[2]),
-        _ => eprintln!("usage: read-ahead-bench run [--addr A] [--rtt-ms N] [--load-writers N] [--runs N] [--out F] [--sizes a,b] [--variants v,w] | summarize F"),
+        Some("upload") => upload::run(&args).await,
+        Some("summarize-upload") => upload::summarize(&args[2]),
+        _ => eprintln!("usage: read-ahead-bench run [--addr A] [--rtt-ms N] [--load-writers N] [--runs N] [--out F] [--sizes a,b] [--variants v,w] | summarize F | upload [same flags] | summarize-upload F"),
     }
 }

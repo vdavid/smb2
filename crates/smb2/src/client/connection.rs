@@ -169,14 +169,15 @@ impl Drop for WaiterGuard {
 const STALE_WAITER_SWEEP: std::time::Duration = std::time::Duration::from_secs(10);
 const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// How long a download's measured rate seeds the next download's window.
+/// How long a transfer's measured rate seeds the next window the same way,
+/// for downloads and uploads alike.
 ///
 /// Long enough to span the gaps in a folder copy (the consumer writing one
 /// file locally before opening the next), short enough that a link which
 /// changed since (Wi-Fi roaming, a VPN coming up) is measured afresh. A stale
-/// hint costs at most one window at the start of one download: the first
+/// hint costs at most one window at the start of one transfer: the first
 /// delivery replaces it with a measurement.
-const READ_RATE_HINT_TTL: Duration = Duration::from_secs(30);
+const RATE_HINT_TTL: Duration = Duration::from_secs(30);
 
 /// How often a send parked on credits rechecks whether anything is still
 /// outstanding. Short enough that "the last response landed while we waited"
@@ -1243,6 +1244,7 @@ fn sweep_connection(inner: &Inner) {
 
 use crate::client::credits::{self, CreditPool, CreditReservation};
 use crate::client::read_ahead;
+use crate::client::write_behind;
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
@@ -1765,8 +1767,12 @@ struct Inner {
     /// The last delivery rate a download measured on this connection, in
     /// bytes per second, and when. Seeds the next download's read-ahead
     /// window, so a folder of 1 MiB files doesn't pay a round trip per file
-    /// to rediscover the link. See [`READ_RATE_HINT_TTL`].
+    /// to rediscover the link. See [`RATE_HINT_TTL`].
     read_rate_hint: StdMutex<Option<(tokio::time::Instant, f64)>>,
+    /// The same for uploads: the last rate a writer's WRITEs were confirmed
+    /// at. Kept apart from the download rate because most links are
+    /// asymmetric, a home uplink often ten times slower than its downlink.
+    write_rate_hint: StdMutex<Option<(tokio::time::Instant, f64)>>,
     /// Whether compression is active on this connection (negotiated).
     compression_enabled: AtomicBool,
     /// Whether the client wants compression (from config).
@@ -1879,6 +1885,7 @@ impl Inner {
             params: StdMutex::new(None),
             estimated_rtt: StdMutex::new(None),
             read_rate_hint: StdMutex::new(None),
+            write_rate_hint: StdMutex::new(None),
             compression_enabled: AtomicBool::new(false),
             compression_requested: AtomicBool::new(true),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
@@ -2779,7 +2786,7 @@ impl Connection {
     /// it's recent enough to still describe the link.
     pub(crate) fn read_rate_hint(&self) -> Option<f64> {
         let hint = *self.inner.read_rate_hint.lock().unwrap();
-        hint.filter(|(at, _)| at.elapsed() < READ_RATE_HINT_TTL)
+        hint.filter(|(at, _)| at.elapsed() < RATE_HINT_TTL)
             .map(|(_, rate)| rate)
     }
 
@@ -2861,6 +2868,97 @@ impl Connection {
     /// Record a download's measured delivery rate for the next one.
     pub(crate) fn note_read_rate(&self, bytes_per_sec: f64) {
         *self.inner.read_rate_hint.lock().unwrap() =
+            Some((tokio::time::Instant::now(), bytes_per_sec));
+    }
+
+    /// The rate the last upload on this connection had its WRITEs confirmed
+    /// at, if it's recent enough to still describe the link.
+    pub(crate) fn write_rate_hint(&self) -> Option<f64> {
+        let hint = *self.inner.write_rate_hint.lock().unwrap();
+        hint.filter(|(at, _)| at.elapsed() < RATE_HINT_TTL)
+            .map(|(_, rate)| rate)
+    }
+
+    /// How fast uploads on this connection have been moving data lately, in
+    /// bytes per second, or `None` when nothing recent was measured.
+    ///
+    /// The upload twin of [`download_rate_hint`](Self::download_rate_hint),
+    /// measured apart from it because most links are asymmetric. Every
+    /// pipelined upload measures it ([`FileWriter`](crate::FileWriter),
+    /// [`FileUpload`](crate::FileUpload), [`Tree::write_file_pipelined`](crate::Tree::write_file_pipelined),
+    /// [`Tree::write_file_streamed`](crate::Tree::write_file_streamed)), over
+    /// the last eight WRITEs the server confirmed, and it's shared by every
+    /// clone of this connection. The same rules as the download rate:
+    ///
+    /// - **Only an upload of two or more WRITEs measures it.** One WRITE's
+    ///   rate is mostly its round trip, so small files and compound writes
+    ///   leave it untouched.
+    /// - **It expires 30 seconds after the last measurement**, and **a
+    ///   reconnect clears it**.
+    /// - **It errs low.** A WRITE's answer shares the downlink with anything
+    ///   else the connection receives, and a producer slower than the link
+    ///   makes the upload slower than the link. See the
+    ///   [`write_behind` module docs](crate::client::write_behind).
+    ///
+    /// To decide between one compound write and a streamed upload, use
+    /// [`quick_write_limit`](Self::quick_write_limit), which is built on this.
+    #[must_use]
+    pub fn upload_rate_hint(&self) -> Option<u64> {
+        self.write_rate_hint().map(|rate| rate as u64)
+    }
+
+    /// The largest file worth writing as one frame on this connection right
+    /// now, in bytes: the size cut-off between one compound
+    /// CREATE + WRITE + FLUSH + CLOSE ([`Tree::write_file_compound`](crate::Tree::write_file_compound))
+    /// and a streamed [`FileWriter`](crate::FileWriter).
+    ///
+    /// The upload twin of [`quick_read_limit`](Self::quick_read_limit), for
+    /// the same reason: one frame costs a single round trip, but nothing else
+    /// on the connection moves while it crawls up the link, and it reports no
+    /// progress. A streamed upload costs a few more round trips (CREATE, and
+    /// the FLUSH and CLOSE after the last WRITE) and never makes the
+    /// connection wait behind more than about a chunk. So a file is worth one
+    /// frame when the uplink moves it in about 250 ms, the headroom the
+    /// adaptive write-behind window allows:
+    ///
+    /// - With an [`upload_rate_hint`](Self::upload_rate_hint), it's what the
+    ///   connection moves up in 250 ms at that rate.
+    /// - Never less than one [`UPLOAD_CHUNK_SIZE`](crate::UPLOAD_CHUNK_SIZE)
+    ///   (512 KiB): up to one chunk, a streamed upload is one WRITE anyway,
+    ///   plus the round trips. That's also the answer with no hint.
+    /// - Never more than [`compound_write_limit`](Self::compound_write_limit):
+    ///   `MaxWriteSize`, lowered to what half the credit window funds. That
+    ///   one beats the one-chunk floor and can be 0 on a tiny window, meaning
+    ///   stream everything.
+    ///
+    /// A consumer that promises "one frame, all or nothing" up front (for
+    /// example, to skip writing through a temporary name) can decide by this
+    /// and still send the frame later if the limit has moved in between: the
+    /// promise stays safe as long as the size fits `compound_write_limit`,
+    /// which this never exceeds.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(conn: &mut smb2::client::Connection, tree: &std::sync::Arc<smb2::Tree>, data: &[u8]) -> Result<(), smb2::Error> {
+    /// if data.len() as u64 <= conn.quick_write_limit() {
+    ///     tree.write_file_compound(conn, "photo.jpg", data).await?;
+    /// } else {
+    ///     let mut writer = tree.create_file_writer(conn.clone(), "photo.jpg").await?;
+    ///     writer.write_chunk(data).await?;
+    ///     writer.finish().await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn quick_write_limit(&self) -> u64 {
+        write_behind::quick_write_limit(self.write_rate_hint(), self.compound_write_limit())
+    }
+
+    /// Record an upload's measured rate for the next one.
+    pub(crate) fn note_write_rate(&self, bytes_per_sec: f64) {
+        *self.inner.write_rate_hint.lock().unwrap() =
             Some((tokio::time::Instant::now(), bytes_per_sec));
     }
 
@@ -4963,6 +5061,7 @@ impl Connection {
         *inner.last_frame_at.lock().unwrap() = None;
         *inner.estimated_rtt.lock().unwrap() = None;
         *inner.read_rate_hint.lock().unwrap() = None;
+        *inner.write_rate_hint.lock().unwrap() = None;
         inner.abandoned.lock().unwrap().clear();
         inner.dfs_trees.lock().unwrap().clear();
         *inner.ipc_tree.lock().unwrap() = None;

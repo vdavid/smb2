@@ -189,6 +189,24 @@ pub(crate) fn build_write_response(count: u32) -> Vec<u8> {
     pack_message(&h, &body)
 }
 
+/// [`build_write_response`] from a server that grants back only `credits`,
+/// the way one that stopped growing its window answers.
+pub(crate) fn build_write_response_granting(count: u32, credits: u16) -> Vec<u8> {
+    use crate::msg::write::WriteResponse;
+    let mut h = Header::new_request(Command::Write);
+    h.flags.set_response();
+    h.credits = credits;
+
+    let body = WriteResponse {
+        count,
+        remaining: 0,
+        write_channel_info_offset: 0,
+        write_channel_info_length: 0,
+    };
+
+    pack_message(&h, &body)
+}
+
 /// Build a WRITE response with a non-success status (for error tests).
 pub(crate) fn build_write_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
     use crate::msg::header::ErrorResponse;

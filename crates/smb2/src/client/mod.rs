@@ -26,7 +26,11 @@ pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 pub mod tree;
+#[cfg(test)]
+mod upload_tests;
 pub mod watcher;
+pub mod write_behind;
+pub(crate) mod write_pipe;
 
 pub use crate::crypto::encryption::Cipher;
 pub use connection::{
@@ -1629,13 +1633,12 @@ impl SmbClient {
         } else {
             // Large file: open the file, let the caller drive chunks.
             let file_id = tree.open_file_for_write(&mut self.conn, path).await?;
-            let chunk_size = max_write as u32;
             Ok(stream::FileUpload::new(
                 tree,
                 &mut self.conn,
                 file_id,
                 data,
-                chunk_size,
+                max_write as u32,
             ))
         }
     }
@@ -1807,70 +1810,65 @@ impl SmbClient {
             .params()
             .map(|p| p.max_write_size)
             .unwrap_or(65536);
+        let mut pipe =
+            write_pipe::WritePipe::new(self.conn.clone(), tree.tree_id, file_id, max_write);
+        let total_bytes = Some(data.len() as u64);
 
-        let mut total_written = 0u64;
-        let mut offset = 0usize;
-        let mut cancelled = false;
+        // Reported whenever the server has confirmed more, which is what
+        // `bytes_transferred` counts.
+        let mut reported = 0u64;
+        let mut report = |pipe: &write_pipe::WritePipe| -> ControlFlow<()> {
+            if pipe.confirmed() == reported {
+                return ControlFlow::Continue(());
+            }
+            reported = pipe.confirmed();
+            on_progress(Progress {
+                bytes_transferred: reported,
+                total_bytes,
+            })
+        };
 
-        while offset < data.len() {
-            let remaining = data.len() - offset;
-            let chunk_size = remaining.min(self.conn.fundable_chunk(max_write) as usize);
-            let chunk = &data[offset..offset + chunk_size];
+        let written = async {
+            let mut sent = 0;
+            while sent < data.len() {
+                let len = (data.len() - sent).min(pipe.next_len() as usize);
+                pipe.send(data[sent..sent + len].to_vec()).await?;
+                sent += len;
+                if report(&pipe).is_break() {
+                    return Ok(None);
+                }
+            }
+            while pipe.confirm_next().await? {
+                if report(&pipe).is_break() {
+                    return Ok(None);
+                }
+            }
+            Ok::<_, crate::Error>(Some(pipe.confirmed()))
+        }
+        .await;
 
-            let write_req = crate::msg::write::WriteRequest {
-                data_offset: 0x70,
-                offset: offset as u64,
-                file_id,
-                channel: 0,
-                remaining_bytes: 0,
-                write_channel_info_offset: 0,
-                write_channel_info_length: 0,
-                flags: 0,
-                data: chunk.to_vec(),
-            };
-
-            let credit_charge = credits::charge_for_payload(chunk_size as u64);
-            let frame = self
-                .conn
-                .execute_with_credits(
-                    crate::types::Command::Write,
-                    &write_req,
-                    Some(tree.tree_id),
-                    crate::types::CreditCharge(credit_charge),
-                )
-                .await?;
-
-            if frame.header.status != crate::types::status::NtStatus::SUCCESS {
-                // Close handle before returning error.
+        let total_written = match written {
+            Ok(Some(total)) => total,
+            Ok(None) => {
+                // Cancelled: wait out what's on the wire, then close without
+                // a flush (best-effort).
+                pipe.abandon().await;
                 let _ = tree.close_handle(&mut self.conn, file_id).await;
-                return Err(crate::Error::Protocol {
-                    status: frame.header.status,
-                    command: crate::types::Command::Write,
-                });
+                return Err(crate::Error::Cancelled);
             }
-
-            let mut cursor = crate::pack::ReadCursor::new(&frame.body);
-            let resp = crate::msg::write::WriteResponse::unpack(&mut cursor)?;
-
-            total_written += resp.count as u64;
-            offset += chunk_size;
-
-            let progress = Progress {
-                bytes_transferred: total_written,
-                total_bytes: Some(data.len() as u64),
-            };
-
-            if let ControlFlow::Break(()) = on_progress(progress) {
-                cancelled = true;
-                break;
+            Err(e) => {
+                if matches!(
+                    e,
+                    crate::Error::Protocol {
+                        command: crate::types::Command::Write,
+                        ..
+                    }
+                ) {
+                    let _ = tree.close_handle(&mut self.conn, file_id).await;
+                }
+                return Err(e);
             }
-        }
-
-        if cancelled {
-            // Best-effort close without flush.
-            let _ = tree.close_handle(&mut self.conn, file_id).await;
-            return Err(crate::Error::Cancelled);
-        }
+        };
 
         // Flush to ensure data is persisted.
         tree.flush_handle(&mut self.conn, file_id).await?;

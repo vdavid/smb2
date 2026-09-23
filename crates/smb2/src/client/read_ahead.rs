@@ -2,7 +2,8 @@
 //!
 //! [`ReadAhead`] is the public knob; `Window` is the controller a
 //! [`FileDownload`](crate::FileDownload) consults before every READ it sends.
-//! The controller is pure (it takes instants, it never reads a clock or sends
+//! Uploads pace through the same controller (`write_behind.rs`), since the
+//! arithmetic doesn't care which way the payload flows. The controller is pure (it takes instants, it never reads a clock or sends
 //! anything), so its behavior is pinned by deterministic tests below.
 //!
 //! # Why adaptive is the default
@@ -53,9 +54,9 @@ pub const ADAPTIVE_MAX_IN_FLIGHT: u64 = 4 * 1024 * 1024;
 /// The most READs an adaptive download keeps in flight, whatever the chunk.
 ///
 /// Only a caller-chosen chunk far below 512 KiB reaches it (4 MiB of 4 KiB
-/// READs would be 1,024 of them, each holding a credit and a waiter). Matches
-/// the write pipeline's window.
-pub(crate) const ADAPTIVE_MAX_READS: usize = 32;
+/// READs would be 1,024 of them, each holding a credit and a waiter). Caps an
+/// adaptive upload's WRITEs the same way.
+pub(crate) const ADAPTIVE_MAX_REQUESTS: usize = 32;
 
 /// Margin on top of the round trip, in time at the delivery rate.
 ///
@@ -127,7 +128,17 @@ pub enum ReadAhead {
 impl ReadAhead {
     /// One READ at a time.
     pub const SEQUENTIAL: Self = Self::Fixed(1);
+}
 
+/// The policy a [`Window`] runs, whichever way it paces: what [`ReadAhead`]
+/// and [`WriteBehind`](crate::WriteBehind) both come down to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pacing {
+    Adaptive,
+    Fixed(usize),
+}
+
+impl Pacing {
     /// The fixed window this policy pins, if any.
     pub(crate) fn fixed_window(self) -> Option<usize> {
         match self {
@@ -137,14 +148,25 @@ impl ReadAhead {
     }
 }
 
-/// What a download should do about its next READ.
+impl From<ReadAhead> for Pacing {
+    fn from(policy: ReadAhead) -> Self {
+        match policy {
+            ReadAhead::Adaptive => Self::Adaptive,
+            ReadAhead::Fixed(n) => Self::Fixed(n),
+        }
+    }
+}
+
+/// What a transfer should do about its next request: a READ for a download,
+/// a WRITE for an upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Dispatch {
     /// Send it now.
     Now,
-    /// Send it at this instant if the head READ hasn't landed by then.
+    /// Send it at this instant if nothing in flight has landed by then.
     At(Instant),
-    /// Nothing to send until the head READ is delivered.
+    /// Nothing to send until a request in flight lands (for a download, the
+    /// head READ, since chunks are delivered in file order).
     AfterHead,
 }
 
@@ -154,25 +176,34 @@ pub(crate) enum Dispatch {
 /// [`Connection::quick_read_limit`](crate::client::Connection::quick_read_limit),
 /// which documents the reasoning.
 pub(crate) fn quick_read_limit(rate: Option<f64>, max_read: u32) -> u64 {
-    let one_chunk = u64::from(DOWNLOAD_CHUNK_SIZE);
-    let in_headroom = rate.map_or(0, |rate| (rate * ADAPTIVE_HEADROOM.as_secs_f64()) as u64);
-    one_chunk.max(in_headroom).min(u64::from(max_read))
+    quick_limit(rate, DOWNLOAD_CHUNK_SIZE, u64::from(max_read))
 }
 
-/// What the connection already knows about the link when a download starts.
+/// What the link moves in [`ADAPTIVE_HEADROOM`] at `rate` bytes/s, at least
+/// `chunk` and at most `cap`: the one-frame cut-off in either direction.
+pub(crate) fn quick_limit(rate: Option<f64>, chunk: u32, cap: u64) -> u64 {
+    let in_headroom = rate.map_or(0, |rate| (rate * ADAPTIVE_HEADROOM.as_secs_f64()) as u64);
+    u64::from(chunk).max(in_headroom).min(cap)
+}
+
+/// What the connection already knows about the link when a transfer starts.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LinkHint {
     /// The NEGOTIATE round trip, if one was measured.
     pub(crate) rtt: Option<Duration>,
-    /// The delivery rate a recent download on the same connection measured,
-    /// in bytes per second.
+    /// The delivery rate a recent transfer the same way on the same
+    /// connection measured, in bytes per second.
     pub(crate) rate: Option<f64>,
 }
 
-/// The read-ahead controller for one download.
+/// The pacing controller for one transfer, download or upload.
 ///
-/// The download reports every READ it sends and every chunk it delivers; in
-/// return this says when the next READ should go out. "In flight" below means
+/// A download reports every READ it sends and every chunk it delivers; an
+/// upload reports every WRITE it hands the connection and every WRITE the
+/// server confirms. In return this says when the next request should go out.
+/// The docs below speak of READs; for an upload read WRITEs, with
+/// "delivered" meaning confirmed: a WRITE's bytes are on their way until the
+/// server has them, which its response says. "In flight" below means
 /// requested but not yet delivered to the caller, which is what the memory
 /// and window bounds count. The adaptive target counts something narrower:
 /// bytes estimated to be still on their way (`unarrived`), drained at the
@@ -181,7 +212,7 @@ pub(crate) struct LinkHint {
 /// after.
 #[derive(Debug)]
 pub(crate) struct Window {
-    policy: ReadAhead,
+    policy: Pacing,
     max_in_flight: u64,
     hint: LinkHint,
     /// The fastest dispatch-to-delivery time seen, an upper bound on the RTT.
@@ -196,9 +227,9 @@ pub(crate) struct Window {
 }
 
 impl Window {
-    pub(crate) fn new(policy: ReadAhead, chunk_size: u32, hint: LinkHint) -> Self {
+    pub(crate) fn new(policy: impl Into<Pacing>, chunk_size: u32, hint: LinkHint) -> Self {
         Self {
-            policy,
+            policy: policy.into(),
             // A chunk bigger than the cap still gets one READ in flight.
             max_in_flight: ADAPTIVE_MAX_IN_FLIGHT.max(u64::from(chunk_size)),
             hint,
@@ -228,7 +259,7 @@ impl Window {
                 Dispatch::AfterHead
             };
         }
-        if reads_in_flight >= ADAPTIVE_MAX_READS
+        if reads_in_flight >= ADAPTIVE_MAX_REQUESTS
             || bytes_in_flight + u64::from(next_len) > self.max_in_flight
         {
             return Dispatch::AfterHead;
@@ -290,10 +321,10 @@ impl Window {
         self.measured_rate().or(self.hint.rate)
     }
 
-    /// The rate worth handing to the next download on this connection: one
-    /// measured over at least two deliveries. A single READ's rate is mostly
-    /// its round trip, and recording it after every small file would keep
-    /// dragging the hint down to that.
+    /// The rate worth handing to the next transfer on this connection: one
+    /// measured over at least two deliveries. A single request's rate is
+    /// mostly its round trip, and recording it after every small file would
+    /// keep dragging the hint down to that.
     pub(crate) fn rate_to_share(&self) -> Option<f64> {
         if self.deliveries.len() < 3 {
             return None;

@@ -1,0 +1,169 @@
+//! How much an upload keeps on the wire.
+//!
+//! [`WriteBehind`] is the public knob. Every pipelined upload paces through
+//! one engine (`write_pipe.rs`), which consults the same `Window` a download
+//! does (`read_ahead.rs`): the arithmetic doesn't care which way the payload
+//! flows, only when a request went out and when its bytes had arrived.
+//!
+//! # What a WRITE's answer measures
+//!
+//! A READ's answer carries the payload, so its arrival is the delivery. A
+//! WRITE's answer is small and comes back after the payload went the other
+//! way, so its arrival is the moment the server had every byte, plus the
+//! server's own write and half a round trip. Over several WRITEs that is the
+//! uplink's rate, which is what the window needs, and the round trip it adds
+//! is already in the window's budget. Two things make it read low, never
+//! high:
+//!
+//! - **The answer shares the downlink.** A download on the same connection
+//!   queues the WRITE answers behind its READ payload, and a slow server disk
+//!   holds them back. Both look like a slower uplink.
+//! - **An answer counts when the upload looks at it.** Uploads are push-based,
+//!   so a producer slower than the link sees its answers late. The link then
+//!   isn't the bottleneck, and the window it sizes doesn't matter much.
+//!
+//! Reading low keeps the window small, which errs toward keeping the
+//! connection responsive. It is also why the rate is kept apart from the
+//! download one: an asymmetric link (most home connections) moves each way at
+//! its own speed.
+//!
+//! # Why adaptive is the default
+//!
+//! The same two constraints as for downloads (see [`crate::client::read_ahead`]):
+//! a fast link needs bytes in flight, and on a slow one every queued byte is
+//! latency for everything else on the connection. Before 0.25 a writer kept up
+//! to 32 WRITEs of `MaxWriteSize` in flight (bounded at 32 MiB per connection
+//! by the write budget), so a `stat` on the same connection waited behind all
+//! of it: 23 s on a 375 KB/s uplink behind one 8 MiB file, and a Cmdr user's
+//! 1 MiB frames sat 5–12 s in the send queue with every directory listing
+//! behind them. The adaptive window keeps about `rate × (RTT + 250 ms)` in
+//! flight instead: at least one WRITE, at most
+//! [`ADAPTIVE_MAX_IN_FLIGHT`](crate::client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT).
+
+use crate::client::read_ahead::{quick_limit, Pacing};
+
+/// Chunk size a [`FileWriter`](crate::FileWriter) writes by default, and the
+/// one every pipelined upload uses: one WRITE's worth, capped at the server's
+/// `MaxWriteSize`.
+///
+/// The same trade as [`DOWNLOAD_CHUNK_SIZE`](crate::DOWNLOAD_CHUNK_SIZE): small
+/// enough that a slow uplink carries one in about a second and a half (at
+/// 375 KB/s, where an 8 MiB WRITE took 22 s with nothing else moving), large
+/// enough that a fast link needs few of them.
+pub const UPLOAD_CHUNK_SIZE: u32 = 512 * 1024;
+
+/// How many WRITEs an upload keeps on the wire.
+///
+/// Every pipelined upload paces this way: [`FileWriter`](crate::FileWriter),
+/// [`FileUpload`](crate::FileUpload), [`Tree::write_file_pipelined`](crate::Tree::write_file_pipelined),
+/// [`Tree::write_file_streamed`](crate::Tree::write_file_streamed), and
+/// [`SmbClient::write_file_with_progress`](crate::SmbClient::write_file_with_progress).
+/// A `FileWriter` takes the knob through
+/// [`with_write_behind`](crate::FileWriter::with_write_behind); the others
+/// use the default.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(client: &smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+/// use smb2::WriteBehind;
+///
+/// // The behavior before 0.25: `MaxWriteSize` WRITEs, 32 in flight.
+/// let max_write = client.params().map(|p| p.max_write_size).unwrap_or(65536);
+/// let mut writer = client
+///     .create_file_writer(share, "big.bin")
+///     .await?
+///     .with_chunk_size(max_write)
+///     .with_write_behind(WriteBehind::Fixed(32));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum WriteBehind {
+    /// Size the window to the link (the default).
+    ///
+    /// Keeps about `upload rate × (RTT + 250 ms)` bytes handed to the
+    /// connection but not yet confirmed by the server: never fewer than one
+    /// WRITE, never more than
+    /// [`ADAPTIVE_MAX_IN_FLIGHT`](crate::client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT).
+    /// The rate is re-measured over the last eight confirmed WRITEs; the RTT
+    /// is the connection's NEGOTIATE round trip or the fastest WRITE so far,
+    /// whichever is smaller. See the [module docs](crate::client::write_behind).
+    #[default]
+    Adaptive,
+    /// Keep exactly this many WRITEs in flight (values below one mean one).
+    ///
+    /// A big fixed window is fastest on a fast link and worst on a slow one:
+    /// every other request on the connection queues behind all of it.
+    Fixed(usize),
+}
+
+impl WriteBehind {
+    /// One WRITE at a time.
+    pub const SEQUENTIAL: Self = Self::Fixed(1);
+}
+
+impl From<WriteBehind> for Pacing {
+    fn from(policy: WriteBehind) -> Self {
+        match policy {
+            WriteBehind::Adaptive => Self::Adaptive,
+            WriteBehind::Fixed(n) => Self::Fixed(n),
+        }
+    }
+}
+
+/// The largest write worth sending as one frame: what the uplink moves in the
+/// adaptive headroom at `rate` bytes/s, never less than one upload chunk and
+/// never more than `compound_limit` (which wins over the chunk floor, and can
+/// be 0). Behind
+/// [`Connection::quick_write_limit`](crate::client::Connection::quick_write_limit),
+/// which documents the reasoning.
+pub(crate) fn quick_write_limit(rate: Option<f64>, compound_limit: u64) -> u64 {
+    quick_limit(rate, UPLOAD_CHUNK_SIZE, compound_limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHUNK: u64 = UPLOAD_CHUNK_SIZE as u64;
+    const EIGHT_MIB: u64 = 8 << 20;
+
+    #[test]
+    fn with_no_rate_one_chunk_is_quick() {
+        assert_eq!(quick_write_limit(None, EIGHT_MIB), CHUNK);
+    }
+
+    #[test]
+    fn a_fast_uplink_makes_what_it_moves_in_the_headroom_quick() {
+        // 16 MB/s moves 4 MB in 250 ms.
+        assert_eq!(quick_write_limit(Some(16e6), EIGHT_MIB), 4_000_000);
+    }
+
+    #[test]
+    fn a_slow_uplink_still_writes_one_chunk_in_one_go() {
+        // 375 KB/s moves 94 KB in 250 ms, but one chunk is one WRITE either way.
+        assert_eq!(quick_write_limit(Some(375e3), EIGHT_MIB), CHUNK);
+    }
+
+    #[test]
+    fn one_frame_never_carries_more_than_the_compound_write_limit() {
+        assert_eq!(quick_write_limit(Some(1e9), EIGHT_MIB), EIGHT_MIB);
+        assert_eq!(quick_write_limit(None, 65536), 65536);
+        // A window too small for any compound: stream everything, the floor
+        // notwithstanding.
+        assert_eq!(quick_write_limit(Some(16e6), 0), 0);
+        assert_eq!(quick_write_limit(None, 0), 0);
+    }
+
+    #[test]
+    fn a_fixed_window_is_at_least_one() {
+        assert_eq!(Pacing::from(WriteBehind::Fixed(0)).fixed_window(), Some(1));
+        assert_eq!(
+            Pacing::from(WriteBehind::SEQUENTIAL).fixed_window(),
+            Some(1)
+        );
+        assert_eq!(Pacing::from(WriteBehind::Adaptive).fixed_window(), None);
+    }
+}

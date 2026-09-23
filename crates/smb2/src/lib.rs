@@ -78,7 +78,8 @@ pub use client::{connect, ClientConfig, SmbClient};
 
 // Streaming I/O
 pub use client::stream::{
-    FileDownload, FileReader, FileUpload, FileWriter, Progress, ReadAhead, DOWNLOAD_CHUNK_SIZE,
+    FileDownload, FileReader, FileUpload, FileWriter, Progress, ReadAhead, WriteBehind,
+    DOWNLOAD_CHUNK_SIZE, UPLOAD_CHUNK_SIZE,
 };
 
 // Server-side copy (FSCTL_SRV_COPYCHUNK): copy byte ranges between two files

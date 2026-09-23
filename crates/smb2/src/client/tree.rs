@@ -10,11 +10,10 @@ use std::time::{Duration, Instant};
 
 use log::{debug, info, trace, warn};
 
-use crate::client::connection::{
-    reserve_write_budget_or_drain, CompoundOp, Connection, Frame, WaiterGuard, WriteBudgetStep,
-};
+use crate::client::connection::{CompoundOp, Connection, Frame, WaiterGuard};
 use crate::client::credits;
 use crate::client::stream::{FileDownload, Progress};
+use crate::client::write_pipe::WritePipe;
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
 use crate::msg::create::{
@@ -38,28 +37,44 @@ use crate::types::MessageId;
 use crate::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
 use crate::Error;
 
-/// Maximum number of requests to keep in flight during pipelining.
+/// Maximum number of READs to keep in flight during a pipelined read.
 ///
 /// More than 32 in-flight requests creates diminishing returns and
 /// increases memory usage (buffering responses). 32 x 64 KB = 2 MB
-/// in flight is plenty for Gigabit LAN.
+/// in flight is plenty for Gigabit LAN. Writes pace through `WritePipe`
+/// instead.
 const MAX_PIPELINE_WINDOW: usize = 32;
 
-/// Bytes the server confirmed for one finished WRITE.
+/// Pull `next_chunk` dry into `pipe`, then wait for every WRITE's answer.
+/// Returns the bytes the server confirmed.
 ///
-/// The one place the pipelined write loops turn a completed frame into a byte
-/// count, so a status they can't accept fails the same way wherever it is
-/// noticed.
-fn confirmed_write_bytes(frame: Result<Frame>) -> Result<u64> {
-    let frame = frame?;
-    if frame.header.status != NtStatus::SUCCESS {
-        return Err(Error::Protocol {
-            status: frame.header.status,
-            command: Command::Write,
-        });
+/// The body of [`Tree::write_file_streamed`]: a callback error stops the
+/// pulling, waits out what's already on the wire, and comes back as
+/// [`Error::Io`]; an empty chunk ends the stream like `None`.
+async fn write_streamed<F>(pipe: &mut WritePipe, next_chunk: &mut F) -> Result<u64>
+where
+    F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
+{
+    loop {
+        match next_chunk() {
+            None => break,
+            Some(Err(e)) => {
+                pipe.drain().await?;
+                return Err(Error::Io(e));
+            }
+            Some(Ok(data)) if data.is_empty() => break,
+            Some(Ok(data)) => {
+                let mut sent = 0;
+                while sent < data.len() {
+                    let len = (data.len() - sent).min(pipe.next_len() as usize);
+                    pipe.send(data[sent..sent + len].to_vec()).await?;
+                    sent += len;
+                }
+            }
+        }
     }
-    let mut cursor = ReadCursor::new(&frame.body);
-    Ok(u64::from(WriteResponse::unpack(&mut cursor)?.count))
+    pipe.drain().await?;
+    Ok(pipe.confirmed())
 }
 
 /// Unwrap an `execute_compound` result, propagating the first inner
@@ -1767,21 +1782,28 @@ impl Tree {
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
 
-        // Use MaxWriteSize for pipelined writes: minimizes overhead for
-        // large payloads being sent (we're sending data, not just a small request).
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-        let chunk_size = conn.fundable_chunk(max_write);
-        let credit_charge = credits::charge_for_payload(chunk_size as u64);
-        let total_chunks = data.len().div_ceil(chunk_size as usize);
+        let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
         trace!(
-            "tree: write_file_pipelined path={}, len={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
-            normalized, data.len(), chunk_size, credit_charge, total_chunks, conn.credits()
+            "tree: write_file_pipelined path={}, len={}, chunk_size={}, credits={}",
+            normalized,
+            data.len(),
+            pipe.next_len(),
+            conn.credits()
         );
 
         let start = std::time::Instant::now();
-        let result = self
-            .write_pipelined_loop(conn, file_id, data, chunk_size, credit_charge, total_chunks)
-            .await;
+        let result = async {
+            let mut sent = 0;
+            while sent < data.len() {
+                let len = (data.len() - sent).min(pipe.next_len() as usize);
+                pipe.send(data[sent..sent + len].to_vec()).await?;
+                sent += len;
+            }
+            pipe.drain().await?;
+            Ok::<_, Error>(pipe.confirmed())
+        }
+        .await;
 
         // Flush to ensure data is persisted on the server.
         if result.is_ok() {
@@ -1881,12 +1903,10 @@ impl Tree {
         let file_id = self.open_file_for_write(conn, path).await?;
 
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-        let chunk = conn.fundable_chunk(max_write);
+        let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
 
         let start = std::time::Instant::now();
-        let result = self
-            .write_streamed_loop(conn, file_id, next_chunk, chunk)
-            .await;
+        let result = write_streamed(&mut pipe, next_chunk).await;
 
         // Flush to ensure data is persisted on the server.
         if result.is_ok() {
@@ -2794,308 +2814,6 @@ impl Tree {
         }
 
         Ok(data)
-    }
-
-    /// Pipelined write using a sliding window.
-    ///
-    /// Instead of batch send/receive phases, each received response
-    /// immediately triggers the next send. The pipe stays full at all times.
-    ///
-    /// Two bounds hold it back, and they answer different questions:
-    /// `MAX_PIPELINE_WINDOW` caps how many frames THIS call keeps queued, and
-    /// the connection-wide write budget caps how much payload every writer on
-    /// the connection has outstanding together. See
-    /// [`reserve_write_budget_or_drain`] for why the order below is what it is.
-    async fn write_pipelined_loop(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-        data: &[u8],
-        chunk_size: u32,
-        credit_charge: u16,
-        total_chunks: usize,
-    ) -> Result<u64> {
-        use futures_util::stream::{FuturesUnordered, StreamExt};
-
-        let mut chunks_sent = 0usize;
-        let mut chunks_received = 0usize;
-        let mut total_written = 0u64;
-
-        // How many requests to keep queued, not how many the credit budget
-        // allows: `Connection` reserves credits per send and parks a request
-        // that can't afford one, so throttling here as well could only
-        // under-send.
-        let initial_window = total_chunks.min(MAX_PIPELINE_WINDOW);
-
-        trace!(
-            "tree: pipeline write sliding window: initial_window={}, total_chunks={}, credits={}",
-            initial_window,
-            total_chunks,
-            conn.credits()
-        );
-
-        let mut in_flight = FuturesUnordered::new();
-        let chunk_range = |chunk_index: usize| -> (usize, usize) {
-            let offset = chunk_index * chunk_size as usize;
-            (offset, (offset + chunk_size as usize).min(data.len()))
-        };
-        let build_req = |chunk_index: usize| -> WriteRequest {
-            let (offset, end) = chunk_range(chunk_index);
-            WriteRequest {
-                data_offset: 0x70,
-                offset: offset as u64,
-                file_id,
-                channel: 0,
-                remaining_bytes: 0,
-                write_channel_info_offset: 0,
-                write_channel_info_length: 0,
-                flags: 0,
-                data: data[offset..end].to_vec(),
-            }
-        };
-        let launch_chunk =
-            |conn: &Connection,
-             chunk_index: usize,
-             tree_id: TreeId,
-             permit: Option<tokio::sync::OwnedSemaphorePermit>| {
-                let c = conn.clone();
-                let req = build_req(chunk_index);
-                async move {
-                    // Parked inside the future so completing, aborting, or dropping
-                    // it returns the budget with no explicit release anywhere.
-                    let _budget = permit;
-                    let frame = c
-                        .execute_with_credits(
-                            Command::Write,
-                            &req,
-                            Some(tree_id),
-                            CreditCharge(credit_charge),
-                        )
-                        .await;
-                    (chunk_index, frame)
-                }
-            };
-
-        while chunks_received < total_chunks {
-            // Room in our own window and something left to send: ask for the
-            // budget, which may hand back one of our own responses instead.
-            if chunks_sent < total_chunks && in_flight.len() < initial_window {
-                let (offset, end) = chunk_range(chunks_sent);
-                let step =
-                    reserve_write_budget_or_drain(conn, (end - offset) as u64, &mut in_flight)
-                        .await;
-                match step {
-                    WriteBudgetStep::Granted(permit) => {
-                        in_flight.push(launch_chunk(conn, chunks_sent, self.tree_id, permit));
-                        chunks_sent += 1;
-                    }
-                    WriteBudgetStep::Drained((_chunk_index, frame_result)) => {
-                        chunks_received += 1;
-                        total_written += confirmed_write_bytes(frame_result)?;
-                    }
-                }
-                continue;
-            }
-
-            // Window full, or everything is on the wire: wait for a response.
-            let Some((_chunk_index, frame_result)) = in_flight.next().await else {
-                break;
-            };
-            chunks_received += 1;
-            total_written += confirmed_write_bytes(frame_result)?;
-        }
-
-        Ok(total_written)
-    }
-
-    /// Inner loop for streamed writes with a sliding window.
-    ///
-    /// Pulls chunks from the callback, splits them if larger than
-    /// `max_write`, and sends WRITE requests. Uses a sliding window
-    /// of in-flight requests for throughput.
-    async fn write_streamed_loop<F>(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-        next_chunk: &mut F,
-        max_write: u32,
-    ) -> Result<u64>
-    where
-        F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
-    {
-        use futures_util::stream::{FuturesUnordered, StreamExt};
-
-        type BoxedExecute = std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<crate::client::connection::Frame>> + Send>,
-        >;
-
-        let mut offset = 0u64;
-        let mut in_flight = 0usize;
-        let mut total_written = 0u64;
-        let mut done = false; // callback exhausted or errored
-        let mut callback_err: Option<std::io::Error> = None;
-        let mut in_flight_futs: FuturesUnordered<BoxedExecute> = FuturesUnordered::new();
-
-        // Buffer for leftover data when a callback chunk is larger than max_write.
-        let mut pending_data: Vec<u8> = Vec::new();
-        let mut pending_offset = 0usize;
-
-        // Helper: try to get the next wire-level chunk (up to max_write bytes).
-        // Returns Some(data) or None if no more data available.
-        let next_wire_chunk = |pending_data: &mut Vec<u8>,
-                               pending_offset: &mut usize,
-                               done: &mut bool,
-                               callback_err: &mut Option<std::io::Error>,
-                               next_chunk: &mut F|
-         -> Option<Vec<u8>> {
-            // First, drain any pending leftover from a previous large chunk.
-            if *pending_offset < pending_data.len() {
-                let end = (*pending_offset + max_write as usize).min(pending_data.len());
-                let slice = pending_data[*pending_offset..end].to_vec();
-                *pending_offset = end;
-                if *pending_offset >= pending_data.len() {
-                    pending_data.clear();
-                    *pending_offset = 0;
-                }
-                return Some(slice);
-            }
-
-            if *done {
-                return None;
-            }
-
-            // Pull from the callback.
-            match next_chunk() {
-                None => {
-                    *done = true;
-                    None
-                }
-                Some(Err(e)) => {
-                    *done = true;
-                    *callback_err = Some(e);
-                    None
-                }
-                Some(Ok(data)) => {
-                    if data.is_empty() {
-                        // Treat empty chunk as end of stream.
-                        *done = true;
-                        return None;
-                    }
-                    if data.len() <= max_write as usize {
-                        Some(data)
-                    } else {
-                        // Split: return first max_write bytes, buffer the rest.
-                        let first = data[..max_write as usize].to_vec();
-                        *pending_data = data;
-                        *pending_offset = max_write as usize;
-                        Some(first)
-                    }
-                }
-            }
-        };
-
-        // One chunk pulled from the callback but not yet launched, because the
-        // budget handed back a response first. It goes out next, so the wire
-        // order (and therefore `offset`) never changes.
-        let mut stashed: Option<Vec<u8>> = None;
-
-        // Two bounds, answering different questions: `MAX_PIPELINE_WINDOW` caps
-        // how many frames THIS call keeps queued -- a queue bound, not a credit
-        // bound, since `Connection` reserves credits per send and parks a write
-        // that can't afford one -- and the connection-wide write budget caps how
-        // much payload every writer on the connection has outstanding together.
-        loop {
-            // A response handed to us by the budget's drain step, if any.
-            let mut drained: Option<Result<Frame>> = None;
-
-            if in_flight < MAX_PIPELINE_WINDOW && callback_err.is_none() {
-                if stashed.is_none() {
-                    stashed = next_wire_chunk(
-                        &mut pending_data,
-                        &mut pending_offset,
-                        &mut done,
-                        &mut callback_err,
-                        next_chunk,
-                    );
-                }
-
-                if let Some(chunk_data) = stashed.take() {
-                    let data_len = chunk_data.len() as u64;
-                    let step =
-                        reserve_write_budget_or_drain(conn, data_len, &mut in_flight_futs).await;
-                    match step {
-                        WriteBudgetStep::Granted(permit) => {
-                            let cc = credits::charge_for_payload(data_len);
-                            let c = conn.clone();
-                            let tree_id = self.tree_id;
-                            let req = WriteRequest {
-                                data_offset: 0x70,
-                                offset,
-                                file_id,
-                                channel: 0,
-                                remaining_bytes: 0,
-                                write_channel_info_offset: 0,
-                                write_channel_info_length: 0,
-                                flags: 0,
-                                data: chunk_data,
-                            };
-                            in_flight_futs.push(Box::pin(async move {
-                                // Parked inside the future, so every path that
-                                // ends it returns the budget for free.
-                                let _budget = permit;
-                                c.execute_with_credits(
-                                    Command::Write,
-                                    &req,
-                                    Some(tree_id),
-                                    CreditCharge(cc),
-                                )
-                                .await
-                            }));
-                            offset += data_len;
-                            in_flight += 1;
-                            continue;
-                        }
-                        WriteBudgetStep::Drained(frame_result) => {
-                            stashed = Some(chunk_data);
-                            drained = Some(frame_result);
-                        }
-                    }
-                }
-            }
-
-            // Nothing to launch (window full, callback exhausted, or the budget
-            // drained one on us): account for a response.
-            let frame_result = match drained {
-                Some(result) => result,
-                None => {
-                    if in_flight == 0 {
-                        break;
-                    }
-                    match in_flight_futs.next().await {
-                        Some(result) => result,
-                        None => break,
-                    }
-                }
-            };
-            in_flight -= 1;
-
-            match confirmed_write_bytes(frame_result) {
-                Ok(count) => total_written += count,
-                Err(e) => {
-                    // Drain remaining in-flight responses (best-effort).
-                    while in_flight_futs.next().await.is_some() {}
-                    return Err(e);
-                }
-            }
-        }
-
-        // If the callback returned an error, propagate it now
-        // (after all in-flight responses have been drained).
-        if let Some(io_err) = callback_err {
-            return Err(Error::Io(io_err));
-        }
-
-        Ok(total_written)
     }
 
     /// Flush a file handle to ensure data is persisted on the server.
