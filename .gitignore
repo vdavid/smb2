@@ -5,3 +5,7 @@ related-repos/
 target/
 .DS_Store
 .env
+
+# Left by the worktree warm-start script
+.warming-worktree
+.warming-worktree.log
