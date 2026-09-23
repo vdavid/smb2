@@ -596,6 +596,43 @@ fn rc4_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Recover the exported session key from an AUTHENTICATE_MESSAGE the way a
+/// SERVER does, so a test can sign a response exactly as a real one would.
+///
+/// Test-only: nothing in this crate ever plays the server. It exists because
+/// the client refuses a final SESSION_SETUP response it cannot verify, and the
+/// key that verifies it comes out of the client's own random choices (the
+/// client challenge, the key-exchange key), which only this derivation sees
+/// through.
+#[cfg(test)]
+pub(crate) fn exported_session_key_as_server(
+    authenticate: &[u8],
+    username: &str,
+    password: &str,
+    domain: &str,
+) -> Vec<u8> {
+    let field = |at: usize| -> &[u8] {
+        let len = u16::from_le_bytes([authenticate[at], authenticate[at + 1]]) as usize;
+        let offset = u32::from_le_bytes(authenticate[at + 4..at + 8].try_into().unwrap()) as usize;
+        &authenticate[offset..offset + len]
+    };
+    // NtChallengeResponseFields at 20, EncryptedRandomSessionKeyFields at 52
+    // (MS-NLMP § 2.2.1.3).
+    let nt_proof_str = &field(20)[..16];
+    let encrypted_random_session_key = field(52);
+
+    let ntlmv2_hash = compute_ntlmv2_hash(&compute_nt_hash(password), username, domain);
+    let mut mac = HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
+    mac.update(nt_proof_str);
+    let session_base_key = mac.finalize().into_bytes().to_vec();
+
+    if encrypted_random_session_key.is_empty() {
+        session_base_key
+    } else {
+        rc4_encrypt(&session_base_key, encrypted_random_session_key)
+    }
+}
+
 /// Compute the MIC: HMAC_MD5(ExportedSessionKey, negotiate || challenge || authenticate).
 fn compute_mic(
     exported_session_key: &[u8],

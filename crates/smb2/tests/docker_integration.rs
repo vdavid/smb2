@@ -448,6 +448,28 @@ async fn auth_list_shares() {
     );
 }
 
+/// smb-guest runs `map to guest = Bad User`, so Samba answers an unknown
+/// account with a guest session rather than `STATUS_LOGON_FAILURE`. A login
+/// that named an account refuses it: taking it would mean an unsigned session
+/// the caller never asked for, which is also exactly what an on-path attacker
+/// setting `IS_GUEST` would produce.
+#[tokio::test]
+#[ignore]
+async fn a_named_login_mapped_to_guest_is_refused() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(GUEST_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let err = Session::setup(&mut conn, "nobody-by-this-name", "wrong", "")
+        .await
+        .expect_err("a guest session must not stand in for the account");
+
+    assert_eq!(err.kind(), smb2::ErrorKind::AuthRequired, "got: {err}");
+    assert!(err.to_string().contains("guest session"), "got: {err}");
+}
+
 // ── SmbClient high-level API (smb-guest) ─────────────────────────────
 
 #[tokio::test]

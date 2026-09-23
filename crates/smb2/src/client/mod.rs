@@ -2046,7 +2046,8 @@ mod tests {
         // A guest session, so signing stays off: every canned response below
         // arrives unsigned, and a signed session rejects those (MS-SMB2
         // § 3.2.5.1.3). These tests exercise routing, DFS, and reconnects,
-        // not signing.
+        // not signing. The callers log in without a username to match: a
+        // login naming an account refuses a guest session.
         mock.queue_response(build_session_setup_response(
             NtStatus::SUCCESS,
             session_id,
@@ -2068,13 +2069,13 @@ mod tests {
 
         conn.negotiate().await.unwrap();
 
-        let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
+        let session = Session::setup(&mut conn, "", "", "").await.unwrap();
 
         let config = ClientConfig {
             addr: "test-server:445".to_string(),
             timeout: Duration::from_secs(5),
-            username: "user".to_string(),
-            password: "pass".to_string(),
+            username: String::new(),
+            password: String::new(),
             domain: String::new(),
             auto_reconnect: false,
             compression: true,
@@ -2801,8 +2802,8 @@ mod tests {
         let client = make_mock_client(&mock, SessionId(1)).await;
 
         assert_eq!(client.config().addr, "test-server:445");
-        assert_eq!(client.config().username, "user");
-        assert_eq!(client.config().password, "pass");
+        assert_eq!(client.config().username, "");
+        assert_eq!(client.config().password, "");
         assert!(!client.config().auto_reconnect);
     }
 
@@ -2874,7 +2875,7 @@ mod tests {
 
         async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
             conn.negotiate().await?;
-            Session::setup(conn, "user", "pass", "").await?;
+            Session::setup(conn, "", "", "").await?;
             Ok(())
         }
     }
@@ -2990,7 +2991,7 @@ mod tests {
 
         async fn reauthenticate(&self, conn: &mut Connection) -> Result<()> {
             conn.negotiate().await?;
-            Session::setup(conn, "user", "pass", "").await?;
+            Session::setup(conn, "", "", "").await?;
             Ok(())
         }
     }
@@ -3112,13 +3113,13 @@ mod tests {
             "test-server",
         );
         conn.negotiate().await.unwrap();
-        let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
+        let session = Session::setup(&mut conn, "", "", "").await.unwrap();
 
         let config = ClientConfig {
             addr: "test-server:445".to_string(),
             timeout: Duration::from_secs(5),
-            username: "user".to_string(),
-            password: "pass".to_string(),
+            username: String::new(),
+            password: String::new(),
             domain: String::new(),
             auto_reconnect: true,
             compression: true,

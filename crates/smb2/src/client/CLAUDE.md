@@ -325,8 +325,23 @@ Both consume `self` so write-after-close/abort is a compile error. `Drop` logs a
 3. Send NTLM AUTHENTICATE in SESSION_SETUP, update preauth hash with request only
 4. Receive STATUS_SUCCESS (do NOT include in preauth hash)
 5. Derive signing/encryption keys via SP800-108 KDF
-6. Activate signing on the connection
-7. If session or share requires encryption, activate encryption (TRANSFORM_HEADER wrapping with AEAD)
+6. `authenticate_final_response`: prove the STATUS_SUCCESS response before reading its `SessionFlags`
+7. Activate signing on the connection
+8. If session or share requires encryption, activate encryption (TRANSFORM_HEADER wrapping with AEAD)
+
+Step 6 exists because the final response's flags decide whether signing and encryption turn on at all, and nothing
+else checks that response (the receiver only verifies once signing is active). Kerberos goes through the same function.
+Rules, in order (AGENTS.md pitfall 30):
+
+- **Empty username:** a guest or anonymous login the caller asked for. Nothing to prove; the server's flags stand.
+- **Named account, `IS_GUEST` or `IS_NULL`:** `Error::Auth`. Samba's `map to guest = bad user` does this for a wrong
+  password, and it's also what tampering looks like. ❌ Keep this before the signature check: a genuine guest response is
+  never signed, so the other order reports a wrong password as a bad signature.
+- **Named account, SMB 3.x:** must carry `SMB2_FLAGS_SIGNED` and verify with the new signing key, else `Error::Auth`.
+- **Named account, SMB 2.x:** verified if flagged signed. The spec asks nothing more, and with guest refused there is no
+  flag left to downgrade.
+- Kerberos answering `STATUS_MORE_PROCESSING_REQUIRED` goes through the same rules. That response is never signed, so
+  on 3.x the login fails there rather than carrying on with a half-established session.
 
 ## Encryption
 

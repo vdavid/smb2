@@ -8,9 +8,10 @@ use log::{debug, info, trace, warn};
 use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
 use crate::client::connection::Connection;
 use crate::crypto::kdf::derive_session_keys;
-use crate::crypto::signing::{algorithm_for_dialect, SigningAlgorithm};
+use crate::crypto::signing::{self, algorithm_for_dialect, SigningAlgorithm};
 use crate::error::Result;
-use crate::msg::session_setup::{SessionSetupRequest, SessionSetupResponse};
+use crate::msg::header::Header;
+use crate::msg::session_setup::{SessionFlags, SessionSetupRequest, SessionSetupResponse};
 use crate::pack::{ReadCursor, Unpack};
 use crate::types::flags::{Capabilities, SecurityMode};
 use crate::types::status::NtStatus;
@@ -67,7 +68,9 @@ impl Session {
     /// 5. Receive STATUS_SUCCESS with session flags.
     /// 6. Update preauth hash with request+response.
     /// 7. Derive signing/encryption keys.
-    /// 8. Activate signing on the connection.
+    /// 8. Prove the final response (signature, no guest stand-in for a named
+    ///    account) before trusting the session flags it carries.
+    /// 9. Activate signing on the connection.
     pub async fn setup(
         conn: &mut Connection,
         username: &str,
@@ -253,6 +256,19 @@ impl Session {
             }
         };
 
+        // Nothing below may read `session_flags` before this: they decide
+        // whether signing and encryption turn on at all.
+        let account = (!username.is_empty()).then_some(username);
+        authenticate_final_response(
+            &frame2.raw,
+            &resp2_header,
+            setup_resp2.session_flags,
+            params.dialect,
+            &signing_key,
+            signing_algorithm,
+            account,
+        )?;
+
         // Determine if we should sign.
         let should_sign = params.signing_required
             || !setup_resp2.session_flags.is_guest() && !setup_resp2.session_flags.is_null();
@@ -309,9 +325,11 @@ impl Session {
     /// Perform Kerberos-based SESSION_SETUP.
     ///
     /// Authenticates against the KDC first (AS + TGS), then sends the
-    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP. Handles both single-round
-    /// (STATUS_SUCCESS) and mutual-auth (STATUS_MORE_PROCESSING_REQUIRED)
-    /// flows.
+    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP, one round. The AP-REP that
+    /// completes mutual authentication rides in that STATUS_SUCCESS response.
+    /// A server asking for another round (STATUS_MORE_PROCESSING_REQUIRED) is
+    /// not followed: on SMB 3.x that fails the login, because that response is
+    /// unsigned and the session flags it carries can't be trusted.
     ///
     /// The session key comes from the Kerberos TGS exchange, not from the
     /// SMB server response.
@@ -329,15 +347,17 @@ impl Session {
         let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
         auth.authenticate_from_ccache(ccache, server_hostname)
             .await?;
-        Self::setup_kerberos_with_auth(conn, &mut auth).await
+        Self::setup_kerberos_with_auth(conn, &mut auth, &credentials.username).await
     }
 
     /// Perform Kerberos-based SESSION_SETUP.
     ///
     /// Authenticates against the KDC first (AS + TGS), then sends the
-    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP. Handles both single-round
-    /// (STATUS_SUCCESS) and mutual-auth (STATUS_MORE_PROCESSING_REQUIRED)
-    /// flows.
+    /// SPNEGO-wrapped AP-REQ in SESSION_SETUP, one round. The AP-REP that
+    /// completes mutual authentication rides in that STATUS_SUCCESS response.
+    /// A server asking for another round (STATUS_MORE_PROCESSING_REQUIRED) is
+    /// not followed: on SMB 3.x that fails the login, because that response is
+    /// unsigned and the session flags it carries can't be trusted.
     ///
     /// The session key comes from the Kerberos TGS exchange, not from the
     /// SMB server response.
@@ -348,7 +368,7 @@ impl Session {
     ) -> Result<Session> {
         let mut auth = crate::auth::kerberos::KerberosAuthenticator::new(credentials.clone());
         auth.authenticate(server_hostname).await?;
-        Self::setup_kerberos_with_auth(conn, &mut auth).await
+        Self::setup_kerberos_with_auth(conn, &mut auth, &credentials.username).await
     }
 
     /// Shared Kerberos SESSION_SETUP logic used by both password-based
@@ -356,6 +376,7 @@ impl Session {
     async fn setup_kerberos_with_auth(
         conn: &mut Connection,
         auth: &mut crate::auth::kerberos::KerberosAuthenticator,
+        account: &str,
     ) -> Result<Session> {
         let params = conn
             .params()
@@ -504,6 +525,18 @@ impl Session {
             _ => (session_key.clone(), None, None),
         };
 
+        // A Kerberos login always names an account, so the final response
+        // has to prove itself before its flags are believed.
+        authenticate_final_response(
+            &resp_raw,
+            &resp_header,
+            setup_resp.session_flags,
+            params.dialect,
+            &signing_key,
+            signing_algorithm,
+            Some(account),
+        )?;
+
         let should_sign = params.signing_required
             || !setup_resp.session_flags.is_guest() && !setup_resp.session_flags.is_null();
 
@@ -542,6 +575,92 @@ impl Session {
         conn.adopt_session(&session);
         Ok(session)
     }
+}
+
+/// Decide whether the final SESSION_SETUP response can be believed, before
+/// anything reads its `SessionFlags`.
+///
+/// Those flags decide whether the session is signed (`IS_GUEST`, `IS_NULL`)
+/// and encrypted (`ENCRYPT_DATA`) at all, and they arrive in the one response
+/// no session key protects yet. So an on-path attacker who sets `IS_GUEST` or
+/// clears `ENCRYPT_DATA` there switches protection off for the whole session,
+/// and every later check (pitfall 29) is checking nothing.
+///
+/// `account` is `None` when the caller asked for a guest or anonymous login;
+/// then there is no secret key to prove anything with, and the server's
+/// answer stands as it always has. With an account:
+///
+/// - **A guest or anonymous session is refused.** The caller asked to be
+///   someone; a server that grants a guest session instead has either been
+///   tampered with or (Samba's `map to guest = bad user`) is answering a wrong
+///   password. MS-SMB2 § 3.2.5.3.1 makes the same call for a client that
+///   requires signing. Checked first because a genuine guest response is never
+///   signed, so the verification below would only produce a vaguer error.
+/// - **On SMB 3.x the response must be signed, and verify.** A server MUST sign
+///   it for a non-guest session (§ 3.3.5.5.3), and a client on 3.1.1 MUST
+///   refuse one without `SMB2_FLAGS_SIGNED` (§ 3.2.5.3.1). The key comes from
+///   the session key the attacker doesn't have, and on 3.1.1 from the preauth
+///   hash too, so a good signature also vouches for the whole negotiation.
+///   ❌ The flag can only fail this early, never let a response skip
+///   verification: it travels in the same untrusted bytes.
+/// - **On SMB 2.x it's verified if the server flagged it signed.** The spec
+///   asks no more of a 2.x client, and with guest and anonymous already
+///   refused there is nothing left in the response to downgrade: 2.x has no
+///   encryption, and a non-guest session is always signed.
+fn authenticate_final_response(
+    raw: &[u8],
+    header: &Header,
+    flags: SessionFlags,
+    dialect: Dialect,
+    signing_key: &[u8],
+    algorithm: SigningAlgorithm,
+    account: Option<&str>,
+) -> Result<()> {
+    let Some(account) = account else {
+        return Ok(());
+    };
+
+    if flags.is_guest() || flags.is_null() {
+        let offered = if flags.is_guest() {
+            "a guest session"
+        } else {
+            "an anonymous session"
+        };
+        debug!("session: server offered {offered} to a login as {account}, refusing");
+        return Err(Error::Auth {
+            message: format!(
+                "the server offered {offered} instead of signing in as {account}. \
+                 Check the username and password: a Samba server set to \
+                 `map to guest = bad user` answers a wrong password this way"
+            ),
+        });
+    }
+
+    let is_smb3 = matches!(
+        dialect,
+        Dialect::Smb3_0 | Dialect::Smb3_0_2 | Dialect::Smb3_1_1
+    );
+    let flagged_signed = header.flags.is_signed();
+    if !flagged_signed && !is_smb3 {
+        return Ok(());
+    }
+    if !flagged_signed {
+        return Err(Error::Auth {
+            message: format!(
+                "the server's final SESSION_SETUP response ({:?}) was not signed, \
+                 so its session flags can't be trusted",
+                header.status
+            ),
+        });
+    }
+    signing::verify_signature(raw, signing_key, algorithm, header.message_id.0, false).map_err(
+        |_| Error::Auth {
+            message: "the server's final SESSION_SETUP response failed signature \
+                      verification: either it was altered on the way, or the server \
+                      doesn't know the session key"
+                .to_string(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -784,6 +903,10 @@ mod tests {
     /// That includes a credit window: the NEGOTIATE response is what opens
     /// one, and SESSION_SETUP spends from it like any other request.
     fn set_test_params(conn: &mut Connection, dialect: Dialect) {
+        set_test_params_with(conn, dialect, false);
+    }
+
+    fn set_test_params_with(conn: &mut Connection, dialect: Dialect, gmac_negotiated: bool) {
         conn.set_credits(512);
         conn.set_test_params(NegotiatedParams {
             dialect,
@@ -793,9 +916,332 @@ mod tests {
             server_guid: Guid::ZERO,
             signing_required: false,
             capabilities: Capabilities::default(),
-            gmac_negotiated: false,
+            gmac_negotiated,
             cipher: None,
             compression_supported: false,
         });
+    }
+
+    // ── The final SESSION_SETUP response has to prove itself ──
+    //
+    // Everything below plays the server's half of NTLM well enough to sign
+    // the final response the way a real server does, then lets a test decide
+    // what reaches the client: that response, an unsigned one, or a signed
+    // one an on-path attacker edited afterwards.
+
+    /// What the "wire" does to the server's final response.
+    enum Final {
+        /// The server signs it and it arrives intact.
+        Signed,
+        /// It arrives without a signature (and without `SMB2_FLAGS_SIGNED`).
+        Unsigned,
+        /// The server signs it, then something on the path edits it.
+        SignedThenTampered(fn(&mut Vec<u8>)),
+    }
+
+    const USER: &str = "user";
+    const PASS: &str = "pass";
+
+    /// Run `Session::setup` against a mock that answers the final round with
+    /// `flags`, signed (or not) with the key a real server would derive.
+    async fn setup_against_server(
+        dialect: Dialect,
+        gmac: bool,
+        username: &str,
+        password: &str,
+        flags: SessionFlags,
+        finish: Final,
+    ) -> Result<Session> {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let session_id = SessionId(0x4242);
+
+        let mut challenge = build_session_setup_response(
+            NtStatus::MORE_PROCESSING_REQUIRED,
+            session_id,
+            build_ntlm_challenge(),
+            SessionFlags(0),
+        );
+        mock.queue_response(challenge.clone());
+
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        set_test_params_with(&mut conn, dialect, gmac);
+        let mut hasher = conn.preauth_hasher();
+
+        let (user, pass) = (username.to_string(), password.to_string());
+        let task = tokio::spawn(async move { Session::setup(&mut conn, &user, &pass, "").await });
+
+        // Wait for the AUTHENTICATE request: the key the final response is
+        // signed with depends on what the client put in it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mock.sent_count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "client never sent AUTHENTICATE"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let negotiate = mock.sent_message(0).unwrap();
+        let authenticate = mock.sent_message(1).unwrap();
+        let msg_id = |frame: &[u8]| u64::from_le_bytes(frame[24..32].try_into().unwrap());
+
+        // The client hashed the challenge as it arrived, with the MessageId
+        // the mock rewrote into it.
+        challenge[24..32].copy_from_slice(&msg_id(&negotiate).to_le_bytes());
+        hasher.update(&negotiate);
+        hasher.update(&challenge);
+        hasher.update(&authenticate);
+
+        let request = SessionSetupRequest::unpack(&mut ReadCursor::new(&authenticate[64..]))
+            .expect("AUTHENTICATE request parses");
+        let session_key = crate::auth::ntlm::exported_session_key_as_server(
+            &request.security_buffer,
+            username,
+            password,
+            "",
+        );
+        let signing_key = match dialect {
+            Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
+                derive_session_keys(&session_key, dialect, None, 128).signing_key
+            }
+            Dialect::Smb3_1_1 => {
+                derive_session_keys(&session_key, dialect, Some(hasher.value()), 128).signing_key
+            }
+            _ => session_key,
+        };
+        let algorithm = algorithm_for_dialect(dialect, gmac);
+
+        let mut response =
+            build_session_setup_response(NtStatus::SUCCESS, session_id, vec![], flags);
+        // Stamp the real MessageId before signing: it's under the signature,
+        // and under the GMAC nonce.
+        let final_id = msg_id(&authenticate);
+        response[24..32].copy_from_slice(&final_id.to_le_bytes());
+        if !matches!(finish, Final::Unsigned) {
+            let mut header_flags = crate::types::flags::HeaderFlags(u32::from_le_bytes(
+                response[16..20].try_into().unwrap(),
+            ));
+            header_flags.set_signed();
+            response[16..20].copy_from_slice(&header_flags.0.to_le_bytes());
+            crate::crypto::signing::sign_message_as_server(
+                &mut response,
+                &signing_key,
+                algorithm,
+                final_id,
+                false,
+            )
+            .unwrap();
+        }
+        if let Final::SignedThenTampered(tamper) = finish {
+            tamper(&mut response);
+        }
+        mock.queue_response(response);
+
+        task.await.unwrap()
+    }
+
+    /// Offset of `SessionFlags` in a SESSION_SETUP response: the 64-byte
+    /// header, then `StructureSize` (2).
+    const SESSION_FLAGS_AT: usize = 66;
+
+    #[track_caller]
+    fn assert_auth_error(result: Result<Session>, needle: &str) {
+        match result {
+            Err(Error::Auth { message }) => assert!(
+                message.contains(needle),
+                "expected an auth error mentioning {needle:?}, got: {message}"
+            ),
+            Err(other) => panic!("expected Error::Auth mentioning {needle:?}, got: {other}"),
+            Ok(session) => panic!(
+                "expected Error::Auth mentioning {needle:?}, got a session (sign={}, encrypt={})",
+                session.should_sign, session.should_encrypt
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_final_response_is_accepted_on_3_1_1_gmac() {
+        let session = setup_against_server(
+            Dialect::Smb3_1_1,
+            true,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Signed,
+        )
+        .await
+        .unwrap();
+        assert!(session.should_sign);
+        assert_eq!(session.signing_algorithm, SigningAlgorithm::AesGmac);
+    }
+
+    #[tokio::test]
+    async fn signed_final_response_is_accepted_on_3_0_2() {
+        let session = setup_against_server(
+            Dialect::Smb3_0_2,
+            false,
+            USER,
+            PASS,
+            SessionFlags(SessionFlags::ENCRYPT_DATA),
+            Final::Signed,
+        )
+        .await
+        .unwrap();
+        assert!(session.should_encrypt);
+    }
+
+    #[tokio::test]
+    async fn signed_final_response_is_accepted_on_2_0_2() {
+        let session = setup_against_server(
+            Dialect::Smb2_0_2,
+            false,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Signed,
+        )
+        .await
+        .unwrap();
+        assert!(session.should_sign);
+    }
+
+    /// MS-SMB2 § 3.2.5.3.1: on 3.1.1 a final response without
+    /// `SMB2_FLAGS_SIGNED` is an error. Accepting it would let whoever
+    /// stripped the signature choose the session's flags.
+    #[tokio::test]
+    async fn unsigned_final_response_is_refused_on_3_1_1() {
+        let result = setup_against_server(
+            Dialect::Smb3_1_1,
+            false,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Unsigned,
+        )
+        .await;
+        assert_auth_error(result, "not signed");
+    }
+
+    /// A server MUST sign the final response of a non-guest session on every
+    /// 3.x dialect (MS-SMB2 § 3.3.5.5.3), and on 3.0 it's the only thing
+    /// vouching for `ENCRYPT_DATA`.
+    #[tokio::test]
+    async fn unsigned_final_response_is_refused_on_3_0_2() {
+        let result = setup_against_server(
+            Dialect::Smb3_0_2,
+            false,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Unsigned,
+        )
+        .await;
+        assert_auth_error(result, "not signed");
+    }
+
+    /// The downgrade this check exists for: a server demands encryption, and
+    /// an on-path attacker clears `ENCRYPT_DATA` so the session runs in the
+    /// clear.
+    #[tokio::test]
+    async fn cleared_encrypt_data_flag_is_refused() {
+        let result = setup_against_server(
+            Dialect::Smb3_1_1,
+            true,
+            USER,
+            PASS,
+            SessionFlags(SessionFlags::ENCRYPT_DATA),
+            Final::SignedThenTampered(|r| {
+                r[SESSION_FLAGS_AT] &= !(SessionFlags::ENCRYPT_DATA as u8)
+            }),
+        )
+        .await;
+        assert_auth_error(result, "signature");
+    }
+
+    /// Setting `IS_GUEST` on a genuine response turns signing off, so a
+    /// credentialed login never accepts it, signed or not.
+    #[tokio::test]
+    async fn tampered_guest_flag_is_refused() {
+        let result = setup_against_server(
+            Dialect::Smb3_1_1,
+            true,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::SignedThenTampered(|r| r[SESSION_FLAGS_AT] |= SessionFlags::IS_GUEST as u8),
+        )
+        .await;
+        assert_auth_error(result, "guest");
+    }
+
+    /// Samba's `map to guest = bad user` answers a wrong password with a
+    /// guest session. Someone who typed a password wants to hear it was wrong.
+    #[tokio::test]
+    async fn guest_session_for_a_credentialed_login_is_refused() {
+        for dialect in [Dialect::Smb2_0_2, Dialect::Smb3_1_1] {
+            let result = setup_against_server(
+                dialect,
+                false,
+                USER,
+                PASS,
+                SessionFlags(SessionFlags::IS_GUEST),
+                Final::Unsigned,
+            )
+            .await;
+            assert_auth_error(result, "guest");
+        }
+    }
+
+    #[tokio::test]
+    async fn null_session_for_a_credentialed_login_is_refused() {
+        let result = setup_against_server(
+            Dialect::Smb3_1_1,
+            false,
+            USER,
+            PASS,
+            SessionFlags(SessionFlags::IS_NULL),
+            Final::Unsigned,
+        )
+        .await;
+        assert_auth_error(result, "anonymous");
+    }
+
+    /// 2.x servers aren't required to flag the final response signed from
+    /// the client's point of view, but one that says it signed has to mean it.
+    #[tokio::test]
+    async fn bad_signature_is_refused_on_2_0_2() {
+        let result = setup_against_server(
+            Dialect::Smb2_0_2,
+            false,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::SignedThenTampered(|r| r[48] ^= 0xFF),
+        )
+        .await;
+        assert_auth_error(result, "signature");
+    }
+
+    /// What the caller asked for: no username means a guest or anonymous
+    /// session, and the server granting one is the success case.
+    #[tokio::test]
+    async fn guest_login_without_a_username_still_works() {
+        for dialect in [Dialect::Smb2_0_2, Dialect::Smb3_1_1] {
+            let session = setup_against_server(
+                dialect,
+                false,
+                "",
+                "",
+                SessionFlags(SessionFlags::IS_GUEST),
+                Final::Unsigned,
+            )
+            .await
+            .unwrap();
+            assert!(!session.should_sign);
+        }
     }
 }

@@ -89,7 +89,7 @@ cargo test -p smb2 --test docker_integration -- --ignored   # repeat (~8s)
 
 | Container | Port | Focus |
 |-----------|------|-------|
-| smb-guest | 10445 | Guest auth, CRUD, compound, pipelined, streamed write, streaming, progress, cancel, fs_info, reconnect, file watching |
+| smb-guest | 10445 | Guest auth, a named login mapped to guest is refused, CRUD, compound, pipelined, streamed write, streaming, progress, cancel, fs_info, reconnect, file watching |
 | smb-auth | 10446 | NTLM auth, wrong-password rejection |
 | smb-signing | 10447 | Mandatory signing: write/read, compound, pipelined 512 KB, streamed write |
 | smb-readonly | 10448 | Read-only share: list/read/stat succeed, write/delete/mkdir/streamed-write fail cleanly |
