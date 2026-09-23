@@ -51,6 +51,13 @@
 //! and growth past that point takes the ceiling away again. Only a charge wider
 //! than a known ceiling fails fast; anything else waits as before.
 //!
+//! Replies are read one at a time, but servers grant for several at once: a
+//! compound's whole grant rides on one reply and the rest carry 0, and Samba
+//! answers a pipeline at its maximum unevenly (one reply double, the next
+//! nothing). So a 0 is no verdict either way, and growth only counts once it
+//! exceeds the ceiling by more than what's still in flight
+//! ([`Window::answer`]). Without both, any compound forgot a known ceiling.
+//!
 //! The ceiling also sizes the requests this crate picks the size of (chunks,
 //! compound limits): see [`CreditPool::comfortable_charge`].
 
@@ -122,6 +129,10 @@ struct Window {
     /// the one that carries the grant, since a final response after an interim
     /// one grants nothing.
     awaiting: HashMap<u64, Expected>,
+    /// The sum of `awaiting`'s charges: the part of `size` riding on requests
+    /// whose answer hasn't come back. Kept by [`expect`](Self::expect) and
+    /// [`settle`](Self::settle), the only two ways in and out of `awaiting`.
+    in_flight: i64,
 }
 
 /// What a request in flight holds of the window, and what it asked for.
@@ -132,11 +143,27 @@ struct Expected {
 }
 
 impl Window {
+    /// Enter a request that is about to go on the wire.
+    fn expect(&mut self, msg_id: MessageId, expected: Expected) {
+        if let Some(old) = self.awaiting.insert(msg_id.0, expected) {
+            self.in_flight -= i64::from(old.charge);
+        }
+        self.in_flight += i64::from(expected.charge);
+    }
+
+    /// Take a request out of the window's in-flight record: answered, or
+    /// refunded because it never reached the wire.
+    fn settle(&mut self, msg_id: MessageId) -> Option<Expected> {
+        let expected = self.awaiting.remove(&msg_id.0)?;
+        self.in_flight -= i64::from(expected.charge);
+        Some(expected)
+    }
+
     /// Settle the request `msg_id` with the `granted` credits its response
     /// carried, and read the server's intent off it.
     fn answer(&mut self, msg_id: MessageId, granted: u16) {
         self.size += i64::from(granted);
-        let Some(expected) = self.awaiting.remove(&msg_id.0) else {
+        let Some(expected) = self.settle(msg_id) else {
             return;
         };
         self.size -= i64::from(expected.charge);
@@ -145,10 +172,27 @@ impl Window {
         if expected.requested <= expected.charge {
             return;
         }
-        let size = u16::try_from(self.size.max(0)).unwrap_or(u16::MAX);
+        // Neither is a reply granting nothing: Samba and Windows put a
+        // compound's whole grant on one reply and 0 on the others (Samba
+        // `smb2_calculate_credits`), so a 0 is usually a grant that rides on a
+        // sibling, not the server declining.
+        if granted == 0 {
+            return;
+        }
         if granted <= expected.charge {
-            self.ceiling = Some(size);
-        } else if self.ceiling.is_some_and(|ceiling| size > ceiling) {
+            self.ceiling = Some(u16::try_from(self.size.max(0)).unwrap_or(u16::MAX));
+            return;
+        }
+        // Growth counts only past what's still in flight. A grant that covers
+        // siblings (a compound's, or Samba answering a pipeline unevenly)
+        // lifts `size` above the ceiling until those siblings' charges come
+        // off, which is the window staying put, not growing. Reading it as
+        // growth forgot the ceiling on every compound, and the next chunked
+        // transfer sized itself past what the server funds.
+        if self
+            .ceiling
+            .is_some_and(|ceiling| self.size - self.in_flight > i64::from(ceiling))
+        {
             self.ceiling = None;
         }
     }
@@ -307,7 +351,7 @@ impl CreditPool {
         if !expected.is_empty() {
             let mut window = self.window.lock().unwrap();
             for msg_id in expected {
-                window.awaiting.remove(&msg_id.0);
+                window.settle(*msg_id);
             }
         }
         self.put_back(charge);
@@ -430,8 +474,7 @@ impl<'a> CreditReservation<'a> {
         pool.window
             .lock()
             .unwrap()
-            .awaiting
-            .insert(header.message_id.0, Expected { charge, requested });
+            .expect(header.message_id, Expected { charge, requested });
         self.stamped.push(header.message_id);
     }
 
@@ -675,6 +718,57 @@ mod tests {
         pool.answer(MessageId(2), 33);
         assert_eq!(pool.ceiling(), None);
         assert!(!pool.can_never_fund(500));
+    }
+
+    #[test]
+    fn a_compound_at_the_ceiling_keeps_it() {
+        let pool = CreditPool::new();
+        pool.set_available(64);
+        send(&pool, 1, 1);
+        pool.answer(MessageId(1), 1);
+        assert_eq!(pool.ceiling(), Some(64));
+
+        // Samba and Windows put a compound's whole grant on its LAST reply
+        // and 0 on the others (Samba `smb2_calculate_credits`: "To match
+        // Windows"). Read reply by reply, the 0 looks like the window
+        // shrinking and the 2 like it growing again, and together they
+        // forgot a ceiling the server never moved.
+        send(&pool, 2, 1);
+        send(&pool, 3, 1);
+        pool.answer(MessageId(2), 0);
+        pool.answer(MessageId(3), 2);
+
+        assert_eq!(pool.ceiling(), Some(64));
+        assert!(pool.can_never_fund(81));
+
+        // The replies are routed in either order. Settling the grant first
+        // puts the window one above the ceiling until the sibling's charge
+        // comes off, which is not the server growing it.
+        send(&pool, 4, 1);
+        send(&pool, 5, 1);
+        pool.answer(MessageId(4), 2);
+        pool.answer(MessageId(5), 0);
+
+        assert_eq!(pool.ceiling(), Some(64));
+    }
+
+    #[test]
+    fn a_pipeline_keeps_the_ceiling_while_the_server_grants_unevenly() {
+        // Samba answering pipelined WRITEs at its 64-credit maximum: one reply
+        // grants double its charge while the next is still in flight, and the
+        // next grants nothing (seen against smb-smallcredits, 2026-09-23).
+        let pool = CreditPool::new();
+        pool.set_available(64);
+        send(&pool, 1, 32);
+        pool.answer(MessageId(1), 32);
+        assert_eq!(pool.ceiling(), Some(64));
+
+        send(&pool, 2, 32);
+        send(&pool, 3, 32);
+        pool.answer(MessageId(2), 64);
+        pool.answer(MessageId(3), 0);
+
+        assert_eq!(pool.ceiling(), Some(64));
     }
 
     #[test]
