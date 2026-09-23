@@ -1,6 +1,6 @@
 [package]
 name = "smb2-cli"
-version = "0.4.9"
+version = "0.4.10"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -42,7 +42,7 @@ doc = false
 # publish` rewrites the dependency to the bare version. Keep the version equal
 # to the library's current one -- a stale number here is a publish-time error
 # rather than a CLI that silently ships against an old library.
-smb2 = { version = "0.24.4", path = "../smb2" }
+smb2 = { version = "0.25.0", path = "../smb2" }
 
 anyhow = "1.0.104"
 clap = { version = "4.6.5", features = ["derive", "env"] }

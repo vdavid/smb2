@@ -650,13 +650,14 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smb2"
-version = "0.24.4"
+version = "0.25.0"
 dependencies = [
  "aes",
  "aes-gcm",
  "async-trait",
  "ccm",
  "cmac",
+ "ctutils",
  "digest",
  "futures-util",
  "getrandom 0.4.2",
