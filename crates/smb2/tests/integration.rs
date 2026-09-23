@@ -364,6 +364,59 @@ async fn read_file_compound_on_nas() {
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
 
+/// Create `dir/MixedCase Name.txt`, resolve it through a case-mismatched
+/// path (plainly and through a `FileReader`), and clean up.
+async fn resolve_names_the_stored_file(conn: &mut Connection, tree: Tree, dir: &str) {
+    let stored = format!("{dir}/MixedCase Name.txt");
+    let asked = format!("{}/mixedcase name.TXT", dir.to_uppercase());
+    let _ = tree.create_directory(conn, dir).await;
+    tree.write_file(conn, &stored, b"resolve")
+        .await
+        .expect("write_file failed");
+
+    let resolved = tree.resolve(conn, &asked).await.expect("resolve failed");
+    println!("resolve {asked:?} -> {:?}", resolved.path);
+    assert_eq!(resolved.path, stored);
+    assert_eq!(resolved.info.size, 7);
+    assert!(resolved.identity.is_some());
+
+    let tree = std::sync::Arc::new(tree);
+    let reader = tree
+        .open_file_reader(conn.clone(), &asked)
+        .await
+        .expect("open_file_reader failed");
+    assert_eq!(reader.resolved_path(), Some(stored.as_str()));
+    reader.close().await.unwrap();
+
+    tree.delete_file(conn, &stored).await.expect("delete_file");
+    tree.delete_directory(conn, dir).await.expect("delete dir");
+}
+
+#[tokio::test]
+#[ignore]
+async fn resolve_on_nas() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_to_nas().await;
+    resolve_names_the_stored_file(&mut conn, tree, "smb2-resolve-Dir").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn resolve_on_raspberry_pi() {
+    let _ = env_logger::try_init();
+    let mut conn = Connection::connect(PI_ADDR, Duration::from_secs(5))
+        .await
+        .expect("failed to connect to Raspberry Pi");
+    conn.negotiate().await.expect("negotiate failed");
+    Session::setup(&mut conn, USER, &pi_password(), "")
+        .await
+        .expect("session setup failed");
+    let tree = Tree::connect(&mut conn, "PiHDD")
+        .await
+        .expect("tree connect failed");
+    resolve_names_the_stored_file(&mut conn, tree, "smb2-resolve-Dir").await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn stat_file_on_nas() {

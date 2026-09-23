@@ -17,6 +17,7 @@ pub mod durable;
 mod fault_injection_tests;
 pub mod pipeline;
 pub mod read_ahead;
+pub mod resolve;
 pub mod session;
 pub mod shares;
 #[cfg(test)]
@@ -37,8 +38,9 @@ pub use diagnostics::{
     DfsCacheEntry, Diagnostics, EncryptionInfo, InboundProgress, Liveness, MetricsSnapshot,
     NegotiatedSummary, SessionDiagnostics, SigningInfo,
 };
-pub use durable::{DurableHandle, DurableOpen};
+pub use durable::{DurableHandle, DurableOpen, FileIdentity};
 pub use pipeline::{Op, OpResult, Pipeline};
+pub use resolve::Resolved;
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
@@ -1411,6 +1413,35 @@ impl SmbClient {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree)?;
                 tree.stat(conn, path).await
+            }
+            other => other,
+        }
+    }
+
+    /// Ask the server which file `path` names, and what it calls it: the
+    /// stored path (case and 8.3 aliases resolved), the metadata `stat`
+    /// returns, and the file's identity. See [`Tree::resolve`].
+    ///
+    /// Follows a DFS link and replays after a reconnect, like
+    /// [`stat`](Self::stat). After a DFS redirect the returned path is
+    /// relative to the target share, which is what `tree` points at by then.
+    #[doc(alias = "canonicalize")]
+    #[doc(alias = "realpath")]
+    pub async fn resolve(&mut self, tree: &mut Tree, path: &str) -> Result<resolve::Resolved> {
+        let result = {
+            let conn = self.connection_for_tree(tree)?;
+            tree.resolve(conn, path).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree)?;
+                tree.resolve(conn, &new_path).await
+            }
+            Err(e) if self.session_is_gone(tree, &e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree)?;
+                tree.resolve(conn, path).await
             }
             other => other,
         }

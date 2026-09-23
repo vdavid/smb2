@@ -360,6 +360,23 @@ pub(crate) fn build_query_info_error_response(status: crate::types::status::NtSt
     build_query_info_response_with_status(status, Vec::new())
 }
 
+/// `FILE_NAME_INFORMATION` (MS-FSCC § 2.1.7): a `u32` byte length, then the
+/// name in UTF-16LE. What `FileNormalizedNameInformation` returns on its own.
+pub(crate) fn file_name_information(name: &str) -> Vec<u8> {
+    let utf16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut out = (utf16.len() as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&utf16);
+    out
+}
+
+/// `FILE_ALL_INFORMATION` (MS-FSCC § 2.4.2) with every fixed field zeroed and
+/// `name` in its trailing `FILE_NAME_INFORMATION`, 96 bytes in.
+pub(crate) fn file_all_information(name: &str) -> Vec<u8> {
+    let mut out = vec![0u8; 96];
+    out.extend_from_slice(&file_name_information(name));
+    out
+}
+
 /// Build a QUERY_INFO response with an explicit status.
 pub(crate) fn build_query_info_response_with_status(
     status: crate::types::status::NtStatus,

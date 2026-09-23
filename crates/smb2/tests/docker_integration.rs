@@ -170,6 +170,177 @@ async fn guest_stat_file() {
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
 
+/// The 8.3 alias Samba hands out for `path` (`FileAlternateNameInformation`,
+/// class 21). Samba's aliases are hash-mangled, so a test asks rather than
+/// guesses.
+async fn short_name(conn: &Connection, tree: &Tree, path: &str) -> String {
+    use smb2::client::CompoundOp;
+    use smb2::msg::close::CloseRequest;
+    use smb2::msg::create::{CreateDisposition, CreateRequest, ImpersonationLevel, ShareAccess};
+    use smb2::msg::query_info::{InfoType, QueryInfoRequest, QueryInfoResponse};
+    use smb2::pack::{ReadCursor, Unpack};
+    use smb2::types::flags::FileAccessMask;
+    use smb2::types::{Command, CreditCharge, FileId, OplockLevel};
+
+    let create = CreateRequest {
+        requested_oplock_level: OplockLevel::None,
+        impersonation_level: ImpersonationLevel::Impersonation,
+        desired_access: FileAccessMask::new(
+            FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+        ),
+        file_attributes: 0,
+        share_access: ShareAccess(ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE),
+        create_disposition: CreateDisposition::FileOpen,
+        create_options: 0,
+        name: path.replace('/', "\\"),
+        create_contexts: vec![],
+    };
+    let query = QueryInfoRequest {
+        info_type: InfoType::File,
+        file_info_class: 21,
+        output_buffer_length: 4096,
+        additional_information: 0,
+        flags: 0,
+        file_id: FileId::SENTINEL,
+        input_buffer: vec![],
+    };
+    let close = CloseRequest {
+        flags: 0,
+        file_id: FileId::SENTINEL,
+    };
+    let op = |command, body| CompoundOp {
+        command,
+        body,
+        tree_id: Some(tree.tree_id),
+        credit_charge: CreditCharge(1),
+    };
+    let frames = conn
+        .execute_compound(&[
+            op(Command::Create, &create),
+            op(Command::QueryInfo, &query),
+            op(Command::Close, &close),
+        ])
+        .await
+        .expect("short-name compound failed");
+    let answer = frames[1].as_ref().expect("no QUERY_INFO answer");
+    assert!(
+        answer.header.status.is_success(),
+        "class 21 refused: {:?}",
+        answer.header.status
+    );
+    let buf = QueryInfoResponse::unpack(&mut ReadCursor::new(&answer.body))
+        .unwrap()
+        .output_buffer;
+    let len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let units: Vec<u16> = buf[4..4 + len]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&units).unwrap()
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_resolve_names_the_file_the_server_opened() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+
+    let dir = "resolve-Dir";
+    let stored = "resolve-Dir/MixedCase Name.txt";
+    let _ = tree.create_directory(&mut conn, dir).await;
+    tree.write_file(&mut conn, stored, b"resolve me")
+        .await
+        .expect("write_file failed");
+
+    // Case folding: the server opens the stored file and says so.
+    let resolved = tree
+        .resolve(&mut conn, "RESOLVE-DIR/mixedcase name.TXT")
+        .await
+        .expect("resolve failed");
+    assert_eq!(resolved.path, stored);
+    assert_eq!(resolved.info.size, 10);
+    assert!(!resolved.info.is_directory);
+    let identity = resolved.identity.expect("Samba identifies files");
+
+    // An 8.3 alias resolves to the long name, and to the same file.
+    let alias = short_name(&conn, &tree, stored).await;
+    assert_ne!(alias, "MixedCase Name.txt", "expected a mangled alias");
+    let via_alias = tree
+        .resolve(&mut conn, &format!("{dir}/{alias}"))
+        .await
+        .expect("resolve via the 8.3 alias failed");
+    assert_eq!(via_alias.path, stored);
+    assert_eq!(via_alias.identity, Some(identity));
+
+    // A directory resolves too.
+    let resolved_dir = tree
+        .resolve(&mut conn, "RESOLVE-dir")
+        .await
+        .expect("resolve dir failed");
+    assert_eq!(resolved_dir.path, dir);
+    assert!(resolved_dir.info.is_directory);
+
+    // A name that needs the private-use mapping comes back in caller form.
+    let mapped = "resolve-Dir/Who Asked?.txt";
+    tree.write_file(&mut conn, mapped, b"?")
+        .await
+        .expect("write_file (mapped name) failed");
+    let resolved_mapped = tree
+        .resolve(&mut conn, "resolve-dir/WHO ASKED?.TXT")
+        .await
+        .expect("resolve (mapped name) failed");
+    assert_eq!(resolved_mapped.path, mapped);
+
+    let missing = tree
+        .resolve(&mut conn, "resolve-Dir/nope.txt")
+        .await
+        .expect_err("a missing file must not resolve");
+    assert_eq!(missing.kind(), smb2::ErrorKind::NotFound);
+
+    tree.delete_file(&mut conn, mapped).await.unwrap();
+    tree.delete_file(&mut conn, stored).await.unwrap();
+    tree.delete_directory(&mut conn, dir).await.unwrap();
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_file_handles_record_the_name_the_server_opened() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let tree = std::sync::Arc::new(tree);
+
+    let stored = "Handle-Name.bin";
+    let mut writer = tree
+        .create_file_writer(conn.clone(), "handle-name.bin")
+        .await
+        .expect("create_file_writer failed");
+    // A new file is stored under the name it was created with.
+    assert_eq!(writer.resolved_path(), Some("handle-name.bin"));
+    writer.write_chunk(b"abc").await.unwrap();
+    writer.finish().await.unwrap();
+    tree.rename(&mut conn, "handle-name.bin", stored)
+        .await
+        .expect("rename failed");
+
+    let reader = tree
+        .open_file_reader(conn.clone(), "HANDLE-NAME.BIN")
+        .await
+        .expect("open_file_reader failed");
+    assert_eq!(reader.resolved_path(), Some(stored));
+    assert_eq!(reader.read_at(0, 3).await.unwrap(), b"abc");
+    reader.close().await.unwrap();
+
+    let writer = tree
+        .create_file_writer_at(conn.clone(), "handle-NAME.bin", 3)
+        .await
+        .expect("create_file_writer_at failed");
+    assert_eq!(writer.resolved_path(), Some(stored));
+    writer.abort().await.unwrap();
+
+    tree.delete_file(&mut conn, stored).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore]
 async fn guest_create_delete_directory() {
@@ -2203,6 +2374,41 @@ async fn dfs_read_file_through_link() {
 
     let text = String::from_utf8(data).expect("not UTF-8");
     assert_eq!(text.trim(), "Hello from DFS target!");
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_resolve_is_relative_to_the_share_the_caller_holds() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+    assert!(tree.is_dfs);
+
+    // A file in the DFS root share itself (seeded by the fixture): the
+    // CREATE carries `server\share\path`, and the answer must not.
+    let resolved = client
+        .resolve(&mut tree, "ROOT-FILE.TXT")
+        .await
+        .expect("resolve on the DFS root share failed");
+    assert_eq!(resolved.path, "Root-File.txt");
+
+    // Through a link: the tree follows the redirect, and the path is
+    // relative to the target share it points at afterwards.
+    let through_link = client
+        .resolve(&mut tree, "data/HELLO.TXT")
+        .await
+        .expect("resolve through the DFS link failed");
+    assert_eq!(through_link.path, "hello.txt");
+    assert_eq!(tree.share_name, "files");
 
     client
         .disconnect_share(&tree)

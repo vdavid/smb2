@@ -448,7 +448,7 @@ fn parse_notify_information(data: &[u8]) -> Result<Vec<FileNotifyEvent>> {
 }
 
 /// Decode a UTF-16LE byte slice into a Rust String.
-fn decode_utf16le(bytes: &[u8]) -> Result<String> {
+pub(super) fn decode_utf16le(bytes: &[u8]) -> Result<String> {
     if bytes.len() % 2 != 0 {
         return Err(Error::invalid_data("UTF-16LE filename has odd byte count"));
     }

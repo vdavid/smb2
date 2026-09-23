@@ -23,6 +23,7 @@ use crate::client::read_ahead::{Dispatch, LinkHint, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
 use crate::client::tree::{close_outcome, Tree};
 use crate::error::Result;
+use crate::msg::create::CreateDisposition;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{ReadCursor, Unpack};
@@ -614,6 +615,7 @@ pub struct FileReader {
     file_id: FileId,
     file_size: u64,
     max_read: u32,
+    resolved_path: Option<String>,
     closed: bool,
 }
 
@@ -635,10 +637,14 @@ pub async fn open_file_reader(
 ) -> Result<FileReader> {
     trace!("stream: open_file_reader path={}", path);
 
-    let (file_id, file_size) = tree.open_file(&mut conn, path).await?;
+    let (created, resolved_path) = tree
+        .open_and_name(&mut conn, path, &tree.read_open_request(path), true)
+        .await?;
     let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
-    Ok(FileReader::new(tree, conn, file_id, file_size, max_read))
+    let mut reader = FileReader::new(tree, conn, created.file_id, created.end_of_file, max_read);
+    reader.resolved_path = resolved_path;
+    Ok(reader)
 }
 
 impl FileReader {
@@ -659,6 +665,7 @@ impl FileReader {
             file_id,
             file_size,
             max_read,
+            resolved_path: None,
             closed: false,
         }
     }
@@ -667,6 +674,18 @@ impl FileReader {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.file_size
+    }
+
+    /// The path the server opened, as it stores it: relative to the share,
+    /// `/`-separated, in on-disk casing, with 8.3 aliases replaced by their
+    /// long names (see [`Tree::resolve`]). Asked in the same round trip as
+    /// the open, so it names exactly the file this handle reads.
+    ///
+    /// `None` when the server can't name it (SMB 2.x or 3.0.2, or Windows
+    /// before 10 / Server v1803); the open itself is unaffected.
+    #[must_use]
+    pub fn resolved_path(&self) -> Option<&str> {
+        self.resolved_path.as_deref()
     }
 
     /// Read up to `len` bytes starting at `offset`.
@@ -1028,6 +1047,8 @@ pub struct FileWriter {
     stashed_chunk: Option<Vec<u8>>,
     /// Whether the writer has been finalized (handle closed).
     done: bool,
+    /// What the server called the file at open, if it said.
+    resolved_path: Option<String>,
 }
 
 /// Open (or create) a file for writing and return a streaming [`FileWriter`]
@@ -1052,10 +1073,13 @@ pub async fn open_file_writer(
 ) -> Result<FileWriter> {
     trace!("stream: open_file_writer path={}", path);
 
-    let file_id = tree.open_file_for_write(&mut conn, path).await?;
+    let (file_id, resolved_path) =
+        open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOverwriteIf).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
-    Ok(FileWriter::new(tree, conn, file_id, max_write))
+    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
+    writer.resolved_path = resolved_path;
+    Ok(writer)
 }
 
 /// Exclusive-create sibling of [`open_file_writer`]. Opens the CREATE with
@@ -1072,10 +1096,13 @@ pub async fn open_file_writer_exclusive(
 ) -> Result<FileWriter> {
     trace!("stream: open_file_writer_exclusive path={}", path);
 
-    let file_id = tree.open_file_for_exclusive_create(&mut conn, path).await?;
+    let (file_id, resolved_path) =
+        open_for_writer(&tree, &mut conn, path, CreateDisposition::FileCreate).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
-    Ok(FileWriter::new(tree, conn, file_id, max_write))
+    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
+    writer.resolved_path = resolved_path;
+    Ok(writer)
 }
 
 /// Open a file for writing at an arbitrary starting offset, returning a
@@ -1115,12 +1142,33 @@ pub async fn open_file_writer_at(
         offset
     );
 
-    let file_id = tree.open_file_for_write_at(&mut conn, path).await?;
+    let (file_id, resolved_path) =
+        open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOpenIf).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
     let mut writer = FileWriter::new(tree, conn, file_id, max_write);
     writer.offset = offset;
+    writer.resolved_path = resolved_path;
     Ok(writer)
+}
+
+/// The CREATE behind every [`FileWriter`], with the server's name for the
+/// file asked in the same round trip.
+async fn open_for_writer(
+    tree: &Tree,
+    conn: &mut Connection,
+    path: &str,
+    disposition: CreateDisposition,
+) -> Result<(FileId, Option<String>)> {
+    let (created, resolved_path) = tree
+        .open_and_name(
+            conn,
+            path,
+            &tree.write_open_request(path, disposition),
+            false,
+        )
+        .await?;
+    Ok((created.file_id, resolved_path))
 }
 
 impl FileWriter {
@@ -1149,7 +1197,20 @@ impl FileWriter {
             pending_offset: 0,
             stashed_chunk: None,
             done: false,
+            resolved_path: None,
         }
+    }
+
+    /// The path the server opened, as it stores it: relative to the share,
+    /// `/`-separated, in on-disk casing, with 8.3 aliases replaced by their
+    /// long names (see [`Tree::resolve`]). Asked in the same round trip as
+    /// the open, so it names exactly the file this handle writes.
+    ///
+    /// `None` when the server can't name it (SMB 2.x or 3.0.2, or Windows
+    /// before 10 / Server v1803); the open itself is unaffected.
+    #[must_use]
+    pub fn resolved_path(&self) -> Option<&str> {
+        self.resolved_path.as_deref()
     }
 
     /// Push a data chunk to the writer.
@@ -1562,9 +1623,11 @@ impl Drop for FileWriter {
 mod tests {
     use super::*;
     use crate::client::test_helpers::{
-        build_close_error_response, build_close_response, build_create_response,
-        build_flush_response, build_read_error_response, build_read_response,
-        build_write_error_response, build_write_response, setup_connection,
+        build_close_error_response, build_close_response, build_compound_response_frame,
+        build_create_error_response, build_create_response, build_flush_response,
+        build_query_info_error_response, build_query_info_response, build_read_error_response,
+        build_read_response, build_write_error_response, build_write_response,
+        file_all_information, file_name_information, setup_connection,
     };
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -1587,6 +1650,25 @@ mod tests {
             persistent: 0xAA,
             volatile: 0xBB,
         }
+    }
+
+    /// The compound a writer's open gets back: CREATE, then a class 48 name
+    /// query the server refused (so `resolved_path` is `None`).
+    fn writer_opened(file_id: FileId) -> Vec<u8> {
+        build_compound_response_frame(&[
+            build_create_response(file_id, 0),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+        ])
+    }
+
+    /// The compound a reader's open gets back: CREATE, then class 18 and
+    /// class 48, both refused.
+    fn reader_opened(file_id: FileId, end_of_file: u64) -> Vec<u8> {
+        build_compound_response_frame(&[
+            build_create_response(file_id, end_of_file),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+        ])
     }
 
     // ── FileWriter tests ───────────────────────────────────────────────
@@ -1623,7 +1705,7 @@ mod tests {
         let file_id = test_file_id();
 
         // CREATE (FileOpenIf) + WRITE(50) + FLUSH + CLOSE.
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(50));
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
@@ -1659,7 +1741,7 @@ mod tests {
         let file_id = test_file_id();
 
         // Queue: CREATE + WRITE(100) + FLUSH + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(100));
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
@@ -1679,7 +1761,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(100));
         mock.queue_response(build_write_response(100));
         mock.queue_response(build_write_response(100));
@@ -1703,7 +1785,7 @@ mod tests {
         let file_id = test_file_id();
 
         // Queue: CREATE + FLUSH + CLOSE (no WRITE)
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
@@ -1724,7 +1806,7 @@ mod tests {
         let file_id = test_file_id();
 
         // Queue: CREATE + WRITE(50) + FLUSH + CLOSE
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(50));
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
@@ -1755,7 +1837,7 @@ mod tests {
         let wire_3 = 65536u32;
         let wire_4 = (chunk_size - 3 * 65536) as u32; // 8192
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(wire_1));
         mock.queue_response(build_write_response(wire_2));
         mock.queue_response(build_write_response(wire_3));
@@ -1780,7 +1862,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_flush_response());
         mock.queue_response(build_close_response());
 
@@ -1799,7 +1881,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(100));
         mock.queue_response(build_write_response(200));
         mock.queue_response(build_flush_response());
@@ -1827,7 +1909,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
 
         // Queue MAX_PIPELINE_WINDOW + 1 write responses.
         for _ in 0..MAX_PIPELINE_WINDOW + 1 {
@@ -1861,7 +1943,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         // Return error for the WRITE.
         mock.queue_response(build_write_error_response(NtStatus::DISK_FULL));
         // CLOSE after error cleanup.
@@ -1887,7 +1969,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(50));
         mock.queue_response(build_write_response(75));
         mock.queue_response(build_write_response(25));
@@ -1919,7 +2001,7 @@ mod tests {
         let file_id = test_file_id();
 
         // Queue: CREATE + CLOSE (note: no FLUSH — abort skips fsync).
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_close_response());
 
         let conn = setup_connection(&mock);
@@ -1940,7 +2022,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         // Three WRITEs on the wire, three responses queued.
         mock.queue_response(build_write_response(50));
         mock.queue_response(build_write_response(75));
@@ -1974,7 +2056,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(100));
         // Second WRITE errors — abort must not bubble this up.
         mock.queue_response(build_write_error_response(NtStatus::DISK_FULL));
@@ -2003,7 +2085,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_close_response());
 
         let conn = setup_connection(&mock);
@@ -2031,7 +2113,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_write_response(100));
         // CLOSE returns an error. abort() must still return Ok.
         mock.queue_response(build_close_error_response(NtStatus::FILE_CLOSED));
@@ -2063,7 +2145,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(writer_opened(file_id));
         mock.queue_response(build_close_response());
 
         let conn = setup_connection(&mock);
@@ -2087,7 +2169,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 1000));
+        mock.queue_response(reader_opened(file_id, 1000));
         mock.queue_response(build_read_response(vec![0xAA; 4]));
         mock.queue_response(build_read_response(vec![0xBB; 8]));
         mock.queue_response(build_read_response(vec![0xCC; 2]));
@@ -2117,7 +2199,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 10));
+        mock.queue_response(reader_opened(file_id, 10));
         // Only ONE READ hits the wire: the clamped [8, 10) read of 2 bytes.
         mock.queue_response(build_read_response(vec![0xEE; 2]));
         mock.queue_response(build_close_response());
@@ -2150,7 +2232,7 @@ mod tests {
         let file_id = test_file_id();
 
         let total = 65536usize * 2 + 100; // 3 wire reads: 65536, 65536, 100
-        mock.queue_response(build_create_response(file_id, total as u64));
+        mock.queue_response(reader_opened(file_id, total as u64));
         mock.queue_response(build_read_response(vec![1u8; 65536]));
         mock.queue_response(build_read_response(vec![2u8; 65536]));
         mock.queue_response(build_read_response(vec![3u8; 100]));
@@ -2178,7 +2260,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 100));
+        mock.queue_response(reader_opened(file_id, 100));
         mock.queue_response(build_read_error_response(NtStatus::ACCESS_DENIED));
         mock.queue_response(build_close_response());
 
@@ -2206,7 +2288,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
-        mock.queue_response(build_create_response(file_id, 100));
+        mock.queue_response(reader_opened(file_id, 100));
         mock.queue_response(build_read_response(vec![0x11; 4]));
 
         let conn = setup_connection(&mock);
@@ -2257,5 +2339,136 @@ mod tests {
         };
         let frac = large.fraction();
         assert!(frac > 0.49 && frac < 0.51);
+    }
+
+    // ── What the server opened ─────────────────────────────────────────
+
+    /// The query classes a compound request carried, in order.
+    fn sent_query_classes(mock: &MockTransport, n: usize) -> Vec<u8> {
+        use crate::msg::header::Header;
+        use crate::msg::query_info::QueryInfoRequest;
+        let sent = mock.sent_message(n).unwrap();
+        let mut classes = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut cursor = ReadCursor::new(&sent[offset..]);
+            let header = Header::unpack(&mut cursor).unwrap();
+            if header.command == Command::QueryInfo {
+                classes.push(
+                    QueryInfoRequest::unpack(&mut cursor)
+                        .unwrap()
+                        .file_info_class,
+                );
+            }
+            if header.next_command == 0 {
+                return classes;
+            }
+            offset += header.next_command as usize;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_records_the_name_the_server_opened_in_the_open_round_trip() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(test_file_id(), 5),
+            build_query_info_response(file_all_information("\\Docs\\Report.txt")),
+            build_query_info_response(file_name_information("Docs\\Report.txt")),
+        ]));
+        let reader = test_tree()
+            .open_file_reader(setup_connection(&mock), "DOCS/report.TXT")
+            .await
+            .unwrap();
+        assert_eq!(reader.resolved_path(), Some("Docs/Report.txt"));
+        assert_eq!(reader.size(), 5);
+        assert_eq!(mock.sent_count(), 1, "the name costs no extra round trip");
+        // Class 18 before 48, so a server cascading a refused 18 can't take
+        // 48 down with it.
+        assert_eq!(sent_query_classes(&mock, 0), vec![18, 48]);
+    }
+
+    #[tokio::test]
+    async fn a_reader_falls_back_to_file_all_information() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(test_file_id(), 5),
+            build_query_info_response(file_all_information("\\Docs\\Report.txt")),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+        ]));
+        let reader = test_tree()
+            .open_file_reader(setup_connection(&mock), "docs/report.txt")
+            .await
+            .unwrap();
+        assert_eq!(reader.resolved_path(), Some("Docs/Report.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_reader_opens_fine_on_a_server_that_names_nothing() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(reader_opened(test_file_id(), 5));
+        let reader = test_tree()
+            .open_file_reader(setup_connection(&mock), "docs/report.txt")
+            .await
+            .unwrap();
+        assert_eq!(reader.resolved_path(), None);
+        assert_eq!(reader.size(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_cannot_open_reports_the_create_error() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+        ]));
+        let err = test_tree()
+            .open_file_reader(setup_connection(&mock), "missing.txt")
+            .await
+            .err()
+            .expect("a missing file must not open");
+        assert_eq!(err.kind(), crate::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_writer_records_the_name_the_server_opened() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(test_file_id(), 0),
+            build_query_info_response(file_name_information("Out\\new\u{F025}.bin")),
+        ]));
+        mock.queue_response(build_close_response());
+        let writer = test_tree()
+            .create_file_writer(setup_connection(&mock), "out/new?.bin")
+            .await
+            .unwrap();
+        assert_eq!(writer.resolved_path(), Some("Out/new?.bin"));
+        // A write handle has no FILE_READ_ATTRIBUTES, so class 18 isn't asked.
+        assert_eq!(sent_query_classes(&mock, 0), vec![48]);
+        writer.abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_writer_open_names_what_it_opened() {
+        for disposition in ["exclusive", "at"] {
+            let mock = Arc::new(MockTransport::new());
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(test_file_id(), 0),
+                build_query_info_response(file_name_information("Out.bin")),
+            ]));
+            mock.queue_response(build_close_response());
+            let conn = setup_connection(&mock);
+            let writer = match disposition {
+                "exclusive" => {
+                    test_tree()
+                        .create_file_writer_exclusive(conn, "out.bin")
+                        .await
+                }
+                _ => test_tree().create_file_writer_at(conn, "out.bin", 10).await,
+            }
+            .unwrap();
+            assert_eq!(writer.resolved_path(), Some("Out.bin"), "{disposition}");
+            writer.abort().await.unwrap();
+        }
     }
 }

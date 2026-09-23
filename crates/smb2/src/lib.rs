@@ -92,6 +92,10 @@ pub use client::tree::{
     DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
 };
 
+// What a path resolved to on the server (`Tree::resolve`), and which file it is.
+pub use client::durable::FileIdentity;
+pub use client::resolve::Resolved;
+
 // Pipeline
 pub use client::pipeline::{Op, OpResult, Pipeline};
 

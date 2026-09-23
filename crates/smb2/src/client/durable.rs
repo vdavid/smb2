@@ -119,7 +119,7 @@ impl FileIdentity {
     /// The `QUERY_INFO` that reads the index number, for compounding onto a
     /// CREATE. `FileId::SENTINEL` makes the server substitute the handle the
     /// CREATE ahead of it just produced.
-    fn index_query() -> QueryInfoRequest {
+    pub(super) fn index_query() -> QueryInfoRequest {
         QueryInfoRequest {
             info_type: InfoType::File,
             file_info_class: FILE_INTERNAL_INFORMATION,
@@ -132,7 +132,7 @@ impl FileIdentity {
     }
 
     /// The `QUERY_INFO` that reads the volume serial.
-    fn volume_query() -> QueryInfoRequest {
+    pub(super) fn volume_query() -> QueryInfoRequest {
         QueryInfoRequest {
             info_type: InfoType::Filesystem,
             file_info_class: FS_VOLUME_INFORMATION,
@@ -158,7 +158,7 @@ impl FileIdentity {
 
     /// Assemble one from the two compounded answers. `None` when the index
     /// number — the part that actually discriminates — is missing.
-    fn from_frames(index: Option<&Frame>, volume: Option<&Frame>) -> Option<Self> {
+    pub(super) fn from_frames(index: Option<&Frame>, volume: Option<&Frame>) -> Option<Self> {
         let index_number = {
             let body = Self::payload(index?)?;
             ReadCursor::new(&body).read_u64_le().ok()?

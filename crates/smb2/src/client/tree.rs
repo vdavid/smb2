@@ -77,7 +77,7 @@ fn confirmed_write_bytes(frame: Result<Frame>) -> Result<u64> {
 /// The `expected` count is what keeps every caller's `responses[2]` from
 /// being a panic: a server that answers a four-op chain with two frames is
 /// a protocol error, not a reason to take the process down.
-fn all_or_first_err(
+pub(super) fn all_or_first_err(
     frames: Vec<Result<crate::client::connection::Frame>>,
     expected: usize,
 ) -> Result<Vec<crate::client::connection::Frame>> {
@@ -105,10 +105,10 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
 /// FileBasicInformation class for QUERY_INFO (MS-FSCC 2.4.7).
-const FILE_BASIC_INFORMATION: u8 = 4;
+pub(super) const FILE_BASIC_INFORMATION: u8 = 4;
 
 /// FileStandardInformation class for QUERY_INFO (MS-FSCC 2.4.41).
-const FILE_STANDARD_INFORMATION: u8 = 5;
+pub(super) const FILE_STANDARD_INFORMATION: u8 = 5;
 
 /// FileRenameInformation class for SET_INFO (MS-FSCC 2.4.34.2).
 const FILE_RENAME_INFORMATION: u8 = 10;
@@ -933,24 +933,6 @@ impl Tree {
             warn!("recv: STATUS_BUFFER_OVERFLOW on FileBasicInformation, response data may be truncated");
         }
 
-        // Parse FileBasicInformation.
-        let mut cursor = ReadCursor::new(basic_body);
-        let basic_resp = QueryInfoResponse::unpack(&mut cursor)?;
-        let basic_buf = &basic_resp.output_buffer;
-
-        if basic_buf.len() < 36 {
-            return Err(Error::invalid_data(format!(
-                "FileBasicInformation too short: {} bytes",
-                basic_buf.len()
-            )));
-        }
-
-        let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
-        let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
-        let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
-        let _change_time = u64::from_le_bytes(basic_buf[24..32].try_into().unwrap());
-        let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
-
         // Check second QUERY_INFO (standard). If it failed, issue standalone CLOSE.
         if !std_header.status.is_success_or_partial() {
             let mut cursor = ReadCursor::new(create_body);
@@ -969,26 +951,7 @@ impl Tree {
             warn!("recv: STATUS_BUFFER_OVERFLOW on FileStandardInformation, response data may be truncated");
         }
 
-        // Parse FileStandardInformation.
-        let mut cursor = ReadCursor::new(std_body);
-        let std_resp = QueryInfoResponse::unpack(&mut cursor)?;
-        let std_buf = &std_resp.output_buffer;
-
-        if std_buf.len() < 22 {
-            return Err(Error::invalid_data(format!(
-                "FileStandardInformation too short: {} bytes",
-                std_buf.len()
-            )));
-        }
-
-        let _allocation_size = u64::from_le_bytes(std_buf[0..8].try_into().unwrap());
-        let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
-        let _number_of_links = u32::from_le_bytes(std_buf[16..20].try_into().unwrap());
-        let _delete_pending = std_buf[20];
-        let is_directory_byte = std_buf[21];
-
-        let is_directory =
-            is_directory_byte != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        let info = file_info_from(basic_body, std_body)?;
 
         // Check CLOSE response (non-fatal, we already have the data).
         if close_header.status != NtStatus::SUCCESS {
@@ -1000,16 +963,10 @@ impl Tree {
 
         trace!(
             "tree: stat done, size={}, is_dir={}",
-            end_of_file,
-            is_directory
+            info.size,
+            info.is_directory
         );
-        Ok(FileInfo {
-            size: end_of_file,
-            is_directory,
-            created,
-            modified,
-            accessed,
-        })
+        Ok(info)
     }
 
     /// Stat multiple files, one compound request each.
@@ -2263,27 +2220,7 @@ impl Tree {
     /// drop, or by calling the internal close path). Leaking the handle
     /// wastes server resources.
     pub async fn open_file(&self, conn: &mut Connection, path: &str) -> Result<(FileId, u64)> {
-        let path = self.format_path(path);
-        let req = CreateRequest {
-            requested_oplock_level: OplockLevel::None,
-            impersonation_level: ImpersonationLevel::Impersonation,
-            desired_access: FileAccessMask::new(
-                FileAccessMask::FILE_READ_DATA
-                    | FileAccessMask::FILE_READ_ATTRIBUTES
-                    | FileAccessMask::SYNCHRONIZE,
-            ),
-            file_attributes: 0,
-            share_access: ShareAccess(
-                ShareAccess::FILE_SHARE_READ
-                    | ShareAccess::FILE_SHARE_WRITE
-                    | ShareAccess::FILE_SHARE_DELETE,
-            ),
-            create_disposition: CreateDisposition::FileOpen,
-            create_options: 0,
-            name: path,
-            create_contexts: vec![],
-        };
-
+        let req = self.read_open_request(path);
         let frame = conn
             .execute(Command::Create, &req, Some(self.tree_id))
             .await?;
@@ -2300,6 +2237,31 @@ impl Tree {
         Ok((resp.file_id, resp.end_of_file))
     }
 
+    /// The CREATE [`open_file`](Self::open_file) and a
+    /// [`FileReader`](crate::FileReader) send: read access, `FileOpen`
+    /// (fail if absent), and the standard share mask.
+    pub(super) fn read_open_request(&self, path: &str) -> CreateRequest {
+        CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_DATA
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: 0,
+            name: self.format_path(path),
+            create_contexts: vec![],
+        }
+    }
+
     /// Open (or create) a file for writing, returning the file handle.
     ///
     /// Uses `FileOverwriteIf` disposition (create if absent, overwrite if present)
@@ -2309,40 +2271,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<FileId> {
-        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOverwriteIf)
-            .await
-    }
-
-    /// Open a file for writing using a specific `CreateDisposition`.
-    ///
-    /// Shared body of [`open_file_for_write`](Self::open_file_for_write)
-    /// (`FileOverwriteIf`) and
-    /// [`open_file_for_exclusive_create`](Self::open_file_for_exclusive_create)
-    /// (`FileCreate`). Held private so the disposition stays a strict
-    /// allow-list inside the crate.
-    async fn open_file_for_write_with_disposition(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-        create_disposition: CreateDisposition,
-    ) -> Result<FileId> {
-        let path = self.format_path(path);
-        let req = CreateRequest {
-            requested_oplock_level: OplockLevel::None,
-            impersonation_level: ImpersonationLevel::Impersonation,
-            desired_access: FileAccessMask::new(
-                FileAccessMask::FILE_WRITE_DATA
-                    | FileAccessMask::FILE_WRITE_ATTRIBUTES
-                    | FileAccessMask::SYNCHRONIZE,
-            ),
-            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
-            share_access: ShareAccess(0),
-            create_disposition,
-            create_options: FILE_NON_DIRECTORY_FILE,
-            name: path,
-            create_contexts: vec![],
-        };
-
+        let req = self.write_open_request(path, CreateDisposition::FileOverwriteIf);
         let frame = conn
             .execute(Command::Create, &req, Some(self.tree_id))
             .await?;
@@ -2359,42 +2288,32 @@ impl Tree {
         Ok(resp.file_id)
     }
 
-    /// Open a file for writing with `FileCreate` disposition (exclusive create).
-    ///
-    /// Returns the file handle on success. When the file already exists the
-    /// server returns `STATUS_OBJECT_NAME_COLLISION`, which surfaces as
-    /// [`crate::ErrorKind::AlreadyExists`]. Used by
-    /// [`Tree::create_file_writer_exclusive`](Self::create_file_writer_exclusive)
-    /// so consumers can implement a race-free "create only if absent" file
-    /// write.
-    ///
-    /// Pairs with [`open_file_for_write`](Self::open_file_for_write), which
-    /// uses `FileOverwriteIf` (truncating).
-    pub(crate) async fn open_file_for_exclusive_create(
+    /// The CREATE every write open sends, with the disposition chosen by the
+    /// caller: `FileOverwriteIf` (create or truncate), `FileCreate` (exclusive,
+    /// refused with `STATUS_OBJECT_NAME_COLLISION` if the name exists, which
+    /// surfaces as [`crate::ErrorKind::AlreadyExists`]), or `FileOpenIf` (open
+    /// without truncating, for a positioned writer). Kept `pub(super)` so the
+    /// disposition stays an allow-list inside the crate.
+    pub(super) fn write_open_request(
         &self,
-        conn: &mut Connection,
         path: &str,
-    ) -> Result<FileId> {
-        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileCreate)
-            .await
-    }
-
-    /// Open an existing file (or create it if absent) for writing *without*
-    /// truncating it, returning the file handle.
-    ///
-    /// Uses `FileOpenIf` disposition and requests write access. Unlike
-    /// [`open_file_for_write`](Self::open_file_for_write) (`FileOverwriteIf`,
-    /// which truncates), this preserves existing content so a caller can write
-    /// at an arbitrary offset over or past it. Used by the positioned
-    /// [`FileWriter`](crate::client::stream::FileWriter) built via
-    /// [`create_file_writer_at`](Self::create_file_writer_at).
-    pub(crate) async fn open_file_for_write_at(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<FileId> {
-        self.open_file_for_write_with_disposition(conn, path, CreateDisposition::FileOpenIf)
-            .await
+        create_disposition: CreateDisposition,
+    ) -> CreateRequest {
+        CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_WRITE_DATA
+                    | FileAccessMask::FILE_WRITE_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            share_access: ShareAccess(0),
+            create_disposition,
+            create_options: FILE_NON_DIRECTORY_FILE,
+            name: self.format_path(path),
+            create_contexts: vec![],
+        }
     }
 
     /// Open (or create) a file with combined read+write access, **without**
@@ -3323,6 +3242,43 @@ fn normalize_path(path: &str) -> String {
     crate::name::encode_path(path)
 }
 
+/// Build a [`FileInfo`] from the QUERY_INFO response bodies for
+/// `FileBasicInformation` and `FileStandardInformation`. Shared by
+/// [`Tree::stat`] and [`Tree::resolve`], which ask the same two questions.
+pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileInfo> {
+    let basic_resp = QueryInfoResponse::unpack(&mut ReadCursor::new(basic_body))?;
+    let basic_buf = &basic_resp.output_buffer;
+    if basic_buf.len() < 36 {
+        return Err(Error::invalid_data(format!(
+            "FileBasicInformation too short: {} bytes",
+            basic_buf.len()
+        )));
+    }
+    let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
+    let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
+    let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
+    let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
+
+    let std_resp = QueryInfoResponse::unpack(&mut ReadCursor::new(std_body))?;
+    let std_buf = &std_resp.output_buffer;
+    if std_buf.len() < 22 {
+        return Err(Error::invalid_data(format!(
+            "FileStandardInformation too short: {} bytes",
+            std_buf.len()
+        )));
+    }
+    let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
+    let is_directory = std_buf[21] != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    Ok(FileInfo {
+        size: end_of_file,
+        is_directory,
+        created,
+        modified,
+        accessed,
+    })
+}
+
 /// Parse `FileBothDirectoryInformation` entries from raw bytes.
 ///
 /// Each entry has:
@@ -3946,7 +3902,8 @@ mod tests {
     }
 
     use crate::client::test_helpers::{
-        build_query_info_response, build_query_info_response_with_status, build_set_info_response,
+        build_query_info_error_response, build_query_info_response,
+        build_query_info_response_with_status, build_set_info_response,
     };
 
     /// Build a FileBasicInformation buffer (40 bytes).
@@ -4845,27 +4802,33 @@ mod tests {
     // ── Exclusive-create writer open tests ────────────────────────────
 
     #[tokio::test]
-    async fn open_file_for_exclusive_create_sends_file_create_disposition() {
+    async fn exclusive_writer_sends_file_create_disposition() {
         let mock = Arc::new(MockTransport::new());
         let file_id = FileId {
             persistent: 0xAA,
             volatile: 0xBB,
         };
-        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(file_id, 0),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+        ]));
+        mock.queue_response(build_close_response());
 
-        let mut conn = setup_connection(&mock);
-        let tree = Tree {
+        let conn = setup_connection(&mock);
+        let tree = Arc::new(Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
             dfs_origin: None,
-        };
+        });
 
-        tree.open_file_for_exclusive_create(&mut conn, "new.bin")
+        let writer = tree
+            .create_file_writer_exclusive(conn, "new.bin")
             .await
             .unwrap();
+        writer.abort().await.unwrap();
 
         let sent = mock.sent_message(0).unwrap();
         let mut cursor = ReadCursor::new(&sent);
@@ -4881,26 +4844,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_file_for_exclusive_create_maps_collision_to_already_exists() {
+    async fn exclusive_writer_maps_collision_to_already_exists() {
         let mock = Arc::new(MockTransport::new());
         // STATUS_OBJECT_NAME_COLLISION = 0xC0000035; the server response any
         // time `FileCreate` hits an existing file.
-        mock.queue_response(build_create_error_response(NtStatus::OBJECT_NAME_COLLISION));
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_error_response(NtStatus::OBJECT_NAME_COLLISION),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_COLLISION),
+        ]));
 
-        let mut conn = setup_connection(&mock);
-        let tree = Tree {
+        let conn = setup_connection(&mock);
+        let tree = Arc::new(Tree {
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
             is_dfs: false,
             encrypt_data: false,
             dfs_origin: None,
-        };
+        });
 
         let err = tree
-            .open_file_for_exclusive_create(&mut conn, "existing.bin")
+            .create_file_writer_exclusive(conn, "existing.bin")
             .await
-            .expect_err("exclusive-create on an existing file must error");
+            .err()
+            .expect("exclusive-create on an existing file must error");
         assert_eq!(
             err.kind(),
             crate::ErrorKind::AlreadyExists,

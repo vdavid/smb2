@@ -17,6 +17,13 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - **Kerberos works with tokens larger than 64 KiB.** An AP-REQ carries the service ticket and its PAC, which grows with group and claim count, so a user in many groups on a large Active Directory can pass 64 KiB. The DER encoder dropped the length's high bits there, declared a far shorter value, and the server refused a malformed request with no clear reason. Lengths of any size now encode correctly, including the GSS-API wrapper around the AP-REQ, which had its own copy of the same cap. Thanks to [@rwbh](https://github.com/rwbh) for spotting it ([#6](https://github.com/vdavid/smb2/issues/6)).
+- **A server's credit ceiling survives compound requests.** Servers grant a compound's credits on one of its replies and 0 on the rest, and Samba answers a pipeline at its maximum unevenly, and the client read those as the window shrinking and then growing again. So on a small-window server (Samba with `smb2 max credits = 64`, embedded NAS firmware), any `stat`, compound read, or similar made the client forget where the window stops, and the next `FileWriter` or chunked transfer sized its requests past what the server funds and failed with `CreditStarvation`. The ceiling now holds until the server actually grows the window.
+
+### Added
+
+- **Find out exactly which file the server opened.** `Tree::resolve` and `SmbClient::resolve` return the path as the server stores it, relative to the share: on-disk casing, and 8.3 aliases like `PROGRA~1` replaced by their long names. So a policy you enforce against a path can check the file the server actually picked, in one round trip, even when the parent directory isn't listable. The result also carries what `stat` returns and the file's `FileIdentity` (index number and volume serial) when the server provides one. Servers that can't name a file (SMB 2.x and 3.0.2, Windows before 10 / Server v1803) get an error classified `ErrorKind::Unsupported`, so you can fall back. Thanks to [@rwbh](https://github.com/rwbh) for the idea ([#6](https://github.com/vdavid/smb2/issues/6)).
+- **`FileReader::resolved_path()` and `FileWriter::resolved_path()`** name the file behind an open handle, asked in the same round trip as the open. A check against that name can't race the read or write that follows. `None` when the server can't say; the open works the same either way.
+- **`FileIdentity` is exported from the crate root.**
 
 ## [0.24.4] - 2026-09-23
 

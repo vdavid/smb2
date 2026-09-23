@@ -21,6 +21,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `dfs.rs` | DFS referral IOCTL helper, `DfsResolver` with TTL-based referral cache |
 | `copy.rs` | Server-side copy (`FSCTL_SRV_COPYCHUNK`): resume-key + copychunk primitives, batched range/whole-file convenience, `ResumeKey` / `CopyChunk` / `ServerSideCopyLimits` public types |
 | `durable.rs` | Durable handles: `open_file_durable` / `reclaim_durable_handle`, `DurableHandle`, `FileIdentity`, and the two-proof rule that makes a resume safe |
+| `resolve.rs` | `Tree::resolve` / `Resolved` (which file the server opened, and its stored name), plus `open_and_name`, the CREATE + name-query compound behind `FileReader` / `FileWriter::resolved_path` |
 
 ## Layering
 
@@ -50,6 +51,7 @@ Full model, rationale, and the incident behind it: `credits.rs` module docs.
 - **❌ The compound read's truncation guard compares `end_of_file` against what the READ requested, never against `MaxReadSize`.** A file that grew past the caller's `expected_size` between the scan and the read comes back exactly `requested` bytes, which is indistinguishable from a complete read of a smaller file. `Error::FileTooLargeForSingleRead { size, requested }` carries the server's authoritative size, so the caller can retry with it.
 - A short send parks until a grant arrives, bounded so it can't become a starvation hang: nothing outstanding to fund the wait → immediate `Error::CreditStarvation`; a charge wider than the server's known **credit ceiling** → immediate `CreditStarvation` too; connection death → `CreditPool::close` wakes every waiter; otherwise the 30 s `set_credit_wait_timeout` deadline.
 - **The ceiling** (`CreditPool` tracks the whole window, in flight included, per request by `MessageId`): set when a response to a request that asked to grow the window grants no more than that request's charge, cleared by growth past it, because servers ramp (Samba declines on early session setup legs; Windows before 2016 grows 32 at a time). Full rule and evidence: `credits.rs` module docs. ❌ Don't fail fast on "window < charge" alone: that fails requests a ramping server was about to fund. ❌ Don't set `header.credits` / `credit_charge` by hand: `CreditReservation::stamp` does both and enters the request in the window BEFORE the send (a fast answer can beat the send's return).
+- **❌ Don't judge the ceiling from a single reply's grant in isolation.** A compound's grant rides on one reply and the others carry 0 (Samba `smb2_calculate_credits`, matching Windows), and Samba answers a pipeline at its maximum unevenly. So a 0 grant is no verdict, and growth clears the ceiling only when it exceeds it by more than what's still in flight (`Window::answer`, `Window::in_flight`). Before that, every compound forgot the ceiling, and `smb-smallcredits` failed the next `FileWriter` with `CreditStarvation` once writer opens became compounds.
 - **Everything this crate sizes itself fits half the ceiling** (`CreditPool::comfortable_charge`; half, so a watcher's long poll and a second chunk still fit): every chunked transfer goes through `Connection::fundable_chunk`, and `quick_read_limit`, `compound_write_limit`, `credit_capacity_for`, `Tree::write_file`, and `SmbClient::upload` all account for it. A new chunked path must too, or it fails outright on a small-window server (Samba cuts the connection on a charge above `smb2 max credits`). Pinned against real Samba by the `smb-smallcredits` fixture.
 - Every request asks for its own charge back plus enough to reach a 512-credit target. ❌ Don't flatten this to a constant: asking for less than the charge lets the window shrink to nothing and serializes every transfer.
 - `STATUS_PENDING` interim responses carry credits but the request isn't done -- keep waiting.
@@ -171,7 +173,7 @@ Full rationale in `connection.rs` on `KEEPALIVE_AFTER` and `Connection::echo_pro
 Table, rationale, and the empirical evidence: `src/name.rs` module docs. What matters at this layer:
 
 - **`Tree::format_path` is the one outbound encode point**, and every method taking a caller path calls it at its own boundary. ❌ Nothing may hand an already-formatted path to another method: a second pass turns the wire path's `\` separators into U+F026 name characters and prepends the DFS prefix twice. The four `open_*` helpers format their own argument, which is what makes double-encoding unreachable rather than merely avoided.
-- **Decoding has to cover every site a name arrives at, or the two halves disagree** and a listing hands back names that nothing can open. Today: `parse_file_both_directory_info` (`tree.rs`, single components → `decode_name`) and `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`). ❌ Adding an info class that carries a name means adding a decode there too.
+- **Decoding has to cover every site a name arrives at, or the two halves disagree** and a listing hands back names that nothing can open. Today: `parse_file_both_directory_info` (`tree.rs`, single components → `decode_name`), `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`), and `resolved_name` (`resolve.rs`, share-relative paths → `decode_path`). ❌ Adding an info class that carries a name means adding a decode there too.
 - **What is deliberately NOT mapped**: share names, tree-connect paths, the `srvsvc` pipe name, DFS referral *server* and *share* fields, and the `*` search pattern in QUERY_DIRECTORY. Those aren't file names, and the wildcard is meant to be a wildcard.
 - **`/` is the only separator a caller can write.** A `\` is a name character (U+F026). `Tree::rename`'s target, `SmbClient::upload`, `Tree::download`, and the DFS remaining-path all go through the same codec so one convention holds end to end.
 - **DFS referral paths are encoded too** (`SmbClient::handle_dfs_redirect`), because the lookup and the CREATE that follows have to agree on where a component ends; the remaining path comes back through `decode_path` into caller form.
@@ -186,6 +188,9 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 - **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.
 - **Stat compound**: CREATE + QUERY_INFO (basic) + QUERY_INFO (standard) + CLOSE (4 ops, 1 round-trip). Default for `stat`.
 - **Fs-info compound**: CREATE + QUERY_INFO (FileFsFullSizeInformation) + CLOSE (3 ops, 1 round-trip). Default for `fs_info`.
+- **Resolve compound**: CREATE + QUERY_INFO ×6 (basic, standard, class 18, index, volume, class 48) + CLOSE (8 ops, 1 round-trip). Default for `resolve`. The order is load-bearing; see § Resolving names.
+- **Named open**: CREATE + QUERY_INFO (class 18, readers only) + QUERY_INFO (class 48), no CLOSE. Every `FileReader` and `FileWriter` open.
+- **A compound CLOSE that didn't succeed gets a standalone CLOSE** in `resolve`, whatever failed ahead of it: MS-SMB2 § 3.3.5.2.7.2 lets a server fail every related op after a failed one with the same status, so an optional query failing takes the CLOSE with it.
 - If CREATE succeeds but a later op fails, the client issues a standalone CLOSE to avoid leaking the handle.
 
 ### Receiving compound responses
@@ -270,6 +275,33 @@ FileWriter provides push-based pipelined writes. The consumer pushes chunks at t
 `FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&self, tree, path)` (clones the primary connection).
 
 Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
+
+## Resolving names (`resolve.rs`)
+
+`Tree::resolve` answers "which file did the server open for this path, and what does it call it?", for a consumer
+enforcing a policy against paths that an 8.3 alias or case folding would otherwise slip past. Full rationale and the
+measurements: `resolve.rs` module docs.
+
+- **Class 48 (`FileNormalizedNameInformation`) is the answer**: long names, on-disk casing, share-relative by spec.
+  Samba (4.20, 4.22) and the QNAP send it with no leading `\`, Windows with one; both are stripped. Refused on dialects
+  2.0.2, 2.1, 3.0.2 and by Windows before 10 / Server v1803.
+- ⚠️ **Class 18's name (`FileAllInformation`) is a fallback with two traps.** A server SHOULD send it EMPTY and current
+  Windows does, so ❌ never read an empty name as the share root. And the Windows versions that fill it (2008–2012 R2)
+  send "an absolute path" with an unspecified root, so only its last N components are used, N being the component
+  count the caller asked for. Samba sends `\dir\file`.
+- **Ordered for servers that cascade failures**: required queries first, class 48 last before CLOSE, so a refused 48
+  (common on older Windows) can't take the metadata or the class 18 fallback with it. Readers ask 18 before 48 for the
+  same reason. Writers ask 48 only: class 18 needs `FILE_READ_ATTRIBUTES`, which a write handle doesn't carry, and ❌
+  adding it to the write CREATE could make an open that works today fail with `ACCESS_DENIED`.
+- **A truncated name is never used.** The name buffer is 64 KiB (one credit, capped at `MaxTransactSize`), and a
+  `STATUS_BUFFER_OVERFLOW` answer counts as no answer: a name cut short can name a different file.
+- **Neither name usable → `Error::Protocol { NOT_SUPPORTED, QueryInfo }`** (`ErrorKind::Unsupported`), whatever
+  statuses the name queries carried: the CREATE succeeded, so all they can mean is "this server can't name it".
+  Identity is `Option` and never fails the call.
+- **DFS**: class 48 on a DFS share is share-relative even though the CREATE carried `server\share\path` (verified
+  against `smb-dfs-root`, Samba 4.20.6, 2026-09-23). `SmbClient::resolve` follows a link like `stat`, and the path is
+  then relative to the target share the caller's `Tree` points at afterwards.
+- Names come back through `decode_path` (Paths and the names SMB2 won't carry, above).
 
 ## Server-side copy (`copy.rs`)
 
