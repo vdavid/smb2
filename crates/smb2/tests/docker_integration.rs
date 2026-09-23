@@ -641,6 +641,25 @@ async fn a_named_login_mapped_to_guest_is_refused() {
     assert!(err.to_string().contains("guest session"), "got: {err}");
 }
 
+/// The named `Guest` login is a guest login on purpose, so Samba mapping it
+/// to guest is the success case, in any case spelling. Consumers have long
+/// connected to guest shares this way.
+#[tokio::test]
+#[ignore]
+async fn a_login_named_guest_mapped_to_guest_is_accepted() {
+    let _ = env_logger::try_init();
+
+    for name in ["Guest", "GUEST"] {
+        let mut conn = Connection::connect(GUEST_ADDR, TIMEOUT)
+            .await
+            .expect("connect failed");
+        conn.negotiate().await.expect("negotiate failed");
+        Session::setup(&mut conn, name, "", "")
+            .await
+            .unwrap_or_else(|e| panic!("a login as {name} must get its guest session: {e}"));
+    }
+}
+
 // ── SmbClient high-level API (smb-guest) ─────────────────────────────
 
 #[tokio::test]

@@ -577,6 +577,17 @@ impl Session {
     }
 }
 
+/// Whether a login named `username` asks for a guest session: the name
+/// `Guest`, in any ASCII case, exactly. Consumers have long logged in to guest
+/// shares this way, and some servers (Windows with anonymous access
+/// restricted, some NAS configurations) accept the named `Guest` login while
+/// refusing an anonymous one, so it must keep working. ❌ Don't widen it to
+/// look-alikes (`DOMAIN\Guest`, `guests`): those are accounts, and a guest
+/// answer to one is the downgrade this check exists for.
+fn is_guest_on_purpose(username: &str) -> bool {
+    username.eq_ignore_ascii_case("guest")
+}
+
 /// Decide whether the final SESSION_SETUP response can be believed, before
 /// anything reads its `SessionFlags`.
 ///
@@ -590,8 +601,13 @@ impl Session {
 /// then there is no secret key to prove anything with, and the server's
 /// answer stands as it always has. With an account:
 ///
-/// - **A guest or anonymous session is refused.** The caller asked to be
-///   someone; a server that grants a guest session instead has either been
+/// - **An account named `Guest` (any ASCII case) takes a guest or anonymous
+///   session as asked for** ([`is_guest_on_purpose`]): that's what the name
+///   requests, so granting it downgrades nothing. Answered with a full session
+///   instead (an enabled Windows `Guest` account), it's verified like any
+///   account below.
+/// - **Any other account refuses a guest or anonymous session.** The caller
+///   asked to be someone; a server that grants a guest session instead has either been
 ///   tampered with or (Samba's `map to guest = bad user`) is answering a wrong
 ///   password. MS-SMB2 § 3.2.5.3.1 makes the same call for a client that
 ///   requires signing. Checked first because a genuine guest response is never
@@ -621,6 +637,9 @@ fn authenticate_final_response(
     };
 
     if flags.is_guest() || flags.is_null() {
+        if is_guest_on_purpose(account) {
+            return Ok(());
+        }
         let offered = if flags.is_guest() {
             "a guest session"
         } else {
@@ -631,7 +650,8 @@ fn authenticate_final_response(
             message: format!(
                 "the server offered {offered} instead of signing in as {account}. \
                  Check the username and password: a Samba server set to \
-                 `map to guest = bad user` answers a wrong password this way"
+                 `map to guest = bad user` answers a wrong password this way. \
+                 To sign in as guest, leave the username empty or use `Guest`"
             ),
         });
     }
@@ -1243,5 +1263,79 @@ mod tests {
             .unwrap();
             assert!(!session.should_sign);
         }
+    }
+
+    /// `Guest` (any ASCII case) asks for a guest session as plainly as an
+    /// empty name does, so a server granting one is the success case, not a
+    /// downgrade. Consumers have logged in to guest shares this way for years,
+    /// and some servers accept the named `Guest` login but refuse an anonymous
+    /// one.
+    #[tokio::test]
+    async fn a_login_named_guest_answered_as_guest_succeeds() {
+        for name in ["Guest", "GUEST", "guest"] {
+            for dialect in [Dialect::Smb2_0_2, Dialect::Smb3_1_1] {
+                for flags in [SessionFlags::IS_GUEST, SessionFlags::IS_NULL] {
+                    let session = setup_against_server(
+                        dialect,
+                        false,
+                        name,
+                        "",
+                        SessionFlags(flags),
+                        Final::Unsigned,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{name} on {dialect:?} answered {flags:#x}: {e}"));
+                    assert!(!session.should_sign);
+                }
+            }
+        }
+    }
+
+    /// Only the name `Guest` itself is guest-on-purpose: an account that
+    /// merely looks like it is an account, and a guest answer to it is still
+    /// the downgrade (or the wrong password) it always was.
+    #[tokio::test]
+    async fn a_login_merely_like_guest_answered_as_guest_is_still_refused() {
+        for name in ["guest1", "Guests", " Guest", "DOMAIN\\Guest"] {
+            let result = setup_against_server(
+                Dialect::Smb3_1_1,
+                false,
+                name,
+                "",
+                SessionFlags(SessionFlags::IS_GUEST),
+                Final::Unsigned,
+            )
+            .await;
+            assert_auth_error(result, "guest");
+        }
+    }
+
+    /// A `Guest` login the server answers with a full session (a Windows
+    /// `Guest` account that's enabled) is an account login from there on: its
+    /// final response still has to verify.
+    #[tokio::test]
+    async fn a_login_named_guest_answered_with_a_full_session_is_still_verified() {
+        let result = setup_against_server(
+            Dialect::Smb3_1_1,
+            false,
+            "Guest",
+            "",
+            SessionFlags(0),
+            Final::SignedThenTampered(|r| r[48] ^= 0xFF),
+        )
+        .await;
+        assert_auth_error(result, "signature");
+
+        let session = setup_against_server(
+            Dialect::Smb3_1_1,
+            false,
+            "Guest",
+            "",
+            SessionFlags(0),
+            Final::Signed,
+        )
+        .await
+        .unwrap();
+        assert!(session.should_sign);
     }
 }

@@ -381,6 +381,10 @@ else checks that response (the receiver only verifies once signing is active). K
 Rules, in order (AGENTS.md pitfall 30):
 
 - **Empty username:** a guest or anonymous login the caller asked for. Nothing to prove; the server's flags stand.
+- **Username `Guest` (any ASCII case, exactly), `IS_GUEST` or `IS_NULL`:** accepted, since that's what the name asks for
+  (`is_guest_on_purpose`). Consumers log in to guest shares this way, and some servers take the named `Guest` login but
+  refuse an anonymous one. Answered with a full session, it's a named account from here on. ❌ Don't widen the match to
+  look-alikes (`DOMAIN\Guest`, `guests`).
 - **Named account, `IS_GUEST` or `IS_NULL`:** `Error::Auth`. Samba's `map to guest = bad user` does this for a wrong
   password, and it's also what tampering looks like. ❌ Keep this before the signature check: a genuine guest response is
   never signed, so the other order reports a wrong password as a bad signature.
