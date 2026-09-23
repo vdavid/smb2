@@ -11,13 +11,14 @@
 //! See `docs/specs/connection-actor.md` for the full design (Phase 2).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use futures_util::future::{select, Either};
 use log::{debug, error, info, trace, warn, Level};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 /// One in-flight request: who is waiting, what they asked for, and since when.
 ///
@@ -441,6 +442,56 @@ struct WriteJob {
     done: oneshot::Sender<Result<()>>,
 }
 
+/// The end of one socket's life, shared by the two tasks that hold its halves.
+///
+/// The writer task and the receiver task each own a handle to the same
+/// transport (`TcpTransport` keeps both halves in one object), so the socket
+/// closes only once BOTH have exited. Neither one exiting may leave the other
+/// parked: a server hang-up used to end the receiver while the writer waited
+/// for a frame that could never come, and the socket sat in `CLOSE_WAIT` for as
+/// long as the `Connection` lived.
+///
+/// So each task ends it on the way out, whatever the way out is (see
+/// [`EndsSocketLife`]), and each exits once the other has. [`fan_error_to_waiters`]
+/// ends it too, which is what makes "the connection is dead" and "the socket is
+/// closed" the same statement: a consumer holding a dead connection until its
+/// next operation fails holds no socket meanwhile.
+///
+/// One per generation. A revival hands its tasks a fresh one, so ending the
+/// dead socket's life can never reach the new socket's tasks.
+#[derive(Clone)]
+struct SocketLife(Arc<watch::Sender<bool>>);
+
+impl SocketLife {
+    fn new() -> Self {
+        Self(Arc::new(watch::channel(false).0))
+    }
+
+    /// Tell both tasks to let go of the socket. Idempotent.
+    fn end(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Resolves once [`end`](Self::end) has been called, at once if it already
+    /// has been.
+    async fn ended(&self) {
+        let mut rx = self.0.subscribe();
+        // Can't fail: `self` holds the sender.
+        let _ = rx.wait_for(|ended| *ended).await;
+    }
+}
+
+/// Ends a [`SocketLife`] when dropped, so a task holding one of the socket's
+/// halves ends it however the task stops: returning, panicking, or being
+/// aborted.
+struct EndsSocketLife(SocketLife);
+
+impl Drop for EndsSocketLife {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 /// The only task that touches the transport's write half.
 ///
 /// Callers hand over whole frames and wait for an ack, which buys three
@@ -461,12 +512,26 @@ struct WriteJob {
 /// reached the socket, so the stream can no longer be trusted. A frame
 /// rejected before any byte was written (oversized) is the caller's problem
 /// alone and leaves the connection alive.
+///
+/// Exits once the socket's [`SocketLife`] ends, so a connection declared dead
+/// lets go of the socket straight away. A frame already being written finishes
+/// (or times out) first; the ones still queued answer `Error::Disconnected`.
 async fn writer_loop(
     sender: Arc<dyn TransportSend>,
     mut rx: mpsc::Receiver<WriteJob>,
     inner: Weak<Inner>,
+    life: SocketLife,
 ) {
-    while let Some(job) = rx.recv().await {
+    let _ends_life = EndsSocketLife(life.clone());
+    let mut ended = pin!(life.ended());
+    loop {
+        // `ended` first: once the socket is finished with, nothing queued
+        // behind it should still reach the wire.
+        let job = match select(ended.as_mut(), pin!(rx.recv())).await {
+            Either::Left(_) => return,
+            Either::Right((Some(job), _)) => job,
+            Either::Right((None, _)) => return, // every `write_tx` dropped
+        };
         let Some(strong) = inner.upgrade() else {
             return; // last Connection clone dropped
         };
@@ -849,11 +914,21 @@ fn spawn_plumbing(
 ) {
     let sender: Arc<dyn TransportSend> = Arc::from(sender);
 
-    // The writer task holds a `Weak`, so it can't keep the connection
-    // alive; dropping the last clone closes `write_tx` and ends its loop.
+    // A fresh life for the fresh socket. The retired one is ended here too,
+    // though a revival has normally ended it already by declaring the old
+    // socket dead.
+    let life = SocketLife::new();
+    std::mem::replace(&mut *inner.socket_life.lock().unwrap(), life.clone()).end();
+
+    // Every task holds a `Weak`, so none of them can keep the connection
+    // alive. ❌ Never hand one an `Arc<Inner>` to keep: only `Inner::drop`
+    // aborts these tasks, so a task holding `Inner` alive is a cycle, and
+    // dropping every `Connection` would leave the socket open until the
+    // SERVER hangs up (never, on a server that doesn't reap idle sessions).
     let weak = Arc::downgrade(inner);
+    let writer_life = life.clone();
     let writer = tokio::spawn(async move {
-        writer_loop(sender, write_rx, weak).await;
+        writer_loop(sender, write_rx, weak, writer_life).await;
     });
     if let Some(old) = inner.writer_task.lock().unwrap().replace(writer) {
         old.abort();
@@ -862,9 +937,9 @@ fn spawn_plumbing(
     // Before the receiver task exists, so it can't count a frame into the
     // counter being retired.
     let feed = inner.adopt_receive_progress(receiver.receive_progress());
-    let inner_for_task = Arc::clone(inner);
+    let weak = Arc::downgrade(inner);
     let handle = tokio::spawn(async move {
-        receiver_loop(receiver, inner_for_task, feed).await;
+        receiver_loop(receiver, weak, feed, life).await;
     });
     if let Some(old) = inner.receiver_task.lock().unwrap().replace(handle) {
         old.abort();
@@ -1601,6 +1676,9 @@ struct Inner {
     /// old one instead of accumulating a sweeper per generation — the sweeper
     /// exits on `disconnected`, and a revival clears that flag.
     sweeper_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The current socket's [`SocketLife`], so declaring the connection dead
+    /// can close it. Replaced (and the old one ended) by every revival.
+    socket_life: StdMutex<SocketLife>,
 
     /// How to dial a fresh socket and re-authenticate on it, or `None` when
     /// the consumer has not armed auto-reconnect. See [`SessionReviver`].
@@ -1786,6 +1864,7 @@ impl Inner {
             keepalive_task: StdMutex::new(None),
             receiver_task: StdMutex::new(None),
             sweeper_task: StdMutex::new(None),
+            socket_life: StdMutex::new(SocketLife::new()),
             reviver: StdMutex::new(None),
             revive_lock: tokio::sync::Mutex::new(()),
             reconnect_policy: StdMutex::new(ReconnectPolicy::default()),
@@ -2409,9 +2488,10 @@ impl Metrics {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Last `Arc<Inner>` dropping: abort both background tasks if still
-        // alive. The writer would also stop on its own once `write_tx` drops,
-        // but not while it is parked inside a send.
+        // Last `Arc<Inner>` dropping: abort every background task still
+        // alive. The two that hold the transport let go of it as they stop,
+        // which is what closes the socket. The writer would also stop on its
+        // own once `write_tx` drops, but not while it is parked inside a send.
         if let Some(handle) = self.receiver_task.lock().unwrap().take() {
             handle.abort();
         }
@@ -4757,7 +4837,11 @@ impl Connection {
         inner.disconnected.store(false, Ordering::Release);
     }
 
-    /// Tear the connection down: every waiter told, every new send refused.
+    /// Tear the connection down: every waiter told, every new send refused,
+    /// and the socket closed.
+    ///
+    /// The `Connection` stays usable as a disconnected one: a reviver, if one
+    /// is armed, can bring it back on a fresh socket.
     ///
     /// Public because a consumer that has decided a connection is finished
     /// (a user cancelling, a share unmounted) should be able to say so
@@ -4939,20 +5023,39 @@ impl Connection {
 }
 
 // `Connection`'s teardown lives on `Inner::drop`: the receiver task is
-// aborted only when the last clone drops (the last `Arc<Inner>` goes away).
+// aborted when the last clone drops (the last `Arc<Inner>` goes away), which
+// can only happen because the task itself holds a `Weak`.
 
 /// Receiver task loop: owns the transport receive half, routes each frame
 /// to its waiter.
 ///
 /// `feed` is the counter to record each whole frame into, for a transport that
 /// can't publish its own ([`TransportReceive::receive_progress`] said `None`).
+///
+/// Holds the connection strongly only while it handles a frame, never while
+/// it waits for one: a strong reference held across `receive()` is a cycle
+/// through this task (see [`spawn_plumbing`]). A connection whose last clone
+/// drops mid-frame loses that frame's response, which is exactly what its
+/// callers already gave up on by dropping it.
 async fn receiver_loop(
     transport_recv: Box<dyn TransportReceive>,
-    inner: Arc<Inner>,
+    weak: Weak<Inner>,
     feed: Option<Arc<ReceiveProgress>>,
+    life: SocketLife,
 ) {
+    let _ends_life = EndsSocketLife(life.clone());
+    let mut ended = pin!(life.ended());
     loop {
-        let raw = match transport_recv.receive().await {
+        // Dropping a half-read frame is fine here: `ended` means the
+        // connection is already dead, and nobody reads this socket again.
+        let received = match select(ended.as_mut(), pin!(transport_recv.receive())).await {
+            Either::Left(_) => return,
+            Either::Right((received, _)) => received,
+        };
+        let Some(inner) = weak.upgrade() else {
+            return; // last Connection clone dropped
+        };
+        let raw = match received {
             Ok(bytes) => bytes,
             Err(e) => {
                 debug!("receiver_loop: transport error: {}, shutting down", e);
@@ -5389,12 +5492,17 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
 /// either "still alive → insert succeeds" or "dead → insert rejected",
 /// never "inserted but already drained" (which would leave the caller
 /// hanging on `rx.await`).
+///
+/// Also closes the socket, by ending its [`SocketLife`]: a dead connection
+/// holds no socket, however long a consumer keeps it around. A revival
+/// dials a new one.
 fn fan_error_to_waiters(inner: &Inner, e: &Error) {
     let drained: Vec<(MessageId, Waiter)> = {
         let mut waiters = inner.waiters.lock().unwrap();
         inner.disconnected.store(true, Ordering::Release);
         waiters.drain().collect()
     };
+    inner.socket_life.lock().unwrap().end();
     // Sends parked on credits are waiting for a grant that can no longer
     // arrive. Wake them now instead of letting each burn its full deadline.
     inner.credits.close();

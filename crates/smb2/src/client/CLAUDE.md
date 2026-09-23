@@ -14,6 +14,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `stream.rs` | `FileDownload` / `FileReader` (random-access positioned reads) / `FileUpload` / `FileWriter` (owns `Connection` + `Arc<Tree>`, `'static`) / `open_file_writer` / `open_file_reader` -- streaming and positioned I/O |
 | `read_ahead.rs` | `ReadAhead` (the public knob) and `Window`, the pure controller that decides when a `FileDownload` sends its next READ; `DOWNLOAD_CHUNK_SIZE`, `ADAPTIVE_MAX_IN_FLIGHT` |
 | `download_tests.rs` | `FileDownload` against the mock: order, short reads, EOF, errors, window bounds, cancel safety, adaptive timing on tokio's paused clock |
+| `socket_lifecycle_tests.rs` | When the socket closes, over real loopback sockets: last clone dropped, server hang-up, `mark_dead` |
 | `watcher.rs` | `Watcher` -- directory change notifications via CHANGE_NOTIFY long-poll |
 | `pipeline.rs` | `Pipeline` / `Op` / `OpResult` -- batched concurrent operations (the core feature) |
 | `shares.rs` | Share enumeration via IPC$ + srvsvc RPC |
@@ -362,11 +363,20 @@ Full rationale in `durable.rs`'s module docs. `Tree::open_file_durable` asks for
 
 `Connection::execute` / `execute_compound` is the primary API. A background receiver task (spawned per `Connection` at `from_transport`) owns the transport's read half and routes each sub-frame to a per-request `oneshot::Sender` by `MessageId`.
 
-- `Connection` is `Clone` and holds just `Arc<Inner>`. `Inner` owns `waiters: Mutex<HashMap<MessageId, Waiter>>`, `credits: CreditPool`, `next_message_id: AtomicU64`, the transport send half (via `Arc<dyn TransportSend>`), the receiver task's `JoinHandle`, and crypto state. All state is behind atomics or short-critical-section `std::sync::Mutex`.
+- `Connection` is `Clone` and holds just `Arc<Inner>`. `Inner` owns `waiters: Mutex<HashMap<MessageId, Waiter>>`, `credits: CreditPool`, `next_message_id: AtomicU64`, the queue into the writer task (which owns the transport's send half), the background tasks' `JoinHandle`s, and crypto state. All state is behind atomics or short-critical-section `std::sync::Mutex`.
 - `execute(command, body, tree_id)` allocates a `MessageId` (`AtomicU64::fetch_add(credit_charge)`), registers a `oneshot::Sender` in `waiters` atomically under the waiters lock (re-checks `disconnected` there to rule out a TOCTOU where the receiver task has already shut down and drained the map), packs the frame, signs/encrypts/compresses as needed, and writes through `TransportSend::send`. Then it awaits the local `oneshot::Receiver`. Returns `Result<Frame { header, body, raw }>`.
 - `execute_compound(&[CompoundOp])` does the same per sub-op, building one compound transport frame with `NextCommand` offsets, then awaits each per-sub-op receiver sequentially. Each receiver resolves independently (the receiver task splits the server's response by `NextCommand` and routes each sub-response by its `MessageId`). The outer `Result` is "did the compound hit the wire"; the inner `Vec<Result<Frame>>` has one entry per sub-op.
 - **Cancellation-by-drop is safe by construction.** If a caller's future is aborted (`tokio::spawn` + `JoinHandle::abort()` is the common path in consumers), the locally-owned `oneshot::Receiver` drops; the receiver task's `Sender::send` then fails silently when the late frame arrives; the frame is discarded. Credit grants are still banked in the receiver task so dropped-caller frames don't starve throughput.
 - **Transport drop** fans `Err(Disconnected)` to every pending `oneshot::Sender` and sets `disconnected=true` under the waiters lock. Subsequent `execute` / `execute_compound` sees `disconnected=true` and returns `Err(Disconnected)` without inserting (no leaked waiters).
+
+### Socket lifetime
+
+**The socket closes when the connection is finished with: the last clone drops, or the connection is declared dead.** Never "whenever the server hangs up". Pinned over real loopback sockets by `socket_lifecycle_tests.rs`.
+
+- **Every background task holds a `Weak<Inner>`**, the receiver included, which upgrades once per frame and never holds `Inner` across `receive()`. Only `Inner::drop` aborts the tasks, so a task keeping `Inner` alive is a cycle: dropping every `Connection` then left the socket, `Inner`, and all four tasks alive until the server hung up, and Samba's default (`deadtime = 0`) never does. A consumer mounting and unmounting a share ~60 times held 78 open sockets and ~86 timer wakeups a second that way (Cmdr on smb2 0.24.0, 2026-09-23). ❌ Don't give a task a strong ref to keep.
+- **The writer and the receiver both hold the transport** (`TcpTransport` keeps both halves in one object), so the fd closes only once both exit. They share one `SocketLife` per generation: either one exiting (returning, panicking, or aborted, via `EndsSocketLife`) ends it and the other follows. Without it, a server hang-up ended the receiver while the writer waited for a frame that could never come, and the socket sat in `CLOSE_WAIT` for as long as the consumer held the dead connection.
+- **`fan_error_to_waiters` ends it too**, so `disconnected` and "socket closed" are the same fact: `mark_dead`, `declare_unresponsive`, a failed write, and a bad frame all close the socket at once. The `Connection` stays usable as a disconnected one, and a revival dials a new socket under a fresh `SocketLife`, so ending the old one can't reach the new tasks.
+- There is no LOGOFF on the way out: the server sees a TCP close. A session holding durable opens is kept by the server for their timeout, which is what makes them reclaimable.
 
 Gotcha/Why — there is no split `send_request` / `receive_response` API, so tests can't hand-drive the two halves. Tests that build mocks without going through `setup_connection` call `mock.enable_auto_rewrite_msg_id()`, which rewrites each queued response's zero-msg_id to match the next pending sent msg_id in FIFO order.
 

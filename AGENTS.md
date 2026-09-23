@@ -123,6 +123,7 @@ src/
     copy.rs               # Server-side copy API (FSCTL_SRV_COPYCHUNK): resume-key + copychunk, batched convenience
     durable.rs            # Durable handles: open, reclaim, and the two proofs that make a resume safe
     fault_injection_tests.rs # Hostile-but-plausible servers: one that goes silent, one that goes away and comes back
+    socket_lifecycle_tests.rs # The socket closes when the connection is finished with, over real loopback sockets
 
 tests/
   wire_format_captures.rs # Messages against known byte sequences from real captures
@@ -298,6 +299,8 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 26. **A response still arriving is the server talking** ✅ -- A transport hands over a frame only once it is whole, and TCP delivers in order, so a large response trickling in over a slow link holds the whole inbound stream: an 8 MB READ at 200 KB/s is 40 s during which nothing else can arrive, ECHO replies included. With only whole frames feeding the liveness clock, that looked like 40 s of total silence with every probe unanswered, and the read ended in `Error::ServerUnresponsive` with the connection torn down under every other caller. `TcpTransport` now publishes each socket read to a `ReceiveProgress` (counts and a timestamp, never the unverified bytes), and `Inner::last_heard` folds it into the liveness clock. The same counts are what `Connection::inbound()` and `Connection::liveness()` expose to consumers. ❌ The `Arc<T>` blanket impl must forward `receive_progress`, or every `Connection::connect` quietly loses it. Spans `transport/progress.rs` + `transport/tcp.rs` + `client/connection.rs`; see `client/CLAUDE.md` § Liveness, including the known limit it leaves.
 
 27. **A download's queue is latency for everything else on its connection** ✅ -- READs answer in order on one TCP stream, so a `stat` sent during a download waits behind every byte already queued: 23 s behind one 8 MB READ at 375 KB/s, 11.7 s behind eight 512 KiB READs. No fixed chunk or window is right on both a fast and a slow link, so `Tree::download` sizes its window to the link (`client/read_ahead.rs`), and `next_chunk` is cancel-safe because consumers drop it in `select!`. See `client/CLAUDE.md` § Streaming download entry points.
+
+28. **A socket closes when the connection is finished with, not when the server says so** ✅ -- Two tasks hold the transport (the writer and the receiver), and neither may outlive the connection or the other. Every background task holds a `Weak<Inner>`, because only `Inner::drop` stops them and a strong one is a cycle: a dropped connection used to keep its socket until the server hung up, which a server with no idle reaping never does (78 open sockets in a consumer after ~60 mount/unmount cycles, 2026-09-23). And a per-generation `SocketLife` makes either task's exit end the other, and `fan_error_to_waiters` end both, so a dead connection holds no socket (a server hang-up used to leave it in `CLOSE_WAIT`). Spans `client/connection.rs` + `transport/tcp.rs`; see `client/CLAUDE.md` § Socket lifetime.
 
 ## Testing
 

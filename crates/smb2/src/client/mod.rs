@@ -19,6 +19,8 @@ pub mod pipeline;
 pub mod read_ahead;
 pub mod session;
 pub mod shares;
+#[cfg(test)]
+mod socket_lifecycle_tests;
 pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_helpers;
