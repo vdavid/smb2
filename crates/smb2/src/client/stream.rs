@@ -319,7 +319,8 @@ impl<'a> FileDownload<'a> {
                     }
                 }
             };
-            return self.take_head(frame);
+            let arrived_at = guard.arrived_at().unwrap_or_else(Instant::now);
+            return self.take_head(frame, arrived_at);
         }
     }
 
@@ -366,9 +367,10 @@ impl<'a> FileDownload<'a> {
         }
     }
 
-    /// Take the head READ's response off the queue. Synchronous on purpose:
-    /// from here to handing the chunk out, nothing may be interrupted.
-    fn take_head(&mut self, frame: Frame) -> Result<Option<Vec<u8>>> {
+    /// Take the head READ's response, which came off the wire at `arrived_at`,
+    /// off the queue. Synchronous on purpose: from here to handing the chunk
+    /// out, nothing may be interrupted.
+    fn take_head(&mut self, frame: Frame, arrived_at: Instant) -> Result<Option<Vec<u8>>> {
         let head = self
             .in_flight
             .pop_front()
@@ -408,7 +410,13 @@ impl<'a> FileDownload<'a> {
         self.bytes_received += u64::from(got);
         let in_flight_bytes = self.in_flight_bytes;
         let window = self.window();
-        window.on_delivery(Instant::now(), head.dispatched_at, got, in_flight_bytes);
+        window.on_delivery(
+            Instant::now(),
+            head.dispatched_at,
+            arrived_at,
+            got,
+            in_flight_bytes,
+        );
         if let Some(rate) = window.rate_to_share() {
             self.conn.note_read_rate(rate);
         }

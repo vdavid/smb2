@@ -10,22 +10,22 @@
 //! A READ's answer carries the payload, so its arrival is the delivery. A
 //! WRITE's answer is small and comes back after the payload went the other
 //! way, so its arrival is the moment the server had every byte, plus the
-//! server's own write and half a round trip. Over several WRITEs that is the
-//! uplink's rate, which is what the window needs, and the round trip it adds
-//! is already in the window's budget. Two things make it read low, never
-//! high:
+//! server's own write and half a round trip. The gap between two answers is
+//! the uplink's time for the second WRITE's bytes whenever that WRITE was
+//! already queued behind the first, which is the same test the window applies
+//! to READs (see `Window` § Measuring the link), so the arithmetic carries
+//! over unchanged. Each answer is timed as the receiver task read it off the
+//! wire, not when the upload looks at it: uploads are push-based, and a
+//! producer busy elsewhere may not poll its answers for seconds.
 //!
-//! - **The answer shares the downlink.** A download on the same connection
-//!   queues the WRITE answers behind its READ payload, and a slow server disk
-//!   holds them back. Both look like a slower uplink.
-//! - **An answer counts when the upload looks at it.** Uploads are push-based,
-//!   so a producer slower than the link sees its answers late. The link then
-//!   isn't the bottleneck, and the window it sizes doesn't matter much.
+//! What can still make it read low, never high: **the answer shares the
+//! downlink.** A download on the same connection queues the WRITE answers
+//! behind its READ payload, and a slow server disk holds them back. Both look
+//! like a slower uplink. Reading low keeps the window small, which errs toward
+//! keeping the connection responsive.
 //!
-//! Reading low keeps the window small, which errs toward keeping the
-//! connection responsive. It is also why the rate is kept apart from the
-//! download one: an asymmetric link (most home connections) moves each way at
-//! its own speed.
+//! The rate is kept apart from the download one: an asymmetric link (most
+//! home connections) moves each way at its own speed.
 //!
 //! # Why adaptive is the default
 //!
@@ -95,13 +95,14 @@ pub const UPLOAD_CHUNK_SIZE: u32 = 512 * 1024;
 pub enum WriteBehind {
     /// Size the window to the link (the default).
     ///
-    /// Keeps about `upload rate × (RTT + 250 ms)` bytes handed to the
+    /// Keeps about `uplink rate × (RTT + 250 ms)` bytes handed to the
     /// connection but not yet confirmed by the server: never fewer than one
     /// WRITE, never more than
     /// [`ADAPTIVE_MAX_IN_FLIGHT`](crate::client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT).
-    /// The rate is re-measured over the last eight confirmed WRITEs; the RTT
-    /// is the connection's NEGOTIATE round trip or the fastest WRITE so far,
-    /// whichever is smaller. See the [module docs](crate::client::write_behind).
+    /// The uplink rate is re-measured over the last eight confirmations that
+    /// queued behind each other; the RTT is the connection's NEGOTIATE round
+    /// trip or the fastest WRITE so far, whichever is smaller. See the
+    /// [module docs](crate::client::write_behind).
     #[default]
     Adaptive,
     /// Keep exactly this many WRITEs in flight (values below one mean one).

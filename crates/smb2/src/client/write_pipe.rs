@@ -41,6 +41,10 @@ type InFlightWrite = Pin<Box<dyn Future<Output = Landed> + Send>>;
 /// A WRITE's answer, with what the window needs to learn from it.
 struct Landed {
     dispatched_at: Instant,
+    /// When the answer came off the wire, which can be well before the pipe
+    /// looks at it: a push-based upload only polls its answers when the
+    /// producer hands it more data or finishes.
+    arrived_at: Option<Instant>,
     len: u32,
     frame: Result<Frame>,
 }
@@ -264,7 +268,7 @@ impl WritePipe {
         // Taken before the send: from here the bytes queue ahead of whatever
         // the connection sends next, which is what the window budgets.
         let dispatched_at = Instant::now();
-        let guard = self
+        let mut guard = self
             .conn
             .dispatch_with_credits(Command::Write, &req, Some(self.tree_id), charge)
             .await?;
@@ -276,9 +280,12 @@ impl WritePipe {
         let conn = self.conn.clone();
         self.in_flight.push(Box::pin(async move {
             let _budget = permit;
-            let frame = conn.await_response(guard, Command::Write).await;
+            let frame = conn
+                .await_response_in_place(&mut guard, Command::Write)
+                .await;
             Landed {
                 dispatched_at,
+                arrived_at: guard.arrived_at(),
                 len,
                 frame,
             }
@@ -301,10 +308,12 @@ impl WritePipe {
         self.confirmed += u64::from(resp.count);
 
         let in_flight_bytes = self.in_flight_bytes;
+        let now = Instant::now();
         let window = self.window();
         window.on_delivery(
-            Instant::now(),
+            now,
             landed.dispatched_at,
+            landed.arrived_at.unwrap_or(now),
             landed.len,
             in_flight_bytes,
         );

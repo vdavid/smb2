@@ -7,6 +7,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **`download_rate_hint` and `upload_rate_hint` now report the link, not the last transfer's pace, so `quick_read_limit` and `quick_write_limit` stop streaming files one frame would move faster.** A 4 MiB download at +60 ms on a ~1 GB/s link used to report ~24 MB/s, because eight READs in flight never fill that link, so a consumer choosing by `quick_read_limit` streamed files a compound READ moves in half the time. The rate now comes from answers that queued behind each other on the wire, timed as they arrived rather than when the consumer took them, which also stops a consumer catching up after a stall from reporting a link several times faster than the real one. It still errs low, never high. The adaptive read-ahead and write-behind windows pace by the same rate, so they open faster on fast, distant links.
+
 ### Fixed
 
 - **`write_file` flushes on Windows servers now.** It sends CREATE, WRITE, FLUSH, and CLOSE in one frame, and Windows refuses a FLUSH there that isn't last in the chain (`STATUS_INTERNAL_ERROR`), so a small file written to Windows was never flushed to disk, without any error. Now the first write on a connection notices the refusal and flushes that file again, and later writes to that server end the chain on the FLUSH and close separately, which costs one extra round trip per file on Windows only. Samba and NAS servers keep the one-round-trip write.

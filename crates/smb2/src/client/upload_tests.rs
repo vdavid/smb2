@@ -260,6 +260,31 @@ async fn a_writer_leaves_its_upload_rate_on_the_connection() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_upload_rate_times_answers_by_their_arrival_not_by_when_the_writer_looks() {
+    let mock = Arc::new(MockTransport::new());
+    let conn = setup_connection(&mock);
+    conn.set_estimated_rtt(Some(Duration::from_millis(10)));
+    let mut writer = FileWriter::new(test_tree(), conn.clone(), test_file_id(), 64 * KIB)
+        .with_write_behind(WriteBehind::Fixed(4));
+    writer.write_chunk(&vec![7; 4 * 64 * 1024]).await.unwrap();
+    assert_eq!(sent_writes(&mock).len(), 4);
+
+    // The answers land a second apart (a 64 KiB/s uplink) while the
+    // producer is busy elsewhere; nothing looks at them until `finish` at
+    // t = 10 s. Timed by when the writer looked, the uplink read 26 KiB/s.
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        answer_writes(&mock, 1, 64 * KIB);
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    answer_finish(&mock);
+    assert_eq!(writer.finish().await.unwrap(), 4 * 64 * 1024);
+
+    let rate = conn.upload_rate_hint().expect("four WRITEs leave a rate");
+    assert!((64_000..67_000).contains(&rate), "{rate} B/s");
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_next_writer_starts_with_the_window_the_last_one_measured() {
     let mock = Arc::new(MockTransport::new());
     answer_writes(&mock, 4, 64 * KIB);

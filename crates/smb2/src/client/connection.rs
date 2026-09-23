@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 /// hit: three requests appear to have gone unanswered while small operations on
 /// the same connection kept flowing, and nothing recorded enough to confirm it.
 struct Waiter {
-    tx: oneshot::Sender<Result<Frame>>,
+    tx: oneshot::Sender<Routed>,
     command: Command,
     /// When the waiter was inserted, which is BEFORE the bytes reach the
     /// transport. A request can sit here having never been sent.
@@ -60,6 +60,22 @@ struct Waiter {
     async_id: Option<u64>,
 }
 
+/// What the receiver task hands a waiter: the response, and when its frame
+/// came off the wire.
+///
+/// The instant exists for the read-ahead and write-behind windows, which
+/// measure the link from it. The moment a caller gets round to looking at a
+/// response says how fast the caller is, not the link: a consumer slow to take
+/// chunks reads the link low, and one catching up after a stall takes a burst
+/// of long-arrived chunks at once and reads it high. Crate-private on purpose,
+/// so [`Frame`] keeps its all-public shape.
+struct Routed {
+    result: Result<Frame>,
+    /// `None` for an error the connection fanned out itself, which never
+    /// arrived at all.
+    arrived_at: Option<tokio::time::Instant>,
+}
+
 /// A registered waiter that deregisters itself if its caller goes away.
 ///
 /// Consumers abort in-flight requests as a matter of course (a user cancels a
@@ -80,10 +96,25 @@ pub(crate) struct WaiterGuard {
     generation: u64,
     /// Taken when the response is claimed; `None` afterwards so `Drop` knows
     /// there is nothing left to clean up.
-    rx: Option<oneshot::Receiver<Result<Frame>>>,
+    rx: Option<oneshot::Receiver<Routed>>,
+    /// When the response's frame came off the wire, once it has been claimed.
+    arrived_at: Option<tokio::time::Instant>,
 }
 
 impl WaiterGuard {
+    /// When the claimed response's frame came off the wire: stamped by the
+    /// receiver task as it read the frame, however long the caller took to
+    /// look. `None` until a response has been claimed, and for an error that
+    /// never arrived (the connection died under it).
+    pub(crate) fn arrived_at(&self) -> Option<tokio::time::Instant> {
+        self.arrived_at
+    }
+
+    fn claim(&mut self, routed: Routed) -> Result<Frame> {
+        self.arrived_at = routed.arrived_at;
+        routed.result
+    }
+
     /// The id this guard is holding a slot for.
     pub(crate) fn msg_id(&self) -> MessageId {
         self.msg_id
@@ -110,7 +141,7 @@ impl WaiterGuard {
     pub(crate) fn try_recv(&mut self) -> Option<Result<Frame>> {
         let rx = self.rx.as_mut()?;
         match rx.try_recv() {
-            Ok(result) => Some(result),
+            Ok(routed) => Some(self.claim(routed)),
             Err(oneshot::error::TryRecvError::Empty) => None,
             Err(oneshot::error::TryRecvError::Closed) => Some(Err(Error::Disconnected)),
         }
@@ -125,8 +156,7 @@ impl WaiterGuard {
             return Err(Error::Disconnected);
         };
         match rx.await {
-            Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(e)) => Err(e),
+            Ok(routed) => self.claim(routed),
             Err(_canceled) => Err(Error::Disconnected),
         }
     }
@@ -1765,8 +1795,8 @@ struct Inner {
     params: StdMutex<Option<NegotiatedParams>>,
     /// Estimated round-trip time measured during negotiate.
     estimated_rtt: StdMutex<Option<Duration>>,
-    /// The last delivery rate a download measured on this connection, in
-    /// bytes per second, and when. Seeds the next download's read-ahead
+    /// The last link rate a download measured on this connection, in bytes
+    /// per second, and when. Seeds the next download's read-ahead
     /// window, so a folder of 1 MiB files doesn't pay a round trip per file
     /// to rediscover the link. See [`RATE_HINT_TTL`].
     read_rate_hint: StdMutex<Option<(tokio::time::Instant, f64)>>,
@@ -2796,21 +2826,24 @@ impl Connection {
         *self.inner.estimated_rtt.lock().unwrap()
     }
 
-    /// The delivery rate the last download on this connection measured, if
-    /// it's recent enough to still describe the link.
+    /// The link rate the last download on this connection measured, if it's
+    /// recent enough to still describe the link.
     pub(crate) fn read_rate_hint(&self) -> Option<f64> {
         let hint = *self.inner.read_rate_hint.lock().unwrap();
         hint.filter(|(at, _)| at.elapsed() < RATE_HINT_TTL)
             .map(|(_, rate)| rate)
     }
 
-    /// How fast downloads on this connection have been moving data lately, in
-    /// bytes per second, or `None` when nothing recent was measured.
+    /// How fast this connection's link carries downloads, in bytes per
+    /// second, or `None` when nothing recent was measured.
     ///
     /// Measured by streaming downloads ([`Tree::download`](crate::Tree::download)
-    /// and anything else built on [`FileDownload`](crate::FileDownload)), over
-    /// their last eight chunks, and shared by every clone of this connection.
-    /// What makes it `None`, and how far to trust it otherwise:
+    /// and anything else built on [`FileDownload`](crate::FileDownload)), and
+    /// shared by every clone of this connection. It's the link's capacity
+    /// rather than what one download achieved: it's taken from READ answers
+    /// that queued behind each other on the wire, timed as they arrived, so
+    /// a short download or a consumer slow to take chunks doesn't drag it
+    /// down. What makes it `None`, and how far to trust it otherwise:
     ///
     /// - **Only a download of two or more chunks measures it.** One READ's
     ///   rate is mostly its round trip, so small files and compound reads
@@ -2822,10 +2855,10 @@ impl Connection {
     ///   roaming, a VPN coming up) is measured afresh.
     /// - **A reconnect clears it**, since the new socket may run over a
     ///   different path.
-    /// - **It errs low.** It's what one download achieved, not what the link
-    ///   could carry: a consumer that was slow to take chunks, several
-    ///   downloads sharing the connection, or a download too short to open its
-    ///   window all read lower than the link.
+    /// - **It errs low, never high.** Several transfers sharing the
+    ///   connection, a busy server disk, or a download whose READs never
+    ///   overlapped (then it falls back to the pace they did arrive at) all
+    ///   read lower than the link.
     ///
     /// To decide between one compound read and a streamed download, use
     /// [`quick_read_limit`](Self::quick_read_limit), which is built on this.
@@ -2879,7 +2912,7 @@ impl Connection {
         self.fundable_payload(limit, 2)
     }
 
-    /// Record a download's measured delivery rate for the next one.
+    /// Record a download's measured link rate for the next one.
     pub(crate) fn note_read_rate(&self, bytes_per_sec: f64) {
         *self.inner.read_rate_hint.lock().unwrap() =
             Some((tokio::time::Instant::now(), bytes_per_sec));
@@ -2893,26 +2926,27 @@ impl Connection {
             .map(|(_, rate)| rate)
     }
 
-    /// How fast uploads on this connection have been moving data lately, in
-    /// bytes per second, or `None` when nothing recent was measured.
+    /// How fast this connection's link carries uploads, in bytes per second,
+    /// or `None` when nothing recent was measured.
     ///
     /// The upload twin of [`download_rate_hint`](Self::download_rate_hint),
     /// measured apart from it because most links are asymmetric. Every
     /// pipelined upload measures it ([`FileWriter`](crate::FileWriter),
     /// [`FileUpload`](crate::FileUpload), [`Tree::write_file_pipelined`](crate::Tree::write_file_pipelined),
-    /// [`Tree::write_file_streamed`](crate::Tree::write_file_streamed)), over
-    /// the last eight WRITEs the server confirmed, and it's shared by every
-    /// clone of this connection. The same rules as the download rate:
+    /// [`Tree::write_file_streamed`](crate::Tree::write_file_streamed)), from
+    /// WRITE confirmations that queued behind each other, timed as they
+    /// arrived, and it's shared by every clone of this connection. The same
+    /// rules as the download rate:
     ///
     /// - **Only an upload of two or more WRITEs measures it.** One WRITE's
     ///   rate is mostly its round trip, so small files and compound writes
     ///   leave it untouched.
     /// - **It expires 30 seconds after the last measurement**, and **a
     ///   reconnect clears it**.
-    /// - **It errs low.** A WRITE's answer shares the downlink with anything
-    ///   else the connection receives, and a producer slower than the link
-    ///   makes the upload slower than the link. See the
-    ///   [`write_behind` module docs](crate::client::write_behind).
+    /// - **It errs low, never high.** A WRITE's answer shares the downlink
+    ///   with anything else the connection receives, and a producer too slow
+    ///   to keep WRITEs queued leaves only the pace they did arrive at. See
+    ///   the [`write_behind` module docs](crate::client::write_behind).
     ///
     /// To decide between one compound write and a streamed upload, use
     /// [`quick_write_limit`](Self::quick_write_limit), which is built on this.
@@ -4125,6 +4159,7 @@ impl Connection {
             msg_id,
             generation: self.inner.revivals.load(Ordering::Acquire),
             rx: Some(rx),
+            arrived_at: None,
         })
     }
 
@@ -5346,6 +5381,9 @@ async fn receiver_loop(
         let Some(inner) = weak.upgrade() else {
             return; // last Connection clone dropped
         };
+        // Before any decrypting or verifying: what the windows measure is the
+        // link, and that work is the same for every frame.
+        let arrived_at = tokio::time::Instant::now();
         let raw = match received {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -5539,7 +5577,11 @@ async fn receiver_loop(
                         &inner.metrics.responses_routed_ok
                     };
                     counter.fetch_add(1, Ordering::Relaxed);
-                    if tx.send(result).is_err() {
+                    let routed = Routed {
+                        result,
+                        arrived_at: Some(arrived_at),
+                    };
+                    if tx.send(routed).is_err() {
                         // Caller's oneshot::Receiver was dropped — typical
                         // spawn/abort pattern. Counted distinctly from
                         // stray frames (None branch below).
@@ -5799,7 +5841,10 @@ fn fan_error_to_waiters(inner: &Inner, e: &Error) {
     // arrive. Wake them now instead of letting each burn its full deadline.
     inner.credits.close();
     for (_id, waiter) in drained {
-        let _ = waiter.tx.send(Err(clone_err_for_waiters(e)));
+        let _ = waiter.tx.send(Routed {
+            result: Err(clone_err_for_waiters(e)),
+            arrived_at: None,
+        });
     }
 }
 

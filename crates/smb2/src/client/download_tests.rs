@@ -526,6 +526,43 @@ async fn the_quick_read_limit_stays_within_max_read_size() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_rate_hint_times_chunks_by_their_arrival_not_by_when_the_consumer_takes_them() {
+    let mock = Arc::new(MockTransport::new());
+    let mut conn = setup_connection(&mock);
+    conn.set_estimated_rtt(Some(Duration::from_millis(10)));
+    let tree = test_tree();
+    let mut download = FileDownload::new(&tree, &mut conn, test_file_id(), 4 * 65536, CHUNK)
+        .with_read_ahead(ReadAhead::Fixed(4));
+
+    // All four READs go out at once, and the answers land a second apart:
+    // a 64 KiB/s link.
+    let pending = tokio::time::timeout(Duration::from_secs(1), download.next_chunk()).await;
+    assert!(pending.is_err());
+    assert_eq!(sent_reads(&mock).len(), 4);
+    mock.queue_response(build_read_response(chunk_of(1)));
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(1));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    mock.queue_response(build_read_response(chunk_of(2)));
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(2));
+    // The consumer gets busy while chunks 3 and 4 land, and takes both at
+    // t = 10 s. Timed by when it took them, the link read 26 KiB/s.
+    for i in 3..=4u8 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        mock.queue_response(build_read_response(chunk_of(i)));
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    mock.queue_response(build_close_response());
+    for i in 3..=4u8 {
+        assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(i));
+    }
+    assert!(download.next_chunk().await.is_none());
+    drop(download);
+
+    let rate = conn.download_rate_hint().expect("four chunks leave a rate");
+    assert!((64_000..67_000).contains(&rate), "{rate} B/s");
+}
+
 #[tokio::test]
 async fn only_a_multi_chunk_download_leaves_a_rate_hint() {
     let mock = Arc::new(MockTransport::new());
