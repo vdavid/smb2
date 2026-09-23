@@ -182,8 +182,9 @@ For large file I/O, use the pipelined variants which fill the credit window:
 
 ## Streaming I/O
 
-For large files that don't fit in memory, use the streaming API. It downloads one chunk at a time and supports progress
-reporting and cancellation.
+For large files that don't fit in memory, use the streaming API. It hands you one chunk at a time, in file order, and
+supports progress reporting and cancellation. Underneath, it keeps as many READs on the wire as the link can use: full
+speed on a fast link, and on a slow one no more than about one chunk queued ahead of your other requests.
 
 ### Streaming download
 

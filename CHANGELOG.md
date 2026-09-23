@@ -5,6 +5,28 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`Tree::download` / `SmbClient::download` fill a fast link and stop blocking the connection on a slow one.** They read 512 KiB chunks (`DOWNLOAD_CHUNK_SIZE`, capped at `MaxReadSize`) with an adaptive read-ahead window, where they used to send one `MaxReadSize` READ (8 MiB on most NAS) and wait for it. The window keeps about `delivery rate × (RTT + 250 ms)` bytes on their way: at least one READ, at most 4 MiB. Measured against Samba with injected latency and bandwidth caps (`benchmarks/read-ahead/`):
+  - +60 ms RTT, 100 MiB: 2.0 s, down from 2.7 s. 8 MiB: 338 ms against 328 ms for one 8 MiB READ.
+  - 375 KB/s, 8 MiB: a chunk every 1.6 s at most, where the old default delivered nothing for 23.6 s, and a `stat` on the same connection waits 1.5 s at most, down from 23.5 s. Same total time.
+  - 3 MB/s, 8 MiB: full link speed, with a `stat` waiting 367 ms at most, down from 2.9 s.
+  - A file that fits one chunk still costs exactly one READ. The next download on a connection starts from the rate the last one measured, so a folder of small multi-chunk files doesn't pay a round trip per file.
+  - To keep the old behavior: `.with_chunk_size(max_read_size).with_read_ahead(ReadAhead::SEQUENTIAL)` on the `FileDownload`.
+- **`FileDownload::new` uses the adaptive window too.** Pass `ReadAhead::SEQUENTIAL` for one READ at a time.
+
+### Added
+
+- **`ReadAhead`** (`Adaptive`, the default; `Fixed(n)`; `SEQUENTIAL`), and on `FileDownload`: `with_read_ahead`, `with_chunk_size`, `read_ahead()`, `chunk_size()`, and `peak_in_flight_bytes()`.
+- **`DOWNLOAD_CHUNK_SIZE`** (512 KiB) and **`client::read_ahead::ADAPTIVE_MAX_IN_FLIGHT`** (4 MiB), with the measurements behind both in the `client::read_ahead` module docs.
+
+### Fixed
+
+- **A `FileDownload` could lose its last chunk without an error.** Once the last chunk was counted, `next_chunk` sent CLOSE and awaited it before returning the chunk, so a caller whose future was dropped there (a `select!` arm losing) got `None` on the next call: the file came out short and nothing said so. `next_chunk` is now cancel-safe throughout: a received chunk waits in the download until it's handed out, and READs sent ahead stay registered.
+- **`aes` is capped below 0.9.3**, which needs Rust 1.89, so a consumer on the 1.85 MSRV resolves a version it can build. The lockfile alone can't do that for a library.
+
 ## [0.23.0] - 2026-09-22
 
 ### Breaking
