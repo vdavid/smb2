@@ -346,7 +346,8 @@ impl<'a> FileDownload<'a> {
             if self.next_offset >= self.file_size {
                 return Ok(None);
             }
-            let len = (self.file_size - self.next_offset).min(u64::from(self.chunk_size)) as u32;
+            let chunk = self.conn.fundable_chunk(self.chunk_size);
+            let len = (self.file_size - self.next_offset).min(u64::from(chunk)) as u32;
             let (reads, bytes) = (self.in_flight.len(), self.in_flight_bytes);
             match self.window().decide(Instant::now(), reads, bytes, len) {
                 Dispatch::Now => {}
@@ -690,7 +691,8 @@ impl FileReader {
         let mut pos = offset;
 
         while pos < end {
-            let chunk_len = (end - pos).min(self.max_read as u64) as u32;
+            let chunk_len =
+                (end - pos).min(u64::from(self.conn.fundable_chunk(self.max_read))) as u32;
             let req = ReadRequest {
                 padding: 0x50,
                 flags: 0,
@@ -885,7 +887,7 @@ impl<'a> FileUpload<'a> {
         }
 
         let remaining = self.data.len() - offset;
-        let this_chunk = remaining.min(self.chunk_size as usize);
+        let this_chunk = remaining.min(self.conn.fundable_chunk(self.chunk_size) as usize);
         let chunk = &self.data[offset..offset + this_chunk];
 
         let write_req = WriteRequest {
@@ -1367,7 +1369,8 @@ impl FileWriter {
             return None;
         }
 
-        let end = (self.pending_offset + self.max_write_size as usize).min(self.pending_data.len());
+        let chunk = self.conn.fundable_chunk(self.max_write_size) as usize;
+        let end = (self.pending_offset + chunk).min(self.pending_data.len());
         let slice = self.pending_data[self.pending_offset..end].to_vec();
         self.pending_offset = end;
 
@@ -1587,6 +1590,30 @@ mod tests {
     }
 
     // ── FileWriter tests ───────────────────────────────────────────────
+
+    /// A 1 MiB WRITE charges 16 credits, which a window the server stopped
+    /// growing at 8 can never fund. The writer sends what half that window
+    /// funds instead (four credits, 256 KiB), so a small window slows the
+    /// upload down rather than failing it.
+    #[tokio::test]
+    async fn file_writer_sizes_its_writes_to_a_small_credit_window() {
+        let mock = Arc::new(MockTransport::new());
+        let quarter = 256 * 1024;
+        for _ in 0..4 {
+            mock.queue_response(build_write_response(quarter));
+        }
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        conn.set_credit_ceiling(8);
+        let mut writer = FileWriter::new(test_tree(), conn, test_file_id(), 1024 * 1024);
+        writer.write_chunk(&vec![0u8; 1024 * 1024]).await.unwrap();
+        assert_eq!(writer.finish().await.unwrap(), 1024 * 1024);
+
+        // Four WRITEs, then FLUSH and CLOSE.
+        assert_eq!(mock.sent_count(), 6);
+    }
 
     #[tokio::test]
     async fn file_writer_at_offset_writes_from_given_position() {

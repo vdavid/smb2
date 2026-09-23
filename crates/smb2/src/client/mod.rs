@@ -1586,8 +1586,9 @@ impl SmbClient {
             .map(|p| p.max_write_size as usize)
             .unwrap_or(65536);
 
-        if data.len() <= max_write {
+        if data.len() as u64 <= self.conn.compound_write_limit() {
             // Small file: write everything via compound in one round-trip.
+            // The limit is `max_write`, lowered to what the credit window funds.
             tree.write_file_compound(&mut self.conn, path, data).await?;
             Ok(stream::FileUpload::new_done(
                 tree,
@@ -1782,7 +1783,7 @@ impl SmbClient {
 
         while offset < data.len() {
             let remaining = data.len() - offset;
-            let chunk_size = remaining.min(max_write as usize);
+            let chunk_size = remaining.min(self.conn.fundable_chunk(max_write) as usize);
             let chunk = &data[offset..offset + chunk_size];
 
             let write_req = crate::msg::write::WriteRequest {

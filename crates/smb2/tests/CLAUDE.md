@@ -100,6 +100,7 @@ cargo test -p smb2 --test docker_integration -- --ignored   # repeat (~8s)
 | smb-50shares | 10453 | 50 shares: RPC enumeration returns all 50 (single fragment) |
 | smb-manyshares | 10458 | 200 long-comment shares (~90 KiB reply): multi-fragment / overflow srvsvc reassembly |
 | smb-maxreadsize | 10454 | 64 KB max read/write: pipelined 512 KB, streamed write, streaming download chunk count |
+| smb-smallcredits | 10462 | `smb2 max credits = 64` with the default 8 MiB MaxRead/WriteSize: the connection learns the ceiling, an unfundable compound fails fast with `CreditStarvation` even while a watcher holds a long poll (Samba would cut the connection if it arrived), and every chunked transfer and `write_file` still moves 5 MiB |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2): different cipher family |
 | smb-weirdnames | 10459 | Names with SMB2-illegal characters. `populate.sh` writes them with octal escapes, so the on-disk bytes are exactly what macOS smbfs produces; a listing that decodes them proves Finder parity, which is the strongest assertion CI can make without a Mac. ❌ Don't replace those escapes with the literal characters. |
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target |

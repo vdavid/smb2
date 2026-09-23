@@ -27,12 +27,42 @@
 //! this type. Accounting for a request only once its answer arrives leaves
 //! everything currently in flight invisible, and concurrent senders each read
 //! the same "plenty available" number and pile on.
+//!
+//! **A charge wider than the window fails at once, not after the deadline.**
+//! Waiting only makes sense for a charge the server could still fund. One
+//! wider than the whole window never can, and because the pool is fair it
+//! doesn't wait alone: it soaks up every credit coming back, and every request
+//! queued behind it on the connection waits with it. So the pool tracks the
+//! window as well as what's unspent (see [`Window`]), and
+//! [`CreditPool::can_never_fund`] answers from it.
+//!
+//! "The window" is every credit the server has handed out and not yet been
+//! answered for: what's unspent plus what rides on requests still in flight.
+//! It's what the server bounds (Samba's `smb2 max credits`, Windows'
+//! `Smb2CreditsMax`), so it's also the most a single request can ever charge.
+//! But a small window isn't a verdict on its own. Every request asks the server
+//! to grow it (see [`CreditPool::request_for`]), and servers ramp: Windows
+//! Server before 2016 grants 32 more at a time, and Samba declines to grow on
+//! every session setup leg but the last, then grows on that one (Samba
+//! `source3/smbd/smb2_server.c`, `smb2_set_operation_credit`, read on master
+//! 2026-09-23; it also cuts the connection outright on a charge above its
+//! maximum). So the window only has a CEILING once a response to a request
+//! that asked for more came back granting no more than that request consumed,
+//! and growth past that point takes the ceiling away again. Only a charge wider
+//! than a known ceiling fails fast; anything else waits as before.
+//!
+//! The ceiling also sizes the requests this crate picks the size of (chunks,
+//! compound limits): see [`CreditPool::comfortable_charge`].
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{AcquireError, Semaphore};
+
+use crate::msg::header::Header;
+use crate::types::{CreditCharge, MessageId};
 
 /// The window the client steers the server toward, in credits.
 ///
@@ -67,14 +97,61 @@ pub(crate) fn charge_for_payload(bytes: u64) -> u16 {
 }
 
 /// How many requests charging `charge` each fit in the window the client
-/// steers toward.
+/// steers toward, or in the server's `ceiling` when it has shown one below it.
 ///
 /// An estimate of steady state, not a reading of what is unspent right now:
-/// the server clamps the target to its own maximum, and other work on the
-/// connection draws on the same pool. Never 0, because a caller uses this to
-/// size a batch and a batch of nothing makes no progress.
-pub(crate) fn capacity_for_charge(charge: u16) -> usize {
-    usize::from((CREDIT_TARGET / charge.max(1)).max(1))
+/// other work on the connection draws on the same pool. Never 0, because a
+/// caller uses this to size a batch and a batch of nothing makes no progress.
+pub(crate) fn capacity_for_charge(charge: u16, ceiling: Option<u16>) -> usize {
+    let window = ceiling.map_or(CREDIT_TARGET, |c| c.min(CREDIT_TARGET));
+    usize::from((window / charge.max(1)).max(1))
+}
+
+/// The server's credit window as the client can reconstruct it, and whether it
+/// has stopped growing. See the module docs for why the pool needs this.
+#[derive(Default)]
+struct Window {
+    /// Credits granted and not yet answered for: unspent, reserved, or riding
+    /// on a request in flight. Signed so a server that answers for more than it
+    /// granted (none should) can't wrap it.
+    size: i64,
+    /// Where the window stopped growing, or `None` while it may still grow.
+    ceiling: Option<u16>,
+    /// Requests on the wire (or about to be) whose first response hasn't
+    /// arrived, by `MessageId`. The first response settles the request: it's
+    /// the one that carries the grant, since a final response after an interim
+    /// one grants nothing.
+    awaiting: HashMap<u64, Expected>,
+}
+
+/// What a request in flight holds of the window, and what it asked for.
+#[derive(Clone, Copy)]
+struct Expected {
+    charge: u16,
+    requested: u16,
+}
+
+impl Window {
+    /// Settle the request `msg_id` with the `granted` credits its response
+    /// carried, and read the server's intent off it.
+    fn answer(&mut self, msg_id: MessageId, granted: u16) {
+        self.size += i64::from(granted);
+        let Some(expected) = self.awaiting.remove(&msg_id.0) else {
+            return;
+        };
+        self.size -= i64::from(expected.charge);
+        // A request that didn't ask to grow the window says nothing about
+        // whether the server would have.
+        if expected.requested <= expected.charge {
+            return;
+        }
+        let size = u16::try_from(self.size.max(0)).unwrap_or(u16::MAX);
+        if granted <= expected.charge {
+            self.ceiling = Some(size);
+        } else if self.ceiling.is_some_and(|ceiling| size > ceiling) {
+            self.ceiling = None;
+        }
+    }
 }
 
 /// Default bound on how long a send waits for the server to grant credits
@@ -101,6 +178,8 @@ pub(crate) struct CreditPool {
     permits: Mutex<Arc<Semaphore>>,
     /// The reserve deadline in milliseconds, tunable per connection.
     wait_ms: AtomicU64,
+    /// The whole window, in flight included, and its ceiling.
+    window: Mutex<Window>,
 }
 
 impl CreditPool {
@@ -116,6 +195,7 @@ impl CreditPool {
         Self {
             permits: Mutex::new(Arc::new(Semaphore::new(0))),
             wait_ms: AtomicU64::new(DEFAULT_CREDIT_WAIT.as_millis() as u64),
+            window: Mutex::new(Window::default()),
         }
     }
 
@@ -134,6 +214,7 @@ impl CreditPool {
     /// server exactly the way the original wedge did.
     pub(crate) fn reset(&self) {
         *self.permits.lock().unwrap() = Arc::new(Semaphore::new(0));
+        *self.window.lock().unwrap() = Window::default();
     }
 
     /// Credits on hand: granted by the server and not reserved by a request.
@@ -143,11 +224,50 @@ impl CreditPool {
         self.current().available_permits().min(u16::MAX as usize) as u16
     }
 
-    /// Bank the `CreditResponse` from a response header.
+    /// Bank a grant no request settles, the way [`answer`](Self::answer)
+    /// treats an unsolicited notification, a final response after its interim
+    /// one, or the response to NEGOTIATE.
+    #[cfg(test)]
     pub(crate) fn grant(&self, credits: u16) {
+        self.window.lock().unwrap().size += i64::from(credits);
+        self.put_back(credits);
+    }
+
+    /// Bank the `CreditResponse` from a response to `msg_id`, settling that
+    /// request's share of the window.
+    pub(crate) fn answer(&self, msg_id: MessageId, credits: u16) {
+        self.window.lock().unwrap().answer(msg_id, credits);
+        self.put_back(credits);
+    }
+
+    fn put_back(&self, credits: u16) {
         if credits > 0 {
             self.current().add_permits(credits as usize);
         }
+    }
+
+    /// Where the server's window stopped growing, or `None` while it may
+    /// still grow. See the module docs.
+    pub(crate) fn ceiling(&self) -> Option<u16> {
+        self.window.lock().unwrap().ceiling
+    }
+
+    /// Whether `charge` is wider than a window the server has stopped
+    /// growing, so no amount of waiting can fund it.
+    pub(crate) fn can_never_fund(&self, charge: u16) -> bool {
+        self.ceiling().is_some_and(|ceiling| charge > ceiling)
+    }
+
+    /// The most a request whose size this crate picks (a chunk, a compound
+    /// limit) should charge, or `None` while the window has no ceiling.
+    ///
+    /// Half the ceiling, at least one credit. A request charging the whole
+    /// ceiling is funded only once everything else on the connection has been
+    /// answered, and a watcher's long poll is never answered on cue, so it
+    /// would wait out the deadline. Half leaves room for that, and for a second
+    /// chunk in flight behind the first.
+    pub(crate) fn comfortable_charge(&self) -> Option<u16> {
+        self.ceiling().map(|ceiling| (ceiling / 2).max(1))
     }
 
     /// Take `charge` credits if they are on hand right now.
@@ -181,8 +301,16 @@ impl CreditPool {
     /// Hand back credits reserved for a request whose bytes never reached the
     /// wire (a signing failure, a transport error). Once the bytes are out,
     /// the credits are the server's and only a grant returns them.
-    pub(crate) fn refund(&self, charge: u16) {
-        self.grant(charge);
+    ///
+    /// The window doesn't move: those credits never left the client.
+    fn refund(&self, charge: u16, expected: &[MessageId]) {
+        if !expected.is_empty() {
+            let mut window = self.window.lock().unwrap();
+            for msg_id in expected {
+                window.awaiting.remove(&msg_id.0);
+            }
+        }
+        self.put_back(charge);
     }
 
     /// How many credits to request on a request charging `charge`.
@@ -220,7 +348,13 @@ impl CreditPool {
     /// Force the pool to exactly `credits`, for tests that need to stage a
     /// specific window without a full negotiate exchange.
     #[cfg(test)]
+    pub(crate) fn set_ceiling(&self, ceiling: u16) {
+        self.window.lock().unwrap().ceiling = Some(ceiling);
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_available(&self, credits: u16) {
+        self.window.lock().unwrap().size = i64::from(credits);
         let permits = self.current();
         let have = permits.available_permits();
         let want = usize::from(credits);
@@ -245,6 +379,9 @@ impl CreditPool {
 pub(crate) struct CreditReservation<'a> {
     pool: Option<&'a CreditPool>,
     charge: u16,
+    /// The requests [`stamp`](Self::stamp) entered in the window, forgotten
+    /// again if they never reach the wire.
+    stamped: Vec<MessageId>,
 }
 
 impl<'a> CreditReservation<'a> {
@@ -252,6 +389,7 @@ impl<'a> CreditReservation<'a> {
         Self {
             pool: Some(pool),
             charge,
+            stamped: Vec::new(),
         }
     }
 
@@ -270,7 +408,31 @@ impl<'a> CreditReservation<'a> {
         Self {
             pool: None,
             charge: 0,
+            stamped: Vec::new(),
         }
+    }
+
+    /// Fill in `header`'s `CreditCharge` and `CreditRequest` for a request
+    /// charging `charge` out of this reservation, and enter it in the window
+    /// so its response can settle it.
+    ///
+    /// Before the bytes go out, never after: a fast server can answer before
+    /// the send returns, and an answer to a request the window has no record
+    /// of can't be settled. A compound stamps each of its requests on one
+    /// reservation.
+    pub(crate) fn stamp(&mut self, header: &mut Header, charge: u16) {
+        let Some(pool) = self.pool else {
+            return;
+        };
+        let requested = pool.request_for(charge);
+        header.credit_charge = CreditCharge(charge);
+        header.credits = requested;
+        pool.window
+            .lock()
+            .unwrap()
+            .awaiting
+            .insert(header.message_id.0, Expected { charge, requested });
+        self.stamped.push(header.message_id);
     }
 
     /// The bytes are on the wire: the credits belong to the server now.
@@ -282,7 +444,7 @@ impl<'a> CreditReservation<'a> {
 impl Drop for CreditReservation<'_> {
     fn drop(&mut self) {
         if let Some(pool) = self.pool {
-            pool.refund(self.charge);
+            pool.refund(self.charge, &self.stamped);
         }
     }
 }
@@ -454,5 +616,153 @@ mod tests {
             "a send queued against the old session must fail rather than \
              silently continue on the new one"
         );
+    }
+
+    /// Send one request charging `charge` out of `pool`, entered in the window
+    /// under `msg_id` with whatever it asks the server for.
+    fn send(pool: &CreditPool, msg_id: u64, charge: u16) {
+        assert!(pool.try_reserve(charge));
+        let mut reservation = CreditReservation::new(pool, charge);
+        let mut header = Header::new_request(crate::types::Command::Echo);
+        header.message_id = MessageId(msg_id);
+        reservation.stamp(&mut header, charge);
+        reservation.commit();
+    }
+
+    #[test]
+    fn a_response_that_declines_to_grow_the_window_marks_its_ceiling() {
+        let pool = CreditPool::new();
+        pool.set_available(64);
+
+        send(&pool, 1, 1);
+        assert_eq!(pool.ceiling(), None, "in flight, nothing is known yet");
+        pool.answer(MessageId(1), 1);
+
+        assert_eq!(pool.ceiling(), Some(64));
+        assert!(pool.can_never_fund(65));
+        assert!(!pool.can_never_fund(64), "the whole window is fundable");
+    }
+
+    #[test]
+    fn the_window_counts_credits_in_flight_not_only_the_unspent_ones() {
+        let pool = CreditPool::new();
+        pool.set_available(64);
+
+        // A long poll holds 16 of the 64 while the server declines to grow.
+        send(&pool, 1, 16);
+        send(&pool, 2, 1);
+        pool.answer(MessageId(2), 1);
+
+        assert_eq!(pool.available(), 48);
+        assert_eq!(
+            pool.ceiling(),
+            Some(64),
+            "the long poll's credits come back when it's answered, so they're window"
+        );
+    }
+
+    #[test]
+    fn growth_past_the_ceiling_means_the_window_is_still_ramping() {
+        let pool = CreditPool::new();
+        pool.set_available(1);
+
+        // Samba's shape: the first session setup leg grants the charge only.
+        send(&pool, 1, 1);
+        pool.answer(MessageId(1), 1);
+        assert_eq!(pool.ceiling(), Some(1));
+
+        send(&pool, 2, 1);
+        pool.answer(MessageId(2), 33);
+        assert_eq!(pool.ceiling(), None);
+        assert!(!pool.can_never_fund(500));
+    }
+
+    #[test]
+    fn a_request_that_asked_for_no_growth_says_nothing_about_the_ceiling() {
+        let pool = CreditPool::new();
+        pool.set_available(CREDIT_TARGET + 1);
+
+        // Still at the target once its charge is out, a request asks for
+        // that charge back and no more.
+        send(&pool, 1, 1);
+        pool.answer(MessageId(1), 1);
+
+        assert_eq!(pool.ceiling(), None);
+    }
+
+    #[test]
+    fn only_the_first_response_settles_a_request() {
+        let pool = CreditPool::new();
+        pool.set_available(64);
+
+        // An interim STATUS_PENDING carries the grant, the final answer none.
+        send(&pool, 1, 1);
+        pool.answer(MessageId(1), 1);
+        pool.answer(MessageId(1), 0);
+
+        assert_eq!(
+            pool.ceiling(),
+            Some(64),
+            "the final answer must not take the charge out of the window twice"
+        );
+    }
+
+    #[test]
+    fn a_request_that_never_reached_the_wire_leaves_the_window_as_it_was() {
+        let pool = CreditPool::new();
+        pool.set_available(64);
+
+        assert!(pool.try_reserve(8));
+        let mut reservation = CreditReservation::new(&pool, 8);
+        let mut header = Header::new_request(crate::types::Command::Echo);
+        header.message_id = MessageId(1);
+        reservation.stamp(&mut header, 8);
+        drop(reservation);
+        send(&pool, 2, 1);
+        pool.answer(MessageId(2), 1);
+
+        assert_eq!(pool.available(), 64);
+        assert_eq!(
+            pool.ceiling(),
+            Some(64),
+            "a refund puts credits back in the pool, not new ones in the window"
+        );
+        assert!(
+            pool.window.lock().unwrap().awaiting.is_empty(),
+            "an unsent request has no answer coming to settle it"
+        );
+    }
+
+    #[test]
+    fn a_reset_forgets_the_old_servers_ceiling() {
+        let pool = CreditPool::new();
+        pool.set_available(64);
+        send(&pool, 1, 1);
+        pool.answer(MessageId(1), 1);
+        assert_eq!(pool.ceiling(), Some(64));
+
+        pool.reset();
+
+        assert_eq!(pool.ceiling(), None);
+    }
+
+    #[test]
+    fn a_comfortable_charge_is_half_the_ceiling_and_never_nothing() {
+        let pool = CreditPool::new();
+        assert_eq!(pool.comfortable_charge(), None);
+
+        pool.window.lock().unwrap().ceiling = Some(64);
+        assert_eq!(pool.comfortable_charge(), Some(32));
+
+        pool.window.lock().unwrap().ceiling = Some(1);
+        assert_eq!(pool.comfortable_charge(), Some(1));
+    }
+
+    #[test]
+    fn capacity_counts_the_ceiling_when_it_is_below_the_target() {
+        assert_eq!(capacity_for_charge(10, None), 51);
+        assert_eq!(capacity_for_charge(10, Some(64)), 6);
+        assert_eq!(capacity_for_charge(10, Some(4096)), 51);
+        assert_eq!(capacity_for_charge(130, Some(64)), 1, "never 0");
     }
 }

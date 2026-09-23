@@ -1546,11 +1546,8 @@ impl Tree {
     ///
     /// Returns the total number of bytes written.
     pub async fn write_file(&self, conn: &mut Connection, path: &str, data: &[u8]) -> Result<u64> {
-        let max_write = conn
-            .params()
-            .map(|p| p.max_write_size as usize)
-            .unwrap_or(65536);
-        if data.len() <= max_write {
+        // `max_write`, lowered to what the credit window funds.
+        if data.len() as u64 <= conn.compound_write_limit() {
             self.write_file_compound(conn, path, data).await
         } else {
             self.write_file_pipelined(conn, path, data).await
@@ -1595,6 +1592,7 @@ impl Tree {
             // Use pipeline chunk size, capped to MaxReadSize.
             pipeline_chunk.min(max_read)
         };
+        let chunk_size = conn.fundable_chunk(chunk_size);
         let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
@@ -1673,6 +1671,7 @@ impl Tree {
         } else {
             pipeline_chunk.min(max_read)
         };
+        let chunk_size = conn.fundable_chunk(chunk_size);
         let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
@@ -1814,7 +1813,7 @@ impl Tree {
         // Use MaxWriteSize for pipelined writes: minimizes overhead for
         // large payloads being sent (we're sending data, not just a small request).
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-        let chunk_size = max_write;
+        let chunk_size = conn.fundable_chunk(max_write);
         let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = data.len().div_ceil(chunk_size as usize);
         trace!(
@@ -1925,10 +1924,11 @@ impl Tree {
         let file_id = self.open_file_for_write(conn, path).await?;
 
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+        let chunk = conn.fundable_chunk(max_write);
 
         let start = std::time::Instant::now();
         let result = self
-            .write_streamed_loop(conn, file_id, next_chunk, max_write)
+            .write_streamed_loop(conn, file_id, next_chunk, chunk)
             .await;
 
         // Flush to ensure data is persisted on the server.
@@ -3249,7 +3249,7 @@ impl Tree {
 
         while offset < data.len() {
             let remaining = data.len() - offset;
-            let chunk_size = remaining.min(max_write as usize);
+            let chunk_size = remaining.min(conn.fundable_chunk(max_write) as usize);
             let chunk = &data[offset..offset + chunk_size];
 
             // DataOffset: header (64) + fixed write body (48) = 112 = 0x70

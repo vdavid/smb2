@@ -339,6 +339,7 @@ starts one container rather than 16.
 | smb-dfs-target        | 10457 | DFS target server with actual files            |
 | smb-dfs-namespace     | 10460 | DFS *namespace root*: `msdfs proxy` makes TreeConnect refuse with `STATUS_BAD_NETWORK_NAME`, and only a V3 root referral over IPC$ says where the storage is. Plus a plain share, so a test can prove an ordinary connect still costs nothing |
 | smb-dfs-failover      | 10461 | Two root targets, the first unreachable: multi-target failover and the `TargetHint` that remembers which one worked |
+| smb-smallcredits      | 10462 | `smb2 max credits = 64`: the credit ceiling, fail-fast on unfundable charges, chunks sized to the window |
 
 ### Consumer test containers
 

@@ -1994,13 +1994,18 @@ impl Inner {
     /// encrypt, or reach the transport gives its credits back; `commit` it
     /// once the bytes are out.
     ///
-    /// Waiting is bounded three ways, because an unbounded wait would trade
+    /// Waiting is bounded four ways, because an unbounded wait would trade
     /// the over-spend hang for a starvation hang:
     ///
     /// 1. Nothing outstanding and not enough on hand: no grant can ever
     ///    arrive, so fail immediately rather than wait out the deadline.
-    /// 2. The connection dies: `CreditPool::close` wakes every waiter.
-    /// 3. Otherwise the deadline from
+    /// 2. The charge is wider than a window the server has stopped growing
+    ///    (`CreditPool::can_never_fund`): no grant can ever be enough, and on
+    ///    the fair pool every request queued behind it would wait too, so fail
+    ///    immediately. Checked again while waiting, since the verdict can
+    ///    land mid-wait.
+    /// 3. The connection dies: `CreditPool::close` wakes every waiter.
+    /// 4. Otherwise the deadline from
     ///    [`Connection::set_credit_wait_timeout`] applies.
     async fn reserve_credits(
         &self,
@@ -2016,6 +2021,15 @@ impl Inner {
         if self.waiters.lock().unwrap().is_empty() {
             // Every credit the server will ever return rides on a response,
             // and there is no request outstanding to carry one.
+            return Err(self.starvation(charge, Duration::ZERO));
+        }
+        if self.credits.can_never_fund(charge) {
+            debug!(
+                "credits: {:?} needs {} credit(s), more than the server's whole window of {:?}; not waiting",
+                command,
+                charge,
+                self.credits.ceiling()
+            );
             return Err(self.starvation(charge, Duration::ZERO));
         }
 
@@ -2052,7 +2066,10 @@ impl Inner {
                 }
                 Either::Right((_, still_reserving)) => {
                     let nothing_outstanding = self.waiters.lock().unwrap().is_empty();
-                    if nothing_outstanding || std::time::Instant::now() >= deadline {
+                    if nothing_outstanding
+                        || self.credits.can_never_fund(charge)
+                        || std::time::Instant::now() >= deadline
+                    {
                         self.metrics
                             .credit_starvations
                             .fetch_add(1, Ordering::Relaxed);
@@ -2815,6 +2832,11 @@ impl Connection {
     ///   hint.
     /// - Never more than the server's `MaxReadSize`, which bounds one READ.
     ///   Before NEGOTIATE, assumes the 64 KiB every dialect allows.
+    /// - Never more than half the window funds next to the CREATE and CLOSE,
+    ///   once the server has shown a [`credit_ceiling`](Self::credit_ceiling).
+    ///   This one beats the one-chunk floor, and can be 0 on a tiny window,
+    ///   meaning stream everything: a chain the window can't fund waits out
+    ///   the credit deadline or fails with [`Error::CreditStarvation`].
     ///
     /// # Example
     ///
@@ -2832,7 +2854,8 @@ impl Connection {
     #[must_use]
     pub fn quick_read_limit(&self) -> u64 {
         let max_read = self.params().map_or(65536, |p| p.max_read_size);
-        read_ahead::quick_read_limit(self.read_rate_hint(), max_read)
+        let limit = read_ahead::quick_read_limit(self.read_rate_hint(), max_read);
+        self.fundable_payload(limit, 2)
     }
 
     /// Record a download's measured delivery rate for the next one.
@@ -2939,15 +2962,79 @@ impl Connection {
     ///
     /// This is an estimate of steady state, not a reading of unspent credits
     /// (that is [`credits`](Self::credits)): it measures the window the client
-    /// steers the server toward, which the server may clamp lower, and other
-    /// work on the same connection draws on the same pool. Use it to size a
-    /// batch of concurrent reads; launching more than this many just parks the
-    /// extras in `reserve_credits` until earlier ones finish.
+    /// steers the server toward, or the server's
+    /// [`credit_ceiling`](Self::credit_ceiling) once it has shown one below
+    /// that, and other work on the same connection draws on the same pool. Use
+    /// it to size a batch of concurrent reads; launching more than this many
+    /// just parks the extras in `reserve_credits` until earlier ones finish.
     pub fn credit_capacity_for(&self, bytes: u64) -> usize {
         let max_read = self.params().map(|p| p.max_read_size).unwrap_or(65536) as u64;
         let read_charge = credits::charge_for_payload(bytes.min(max_read));
         // Plus one credit each for the CREATE and the CLOSE riding along.
-        credits::capacity_for_charge(read_charge.saturating_add(2))
+        credits::capacity_for_charge(read_charge.saturating_add(2), self.credit_ceiling())
+    }
+
+    /// The most credits this connection's window will ever hold, once the
+    /// server has shown it: `None` while the server may still grow it.
+    ///
+    /// Every request asks the server to grow the window, and servers ramp up to
+    /// their own maximum (Samba's `smb2 max credits`, 8,192 by default). A
+    /// response that grants no more than its request consumed, although the
+    /// request asked for more, marks the ceiling; growth past it clears it
+    /// again. A request charging more than the ceiling can never be funded, so
+    /// it fails at once with [`Error::CreditStarvation`] instead of waiting out
+    /// [`set_credit_wait_timeout`](Self::set_credit_wait_timeout). Resets with
+    /// the connection.
+    ///
+    /// The size cut-offs this crate hands out already account for it:
+    /// [`quick_read_limit`](Self::quick_read_limit),
+    /// [`compound_write_limit`](Self::compound_write_limit), and
+    /// [`credit_capacity_for`](Self::credit_capacity_for). So do the chunks
+    /// every chunked transfer sends.
+    #[must_use]
+    pub fn credit_ceiling(&self) -> Option<u16> {
+        self.inner.credits.ceiling()
+    }
+
+    /// The largest `data` [`Tree::write_file_compound`](crate::Tree::write_file_compound)
+    /// (or [`Tree::write_file_compound_exclusive`](crate::Tree::write_file_compound_exclusive))
+    /// sends comfortably on this connection right now, in bytes.
+    ///
+    /// The server's `MaxWriteSize`, which bounds one WRITE, lowered once the
+    /// server has shown a [`credit_ceiling`](Self::credit_ceiling) to what
+    /// half the window funds next to the CREATE, FLUSH, and CLOSE riding
+    /// along. Half, because a chain charging the whole window can only be
+    /// funded once everything else on the connection has been answered, and a
+    /// directory watcher's long poll never is on cue. Can be 0 on a tiny
+    /// window, meaning stream everything. Before NEGOTIATE, assumes the
+    /// 64 KiB every dialect allows.
+    ///
+    /// A consumer that promises "one frame, all or nothing" for a compound
+    /// write should decide by this, up front: a bigger chain can wait out the
+    /// credit deadline or fail with [`Error::CreditStarvation`].
+    #[must_use]
+    pub fn compound_write_limit(&self) -> u64 {
+        let max_write = self.params().map_or(65536, |p| p.max_write_size);
+        self.fundable_payload(u64::from(max_write), 3)
+    }
+
+    /// `max` bytes, lowered to what half the window funds once the server has
+    /// shown a ceiling, after `riders` credits for the other requests in the
+    /// same compound. 0 when the riders alone take that budget.
+    pub(crate) fn fundable_payload(&self, max: u64, riders: u16) -> u64 {
+        match self.inner.credits.comfortable_charge() {
+            None => max,
+            Some(charge) => max.min(u64::from(charge.saturating_sub(riders)) * 65536),
+        }
+    }
+
+    /// A chunk of at most `max` bytes that the window funds comfortably, never
+    /// under one credit's 64 KiB. What every chunked transfer sizes its
+    /// requests by, so a server with a small window slows a transfer down
+    /// rather than failing it.
+    pub(crate) fn fundable_chunk(&self, max: u32) -> u32 {
+        let floor = max.min(65536);
+        (self.fundable_payload(u64::from(max), 0) as u32).max(floor)
     }
 
     /// How long a send waits for the server to grant credits before failing
@@ -3066,13 +3153,12 @@ impl Connection {
             return Err(Error::Disconnected);
         }
         let charge = credit_charge.0.max(1);
-        let reservation = self.inner.reserve_credits(charge, command).await?;
+        let mut reservation = self.inner.reserve_credits(charge, command).await?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
-        header.credits = self.inner.credits.request_for(charge);
-        header.credit_charge = CreditCharge(charge);
+        reservation.stamp(&mut header, charge);
         header.session_id = self.session_id();
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
@@ -3175,13 +3261,12 @@ impl Connection {
         // together (MS-SMB2 § 3.2.4.1.6 consumes `CreditCharge` sequence
         // numbers per request), and a reservation that has to wait must not
         // leave a hole in the sequence window meanwhile.
-        let reservation = self.inner.reserve_credits(charge, command).await?;
+        let mut reservation = self.inner.reserve_credits(charge, command).await?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
-        header.credits = self.inner.credits.request_for(charge);
-        header.credit_charge = CreditCharge(charge);
+        reservation.stamp(&mut header, charge);
         header.session_id = self.session_id();
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
@@ -3330,7 +3415,7 @@ impl Connection {
         body: &dyn Pack,
         tree_id: Option<TreeId>,
         charge: u16,
-        reservation: CreditReservation<'_>,
+        mut reservation: CreditReservation<'_>,
     ) -> Result<WaiterGuard> {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -3339,8 +3424,7 @@ impl Connection {
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
-        header.credits = self.inner.credits.request_for(charge);
-        header.credit_charge = CreditCharge(charge);
+        reservation.stamp(&mut header, charge);
         header.session_id = self.session_id();
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
@@ -3570,7 +3654,7 @@ impl Connection {
             .iter()
             .map(|op| op.credit_charge.0.max(1))
             .fold(0u16, |acc, c| acc.saturating_add(c));
-        let reservation = self
+        let mut reservation = self
             .inner
             .reserve_credits(total_charge, ops[0].command)
             .await?;
@@ -3585,8 +3669,7 @@ impl Connection {
 
             let mut header = Header::new_request(op.command);
             header.message_id = msg_id;
-            header.credits = self.inner.credits.request_for(charge);
-            header.credit_charge = CreditCharge(charge);
+            reservation.stamp(&mut header, charge);
             header.session_id = session_id;
             header.tree_id = op.tree_id;
 
@@ -4983,6 +5066,12 @@ impl Connection {
         self.inner.credits.set_available(credits);
     }
 
+    /// Stage a server that has stopped growing its window at `ceiling`.
+    #[cfg(test)]
+    pub(crate) fn set_credit_ceiling(&self, ceiling: u16) {
+        self.inner.credits.set_ceiling(ceiling);
+    }
+
     #[cfg(test)]
     pub(crate) fn set_next_message_id(&mut self, id: u64) {
         self.inner.next_message_id.store(id, Ordering::Release);
@@ -5416,11 +5505,13 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
     // released those credits regardless of whether anyone is still waiting for
     // the response that carried them. Interim STATUS_PENDING frames count too.
     //
-    // Nothing is subtracted here. The charge was already spent when the
-    // request went out (see `Inner::reserve_credits`); charging again on
-    // receipt would double-count, and charging *only* on receipt is what let
-    // concurrent senders each spend the same credits.
-    inner.credits.grant(header.credits);
+    // Nothing is taken from the unspent pool here. The charge was already
+    // spent when the request went out (see `Inner::reserve_credits`); charging
+    // again on receipt would double-count, and charging *only* on receipt is
+    // what let concurrent senders each spend the same credits. The request's
+    // share of the WINDOW is settled here, though, which is how the pool learns
+    // whether the server is still growing it (see `credits.rs`).
+    inner.credits.answer(header.message_id, header.credits);
 
     // Oplock break notification: MessageId=UNSOLICITED.
     if header.message_id == MessageId::UNSOLICITED {
@@ -5877,6 +5968,42 @@ mod tests {
         assert_eq!(conn.credit_capacity_for(8 * 1024 * 1024), 3);
         // A small file charges the minimum: one credit each for all three.
         assert_eq!(conn.credit_capacity_for(4096), 170);
+    }
+
+    /// Once the server has shown where its window stops, every size cut-off
+    /// this crate hands out fits in half of it, so nothing it picks the size
+    /// of can be refused for credits.
+    #[tokio::test]
+    async fn size_cut_offs_fit_a_window_the_server_stopped_growing() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn =
+            crate::client::test_helpers::setup_connection_with_max_read(&mock, 8 * 1024 * 1024);
+        let mut params = conn.params().unwrap();
+        params.max_write_size = 8 * 1024 * 1024;
+        conn.set_test_params(params);
+        conn.note_read_rate(1e12);
+        assert_eq!(conn.quick_read_limit(), 8 * 1024 * 1024);
+        assert_eq!(conn.compound_write_limit(), 8 * 1024 * 1024);
+        assert_eq!(conn.fundable_chunk(8 * 1024 * 1024), 8 * 1024 * 1024);
+
+        conn.set_credit_ceiling(64);
+
+        // Half of 64 is 32: the READ gets 30 next to CREATE and CLOSE, the
+        // WRITE 29 next to CREATE, FLUSH, and CLOSE, and a lone chunk all 32.
+        assert_eq!(conn.quick_read_limit(), 30 * 65536);
+        assert_eq!(conn.compound_write_limit(), 29 * 65536);
+        assert_eq!(conn.fundable_chunk(8 * 1024 * 1024), 32 * 65536);
+        assert_eq!(conn.credit_capacity_for(512 * 1024), 6);
+
+        // A window too small for any compound streams everything, and a
+        // chunk never drops below one credit.
+        conn.set_credit_ceiling(4);
+        assert_eq!(conn.quick_read_limit(), 0);
+        assert_eq!(conn.compound_write_limit(), 0);
+        assert_eq!(conn.fundable_chunk(8 * 1024 * 1024), 2 * 65536);
+        conn.set_credit_ceiling(1);
+        assert_eq!(conn.fundable_chunk(8 * 1024 * 1024), 65536);
+        assert_eq!(conn.fundable_chunk(1000), 1000);
     }
 
     #[tokio::test]
@@ -6436,6 +6563,186 @@ mod tests {
             "CHANGE_NOTIFY must keep waiting, not time out"
         );
         assert_eq!(conn.metrics().response_timeouts, 0);
+    }
+
+    /// An ECHO response carrying `credits` for `msg_id`.
+    fn echo_response_granting(msg_id: u64, credits: u16) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Echo);
+        h.flags.set_response();
+        h.credits = credits;
+        h.message_id = MessageId(msg_id);
+        pack_message(&h, &crate::msg::echo::EchoResponse)
+    }
+
+    /// Send one ECHO and answer it with a grant of `credits`, the way a server
+    /// steers the window: more than the charge grows it, the charge alone
+    /// holds it where it is.
+    async fn echo_answered_with(
+        conn: &Connection,
+        mock: &Arc<MockTransport>,
+        msg_id: u64,
+        credits: u16,
+    ) {
+        let sent_before = mock.sent_count();
+        let sender = conn.clone();
+        let echo = tokio::spawn(async move {
+            sender
+                .execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                .await
+        });
+        while mock.sent_count() == sent_before {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        mock.queue_response(echo_response_granting(msg_id, credits));
+        echo.await.unwrap().expect("the ECHO is answered");
+    }
+
+    /// Park a CHANGE_NOTIFY the server holds on to, the way a directory
+    /// watcher does. It keeps a request outstanding indefinitely, so "nothing
+    /// outstanding" can never say a charge is hopeless while it's there.
+    async fn park_a_long_poll(
+        conn: &Connection,
+        mock: &Arc<MockTransport>,
+    ) -> tokio::task::JoinHandle<Result<Frame>> {
+        let sent_before = mock.sent_count();
+        let poller = conn.clone();
+        let poll = tokio::spawn(async move {
+            let req = crate::msg::change_notify::ChangeNotifyRequest {
+                flags: 0,
+                output_buffer_length: 4096,
+                file_id: crate::types::FileId {
+                    persistent: 1,
+                    volatile: 2,
+                },
+                completion_filter: 0xFF,
+            };
+            poller
+                .execute(Command::ChangeNotify, &req, Some(TreeId(1)))
+                .await
+        });
+        while mock.sent_count() == sent_before {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        poll
+    }
+
+    /// A charge wider than the whole window, on a server that has stopped
+    /// growing it, can never be funded however long it waits. Waiting would
+    /// also stall everything queued behind it on the fair credit pool, so it
+    /// fails at once, even while a long poll keeps a request outstanding.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_charge_wider_than_a_window_the_server_stopped_growing_fails_immediately() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(1);
+        // Deliberately long: passing means the fast path fired, not the deadline.
+        conn.set_credit_wait_timeout(std::time::Duration::from_secs(60));
+
+        // The server grows the window to 64, then declines to grow it further.
+        echo_answered_with(&conn, &mock, 0, 64).await;
+        echo_answered_with(&conn, &mock, 1, 1).await;
+        let poll = park_a_long_poll(&conn, &mock).await;
+        let sent_before = mock.sent_count();
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.execute_with_credits(
+                Command::Echo,
+                &crate::msg::echo::EchoRequest,
+                None,
+                CreditCharge(128),
+            ),
+        )
+        .await;
+        poll.abort();
+
+        let result = result.expect("a charge the window can never fund must not wait at all");
+        assert!(
+            matches!(result, Err(Error::CreditStarvation { needed: 128, .. })),
+            "expected a typed starvation error, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "waited {:?} for a window the server had stopped growing",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock.sent_count(),
+            sent_before,
+            "the unfundable request must not reach the wire"
+        );
+        assert_eq!(conn.credit_ceiling(), Some(64));
+    }
+
+    /// The other side of that rule: a server still growing the window (one
+    /// that grants in steps, as Windows Server before 2016 did) is on its
+    /// way to funding a big charge, so the charge waits for the ramp. Samba
+    /// looks like this too: it declines to grow on the first session setup
+    /// leg and grows the window on the last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_charge_wider_than_a_window_still_growing_waits_for_it() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.set_credits(1);
+        conn.set_credit_wait_timeout(std::time::Duration::from_secs(60));
+
+        echo_answered_with(&conn, &mock, 0, 64).await;
+        echo_answered_with(&conn, &mock, 1, 1).await;
+        // Growth past where it stopped: the window is still ramping.
+        echo_answered_with(&conn, &mock, 2, 33).await;
+        assert_eq!(
+            conn.credit_ceiling(),
+            None,
+            "growth past the ceiling clears it"
+        );
+        let poll = park_a_long_poll(&conn, &mock).await;
+
+        let sender = conn.clone();
+        let big = tokio::spawn(async move {
+            sender
+                .execute_with_credits(
+                    Command::Echo,
+                    &crate::msg::echo::EchoRequest,
+                    None,
+                    CreditCharge(128),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !big.is_finished(),
+            "a still-growing window is worth waiting for"
+        );
+
+        // The long poll's answer grows the window past the charge.
+        let mut h = Header::new_request(Command::ChangeNotify);
+        h.flags.set_response();
+        h.credits = 40;
+        h.message_id = MessageId(3);
+        h.status = NtStatus::NOTIFY_ENUM_DIR;
+        mock.queue_response(pack_message(&h, &crate::msg::echo::EchoResponse));
+        let _ = poll.await;
+        while mock.sent_count() < 5 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        mock.queue_response(echo_response_granting(4, 128));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), big)
+            .await
+            .expect("the funded request completes")
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "expected the ramp to fund it, got {result:?}"
+        );
     }
 
     /// With nothing outstanding, no grant can ever arrive — so there is

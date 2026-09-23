@@ -80,6 +80,12 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10454:445"
 
+  smb-smallcredits:
+    build:
+      context: smb-smallcredits
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10462:445"
+
   smb-weirdnames:
     build:
       context: smb-weirdnames

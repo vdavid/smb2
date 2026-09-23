@@ -5,6 +5,23 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A request the server's credit window can never fund fails at once instead of after 30 seconds.** A server that caps its window below one big request (Samba with `smb2 max credits = 64`, embedded NAS firmware) paired with a large `MaxReadSize` made a compound READ of a few MiB wait out the whole `set_credit_wait_timeout`, and every other request on that connection waited behind it. It only failed fast when nothing else was outstanding, which a directory watcher's long poll never allows. Now the connection tracks the server's whole window and where it stopped growing, and a request wider than that fails right away with the same `Error::CreditStarvation`, before anything reaches the wire. Against a 64-credit Samba with a watcher running, a 5 MiB compound read now fails in under a second, where it used to take 60 seconds with a 60-second credit wait. A window that's still growing (servers ramp up during and after session setup) still gets waited for.
+- **Chunked transfers fit a small credit window instead of failing on it.** `FileWriter`, `FileUpload`, `FileDownload`, `FileReader`, `Tree::read_file_pipelined`, `Tree::write_file_pipelined`, and `Tree::write_file_streamed` sent chunks of up to `MaxWriteSize` / `MaxReadSize`, so on that 64-credit server an 8 MiB WRITE could never be funded. Once the server has shown its ceiling, their chunks fit in half of it (2 MiB at 64 credits), so the transfer runs slower rather than failing.
+- **`Tree::write_file` and `SmbClient::upload` use the compound write only when the window can fund it**, and stream otherwise.
+
+### Added
+
+- **`Connection::credit_ceiling()`**: where the server's credit window stopped growing, or `None` while it may still grow.
+- **`Connection::compound_write_limit()`**: the largest `data` a compound CREATE + WRITE + FLUSH + CLOSE (`write_file_compound`, `write_file_compound_exclusive`) sends comfortably right now: `MaxWriteSize`, lowered to what half the credit window funds once the server has shown its ceiling. A consumer that skips staging for a one-frame write should decide by it up front.
+
+### Changed
+
+- **`Connection::quick_read_limit()` and `Connection::credit_capacity_for()` account for the credit ceiling.** The quick-read limit drops to what half the window funds next to the CREATE and CLOSE (can be 0 on a tiny window, meaning stream everything), and the capacity counts the ceiling where it's below the 512 credits the client steers toward.
+
 ## [0.24.3] - 2026-09-23
 
 ### Added

@@ -30,6 +30,7 @@ const DFS_ROOT_ADDR: &str = "127.0.0.1:10456";
 const DFS_TARGET_ADDR: &str = "127.0.0.1:10457";
 const DFS_NAMESPACE_ADDR: &str = "127.0.0.1:10460";
 const DFS_FAILOVER_ADDR: &str = "127.0.0.1:10461";
+const SMALLCREDITS_ADDR: &str = "127.0.0.1:10462";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -5186,4 +5187,144 @@ async fn dfs_namespace_root_falls_through_to_a_live_target() {
         cache[0].target_hint, 1,
         "the second one is the one that works"
     );
+}
+
+// ── A small credit window (smb-smallcredits) ─────────────────────────
+
+/// Connect as guest to smb-smallcredits, whose window stops at 64 credits.
+async fn connect_smallcredits() -> (Connection, std::sync::Arc<Tree>) {
+    let mut conn = Connection::connect(SMALLCREDITS_ADDR, TIMEOUT)
+        .await
+        .expect("failed to connect to smb-smallcredits");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("guest session setup failed");
+    let tree = Tree::connect(&mut conn, "public")
+        .await
+        .expect("tree connect to 'public' failed");
+    (conn, std::sync::Arc::new(tree))
+}
+
+/// A compound READ of 5 MiB charges 82 credits, which a 64-credit window can
+/// never fund. It fails at once, before anything reaches the wire (Samba
+/// cuts the connection on a charge above its maximum), even while a
+/// watcher's long poll keeps a request outstanding and the old "nothing
+/// outstanding" rule can't fire. The connection stays healthy after.
+#[tokio::test]
+#[ignore]
+async fn smallcredits_an_unfundable_compound_fails_fast_and_the_connection_lives() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_smallcredits().await;
+    let dir = "_test_smallcredits_fail_fast";
+    let _ = tree.create_directory(&mut conn, dir).await;
+    let path = format!("{dir}/five-mib.bin");
+    let data: Vec<u8> = (0..=255u8).cycle().take(5 * 1024 * 1024).collect();
+    tree.write_file(&mut conn, &path, &data)
+        .await
+        .expect("write_file moves 5 MiB through a 64-credit window");
+
+    assert!(
+        conn.params().unwrap().max_read_size >= 5 * 1024 * 1024,
+        "the fixture must pair a small window with a large MaxReadSize"
+    );
+    let ceiling = conn
+        .credit_ceiling()
+        .expect("the server has shown where its window stops");
+    assert!(ceiling <= 64, "ceiling {ceiling} above `smb2 max credits`");
+
+    let mut watcher = tree.watch(&mut conn, dir, false).await.expect("watch");
+    {
+        let watching = watcher.next_events();
+        tokio::pin!(watching);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut watching)
+                .await
+                .is_err(),
+            "nothing changed, so the long poll stays parked"
+        );
+
+        conn.set_credit_wait_timeout(Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        let result = tree
+            .read_file_compound_sized(&mut conn, &path, data.len() as u64)
+            .await;
+        assert!(
+            matches!(result, Err(smb2::Error::CreditStarvation { .. })),
+            "expected CreditStarvation, got {:?}",
+            result.map(|d| d.len())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for a window that can never fund it",
+            started.elapsed()
+        );
+
+        // Same connection, same watcher: still alive, and the read streams.
+        let streamed = tree
+            .read_file_pipelined(&mut conn, &path)
+            .await
+            .expect("a chunked read fits the window");
+        assert_eq!(streamed, data);
+    }
+    watcher.close().await.expect("watcher close");
+
+    tree.delete_file(&mut conn, &path).await.expect("delete");
+    let _ = tree.delete_directory(&mut conn, dir).await;
+}
+
+/// Every transfer that picks its own chunk size sizes it to the window: an
+/// 8 MiB `MaxWriteSize` WRITE (128 credits) would never be funded here.
+#[tokio::test]
+#[ignore]
+async fn smallcredits_chunked_transfers_fit_the_window() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_smallcredits().await;
+    conn.set_credit_wait_timeout(Duration::from_secs(5));
+    let path = "_test_smallcredits_chunked.bin";
+    let data: Vec<u8> = (0..=250u8).cycle().take(5 * 1024 * 1024 + 17).collect();
+
+    let mut writer = tree
+        .create_file_writer(conn.clone(), path)
+        .await
+        .expect("create_file_writer");
+    writer.write_chunk(&data).await.expect("FileWriter write");
+    assert_eq!(
+        writer.finish().await.expect("FileWriter finish"),
+        data.len() as u64
+    );
+
+    let mut got = Vec::new();
+    {
+        let mut download = tree.download(&mut conn, path).await.expect("download");
+        while let Some(chunk) = download.next_chunk().await {
+            got.extend_from_slice(&chunk.expect("download chunk"));
+        }
+    }
+    assert_eq!(got, data, "the streamed download");
+
+    tree.write_file_pipelined(&mut conn, path, &data)
+        .await
+        .expect("write_file_pipelined");
+    assert_eq!(
+        tree.read_file_pipelined(&mut conn, path)
+            .await
+            .expect("read_file_pipelined"),
+        data
+    );
+
+    let limit = conn.quick_read_limit();
+    assert!(limit > 0 && limit < 5 * 1024 * 1024, "limit {limit}");
+    let small = &data[..limit as usize];
+    tree.write_file(&mut conn, path, small)
+        .await
+        .expect("a small write_file");
+    assert_eq!(
+        tree.read_file_compound_sized(&mut conn, path, limit)
+            .await
+            .expect("a read under quick_read_limit is fundable"),
+        small
+    );
+
+    tree.delete_file(&mut conn, path).await.expect("delete");
 }
