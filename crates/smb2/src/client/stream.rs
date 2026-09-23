@@ -21,7 +21,7 @@ use crate::client::connection::{
 use crate::client::credits;
 use crate::client::read_ahead::{Dispatch, LinkHint, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
-use crate::client::tree::Tree;
+use crate::client::tree::{close_outcome, Tree};
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::msg::write::{WriteRequest, WriteResponse};
@@ -77,9 +77,10 @@ impl Progress {
 /// one download buffers at most.
 ///
 /// `next_chunk` is cancel-safe: dropping its future (a `select!` arm losing)
-/// loses no data, and the next call picks up where it left off. The file
-/// handle is closed when the last chunk is consumed; a download dropped before
-/// that leaves the handle open until the session ends (there is no async drop).
+/// loses no data, and the next call picks up where it left off. The CLOSE goes
+/// out as the last chunk arrives, so a download dropped after its last chunk
+/// has closed its handle; one dropped before that leaves the handle open until
+/// the session ends (there is no async drop).
 ///
 /// # Example
 ///
@@ -124,6 +125,13 @@ pub struct FileDownload<'a> {
     /// CLOSE), so a caller that drops `next_chunk` there gets it on the next
     /// call rather than losing it.
     ready: Option<Vec<u8>>,
+    /// The CLOSE, once it's on the wire and until its answer is collected.
+    /// Sent as the last chunk lands, so handing that chunk out never waits a
+    /// round trip for it; the `None` call after the last chunk collects it.
+    closing: Option<WaiterGuard>,
+    /// Why the CLOSE couldn't be sent, held for the `None` call so the last
+    /// chunk, whose data is good, is still handed out.
+    close_failed: Option<Error>,
 }
 
 /// One requested READ of a [`FileDownload`].
@@ -154,7 +162,7 @@ impl<'a> FileDownload<'a> {
     ///
     /// The caller is responsible for making sure `file_id` belongs to `tree`
     /// and was opened with read access. The `FileDownload` will CLOSE the
-    /// handle when the last chunk is consumed.
+    /// handle when the last chunk arrives.
     pub fn new(
         tree: &'a Tree,
         conn: &'a mut Connection,
@@ -177,6 +185,8 @@ impl<'a> FileDownload<'a> {
             in_flight_bytes: 0,
             peak_in_flight_bytes: 0,
             ready: None,
+            closing: None,
+            close_failed: None,
         }
     }
 
@@ -247,38 +257,41 @@ impl<'a> FileDownload<'a> {
     ///
     /// Returns `None` when the download is complete. Chunks come in file
     /// order and are at most the chunk size; a short read from the server
-    /// shows up as a shorter chunk. The file handle is closed when the last
-    /// chunk is consumed. After an error, the download is over: every later
-    /// call returns `None`, and the handle is left open (the connection may
-    /// be what failed).
+    /// shows up as a shorter chunk. After an error, the download is over:
+    /// every later call returns `None`, and the handle is left open (the
+    /// connection may be what failed).
+    ///
+    /// The CLOSE goes out as the last chunk lands, and the last chunk is handed
+    /// out without waiting for its answer. The call after the last chunk
+    /// collects that answer: it returns `None`, or `Some(Err(_))` if the CLOSE
+    /// failed. A caller that stops at the last byte instead (dropping the
+    /// download without that call) still gets the handle closed, since the
+    /// server acts on the CLOSE either way; only a CLOSE error goes unseen.
     ///
     /// Cancel-safe: if this future is dropped before it completes, no data is
     /// lost and the next call continues the download.
     pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>>> {
         if self.ready.is_none() {
+            if self.closing.is_some() || self.close_failed.is_some() {
+                return self.finish_close().await.err().map(Err);
+            }
             if self.done {
                 return None;
             }
             match self.receive_next().await {
                 Ok(Some(data)) => self.ready = Some(data),
-                Ok(None) => {
-                    return match self.close().await {
-                        Ok(()) => None,
-                        Err(e) => Some(Err(e)),
-                    };
-                }
+                Ok(None) => return self.close().await.err().map(Err),
                 Err(e) => return Some(Err(self.fail(e))),
             }
         }
-        // Keep the wire busy while the caller works on this chunk, or close
-        // if it was the last. The chunk waits in `ready` meanwhile.
+        // Keep the wire busy while the caller works on this chunk, or send
+        // the CLOSE if it was the last. The chunk waits in `ready` meanwhile.
         let all_delivered = self.in_flight.is_empty() && self.next_offset >= self.file_size;
-        let after = if all_delivered {
-            self.close().await
-        } else {
-            self.send_reads().await.map(|_| ())
-        };
-        if let Err(e) = after {
+        if all_delivered {
+            if let Err(e) = self.start_close().await {
+                self.close_failed = Some(e);
+            }
+        } else if let Err(e) = self.send_reads().await {
             self.ready = None;
             return Some(Err(self.fail(e)));
         }
@@ -473,8 +486,17 @@ impl<'a> FileDownload<'a> {
         Ok(data)
     }
 
-    /// Close the file handle. Only sends CLOSE once.
+    /// Close the file handle and wait for the answer.
     async fn close(&mut self) -> Result<()> {
+        self.start_close().await?;
+        self.finish_close().await
+    }
+
+    /// Put the CLOSE on the wire, without waiting for its answer. Only ever
+    /// sends one: `done` is set first, so a caller dropped mid-send doesn't
+    /// send a second (the handle then stays open, as with any dropped
+    /// download).
+    async fn start_close(&mut self) -> Result<()> {
         if self.done {
             return Ok(());
         }
@@ -483,7 +505,26 @@ impl<'a> FileDownload<'a> {
         // answers them first; their responses are discarded once the guards
         // drop here.
         self.abandon_in_flight();
-        self.tree.close_handle(self.conn, self.file_id).await
+        let guard = self.tree.dispatch_close(self.conn, self.file_id).await?;
+        self.closing = Some(guard);
+        Ok(())
+    }
+
+    /// Collect the CLOSE's answer, if one is out. Cancel-safe: the guard stays
+    /// in `closing` until the answer is in.
+    async fn finish_close(&mut self) -> Result<()> {
+        if let Some(e) = self.close_failed.take() {
+            return Err(e);
+        }
+        let Some(guard) = self.closing.as_mut() else {
+            return Ok(());
+        };
+        let answer = self
+            .conn
+            .await_response_in_place(guard, Command::Close)
+            .await;
+        self.closing = None;
+        close_outcome(&answer?)
     }
 }
 

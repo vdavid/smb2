@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use crate::client::stream::{FileDownload, ReadAhead};
 use crate::client::test_helpers::{
-    build_close_response, build_read_error_response, build_read_response, setup_connection,
-    setup_connection_with_max_read,
+    build_close_error_response, build_close_response, build_read_error_response,
+    build_read_response, setup_connection, setup_connection_with_max_read,
 };
 use crate::client::tree::Tree;
 use crate::msg::header::Header;
@@ -251,8 +251,10 @@ async fn dropping_next_chunk_while_a_read_is_out_loses_nothing() {
     assert_eq!(sent_reads(&mock).len(), 3);
 }
 
+// ── Closing ────────────────────────────────────────────────────────────
+
 #[tokio::test]
-async fn dropping_next_chunk_during_the_close_still_hands_out_the_last_chunk() {
+async fn the_last_chunk_returns_without_waiting_for_the_close_response() {
     let mock = Arc::new(MockTransport::new());
     // The READ is answered; the CLOSE isn't, yet.
     mock.queue_response(build_read_response(chunk_of(1)));
@@ -262,13 +264,111 @@ async fn dropping_next_chunk_during_the_close_still_hands_out_the_last_chunk() {
     let mut download = FileDownload::new(&tree, &mut conn, test_file_id(), 65536, CHUNK)
         .with_read_ahead(ReadAhead::SEQUENTIAL);
 
-    let first = tokio::time::timeout(Duration::from_millis(50), download.next_chunk()).await;
-    assert!(first.is_err(), "the CLOSE is still waiting for its answer");
+    // Pre-fix, `next_chunk` awaited the CLOSE before handing out the last
+    // chunk, so every download's last chunk landed one round trip late.
+    let last = tokio::time::timeout(Duration::from_millis(50), download.next_chunk())
+        .await
+        .expect("the last chunk doesn't wait for the CLOSE's answer");
+    assert_eq!(last.unwrap().unwrap(), chunk_of(1));
+    assert_eq!(mock.sent_count(), 2, "READ + CLOSE, both on the wire");
 
-    // Pre-fix, the chunk was already counted and gone: this returned `None`,
-    // and the file came out one chunk short with no error anywhere.
-    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(1));
+    // The `None` call collects the CLOSE. Dropping it (a `select!` arm
+    // losing) loses nothing and sends no second CLOSE.
+    let pending = tokio::time::timeout(Duration::from_millis(50), download.next_chunk()).await;
+    assert!(
+        pending.is_err(),
+        "the CLOSE is still waiting for its answer"
+    );
+    mock.queue_response(build_close_response());
     assert!(download.next_chunk().await.is_none());
+    assert!(download.next_chunk().await.is_none());
+    assert_eq!(mock.sent_count(), 2);
+}
+
+#[tokio::test]
+async fn a_close_error_surfaces_on_the_call_after_the_last_chunk() {
+    let mock = Arc::new(MockTransport::new());
+    mock.queue_response(build_read_response(chunk_of(1)));
+    mock.queue_response(build_close_error_response(NtStatus::FILE_CLOSED));
+
+    let mut conn = setup_connection(&mock);
+    let tree = test_tree();
+    let mut download = FileDownload::new(&tree, &mut conn, test_file_id(), 65536, CHUNK);
+
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(1));
+    assert!(matches!(
+        download.next_chunk().await,
+        Some(Err(Error::Protocol {
+            status: NtStatus::FILE_CLOSED,
+            command: Command::Close,
+        }))
+    ));
+    assert!(download.next_chunk().await.is_none());
+}
+
+#[tokio::test]
+async fn a_close_that_cant_be_sent_still_hands_out_the_last_chunk() {
+    let mock = Arc::new(MockTransport::new());
+    // The READ spends the only credit and its answer grants none back, so
+    // there's nothing to send the CLOSE with.
+    let mut starved = build_read_response(chunk_of(1));
+    starved[14..16].copy_from_slice(&0u16.to_le_bytes());
+    mock.queue_response(starved);
+
+    let mut conn = setup_connection(&mock);
+    conn.set_credits(1);
+    let tree = test_tree();
+    let mut download = FileDownload::new(&tree, &mut conn, test_file_id(), 65536, CHUNK);
+
+    // The data is good, so it's handed out; the CLOSE's trouble comes next.
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(1));
+    assert!(matches!(download.next_chunk().await, Some(Err(_))));
+    assert!(download.next_chunk().await.is_none());
+    assert_eq!(mock.sent_count(), 1, "no CLOSE went out");
+}
+
+#[tokio::test]
+async fn a_download_dropped_after_its_last_chunk_has_still_sent_the_close() {
+    let mock = Arc::new(MockTransport::new());
+    mock.queue_response(build_read_response(chunk_of(1)));
+    mock.queue_response(build_read_response(chunk_of(2)));
+
+    let mut conn = setup_connection(&mock);
+    let tree = test_tree();
+    let mut download = FileDownload::new(&tree, &mut conn, test_file_id(), 2 * 65536, CHUNK)
+        .with_read_ahead(ReadAhead::Fixed(2));
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(1));
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(2));
+    // The consumer has every byte and walks away without the `None` call.
+    drop(download);
+
+    let commands: Vec<Command> = mock
+        .sent_messages()
+        .iter()
+        .map(|bytes| Header::unpack(&mut ReadCursor::new(bytes)).unwrap().command)
+        .collect();
+    assert_eq!(commands, vec![Command::Read, Command::Read, Command::Close]);
+    assert!(
+        conn.outstanding_requests().is_empty(),
+        "the CLOSE's waiter went with it"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_collect_after_the_last_chunk_waits_for_the_close_already_out() {
+    let mock = Arc::new(MockTransport::new());
+    mock.queue_response(build_read_response(chunk_of(1)));
+    mock.queue_response(build_close_response());
+
+    let mut conn = setup_connection(&mock);
+    let tree = test_tree();
+    let result = FileDownload::new(&tree, &mut conn, test_file_id(), 65536, CHUNK)
+        .collect_with_progress(|_| std::ops::ControlFlow::Break(()))
+        .await;
+    assert!(matches!(result, Err(Error::Cancelled)));
+    // READ + one CLOSE, answered.
+    assert_eq!(mock.sent_count(), 2);
+    assert!(conn.outstanding_requests().is_empty());
 }
 
 // ── Adaptive window ────────────────────────────────────────────────────

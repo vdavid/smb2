@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use log::{debug, info, trace, warn};
 
 use crate::client::connection::{
-    reserve_write_budget_or_drain, CompoundOp, Connection, Frame, WriteBudgetStep,
+    reserve_write_budget_or_drain, CompoundOp, Connection, Frame, WaiterGuard, WriteBudgetStep,
 };
 use crate::client::credits;
 use crate::client::stream::{FileDownload, Progress};
@@ -3168,15 +3168,23 @@ impl Tree {
         let frame = conn
             .execute(Command::Close, &req, Some(self.tree_id))
             .await?;
+        close_outcome(&frame)
+    }
 
-        if frame.header.status != NtStatus::SUCCESS {
-            return Err(Error::Protocol {
-                status: frame.header.status,
-                command: Command::Close,
-            });
-        }
-
-        Ok(())
+    /// Put a CLOSE on the wire and hand back its guard, without waiting for
+    /// the answer. The server closes the handle on receipt whether or not
+    /// anyone collects the response, so dropping the guard is a valid way to
+    /// be done with it. Collect it with [`close_outcome`].
+    pub(crate) async fn dispatch_close(
+        &self,
+        conn: &Connection,
+        file_id: FileId,
+    ) -> Result<WaiterGuard> {
+        // See `close_handle`.
+        conn.forget_oplock(file_id);
+        let req = CloseRequest { flags: 0, file_id };
+        conn.dispatch(Command::Close, &req, Some(self.tree_id))
+            .await
     }
 
     /// Write data to a file in chunks.
@@ -3228,6 +3236,17 @@ impl Tree {
 
         Ok(total_written)
     }
+}
+
+/// What a CLOSE response says about the close.
+pub(crate) fn close_outcome(frame: &Frame) -> Result<()> {
+    if frame.header.status != NtStatus::SUCCESS {
+        return Err(Error::Protocol {
+            status: frame.header.status,
+            command: Command::Close,
+        });
+    }
+    Ok(())
 }
 
 /// Build a FileRenameInformation buffer (MS-FSCC 2.4.34.2).
