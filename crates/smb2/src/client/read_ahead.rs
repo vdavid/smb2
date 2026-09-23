@@ -39,9 +39,11 @@
 //! value fits every link (0.25.1 shipped a fixed 250 ms), so the window learns
 //! it from how late answers come, on the connection, per direction: tens of
 //! milliseconds on a steady link, more where answers stall, and back down once
-//! they stop. See `Window` § Learning the headroom. The defaults are
-//! provisional until `benchmarks/read-ahead/results/self-tuning.md` settles
-//! them.
+//! they stop. See `Window` § Learning the headroom. The parameters were
+//! picked by minimax regret over a grid of shaped links against Samba
+//! (`benchmarks/read-ahead/results/self-tuning.md`): on a steady 30 MB/s link
+//! a `stat` behind a download waits 52–66 ms where 0.25.1 made it wait
+//! 141 ms, with the same throughput on every link in the grid.
 //!
 //! # The rate is the link's, not the transfer's
 //!
@@ -453,7 +455,15 @@ struct Arrival {
 ///   part. So a late answer counts its idle time plus how long the answer
 ///   before it waited behind others, which is the backlog the stall ate
 ///   through first. Without that, the headroom settles just under the stall
-///   it keeps failing to cover. Idle time under a millisecond counts as none.
+///   it keeps failing to cover.
+/// - **A wobble is not a stall.** On a full pipe every answer has the
+///   window's own standing queue ahead of it, so an answer stamped a few ms
+///   late, or a rate estimate a few percent high, read as lateness would also
+///   count that whole queue, and the headroom would stay pinned at the queue
+///   it built (113–118 ms against a 30 ms floor on a steady 30 MB/s link in
+///   the benchmark). Idle time under 5 ms or a quarter of the answer's own
+///   time on the wire, whichever is longer, counts as none
+///   (`LearnedHeadroom::noise_floor` / `noise_share`).
 /// - **The memory outlasts covered stalls.** Since a covered stall is
 ///   invisible, a memory that forgot a stall once it stopped showing would
 ///   shrink straight back under it. The windowed max keeps a sample for
@@ -681,7 +691,10 @@ impl Window {
             queued_ahead = previous.at.saturating_duration_since(soonest(&previous).0);
         }
         let idle = arrival.at.saturating_duration_since(ideal);
-        let late = if idle < TIMER_RESOLUTION {
+        let noise = learned
+            .noise_floor
+            .max(on_the_wire.mul_f64(learned.noise_share));
+        let late = if idle < noise {
             Duration::ZERO
         } else {
             idle + queued_ahead
@@ -863,20 +876,24 @@ mod tests {
     /// Each READ reaches the server half a round trip after it's sent, and
     /// its answer is ready `server_delay(i)` later (`i` counting READs in the
     /// order they were sent). The link carries ready answers one at a time at
-    /// `rate` bytes/s, earliest-ready first, so uneven server delays reorder
+    /// `rate × rate_wobble(i)` bytes/s, earliest-ready first, so uneven server delays reorder
     /// them the way Samba does; each lands half a round trip after its last
     /// byte leaves. The consumer spends `consumer_delay(k)` on chunk `k`
     /// before asking for the next, and the window only hears about a chunk
     /// when the consumer takes it, as in `FileDownload`. A freeze (a disk
     /// stall, a busy server CPU) holds back every answer that would have
     /// been ready during it until it ends; answers already ready keep
-    /// flowing, as from a socket buffer. The delays default to zero and
-    /// there are no freezes; the `with_*` builders set them.
+    /// flowing, as from a socket buffer. Answer `k` (in file order) is
+    /// stamped `stamp_delay(k)` after it lands, as a receiver task that got
+    /// scheduled late would. The delays default to zero and there are no
+    /// freezes; the `with_*` builders set them.
     struct Link {
         rtt: Duration,
         rate: f64,
         server_delay: Box<dyn Fn(usize) -> Duration>,
         consumer_delay: Box<dyn Fn(usize) -> Duration>,
+        stamp_delay: Box<dyn Fn(usize) -> Duration>,
+        rate_wobble: Box<dyn Fn(usize) -> f64>,
         /// `(start, length)`, as offsets from the start of the download.
         freezes: Vec<(Duration, Duration)>,
     }
@@ -923,8 +940,21 @@ mod tests {
                 rate,
                 server_delay: Box::new(|_| Duration::ZERO),
                 consumer_delay: Box::new(|_| Duration::ZERO),
+                stamp_delay: Box::new(|_| Duration::ZERO),
+                rate_wobble: Box::new(|_| 1.0),
                 freezes: Vec::new(),
             }
+        }
+
+        /// Answer `i` (in send order) crosses the link at `rate × wobble(i)`.
+        fn with_rate_wobble(mut self, wobble: impl Fn(usize) -> f64 + 'static) -> Self {
+            self.rate_wobble = Box::new(wobble);
+            self
+        }
+
+        fn with_stamp_delay(mut self, delay: impl Fn(usize) -> Duration + 'static) -> Self {
+            self.stamp_delay = Box::new(delay);
+            self
         }
 
         /// The server freezes for `length` every `every`, first at `every`,
@@ -958,7 +988,8 @@ mod tests {
             let mut link_free = None::<Instant>;
             for i in order {
                 let starts = link_free.map_or(reads[i].ready, |f: Instant| f.max(reads[i].ready));
-                let done = starts + Duration::from_secs_f64(f64::from(reads[i].len) / self.rate);
+                let rate = self.rate * (self.rate_wobble)(i);
+                let done = starts + Duration::from_secs_f64(f64::from(reads[i].len) / rate);
                 reads[i].lands = done + self.rtt / 2;
                 link_free = Some(done);
             }
@@ -1045,7 +1076,7 @@ mod tests {
                     }
                 };
                 in_flight.pop_front();
-                let arrived = reads[head].lands;
+                let arrived = reads[head].lands + (self.stamp_delay)(k);
                 now = now.max(arrived);
                 let left = bytes_of(&in_flight, &reads);
                 window.on_delivery(now, reads[head].sent, arrived, reads[head].len, left);
@@ -1642,6 +1673,27 @@ mod tests {
         let mut w = adaptive(20 * MS);
         link.download(&mut w, 64 << 20, CHUNK);
         assert_eq!(w.headroom(), learned().floor);
+    }
+
+    #[test]
+    fn a_steady_link_stamped_unevenly_still_learns_a_small_headroom() {
+        // 30 MB/s at +5 ms, answers on time but stamped up to 3 ms late, as
+        // a receiver task scheduled late stamps them, and each one crossing
+        // the link up to 2% slower or faster. The cold ramp fills the
+        // pipe to the cap, so every answer has ~100 ms queued ahead of it,
+        // and a wobble read as lateness also counts that whole queue: the
+        // headroom then stays pinned at the queue it built, and a `stat` waits
+        // behind the full 4 MiB for good. Measured on the Docker grid
+        // (`benchmarks/read-ahead/results/self-tuning.md`) before it was a test.
+        let link = Link::new(5 * MS, 30e6)
+            .with_stamp_delay(|k| noise(k, 3 * MS))
+            // 0.98–1.02: `noise` spans 0–40 ms, read here as 0–0.04.
+            .with_rate_wobble(|i| 0.98 + noise(i + 7, 40 * MS).as_secs_f64());
+        let mut w = adaptive(5 * MS);
+        let run = link.download(&mut w, 64 << 20, CHUNK);
+        assert_eq!(w.headroom(), learned().floor);
+        let settled = run.queued[run.queued.len() - 16..].iter().max().unwrap();
+        assert!(*settled < 2 << 20, "still queues {settled} bytes");
     }
 
     #[test]

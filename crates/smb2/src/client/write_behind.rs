@@ -29,7 +29,12 @@
 //! headroom (`Window` § Learning the headroom): a confirmation that comes late
 //! means the uplink sat idle or the server's disk held it, and either way the
 //! window keeps more queued to cover the next one. A disk that stalls under
-//! writes is exactly what that is for.
+//! writes is exactly what that is for. On a 30 MB/s uplink it halves what a
+//! `stat` waits behind an upload (70 ms against 142 ms, same throughput,
+//! `results/self-tuning.md`). Known gap from the same grid: at 3 MB/s the
+//! link-capacity rate keeps two or three WRITEs queued where the older
+//! delivery-paced rate kept one, so a `stat` waits 340–520 ms there instead
+//! of about 160 ms.
 //!
 //! # Why adaptive is the default
 //!

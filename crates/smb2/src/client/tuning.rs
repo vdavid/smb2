@@ -20,8 +20,8 @@ pub struct Tuning {
 }
 
 impl Tuning {
-    /// What ships. Provisional: the benchmark in `benchmarks/read-ahead/`
-    /// re-picks the learned headroom's parameters.
+    /// What ships: the candidate with the least-bad worst cell on the grid in
+    /// `benchmarks/read-ahead/results/self-tuning.md`.
     pub const SHIPPING: Self = Self {
         headroom: Headroom::Learned(LearnedHeadroom::SHIPPING),
         rate: RateMeasure::LinkCapacity,
@@ -67,10 +67,23 @@ pub struct LearnedHeadroom {
     /// The headroom before anything is learned, and the margin that paces
     /// the ramp until a full pipe has measured the link.
     pub cold: Duration,
+    /// Idle time an answer may show and still count as on time: the larger
+    /// of `noise_floor` and `noise_share` of the answer's own time on the
+    /// wire. Arrival stamps and the rate estimate both wobble, and on a full
+    /// pipe a wobble read as lateness also counts the whole standing queue
+    /// (see `Window` § Learning the headroom), which keeps the headroom
+    /// pinned at the queue it built.
+    pub noise_floor: Duration,
+    /// See [`noise_floor`](Self::noise_floor).
+    pub noise_share: f64,
 }
 
 impl LearnedHeadroom {
-    /// What ships. Provisional, pending `benchmarks/read-ahead/results/self-tuning.md`.
+    /// What ships (`wmax16-n25` in `benchmarks/read-ahead/results/self-tuning.md`).
+    /// Without the noise tolerance (1 ms, as first shipped) the headroom
+    /// stayed pinned at the queue the cold ramp built, so a steady link
+    /// queued as much as a fixed 250 ms. Two memory lengths (8 and 16
+    /// answers) and a 20 ms floor measured within noise of each other.
     pub const SHIPPING: Self = Self {
         estimator: Estimator::WindowedMax {
             answers: 16,
@@ -79,6 +92,8 @@ impl LearnedHeadroom {
         floor: Duration::from_millis(30),
         ceiling: Duration::from_millis(500),
         cold: Duration::from_millis(250),
+        noise_floor: Duration::from_millis(5),
+        noise_share: 0.25,
     };
 }
 
