@@ -1286,6 +1286,33 @@ impl SmbClient {
         }
     }
 
+    /// Write a small NEW file in one compound CREATE+WRITE+FLUSH+CLOSE request.
+    ///
+    /// Like [`write_file_compound`](Self::write_file_compound), but the name
+    /// must be free: if it exists, the write is refused with
+    /// [`crate::ErrorKind::AlreadyExists`] and the existing file is left
+    /// untouched. See [`Tree::write_file_compound_exclusive`].
+    pub async fn write_file_compound_exclusive(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        data: &[u8],
+    ) -> Result<u64> {
+        let result = {
+            let conn = self.connection_for_tree(tree)?;
+            tree.write_file_compound_exclusive(conn, path, data).await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree)?;
+                tree.write_file_compound_exclusive(conn, &new_path, data)
+                    .await
+            }
+            other => other,
+        }
+    }
+
     /// Write data to a file using pipelined I/O (faster for large files).
     pub async fn write_file_pipelined(
         &mut self,

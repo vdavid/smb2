@@ -3027,6 +3027,52 @@ async fn guest_file_writer_basic() {
 
 #[tokio::test]
 #[ignore]
+async fn guest_compound_write_exclusive_never_replaces_an_existing_file() {
+    // The one-frame write for a name that must be NEW: a file someone else put
+    // there is refused with `ErrorKind::AlreadyExists` and survives byte for
+    // byte, where `write_file_compound` would have replaced it.
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_guest().await;
+
+    let test_path = "docker_test_compound_write_exclusive.tmp";
+    let _ = tree.delete_file(&mut conn, test_path).await;
+
+    let theirs = b"someone else's file";
+    let written = tree
+        .write_file_compound_exclusive(&mut conn, test_path, theirs)
+        .await
+        .expect("an exclusive compound write onto a free name must succeed");
+    assert_eq!(written, theirs.len() as u64);
+
+    let err = tree
+        .write_file_compound_exclusive(&mut conn, test_path, b"ours, which must not land")
+        .await
+        .expect_err("an exclusive compound write onto a taken name must be refused");
+    assert_eq!(
+        err.kind(),
+        smb2::ErrorKind::AlreadyExists,
+        "expected AlreadyExists, got: {err}"
+    );
+
+    let data = tree
+        .read_file(&mut conn, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(
+        data, theirs,
+        "the refused write must leave the existing file untouched"
+    );
+
+    // The connection is still good for the next request after the refusal.
+    tree.delete_file(&mut conn, test_path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn guest_create_file_writer_exclusive_fails_on_existing() {
     // Regression for the exclusive-create writer (`FileCreate` disposition):
     // creating a name that already exists must error with

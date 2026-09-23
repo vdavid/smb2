@@ -1338,20 +1338,69 @@ impl Tree {
     /// Sends all four operations in a single transport frame (1 round-trip).
     /// Best for files that fit in MaxWriteSize. For larger files, use
     /// [`write_file_pipelined`](Self::write_file_pipelined).
+    ///
+    /// Creates the file, or REPLACES whatever holds the name (`FileOverwriteIf`).
+    /// When the name must be new, use
+    /// [`write_file_compound_exclusive`](Self::write_file_compound_exclusive).
     pub async fn write_file_compound(
         &self,
         conn: &mut Connection,
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
+        self.write_file_compound_with_disposition(
+            conn,
+            path,
+            data,
+            CreateDisposition::FileOverwriteIf,
+        )
+        .await
+    }
+
+    /// Write a NEW file using a compound CREATE+WRITE+FLUSH+CLOSE request.
+    ///
+    /// The same one-frame write as
+    /// [`write_file_compound`](Self::write_file_compound), with the CREATE
+    /// asking for a new file (`FileCreate`): if the name already exists, the
+    /// server refuses with `STATUS_OBJECT_NAME_COLLISION`, which surfaces as
+    /// [`crate::ErrorKind::AlreadyExists`], and leaves the existing file
+    /// untouched. The server decides it atomically, so a file another writer
+    /// put at the name after the caller last looked is refused too, never
+    /// replaced.
+    ///
+    /// The refusal is an [`Error::Protocol`] naming [`Command::Create`], so a
+    /// caller can tell that nothing was opened or written, and there is nothing
+    /// of its own to clean up at that name.
+    pub async fn write_file_compound_exclusive(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        data: &[u8],
+    ) -> Result<u64> {
+        self.write_file_compound_with_disposition(conn, path, data, CreateDisposition::FileCreate)
+            .await
+    }
+
+    /// Shared body of [`write_file_compound`](Self::write_file_compound)
+    /// (`FileOverwriteIf`) and
+    /// [`write_file_compound_exclusive`](Self::write_file_compound_exclusive)
+    /// (`FileCreate`). Private so the disposition stays a strict allow-list.
+    async fn write_file_compound_with_disposition(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        data: &[u8],
+        create_disposition: CreateDisposition,
+    ) -> Result<u64> {
         let normalized = self.format_path(path);
         trace!(
-            "tree: write_file_compound path={}, len={}",
+            "tree: write_file_compound path={}, len={}, disposition={:?}",
             normalized,
-            data.len()
+            data.len(),
+            create_disposition
         );
 
-        // Build CREATE request (write access, overwrite-if disposition).
+        // Build CREATE request (write access, the caller's disposition).
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -1362,7 +1411,7 @@ impl Tree {
             ),
             file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
             share_access: ShareAccess(0),
-            create_disposition: CreateDisposition::FileOverwriteIf,
+            create_disposition,
             create_options: FILE_NON_DIRECTORY_FILE,
             name: normalized.clone(),
             create_contexts: vec![],
@@ -6825,6 +6874,132 @@ mod tests {
         // Verify CLOSE uses sentinel FileId.
         let close_parsed = CloseRequest::unpack(&mut cursor4).unwrap();
         assert_eq!(close_parsed.file_id, FileId::SENTINEL);
+    }
+
+    /// The CREATE disposition the compound write at `sent_index` asked for.
+    fn compound_create_disposition(mock: &MockTransport, sent_index: usize) -> CreateDisposition {
+        let compound = mock.sent_message(sent_index).unwrap();
+        let mut cursor = ReadCursor::new(&compound);
+        let header = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(header.command, Command::Create);
+        CreateRequest::unpack(&mut cursor)
+            .unwrap()
+            .create_disposition
+    }
+
+    /// A four-reply compound where the CREATE failed with `status` and the
+    /// server cascaded it to the WRITE, FLUSH, and CLOSE.
+    fn build_cascaded_compound_failure(status: NtStatus) -> Vec<u8> {
+        let replies: Vec<Vec<u8>> = [
+            Command::Create,
+            Command::Write,
+            Command::Flush,
+            Command::Close,
+        ]
+        .into_iter()
+        .map(|command| {
+            let mut h = Header::new_request(command);
+            h.flags.set_response();
+            h.credits = 32;
+            h.status = status;
+            pack_message(
+                &h,
+                &crate::msg::header::ErrorResponse {
+                    error_context_count: 0,
+                    error_data: vec![],
+                },
+            )
+        })
+        .collect();
+        build_compound_response_frame(&replies)
+    }
+
+    #[tokio::test]
+    async fn write_file_compound_replaces_whatever_holds_the_name() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(file_id, 0),
+            build_write_response(3),
+            build_flush_response(),
+            build_close_response(),
+        ]));
+        tree.write_file_compound(&mut conn, "replace.txt", b"abc")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            compound_create_disposition(&mock, 1),
+            CreateDisposition::FileOverwriteIf
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_compound_exclusive_asks_for_a_new_file() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(file_id, 0),
+            build_write_response(3),
+            build_flush_response(),
+            build_close_response(),
+        ]));
+        let written = tree
+            .write_file_compound_exclusive(&mut conn, "new.txt", b"abc")
+            .await
+            .unwrap();
+
+        assert_eq!(written, 3);
+        assert_eq!(
+            compound_create_disposition(&mock, 1),
+            CreateDisposition::FileCreate,
+            "an exclusive compound write must use FileCreate, never FileOverwriteIf"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_compound_exclusive_onto_a_taken_name_is_already_exists_and_sends_nothing_more(
+    ) {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        mock.queue_response(build_cascaded_compound_failure(
+            NtStatus::OBJECT_NAME_COLLISION,
+        ));
+        let err = tree
+            .write_file_compound_exclusive(&mut conn, "taken.txt", b"abc")
+            .await
+            .expect_err("a name that exists must refuse an exclusive write");
+
+        assert_eq!(err.kind(), crate::ErrorKind::AlreadyExists, "got: {err}");
+        assert!(
+            matches!(
+                err,
+                Error::Protocol {
+                    command: Command::Create,
+                    ..
+                }
+            ),
+            "the refusal must name the CREATE, so a caller knows nothing was opened: {err:?}"
+        );
+        // TreeConnect + the compound, and no standalone CLOSE: no handle was opened.
+        assert_eq!(mock.sent_count(), 2);
     }
 
     // ── BUFFER_OVERFLOW tests ───────────────────────────────────────
