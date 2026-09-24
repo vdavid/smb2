@@ -44,7 +44,7 @@
 //! tokio's channels and semaphores, which work on any executor):
 //!
 //! ```toml
-//! smb2 = { version = "0.25", default-features = false, features = ["smol"] }
+//! smb2 = { version = "0.26", default-features = false, features = ["smol"] }
 //! ```
 //!
 //! # Modules
