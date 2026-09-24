@@ -288,6 +288,8 @@ async fn run(args: &[String]) {
         // For a server where `run.sh` can't create the files (a real NAS).
         let _ = client.create_directory(&mut tree, "bench").await;
         let _ = client.create_directory(&mut tree, "load").await;
+        // Where `upload` writes.
+        let _ = client.create_directory(&mut tree, "up").await;
         let mut seed = 0x9e3779b97f4a7c15u64;
         for &size in &sizes {
             let data: Vec<u8> = (0..size)

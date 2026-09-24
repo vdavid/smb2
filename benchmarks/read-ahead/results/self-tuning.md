@@ -1,8 +1,10 @@
 # Self-tuning read-ahead and write-behind: the grid (2026-09-24)
 
 Issue #8, Part 3. Ten tuning candidates for the adaptive window (`crates/smb2/src/client/tuning.rs`) on 23 download
-and five upload conditions, scored by minimax regret. The pick is `wmax16-n25`, now `Tuning::SHIPPING`: the learned
-headroom as first shipped, plus a noise tolerance the grid showed it needs.
+and five upload conditions, scored by minimax regret. The grid found three defects and they're fixed (a latched
+headroom, a slow-uplink regression, a scoring fixed point). The final pick, rerun on the fixed code, is `meandev4-b33`,
+now `Tuning::SHIPPING`: the seeded mean + 4 × deviation, with a noise tolerance and a backlog share. Skip to *The final
+pick* for the result; the sections before it are the path there.
 
 **The world these numbers come from:** transfers and browsing share one SMB connection, which is how Cmdr works today.
 That's why the side `stat` counts as much as throughput here. vdavid/cmdr#133 plans a dedicated transfer session;
@@ -580,7 +582,7 @@ Control cells left out; `worst control` is the rig's noise on the same scale.
 | wmax16-n50 | 2.4 | 409 / 529 | 820 | 1910 | 3% / 154% / 1% |
 | meandev4-n25 | 2.4 | 401 / 710 | 832 | 1990 | 2% / 149% / 5% |
 
-## The pick: `wmax16-n25`
+## First pass pick: `wmax16-n25` (superseded below)
 
 A windowed max over 16 answers or 10 s, clamped 30–500 ms, 250 ms cold. Idle under max(5 ms, a quarter of the answer's
 wire time) counts as none. It's now `LearnedHeadroom::SHIPPING`, with the link-capacity rate.
@@ -705,25 +707,110 @@ By the scoring rule, `meandev4-n25` wins. Where the two learned finalists differ
 - **3 MB/s +60 ms with stalls:** `wmax16-n25` 343, `meandev4-n25` 164.
 - **30 MB/s +20 ms, ±40 ms jitter:** `meandev4-n25` 20.6 MB/s against 24.2 for `wmax16-n25` and `ref` (−15%).
 
-**Not switched yet.** With `meandev4-n25` as the default, eight simulator tests in `read_ahead.rs` fail. Three encode the
-windowed max itself. The other five encode behavior the issue asks for:
+That pick wasn't switched to. With it as the default, simulator tests failed, and two of the failures were flaws
+rather than trade-offs:
 
-- A noisy link grows the headroom and keeps the pipe within 3% of a fixed 250 ms. It learns 30 ms under 150 ms freezes.
-- A slow link queues about one chunk. It queues 712 KiB against a 640 KiB bound.
-- A fresh window doesn't overshoot. RFC-style mean + 4 × deviation, seeded with the 250 ms cold value as the mean,
-  jumps to the 500 ms ceiling on its first quiet answers.
+- The windowed max latched again at +1 ms, because the absolute noise floor only moved the latch's fixed point.
+- `meandev4`, seeded with the 250 ms cold value as its mean, climbed to the 500 ms ceiling on its first quiet answers.
 
-That's a decision for the issue owner: switch and replace those tests, or fix `meandev4`'s cold start (RFC 6298's own
-initialization, mean = first sample and deviation = half of it) and rerun.
+Both are fixed in `e493370`, with tests that failed first:
+
+- **Backlog share:** a late answer counts `idle + backlog` only when the idle is at least a third of the backlog, so
+  the scoring contracts instead of certifying its own margin.
+- **Seeding:** mean and deviation start from the first sample (RFC 6298 § 2.2).
+- **Convergence test:** a property test across RTT {1, 5, 20, 60, 200 ms} × {3, 30, 300 MB/s}, with timestamp jitter,
+  an occasional 10 ms scheduling hiccup, and ±2% rate wobble. From a cold start the headroom must end within 2× the
+  floor. It was red at +1 through +60 ms / 30 MB/s (134, 130, 115, and 75 ms). A quarter share held +1 ms at 61 ms
+  against the 60 ms bound, hence a third.
+
+## The final pick: `meandev4-b33` (2026-09-24)
+
+All 28 cells, three runs each, on the code with every fix above. The finalists:
+
+- `ref`
+- `fixed100`
+- `wmax16-b33`: the windowed max with the noise tolerance and backlog share.
+- `meandev4-b33`: the seeded mean + 4 × deviation with the same two.
+
+Command: `TUNINGS="ref fixed100 wmax16-b33 meandev4-b33" ./grid.sh OUT d30 d300 dfree d3 djitter3 djitter dstall
+dstall3 dload up30 up3`, split into four calls.
+
+#### Regret by cell
+
+The largest of throughput (t), listing (s), and per-file (f) regret; 0% is the best candidate there.
+
+| cell | ref | fixed100 | wmax16-b33 | meandev4-b33 |
+|---|---:|---:|---:|---:|
+| down +1 (control) | 7% f | 2% t | 10% t | 17% t |
+| down +1, 2 writers (control) | 28% f | 18% t | 6% f | 17% t |
+| down +1+stall (control) | 15% f | 23% t | 10% f | 17% f |
+| down +1@2400mbit (control) | 3% f | 5% s | 9% f | 2% f |
+| down +1@240mbit | 214% s | 144% s | 31% s | 1% f |
+| down +5@2400mbit (control) | 5% t | 5% f | 6% f | 6% f |
+| down +5@240mbit | 172% s | 138% s | 33% s | 1% f |
+| down +5@240mbit, 2 writers | 174% s | 140% s | 5% f | 5% f |
+| down +5@240mbit+stall | 33% s | 16% s | 32% s | 7% t |
+| down +5@24mbit | 113% s | 1% f | 0% | 0% |
+| down +5~5 (control) | 12% s | 9% s | 25% f | 23% f |
+| down +20 (control) | 40% f | 28% f | 15% f | 7% t |
+| down +20@240mbit | 102% s | 79% s | 26% s | 1% f |
+| down +20@240mbit~10 | 174% s | 139% s | 8% f | 3% f |
+| down +20@240mbit~40 | 111% s | 32% s | 17% s | 24% f |
+| down +60 (control) | 62% f | 69% f | 5% f | 3% f |
+| down +60@240mbit | 2% s | 2% s | 2% f | 1% f |
+| down +60@24mbit | 112% s | 112% s | 0% | 1% f |
+| down +60@24mbit+stall | 112% s | 112% s | 2% f | 22% f |
+| down +60@24mbit~30 | 114% s | 113% s | 27% f | 16% f |
+| down +200 (control) | 34% f | 33% f | 3% f | 5% f |
+| down +200@240mbit | 44% f | 45% f | 1% t | 44% f |
+| down +200@24mbit | 53% s | 53% s | 53% s | 0% |
+| up +5@240mbit | 186% s | 116% s | 6% s | 3% f |
+| up +5@240mbit+stall | 177% s | 109% s | 170% s | 11% f |
+| up +20@240mbit~40 | 33% s | 30% f | 24% f | 27% f |
+| up +60@240mbit | 37% s | 38% s | 4% f | 6% f |
+| up +60@24mbit | 114% s | 2% f | 3% f | 0% |
+
+#### Worst cells per candidate
+
+Control cells left out; `worst control` is the rig's noise on the same scale.
+
+| candidate | worst | where | second worst | mean | worst control |
+|---|---:|---|---:|---:|---:|
+| meandev4-b33 | 44% | down +200@240mbit | 27% | 9% | 23% |
+| fixed100 | 144% | down +1@240mbit | 140% | 75% | 69% |
+| wmax16-b33 | 170% | up +5@240mbit+stall | 53% | 23% | 25% |
+| ref | 214% | down +1@240mbit | 186% | 109% | 62% |
+
+
+**`meandev4-b33` wins by far more than the noise:** 44% against 170% for the windowed max, so the stall-covering
+tie-break doesn't apply. It's now `LearnedHeadroom::SHIPPING` (`2c0b9f9`).
+
+- **Its worst cell (44%)** is the 4 MiB `auto` file at +200 ms / 30 MB/s: 670 ms against 467. It's the same bimodal
+  compound-or-stream split `ref` and `fixed100` show there (672 and 679 ms), not the headroom.
+- **The windowed max's worst (170%)** is the listing during an upload with stalls: 139 ms against 52. It covers the
+  freezes and holds that margin for 10 s, which is exactly what makes a listing wait as long as with 0.25.1.
+- **What `meandev4-b33` gives up:** stall coverage. Through recurring 150 ms freezes at 30 MB/s it runs 25.4 MB/s
+  against 27.3 for `ref` (−7%). The `read_ahead.rs` simulator shows 4% for the same shape, and a test now pins both
+  sides of that trade.
+- **Where both learned candidates tie:** steady links at 3 MB/s (162 ms `stat` against `ref`'s 344), the slow uplink
+  (160–161 against 343), and anything the 4 MiB cap bounds.
+
+**Against 0.25.1 (`ref`),** listing waits, `stat` p50 during the transfer:
+
+- 30 MB/s +1 ms: 35 ms against 141.
+- 30 MB/s +5 ms with stalls: 108 against 143.
+- 30 MB/s +20 ms with ±40 ms jitter: 107 against 225. `ref` also moved 16.9 MB/s there, against 24.7.
+- Upload at 30 MB/s +5 ms with stalls: 52 against 142.
+- Upload at 3 MB/s +60 ms: 160 against 343.
+
+Throughput is within noise of `ref` everywhere else.
 
 ## Follow-ups
 
-1. **Decide the default** (see above). The shipping default is still `wmax16-n25`, and it latches at +1 ms on the
-   current code.
-2. **Downloads keep the open-loop drain.** A NAS whose Linux restarts slow start after idle (the default) would leave
+1. **Downloads keep the open-loop drain.** A NAS whose Linux restarts slow start after idle (the default) would leave
    a similar surplus behind a download's first flight. The grid turned that off on the server, so it didn't show; the
    real-NAS run will. The correction needs to know which READs have arrived, which `FileDownload` doesn't track.
-3. **Real NAS validation (Part 4)**, below.
+2. **Real NAS validation (Part 4)**, below.
 
 ## Real NAS validation
 
@@ -734,17 +821,19 @@ Command (from a machine that can reach the NAS, credentials from the maintainer'
 
 ```sh
 cd benchmarks/read-ahead && cargo build --release
-V=auto:shipping,auto:ref,auto:wmax16,compound,adaptive:ref,adaptive:shipping
+export SMB_BENCH_SHARE=<share> SMB_BENCH_USER=<user> SMB_BENCH_PASS=<pass>
+B=./target/release/read-ahead-bench
 for w in 0 2; do
-  SMB_BENCH_SHARE=<share> SMB_BENCH_USER=<user> SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep \
-    --addr <host>:445 --rtt-ms real --load-writers $w --runs 5 --variants "$V" \
+  $B run --prep --addr <host>:445 --rtt-ms real --load-writers $w --runs 5 \
+    --variants auto:shipping,auto:ref,auto:wmax16-b33,auto:fixed100,compound,adaptive:ref,adaptive:shipping \
     --sizes 65536,1048576,4194304,8388608,33554432 --out nas-wired.csv
 done
-./target/release/read-ahead-bench score --detail nas-wired.csv
-./target/release/read-ahead-bench summarize nas-wired.csv
+$B upload --addr <host>:445 --rtt-ms real --load-writers 0 --runs 5 \
+  --variants auto:shipping,auto:ref,auto:wmax16-b33 --sizes 1048576,4194304,8388608,33554432 --out nas-wired-up.csv
+$B score --detail nas-wired.csv nas-wired-up.csv
 ```
 
-`shipping` is `wmax16-n25`, `ref` is 0.25.1's behavior, and `wmax16` is Part 1 as first shipped. Repeat over Wi-Fi
-into `nas-wifi.csv` if possible, then delete `bench/` and `load/` from the share. Success: `shipping` is no worse than
-`ref` on throughput or on side-`stat` wait, beyond noise.
-
+`shipping` is `meandev4-b33`, `ref` is 0.25.1's behavior, and `wmax16-b33` is the stall-covering alternative. Repeat
+over Wi-Fi into `nas-wifi*.csv` if possible, then delete `bench/`, `load/`, and `up/` from the share. Success:
+`shipping` is no worse than `ref` on throughput or on side-`stat` wait, beyond noise. A real NAS's disk stalls are
+where the stall trade gets tested for real. So is a download right after an idle spell (see *Follow-ups*).

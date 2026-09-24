@@ -61,7 +61,7 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
 
 Against a real NAS (from a machine that can reach it): `SMB_BENCH_SHARE=<share> SMB_BENCH_USER=<user>
 SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>:445 --rtt-ms real --load-writers 0
---runs 3 --out nas.csv`. `--prep` uploads the test files to `bench/` (the `stat` probe needs `bench/f_65536.bin`);
+--runs 3 --out nas.csv`. `--prep` uploads the test files to `bench/` (the `stat` probe needs `bench/f_65536.bin`) and creates `up/` for `upload`;
 `--load-writers 2` adds the background writers, which write 32 MiB files to `load/`. Delete both folders afterwards.
 
 `results/` holds the median tables (M1 Max, OrbStack, Samba on Alpine 3.21, container capped at two CPUs):
