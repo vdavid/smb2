@@ -13,7 +13,7 @@ name = "smb-listing-probe"
 path = "src/main.rs"
 
 [dependencies]
-smb2 = { path = "../.." }
+smb2 = { path = "../../crates/smb2" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

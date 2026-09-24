@@ -56,6 +56,7 @@ pub async fn connect_session(target: &Target) -> Result<Session, String> {
         compression: true,
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
+        connect_options: None,
     };
 
     let mut client = SmbClient::connect(config)

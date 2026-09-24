@@ -9,7 +9,7 @@ name = "smb-benchmark"
 path = "src/main.rs"
 
 [dependencies]
-smb2 = { path = "../.." }
+smb2 = { path = "../../crates/smb2" }
 smb = "0.11.1"
 sspi = "0.19"
 smb-rpc = "=0.11.1"
