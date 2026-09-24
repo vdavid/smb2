@@ -76,6 +76,12 @@ pub struct LearnedHeadroom {
     pub noise_floor: Duration,
     /// See [`noise_floor`](Self::noise_floor).
     pub noise_share: f64,
+    /// How large a share of the backlog ahead of it an answer's idle time
+    /// has to be before it counts as a stall. The backlog is mostly the
+    /// window's own margin, so without this any idle above the noise scored
+    /// about the margin itself and re-certified it forever; with it, the
+    /// headroom decays until a stall pokes through the queue, then jumps.
+    pub backlog_share: f64,
 }
 
 impl LearnedHeadroom {
@@ -94,6 +100,7 @@ impl LearnedHeadroom {
         cold: Duration::from_millis(250),
         noise_floor: Duration::from_millis(5),
         noise_share: 0.25,
+        backlog_share: 1.0 / 3.0,
     };
 }
 
@@ -117,8 +124,9 @@ pub enum Estimator {
         span: Duration,
     },
     /// RFC 6298's retransmit-timer shape: a smoothed mean plus `k` times the
-    /// smoothed mean deviation (gains 1/8 and 1/4), starting from the cold
-    /// headroom as the mean.
+    /// smoothed mean deviation (gains 1/8 and 1/4). The cold headroom until
+    /// the first sample, which seeds the mean and half of it the deviation
+    /// (§ 2.2).
     MeanDeviation {
         /// How many mean deviations above the mean.
         k: f64,

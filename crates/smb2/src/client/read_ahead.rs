@@ -297,10 +297,18 @@ impl Lateness {
     /// would have delivered it.
     fn observe(&mut self, late: Duration, at: Instant, learned: &LearnedHeadroom) {
         self.answers += 1;
-        // RFC 6298 § 2.3: the deviation from the old mean first.
         let sample = late.as_secs_f64();
-        self.deviation += ((sample - self.mean).abs() - self.deviation) / 4.0;
-        self.mean += (sample - self.mean) / 8.0;
+        if self.answers == 1 {
+            // RFC 6298 § 2.2: the first sample seeds both. Starting from the
+            // cold margin as the mean instead read a quiet first answer as a
+            // 250 ms deviation and climbed to the ceiling.
+            self.mean = sample;
+            self.deviation = sample / 2.0;
+        } else {
+            // § 2.3: the deviation from the old mean first.
+            self.deviation += ((sample - self.mean).abs() - self.deviation) / 4.0;
+            self.mean += (sample - self.mean) / 8.0;
+        }
 
         if let Estimator::WindowedMax { answers, span } = learned.estimator {
             // Forget what fell out of both memories.
@@ -464,6 +472,16 @@ struct Arrival {
 ///   the benchmark). Idle time under 5 ms or a quarter of the answer's own
 ///   time on the wire, whichever is longer, counts as none
 ///   (`LearnedHeadroom::noise_floor` / `noise_share`).
+/// - **A stall has to poke through the backlog to count.** The backlog is
+///   mostly the window's own margin, so any idle scored as `idle + backlog`
+///   scores about the margin and re-certifies it: a fixed point, which an
+///   absolute noise floor only moves (fine at +5 ms, latched at 133 ms at
+///   +1 ms once the RTT estimate tightened). Idle under a third of the
+///   backlog ahead counts as none (`LearnedHeadroom::backlog_share`). A
+///   stall the queue mostly covered lets the headroom decay, and one more
+///   than about 4/3 of the backlog still registers whole, so the headroom
+///   saw-tooths: down until a stall pokes through, up, and held for the
+///   memory. A wobble of size w can hold it at most about `4 × w`.
 /// - **A backlog follows an on-time answer.** After a stall the held answers
 ///   come back to back, so only the first is late. Late answers in a row
 ///   mean the link slowed, and each waited behind the late one before it,
@@ -749,7 +767,13 @@ impl Window {
         let noise = learned
             .noise_floor
             .max(on_the_wire.mul_f64(learned.noise_share));
-        let late = if idle < noise {
+        // A stall counts at full size (the idle plus the backlog it ate) only
+        // when the idle is a real share of that backlog. The backlog is
+        // mostly the window's own margin, so scoring every wobble as
+        // `idle + backlog` re-certified the margin forever. With the share,
+        // a stall the queue mostly covered lets the headroom decay, and one
+        // larger than about (1 + share) × the backlog still registers whole.
+        let late = if idle < noise.max(queued_ahead.mul_f64(learned.backlog_share)) {
             Duration::ZERO
         } else {
             idle + queued_ahead
@@ -1738,6 +1762,56 @@ mod tests {
         let mut w = adaptive(20 * MS);
         link.download(&mut w, 64 << 20, CHUNK);
         assert_eq!(w.headroom(), learned().floor);
+    }
+
+    #[test]
+    fn the_mean_and_deviation_start_from_the_first_answer_not_the_cold_margin() {
+        // RFC 6298 § 2.2 seeds the mean with the first sample and the
+        // deviation with half of it. Seeded with the 250 ms cold margin as
+        // the mean instead, a quiet first answer read as a 250 ms deviation,
+        // and mean + 4 × deviation climbed to the 500 ms ceiling before
+        // settling: a fresh connection queued twice the cold margin.
+        let meandev = Headroom::Learned(LearnedHeadroom {
+            estimator: Estimator::MeanDeviation { k: 4.0 },
+            ..learned()
+        });
+        let mut w = adaptive_with(meandev, 20 * MS);
+        let run = Link::new(20 * MS, 50e6).download(&mut w, 16 << 20, CHUNK);
+        let peak = run.headroom.iter().max().unwrap();
+        assert!(*peak <= learned().cold, "climbed to {peak:?}");
+        assert_eq!(w.headroom(), learned().floor);
+    }
+
+    #[test]
+    fn a_steady_link_converges_near_the_floor_whatever_its_speed_and_distance() {
+        // Every RTT and rate on the benchmark grid, answers stamped up to 3 ms
+        // late (and every 20th 10 ms late, a receiver task scheduled late on a
+        // loaded machine) and crossing up to 2% slower or faster, no stalls:
+        // from a cold
+        // start the headroom has to come down near the floor. A standing queue
+        // is what the window's own margin built, and scoring a wobble as
+        // `idle + backlog` re-certifies it forever: an absolute noise floor
+        // only moved where that happened (fine at +5 ms, latched at +1 ms on
+        // the rig once the RTT estimate tightened).
+        let mut latched = Vec::new();
+        for rtt_ms in [1u32, 5, 20, 60, 200] {
+            for rate in [3e6, 30e6, 300e6] {
+                let link = Link::new(MS * rtt_ms, rate)
+                    .with_stamp_delay(|k| noise(k, 3 * MS) + if k % 20 == 19 { 10 * MS } else { Duration::ZERO })
+                    // 0.98–1.02: `noise` spans 0–40 ms, read here as 0–0.04.
+                    .with_rate_wobble(|i| 0.98 + noise(i + 7, 40 * MS).as_secs_f64());
+                let mut w = adaptive(MS * rtt_ms);
+                link.download(&mut w, 64 << 20, CHUNK);
+                if w.headroom() > 2 * learned().floor {
+                    latched.push(format!(
+                        "+{rtt_ms} ms at {} MB/s: {:?}",
+                        rate / 1e6,
+                        w.headroom()
+                    ));
+                }
+            }
+        }
+        assert!(latched.is_empty(), "latched: {latched:?}");
     }
 
     #[test]
