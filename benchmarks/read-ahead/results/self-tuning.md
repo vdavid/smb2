@@ -685,9 +685,41 @@ against 175%, the gap being those stall cells scored on listing wait). The full 
 fixes, so the pick stands at `wmax16-n25`, which is no worse than 0.25.1 in any cell here. Rerunning the full grid
 with the five finalists (about 30 minutes) would settle it.
 
+## Final grid on the fixed code (2026-09-24)
+
+The same 28 cells, three runs each, with `ref`, `fixed100`, `wmax16-n25`, `meandev4-n25`, and `wmax16-n50`, after
+`5f495d8`. Worst non-control cell:
+
+- **`meandev4-n25`: 68%**, on the ±40 ms jittered upload (per-file time). Second worst: 53%.
+- **`fixed100`: 146%**, on a steady 30 MB/s link at +1 ms (listing). Second worst: 138%.
+- **`wmax16-n50`: 148%**, on 30 MB/s +5 ms with stalls (listing). Second worst: 38%.
+- **`wmax16-n25`: 196%**, on a steady 30 MB/s link at +1 ms (listing). Second worst: 168%.
+- **`ref` (0.25.1): 213%**, on a steady 30 MB/s link at +1 ms (listing). Second worst: 172%.
+
+By the scoring rule, `meandev4-n25` wins. Where the two learned finalists differ (`stat` p50 in ms, throughput in MB/s):
+
+- **30 MB/s +1 ms, steady:** `wmax16-n25` 133 (latched again: the tighter RTT from `5f495d8` makes the 5 ms noise
+  floor too small at +1 ms), `meandev4-n25` 36, `ref` 141.
+- **30 MB/s +5 ms with stalls:** `wmax16-n25` 142 at 27.4 MB/s, `meandev4-n25` 54 at 25.3 MB/s (−8%), `ref` 141 at
+  27.4.
+- **3 MB/s +60 ms with stalls:** `wmax16-n25` 343, `meandev4-n25` 164.
+- **30 MB/s +20 ms, ±40 ms jitter:** `meandev4-n25` 20.6 MB/s against 24.2 for `wmax16-n25` and `ref` (−15%).
+
+**Not switched yet.** With `meandev4-n25` as the default, eight simulator tests in `read_ahead.rs` fail. Three encode the
+windowed max itself. The other five encode behavior the issue asks for:
+
+- A noisy link grows the headroom and keeps the pipe within 3% of a fixed 250 ms. It learns 30 ms under 150 ms freezes.
+- A slow link queues about one chunk. It queues 712 KiB against a 640 KiB bound.
+- A fresh window doesn't overshoot. RFC-style mean + 4 × deviation, seeded with the 250 ms cold value as the mean,
+  jumps to the 500 ms ceiling on its first quiet answers.
+
+That's a decision for the issue owner: switch and replace those tests, or fix `meandev4`'s cold start (RFC 6298's own
+initialization, mean = first sample and deviation = half of it) and rerun.
+
 ## Follow-ups
 
-1. **Rerun the full grid with the fixes** (the five finalists above) to settle `wmax16-n25` against `meandev4-n25`.
+1. **Decide the default** (see above). The shipping default is still `wmax16-n25`, and it latches at +1 ms on the
+   current code.
 2. **Downloads keep the open-loop drain.** A NAS whose Linux restarts slow start after idle (the default) would leave
    a similar surplus behind a download's first flight. The grid turned that off on the server, so it didn't show; the
    real-NAS run will. The correction needs to know which READs have arrived, which `FileDownload` doesn't track.
