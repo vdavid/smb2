@@ -1,7 +1,8 @@
 //! Minimax-regret scoring of tuning candidates across the grid.
 //!
 //! `score [--detail] F...` reads download and upload CSVs (told apart by
-//! their headers) and scores every variant with a `:<tuning>` suffix. A cell
+//! their headers) and scores every variant with a `:<tuning>` suffix
+//! (`auto:X` as `X`, any other base under its full name). A cell
 //! is one direction × link × load. In each cell, per candidate:
 //!
 //! - **Throughput regret**: `1 − MB/s ÷ best MB/s`, on the cell's largest file.
@@ -91,8 +92,14 @@ pub fn run(args: &[String]) {
         };
         for line in lines {
             let f: Vec<&str> = line.split(',').collect();
-            let Some((_, tuning)) = f[col("variant").unwrap()].split_once(':') else {
-                continue;
+            let variant = f[col("variant").unwrap()];
+            // `auto:X` is the grid's candidate X; any other base keeps its full
+            // name, so `adaptive:X` gets a column of its own instead of
+            // pooling its samples into `auto:X`'s.
+            let tuning = match variant.split_once(':') {
+                Some(("auto", tuning)) => tuning,
+                Some(_) => variant,
+                None => continue,
             };
             if !order.iter().any(|t| t == tuning) {
                 order.push(tuning.to_string());

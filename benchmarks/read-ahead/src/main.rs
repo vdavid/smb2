@@ -343,6 +343,10 @@ async fn run(args: &[String]) {
             let offset = if conns.len() > 1 { run } else { 0 };
             for i in 0..variants.len() {
                 let (name, v, tuned) = &variants[(i + offset) % variants.len()];
+                // One READ can't carry more than `MaxReadSize` (8 MiB on a QNAP).
+                if v.fetch == Fetch::Compound && size > u64::from(max_read) {
+                    continue;
+                }
                 tuning::apply(tuned.as_deref());
                 let mut fresh = if v.cold {
                     let mut c = connect(&addr).await;
