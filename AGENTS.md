@@ -1,6 +1,6 @@
 # smb2
 
-Pure-Rust SMB2/3 client with pipelined I/O. No C dependencies, no FFI. Async, runtime-agnostic.
+Pure-Rust SMB2/3 client with pipelined I/O. No C dependencies, no FFI. Async, on tokio (default) or smol.
 
 This repo is a Cargo workspace holding two published crates:
 
@@ -99,6 +99,11 @@ src/
     mod.rs                # RPC PDU types, NDR encoding/decoding
     srvsvc.rs             # NetShareEnumAll (list shares on a server)
 
+  rt/                     # The async runtime (tokio or smol): spawn, timers, sockets. Crate-private
+    mod.rs                # backend(), TaskHandle, Sleep, timeout, Instant
+    net.rs                # TcpStream halves, UdpSocket, resolve
+    CLAUDE.md
+
   testing/                # Consumer test harness (feature-gated: `testing`)
     mod.rs                # TestServers API, embedded Docker infrastructure
     fixtures/consumer/    # Consumer Docker fixtures, embedded via include_str! (shipped in the crate)
@@ -129,6 +134,7 @@ src/
     resolve.rs            # Tree::resolve: which file the server opened, and its stored name (classes 48 + 18)
     fault_injection_tests.rs # Hostile-but-plausible servers: one that goes silent, one that goes away and comes back
     socket_lifecycle_tests.rs # The socket closes when the connection is finished with, over real loopback sockets
+    smol_runtime_tests.rs # The same connection on smol with no tokio runtime: round trip, deadline, socket teardown
 
 tests/
   wire_format_captures.rs # Messages against known byte sequences from real captures
@@ -137,12 +143,14 @@ tests/
   fuzz_seeds.rs           # Generates the committed fuzz corpus (#[ignore])
   integration.rs          # Tests against real NAS/Pi (#[ignore])
   docker_integration.rs   # Tests against Docker Samba containers (#[ignore])
+  smol_integration.rs     # The client on smol against Docker Samba, run on a smol-only build (#[ignore])
   consumer_integration.rs # Tests against consumer Docker containers (#[ignore])
   docker/                 # Docker infrastructure for smb2's own integration tests
     internal/             # Internal-suite containers (consumer fixtures live in src/testing/fixtures/)
 
 examples/
   list_shares.rs          # Connect and enumerate shares
+  smol_list_shares.rs     # The same on smol (needs `--features smol`)
   list_directory.rs       # List files in a directory
   read_file.rs            # Read a file from a share
   write_file.rs           # Write a file to a share
@@ -233,10 +241,11 @@ discards the late-arriving response silently. See `docs/specs/connection-actor.m
 |----------------------|--------------------------------------------|----------------------------------------------------------------------|
 | Binary serialization | Hand-rolled `ReadCursor`/`WriteCursor`     | Full control, debuggable, no proc-macro dep                          |
 | Async strategy       | `dyn Transport` + `async_trait`            | Simpler public API than generics                                     |
+| Async runtime        | tokio (default) or smol, picked per call   | Every reactor call goes through crate-private `rt/`; see its CLAUDE.md |
 | ID types             | Newtypes (`SessionId(u64)`, etc.)          | Zero-cost compile-time safety                                        |
 | Error handling       | Rich context + `is_retryable()` + NTSTATUS | mtp-rs style                                                         |
 | Transport trait      | Split send/receive                         | Avoids deadlock in pipeline's `select!` loop                         |
-| Single crate         | No workspace                               | Like mtp-rs, keeps things simple                                     |
+| Workspace            | Library + CLI crates                       | A library change and the CLI change it needs land in one commit      |
 | I/O performance      | Pipelined reads/writes as core feature     | Not an optimization, the reason the lib exists                       |
 | Batch operations     | Send-all-then-receive-all for multi-file ops | No new infra needed -- N `send_compound` + N `receive_compound`    |
 | Testing              | TDD with mock transport                    | Spec-driven tests first                                              |
@@ -313,6 +322,8 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 31. **A name the server hands back is only as good as the class that carried it** ✅ -- `Tree::resolve` and the `FileReader` / `FileWriter` opens ask for the stored name of what the server opened, and a policy check trusts that answer, so a wrong one is a security bug, not a cosmetic one. Class 48 (`FileNormalizedNameInformation`) is share-relative by spec and is trusted as sent. Class 18's name (`FileAllInformation`) is the fallback, and ❌ an EMPTY class 18 name means "not answered" (MS-SMB2 § 3.3.5.20.1: a server SHOULD send it empty, and current Windows does), never the share root; a filled one has an unspecified root, so only as many trailing components as the caller asked for are kept. A `STATUS_BUFFER_OVERFLOW` name is truncated and never used. The compound order also matters, because a server MAY fail every related op after a failed one (MS-SMB2 § 3.3.5.2.7.2): class 48 goes last so a refusal can't take the metadata or the fallback down, and the CLOSE it drags along gets a standalone one. Spans `client/resolve.rs` + `client/stream.rs` + `client/tree.rs`; see `client/CLAUDE.md` § Resolving names.
 
+32. **A runtime call outside `rt/` compiles everywhere and works only on tokio** ✅ -- `tokio::spawn`, `tokio::time::sleep` / `timeout`, `tokio::net`, and `tokio::io` all build fine in a default build and panic on a smol consumer with "there is no reactor running" (issue #1, which the README's "runtime-agnostic" claim had invited). ❌ So nothing outside `src/rt/` calls them; `tokio::sync` is the exception and stays everywhere, because it works on any executor. The guard is the smol-only build in `just clippy` and CI, which leaves tokio's `time`, `net`, `io-util`, and `rt` features off so a stray call fails to compile. Two semantics the rest of the crate leans on and `rt` preserves on smol: ❌ a dropped `TaskHandle` detaches and only `abort()` stops the task (smol's own `Task` cancels on drop, which would silently stop a connection's writer or receiver), and a dropped TCP write half shuts the write side down (pitfall 28's socket lifetime assumes it). Spans `rt/` + `client/connection.rs` + `transport/tcp.rs` + `auth/kerberos/kdc.rs`; see `src/rt/CLAUDE.md`.
+
 32. **Windows fails an async op anywhere but last in a compound** ✅ -- Windows (Vista / Server 2008 and later) answers a compounded operation that needs asynchronous processing with `STATUS_INTERNAL_ERROR` unless it's the last one in the chain (MS-SMB2 § 3.3.5.2.7, product behavior note 266). A FLUSH always goes async there, so `write_file`'s CREATE + WRITE + FLUSH + CLOSE never flushed anything on Windows, silently, since a failed FLUSH is tolerated. The connection learns it from the first refusal (`flush_must_end_compound`, erased on revival), re-flushes that file with the FLUSH last, and from then on ends the write chain on the FLUSH and closes separately. Samba and the QNAP take the four-op chain. Spans `client/connection.rs` + `client/tree.rs`; see `client/CLAUDE.md` § Compound requests.
 
 33. **A transfer's rate is the link's only when the pipe was full, and only when timed at the wire** ✅ -- The rate a download or upload leaves on the connection feeds `quick_read_limit` / `quick_write_limit`, so reading it low streams files one frame would move twice as fast, and reading it high compounds files the link can't move quickly (the head-of-line blocking pitfall 27 is about). Two traps, both measured in the `read_ahead.rs` simulator: a gap between answers measures the link only if the later request was already queued at the server (sent at least one RTT before the earlier answer arrived), or a 4 MiB download at +60 ms on ~1 GB/s shares ~24 MB/s; and an answer has to be timed when the receiver task read it, not when the consumer took it, or a consumer catching up after a stall shares 365 MB/s on a 50 MB/s link. The stamp travels crate-privately (`Routed.arrived_at` → `WaiterGuard::arrived_at`); ❌ never on the public `Frame`. An error in the RTT only lowers the estimate, by construction. Spans `client/connection.rs` + `client/read_ahead.rs` + `client/stream.rs` + `client/write_pipe.rs`; see `client/CLAUDE.md` § Streaming download entry points.
@@ -324,7 +335,7 @@ See `tests/CLAUDE.md` for the full testing guide. Quick reference:
 - `cargo test` — unit tests (~1,000), no server needed
 - `just check` — fmt + clippy + tests + doc
 - `cargo test -p smb2 --test integration -- --ignored` — real NAS/Pi tests (needs `.env`)
-- `just test-docker` — Docker container tests (needs Docker, ~28s locally)
+- `just test-docker` — Docker container tests, then the smol suite on a smol-only build (needs Docker, ~28s locally)
 - `just test-consumer` — Consumer integration tests (needs Docker, ~30s locally)
 - `just test-cli-e2e` — the CLI binary against the `smb-auth` fixture (needs Docker, ~2s locally)
 
@@ -413,6 +424,7 @@ crates/smb2/src/msg/CLAUDE.md       # Wire format, Pack/Unpack, offsets, compoun
 crates/smb2/src/transport/CLAUDE.md # Split send/receive, TCP framing, MockTransport
 crates/smb2/src/auth/CLAUDE.md      # NTLM, MIC, session key derivation
 crates/smb2/src/rpc/CLAUDE.md       # RPC-over-pipes, NDR, share enumeration
+crates/smb2/src/rt/CLAUDE.md        # Tokio or smol: how the backend is picked, the task-handle and socket traps
 crates/smb2/src/pack/CLAUDE.md      # Cursors, GUID, FileTime, MAX_UNPACK_BUFFER
 crates/smb2/src/types/CLAUDE.md     # Newtypes, enums, bitflags, NtStatus
 crates/smb2/tests/CLAUDE.md         # Test categories, how to run, writing new tests, AWS access for Kerberos testing

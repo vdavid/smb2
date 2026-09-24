@@ -5,6 +5,20 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **A build with `default-features = false` now has to pick a runtime.** The async runtime is a Cargo feature now (see Added), and a build with neither `tokio` nor `smol` fails with a compile error that says so. Add `features = ["tokio"]` to keep what you had. Builds on the default features change nothing.
+
+### Added
+
+- **smb2 runs on smol, and through smol on any executor** ([#1](https://github.com/vdavid/smb2/issues/1)). The README called the crate runtime-agnostic, but it called tokio's reactor directly, so on smol it panicked with "there is no reactor running". Now the runtime is a feature: `tokio` (on by default, nothing changes for existing users) or `smol`, which brings its own reactor and executor threads, so `futures::executor::block_on` and friends work too. With both on, a call made inside a tokio runtime runs on tokio and anything else on smol, so a dependency somewhere in your graph turning `smol` on can't move you off tokio. Every socket, timer, and background task goes through it, the Kerberos KDC client's included, and a Samba suite (guest, NTLM, signing, encryption, streaming, a watcher) runs against a smol-only build in CI. See the new `smol_list_shares` example.
+
+### Changed
+
+- **`TcpTransport::connect` and `connect_with` take any `impl Display` address**, where they took tokio's `ToSocketAddrs` plus `Display`. Everything that worked before still does (`&str`, `String`, `SocketAddr`); the display form is what gets resolved.
+
 ## [0.25.2] - 2026-09-24
 
 ### Changed

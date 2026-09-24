@@ -57,6 +57,10 @@ clippy:
     @cargo clippy --all-targets --quiet -- -D warnings
     @echo "[*] Running clippy with all features..."
     @cargo clippy --all-targets --all-features --quiet -- -D warnings
+    @# No tokio reactor compiled in, so a stray `tokio::time::sleep` outside `src/rt/` fails here instead of panicking
+    @# on a smol user. Lib and examples only: the test suite is written against tokio's paused clock.
+    @echo "[*] Running clippy on a smol-only build..."
+    @cargo clippy -p smb2 --no-default-features --features smol --lib --examples --quiet -- -D warnings
     @echo "[+] Clippy passed"
 
 # Run tests
@@ -79,6 +83,8 @@ test-docker:
     @./crates/smb2/tests/docker/start.sh internal
     @echo "[*] Running Docker integration tests..."
     @cargo test -p smb2 --test docker_integration -- --ignored --quiet && \
+        echo "[*] Running the smol suite on a smol-only build..." && \
+        cargo test -p smb2 --no-default-features --features smol --test smol_integration -- --ignored --quiet && \
         (echo "[*] Stopping Docker containers..." && ./crates/smb2/tests/docker/stop.sh && echo "[+] Docker integration tests passed") || \
         (echo "[*] Stopping Docker containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
 
@@ -114,6 +120,7 @@ msrv:
         exit 1; \
     fi
     @RUSTFLAGS="-D warnings" cargo +1.85.0 check --quiet
+    @RUSTFLAGS="-D warnings" cargo +1.85.0 check -p smb2 --no-default-features --features smol --quiet
     @cargo +1.85.0 clippy --all-targets --quiet -- -D warnings
     @echo "[+] MSRV check passed"
 

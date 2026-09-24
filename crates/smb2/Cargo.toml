@@ -25,7 +25,7 @@ all-features = true
 # Logging facade -- application picks the backend (env_logger, tracing, etc.)
 log = "0.4"
 
-# Async runtime agnostic
+# `dyn Transport` needs async methods on a trait object.
 async-trait = "0.1"
 
 # `FuturesUnordered` for pipelined concurrent `execute` calls.
@@ -37,8 +37,13 @@ thiserror = "2"
 # Enum conversion derives
 num_enum = "0.7"
 
-# Async runtime -- transport layer needs net, io-util, time, sync
-tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"] }
+# Always on, whichever runtime runs the client: `sync` (channels, semaphores, `Notify`) works on any executor.
+# Everything that needs a running tokio reactor (sockets, timers, spawning) is behind the `tokio` feature below, so a
+# smol-only build can't compile a stray `tokio::time::sleep`. See `src/rt/CLAUDE.md`.
+tokio = { version = "1", features = ["sync"] }
+
+# The `smol` runtime backend: sockets, timers, and a global executor that works under any executor.
+smol = { version = "2.0.2", optional = true }
 
 # Crypto -- signing, encryption, key derivation
 hmac = "0.13"
@@ -72,6 +77,11 @@ lz4_flex = "0.14"
 serde = { version = "1", optional = true, features = ["derive"] }
 
 [features]
+default = ["tokio"]
+# Runtime backends: at least one is required. With both on, a call made inside a tokio runtime runs on tokio and
+# everything else on smol. See `src/rt/CLAUDE.md`.
+tokio = ["tokio/net", "tokio/io-util", "tokio/rt", "tokio/time"]
+smol = ["dep:smol"]
 testing = []  # Enables smb2::testing module for Docker-based test servers
 fuzzing = []  # Exposes parser entry points for `fuzz/` targets; not for applications
 serde = ["dep:serde"]  # `Serialize` impls on `Diagnostics` types and the protocol enums they embed.
@@ -84,3 +94,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net",
 proptest = "1"
 env_logger = "0.11"
 serde_json = "1"  # JSON round-trip tests for the `serde` feature
+smol = "2.0.2"  # `block_on` for the tests that prove the client runs without a tokio runtime
+
+[[example]]
+name = "smol_list_shares"
+required-features = ["smol"]

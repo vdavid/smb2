@@ -20,6 +20,8 @@ pub mod read_ahead;
 pub mod resolve;
 pub mod session;
 pub mod shares;
+#[cfg(all(test, feature = "smol"))]
+mod smol_runtime_tests;
 #[cfg(test)]
 mod socket_lifecycle_tests;
 pub mod stream;

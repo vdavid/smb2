@@ -73,7 +73,7 @@ struct Routed {
     result: Result<Frame>,
     /// `None` for an error the connection fanned out itself, which never
     /// arrived at all.
-    arrived_at: Option<tokio::time::Instant>,
+    arrived_at: Option<rt::Instant>,
 }
 
 /// A registered waiter that deregisters itself if its caller goes away.
@@ -98,7 +98,7 @@ pub(crate) struct WaiterGuard {
     /// there is nothing left to clean up.
     rx: Option<oneshot::Receiver<Routed>>,
     /// When the response's frame came off the wire, once it has been claimed.
-    arrived_at: Option<tokio::time::Instant>,
+    arrived_at: Option<rt::Instant>,
 }
 
 impl WaiterGuard {
@@ -106,7 +106,7 @@ impl WaiterGuard {
     /// receiver task as it read the frame, however long the caller took to
     /// look. `None` until a response has been claimed, and for an error that
     /// never arrived (the connection died under it).
-    pub(crate) fn arrived_at(&self) -> Option<tokio::time::Instant> {
+    pub(crate) fn arrived_at(&self) -> Option<rt::Instant> {
         self.arrived_at
     }
 
@@ -216,7 +216,7 @@ const ROUND_TRIP_SAMPLE_MAX: usize = 4096;
 
 /// What a transfer left on the connection, unless it's older than
 /// [`RATE_HINT_TTL`].
-fn recent<T: Copy>(noted: &StdMutex<Option<(tokio::time::Instant, T)>>) -> Option<T> {
+fn recent<T: Copy>(noted: &StdMutex<Option<(rt::Instant, T)>>) -> Option<T> {
     let noted = *noted.lock().unwrap();
     noted
         .filter(|(at, _)| at.elapsed() < RATE_HINT_TTL)
@@ -586,7 +586,7 @@ async fn writer_loop(
         let started = std::time::Instant::now();
 
         let result = match deadline {
-            Some(d) => match tokio::time::timeout(d, sender.send(&job.bytes)).await {
+            Some(d) => match rt::timeout(d, sender.send(&job.bytes)).await {
                 Ok(r) => r,
                 Err(_) => Err(Error::SendTimeout {
                     command: job.command,
@@ -855,9 +855,9 @@ struct SendActivity {
 /// `Connection` clone drops.
 fn spawn_connection_sweeper(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
-    let handle = tokio::spawn(async move {
+    let handle = rt::spawn(async move {
         loop {
-            tokio::time::sleep(STALE_WAITER_SWEEP).await;
+            rt::sleep(STALE_WAITER_SWEEP).await;
             let Some(inner) = weak.upgrade() else {
                 return; // connection dropped
             };
@@ -938,7 +938,7 @@ enum ProbeOutcome {
 /// probing. Holds a `Weak` so it exits once the last `Connection` clone drops.
 fn spawn_keepalive(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
-    let handle = tokio::spawn(async move { keepalive_loop(weak).await });
+    let handle = rt::spawn(async move { keepalive_loop(weak).await });
     if let Some(old) = inner.keepalive_task.lock().unwrap().replace(handle) {
         old.abort();
     }
@@ -973,7 +973,7 @@ fn spawn_plumbing(
     // SERVER hangs up (never, on a server that doesn't reap idle sessions).
     let weak = Arc::downgrade(inner);
     let writer_life = life.clone();
-    let writer = tokio::spawn(async move {
+    let writer = rt::spawn(async move {
         writer_loop(sender, write_rx, weak, writer_life).await;
     });
     if let Some(old) = inner.writer_task.lock().unwrap().replace(writer) {
@@ -984,7 +984,7 @@ fn spawn_plumbing(
     // counter being retired.
     let feed = inner.adopt_receive_progress(receiver.receive_progress());
     let weak = Arc::downgrade(inner);
-    let handle = tokio::spawn(async move {
+    let handle = rt::spawn(async move {
         receiver_loop(receiver, weak, feed, life).await;
     });
     if let Some(old) = inner.receiver_task.lock().unwrap().replace(handle) {
@@ -1014,7 +1014,7 @@ async fn keepalive_loop(weak: Weak<Inner>) {
             }
             None => return, // last Connection clone dropped
         };
-        tokio::time::sleep(tick).await;
+        rt::sleep(tick).await;
 
         let Some(inner) = weak.upgrade() else {
             return;
@@ -1307,6 +1307,7 @@ use crate::msg::transform::{
     COMPRESSION_PROTOCOL_ID, SMB2_COMPRESSION_FLAG_NONE, TRANSFORM_PROTOCOL_ID,
 };
 use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
+use crate::rt;
 use crate::transport::{ReceiveProgress, TcpTransport, TransportReceive, TransportSend};
 use crate::types::flags::{Capabilities, HeaderFlags, SecurityMode};
 use crate::types::status::NtStatus;
@@ -1712,18 +1713,18 @@ struct Inner {
     send_timeout: StdMutex<Option<Duration>>,
     /// Handle for the writer task, aborted with the receiver task when the
     /// last `Connection` clone drops.
-    writer_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    writer_task: StdMutex<Option<rt::TaskHandle>>,
     /// Handle for the ECHO keepalive task. Aborted with the others when the
     /// last `Connection` clone drops.
-    keepalive_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    keepalive_task: StdMutex<Option<rt::TaskHandle>>,
     /// Handle for the background receiver task. Aborted when the last clone
     /// of `Connection` drops (via `Inner`'s `Drop`). The transport's read
     /// half's EOF also stops the task; the abort is a safety net.
-    receiver_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    receiver_task: StdMutex<Option<rt::TaskHandle>>,
     /// Handle for the stale-request sweeper. Held so a revival can retire the
     /// old one instead of accumulating a sweeper per generation — the sweeper
     /// exits on `disconnected`, and a revival clears that flag.
-    sweeper_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    sweeper_task: StdMutex<Option<rt::TaskHandle>>,
     /// The current socket's [`SocketLife`], so declaring the connection dead
     /// can close it. Replaced (and the old one ended) by every revival.
     socket_life: StdMutex<SocketLife>,
@@ -1814,11 +1815,11 @@ struct Inner {
     /// per second, and when. Seeds the next download's read-ahead
     /// window, so a folder of 1 MiB files doesn't pay a round trip per file
     /// to rediscover the link. See [`RATE_HINT_TTL`].
-    read_rate_hint: StdMutex<Option<(tokio::time::Instant, f64)>>,
+    read_rate_hint: StdMutex<Option<(rt::Instant, f64)>>,
     /// The same for uploads: the last rate a writer's WRITEs were confirmed
     /// at. Kept apart from the download rate because most links are
     /// asymmetric, a home uplink often ten times slower than its downlink.
-    write_rate_hint: StdMutex<Option<(tokio::time::Instant, f64)>>,
+    write_rate_hint: StdMutex<Option<(rt::Instant, f64)>>,
     /// Whether this server refuses a FLUSH that isn't last in its compound.
     ///
     /// Windows (Vista / Server 2008 and later) fails any compounded operation
@@ -1834,9 +1835,9 @@ struct Inner {
     /// How late READ answers came for the last download on this connection,
     /// and when: what the next download's learned headroom starts from.
     /// Same expiry and revival rules as the rate. See [`RATE_HINT_TTL`].
-    read_lateness_hint: StdMutex<Option<(tokio::time::Instant, read_ahead::Lateness)>>,
+    read_lateness_hint: StdMutex<Option<(rt::Instant, read_ahead::Lateness)>>,
     /// The same for WRITE confirmations.
-    write_lateness_hint: StdMutex<Option<(tokio::time::Instant, read_ahead::Lateness)>>,
+    write_lateness_hint: StdMutex<Option<(rt::Instant, read_ahead::Lateness)>>,
     /// Whether compression is active on this connection (negotiated).
     compression_enabled: AtomicBool,
     /// Whether the client wants compression (from config).
@@ -2161,7 +2162,7 @@ impl Inner {
         loop {
             // `select` polls the reservation first, so credits that land in
             // the same tick as a recheck are taken rather than declared lost.
-            let recheck = Box::pin(tokio::time::sleep(CREDIT_STARVATION_RECHECK));
+            let recheck = Box::pin(rt::sleep(CREDIT_STARVATION_RECHECK));
             match select(reserving, recheck).await {
                 Either::Left((res, _)) => {
                     return match res {
@@ -2979,8 +2980,7 @@ impl Connection {
 
     /// Record a download's measured link rate for the next one.
     pub(crate) fn note_read_rate(&self, bytes_per_sec: f64) {
-        *self.inner.read_rate_hint.lock().unwrap() =
-            Some((tokio::time::Instant::now(), bytes_per_sec));
+        *self.inner.read_rate_hint.lock().unwrap() = Some((rt::Instant::now(), bytes_per_sec));
     }
 
     /// What the next download on this connection starts from.
@@ -2998,8 +2998,7 @@ impl Connection {
             self.note_read_rate(rate);
         }
         if let Some(lateness) = window.lateness_to_share() {
-            *self.inner.read_lateness_hint.lock().unwrap() =
-                Some((tokio::time::Instant::now(), lateness));
+            *self.inner.read_lateness_hint.lock().unwrap() = Some((rt::Instant::now(), lateness));
         }
     }
 
@@ -3089,8 +3088,7 @@ impl Connection {
 
     /// Record an upload's measured rate for the next one.
     pub(crate) fn note_write_rate(&self, bytes_per_sec: f64) {
-        *self.inner.write_rate_hint.lock().unwrap() =
-            Some((tokio::time::Instant::now(), bytes_per_sec));
+        *self.inner.write_rate_hint.lock().unwrap() = Some((rt::Instant::now(), bytes_per_sec));
     }
 
     /// What the next upload on this connection starts from.
@@ -3108,8 +3106,7 @@ impl Connection {
             self.note_write_rate(rate);
         }
         if let Some(lateness) = window.lateness_to_share() {
-            *self.inner.write_lateness_hint.lock().unwrap() =
-                Some((tokio::time::Instant::now(), lateness));
+            *self.inner.write_lateness_hint.lock().unwrap() = Some((rt::Instant::now(), lateness));
         }
     }
 
@@ -3825,7 +3822,7 @@ impl Connection {
             .metrics
             .keepalive_probes_sent
             .fetch_add(1, Ordering::Relaxed);
-        match tokio::time::timeout(budget, guard.recv()).await {
+        match rt::timeout(budget, guard.recv()).await {
             Ok(Ok(_frame)) => ProbeOutcome::Alive,
             // The connection died under us; whoever noticed is tearing it down.
             Ok(Err(Error::Disconnected)) | Ok(Err(Error::ServerUnresponsive { .. })) => {
@@ -4451,7 +4448,7 @@ impl Connection {
         let mut receiving = Box::pin(guard.recv());
         let mut extended = false;
         loop {
-            let idle_check = Box::pin(tokio::time::sleep(tick));
+            let idle_check = Box::pin(rt::sleep(tick));
             match select(receiving, idle_check).await {
                 Either::Left((frame, _)) => return frame,
                 Either::Right((_, still_receiving)) => {
@@ -4575,7 +4572,7 @@ impl Connection {
             // Cancelling it loses nothing — the `oneshot` holds the value until
             // a poll takes it — and unlike a pinned future held across the loop
             // it leaves the guard free to be inspected and retired below.
-            match tokio::time::timeout(tick, guard.recv()).await {
+            match rt::timeout(tick, guard.recv()).await {
                 Ok(frame) => return frame.map(LongPollOutcome::Answered),
                 Err(_tick_elapsed) => {}
             }
@@ -5092,7 +5089,7 @@ impl Connection {
         // returns — by which this outlives the budget. ❌ Don't move the bound
         // inside the loop: a per-attempt timeout multiplies by the attempt
         // count and stops being a bound.
-        let outcome = tokio::time::timeout(
+        let outcome = rt::timeout(
             policy.total_budget,
             self.revive_attempts(&reviver, &policy, started),
         )
@@ -5154,7 +5151,7 @@ impl Connection {
                     policy.max_attempts,
                     started.elapsed()
                 );
-                tokio::time::sleep(backoff).await;
+                rt::sleep(backoff).await;
                 backoff = (backoff * 2).min(policy.max_backoff);
             }
             self.inner
@@ -5488,7 +5485,7 @@ async fn receiver_loop(
         };
         // Before any decrypting or verifying: what the windows measure is the
         // link, and that work is the same for every frame.
-        let arrived_at = tokio::time::Instant::now();
+        let arrived_at = rt::Instant::now();
         let raw = match received {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -9381,7 +9378,7 @@ fn acknowledge_oplock_break(
     let conn = Connection {
         inner: Arc::clone(inner),
     };
-    tokio::spawn(async move {
+    rt::spawn(async move {
         let ack = OplockBreak {
             // Down to none: we only ever took the oplock to get durability,
             // and durability is already gone the moment a break arrives.
@@ -9401,5 +9398,6 @@ fn acknowledge_oplock_break(
                 brk.file_id
             ),
         }
-    });
+    })
+    .detach();
 }

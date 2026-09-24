@@ -11,10 +11,10 @@
 use std::future::Future;
 use std::pin::{pin, Pin};
 
+use crate::rt::{self, Instant};
 use futures_util::future::{select, Either};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use log::debug;
-use tokio::time::Instant;
 
 use crate::client::connection::{
     reserve_write_budget_or_drain, Connection, Frame, WriteBudgetStep,
@@ -218,7 +218,7 @@ impl WritePipe {
                     self.land(landed)?;
                 }
                 Dispatch::At(at) => {
-                    let timer = pin!(tokio::time::sleep_until(at));
+                    let timer = pin!(rt::sleep_until(at));
                     match select(self.in_flight.next(), timer).await {
                         Either::Left((Some(landed), _)) => self.land(landed)?,
                         Either::Left((None, _)) => return Ok(()),

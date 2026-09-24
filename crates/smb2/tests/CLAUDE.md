@@ -106,6 +106,15 @@ cargo test -p smb2 --test docker_integration -- --ignored   # repeat (~8s)
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target, plus a seeded `Root-File.txt` in the root share itself (guest can't write there) for `resolve` on a DFS share |
 | smb-dfs-target | 10457 | DFS target server with test files (hello.txt, subdir/nested.txt) |
 
+## smol integration tests (`tests/smol_integration.rs`)
+
+The client on smol against smb-guest, smb-auth, smb-signing, and smb-encryption: login shapes, a file round trip on
+each, streaming both ways, and a watcher. Every test runs inside `smol::block_on` and asserts no tokio runtime is in
+reach first. `just test-docker` and CI run it on a **smol-only build** (`--no-default-features --features smol`), so
+tokio's reactor isn't compiled into the library at all; that's the build that proves issue #1 fixed. With both
+features on, it still runs on smol (no tokio runtime is current). `#![cfg(feature = "smol")]`, so a default
+`cargo test` compiles it to nothing. Runtime rules: `src/rt/CLAUDE.md`.
+
 ## Consumer integration tests (`tests/consumer_integration.rs`)
 
 Tests against 14 Docker-based Samba containers designed for apps that depend on smb2. These test app-level SMB integration (browsing, listing, error handling), not protocol internals.

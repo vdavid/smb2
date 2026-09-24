@@ -13,7 +13,7 @@ Split transport traits for SMB2 message I/O. Two implementations: TCP and mock.
 
 ## Split traits
 
-`TransportSend` and `TransportReceive` are separate traits. This avoids deadlock in the pipeline's `tokio::select!` loop where one task sends requests while another concurrently reads responses on the same connection. A single `Transport` trait would require `&mut self` for both directions, making concurrent send+receive impossible without `Arc<Mutex>`.
+`TransportSend` and `TransportReceive` are separate traits. This avoids deadlock in the pipeline's `select!` loop where one task sends requests while another concurrently reads responses on the same connection. A single `Transport` trait would require `&mut self` for both directions, making concurrent send+receive impossible without `Arc<Mutex>`.
 
 The blanket impl `Transport` combines both halves. `Connection` stores `Box<dyn TransportSend>` and `Box<dyn TransportReceive>` separately.
 
@@ -30,6 +30,11 @@ The blanket impl `Transport` combines both halves. `Connection` stores `Box<dyn 
 
 `TcpTransport::send` prepends the 4-byte header. `TcpTransport::receive` reads the header with `read_exact`, then the
 payload with a counted read loop (below).
+
+The socket, the resolver, and every timer here come from `crate::rt` (`rt::net::TcpStream` halves, `rt::sleep`,
+`rt::timeout_at`), so `TcpTransport` runs on tokio or smol, whichever the connect was made on. ❌ Don't reach for
+`tokio::net` or `tokio::time` here; see `src/rt/CLAUDE.md`. The tests drive the far end with tokio's own sockets and
+wrap one for the transport with `.into()`.
 
 ## Receive progress: bytes inside a frame are signs of life
 
@@ -56,8 +61,8 @@ algorithm): next address after `attempt_delay` (250 ms), earlier attempts left r
 all under one deadline. `connect_with` takes a `ConnectOptions` to tune it. Every failure reports
 `Error::ConnectFailed` with one `ConnectAttempt` per address.
 
-- **Gotcha:** `TcpStream::connect(addr)` walks every resolved address *serially* underneath a single
-  `tokio::time::timeout`, so one address that blackholes SYNs spends the entire budget and the live ones are never
+- **Gotcha:** `TcpStream::connect("name:port")` (tokio's, smol's, and `rt::net::TcpStream::connect_host` alike) walks
+  every resolved address *serially*, so under a single timeout one address that blackholes SYNs spends the entire budget and the live ones are never
   dialled. Every AD domain name and plenty of NASes are multi-homed, and a DFS namespace root makes it worse by
   construction: the name being dialled *is* a domain name. ❌ Don't "simplify" this back to one timeout around
   `TcpStream::connect`.
@@ -65,12 +70,13 @@ all under one deadline. `connect_with` takes a `ConnectOptions` to tune it. Ever
   it, a name whose IPv6 addresses all come first and all blackhole pushes every IPv4 address past
   `max_addresses × attempt_delay` — the same failure, just later.
 - **`error_kind: None` on an attempt means "ran out of budget", not "failed".** Nothing is known about that address.
-- **Known limit, documented rather than solved:** `lookup_host` runs `getaddrinfo` on a blocking pool thread. A timeout
-  abandons the future; the thread stays until the resolver returns. A pure-Rust resolver would fix it and is a
-  dependency this crate has no other reason to take.
-- `connect` and `connect_with` need `impl ToSocketAddrs + Display`, because an error that cannot name what it tried to
-  reach is worth less than the tighter bound costs. `&str`, `String`, and `SocketAddr` all satisfy it; a
-  `(&str, u16)` tuple does not.
+- **Known limit, documented rather than solved:** `rt::net::resolve` runs `getaddrinfo` on a blocking pool thread (on
+  both runtimes). A timeout abandons the future; the thread stays until the resolver returns. A pure-Rust resolver
+  would fix it and is a dependency this crate has no other reason to take.
+- `connect` and `connect_with` take `impl Display` and resolve its display form (`host:port` or `ip:port`), so an
+  error can always name what it tried to reach. `&str`, `String`, and `SocketAddr` all work; a `(&str, u16)` tuple
+  doesn't compile, which is the point: it has no display form. ❌ Don't bring back tokio's `ToSocketAddrs` bound: it
+  puts a tokio type in the public API, and a smol-only build doesn't have one.
 
 ## Who reads the transport
 

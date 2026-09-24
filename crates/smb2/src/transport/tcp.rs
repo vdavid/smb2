@@ -14,13 +14,11 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 
 use crate::error::{Error, Result};
+use crate::rt::net::{self, ReadHalf, TcpStream, WriteHalf};
+use crate::rt::{self, Instant};
 use crate::transport::{ReceiveProgress, TransportReceive, TransportSend};
 
 /// Maximum frame size we accept (16 MB).
@@ -114,14 +112,16 @@ impl fmt::Display for ConnectAttempt {
 ///
 /// Wraps a TCP connection and handles the 4-byte framing header.
 /// The connection is split into independent read and write halves
-/// so that send and receive can proceed concurrently without contention
-/// (required by the pipeline's `tokio::select!` loop).
+/// so that send and receive can proceed concurrently without contention.
+///
+/// Runs on whichever runtime the connect was made on; see the crate docs'
+/// "Async runtime" section.
 #[derive(Debug)]
 pub struct TcpTransport {
     /// The read half of the TCP connection, behind a mutex for `&self` access.
-    reader: Mutex<OwnedReadHalf>,
+    reader: Mutex<ReadHalf>,
     /// The write half of the TCP connection, behind a mutex for `&self` access.
-    writer: Mutex<OwnedWriteHalf>,
+    writer: Mutex<WriteHalf>,
     /// What `receive` has read so far, published per socket read. See
     /// [`ReceiveProgress`].
     progress: Arc<ReceiveProgress>,
@@ -135,31 +135,29 @@ impl TcpTransport {
     /// [`ConnectOptions`] for why that is not the same as "a deadline around
     /// `TcpStream::connect`". Once connected, the socket is split into
     /// independent read/write halves.
-    pub async fn connect(
-        addr: impl ToSocketAddrs + fmt::Display,
-        timeout: Duration,
-    ) -> Result<Self> {
+    ///
+    /// `addr` is anything that displays as `host:port` or `ip:port`: `&str`,
+    /// `String`, and `SocketAddr` all do. The display form is what gets
+    /// resolved, and what an error names.
+    pub async fn connect(addr: impl fmt::Display, timeout: Duration) -> Result<Self> {
         Self::connect_with(addr, ConnectOptions::with_timeout(timeout)).await
     }
 
     /// [`connect`](Self::connect) with the stagger and the address cap under
     /// the caller's control.
-    pub async fn connect_with(
-        addr: impl ToSocketAddrs + fmt::Display,
-        opts: ConnectOptions,
-    ) -> Result<Self> {
+    pub async fn connect_with(addr: impl fmt::Display, opts: ConnectOptions) -> Result<Self> {
         let host = addr.to_string();
         let deadline = Instant::now() + opts.timeout;
 
         // Resolution is inside the budget, because it is part of the wait the
         // caller is bounding.
         //
-        // **Known limit, documented rather than solved:** `lookup_host` runs
+        // **Known limit, documented rather than solved:** resolving runs
         // `getaddrinfo` on a blocking pool thread. A timeout abandons the
         // future; the thread stays until the resolver returns. A pure-Rust
         // resolver would fix it, and is a dependency this crate has no other
         // reason to take.
-        let resolved = tokio::time::timeout_at(deadline, tokio::net::lookup_host(addr))
+        let resolved = rt::timeout_at(deadline, net::resolve(&host))
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(Error::Io)?;
@@ -244,10 +242,10 @@ pub(crate) async fn dial_staggered(
         // (Caught by the fuzz build, which compiles the library without
         // dev-dependencies. `cargo clippy --all-targets` does not.)
         if in_flight.is_empty() {
-            tokio::time::sleep(wake_in).await;
+            rt::sleep(wake_in).await;
             continue;
         }
-        let timer = std::pin::pin!(tokio::time::sleep(wake_in));
+        let timer = std::pin::pin!(rt::sleep(wake_in));
         match futures_util::future::select(in_flight.next(), timer).await {
             // An attempt finished.
             Either::Left((Some((index, result)), _)) => match result {
@@ -440,6 +438,10 @@ impl Drop for FrameInProgress<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The tests drive the far end with tokio's own sockets; `.into()` wraps
+    // one for `TcpTransport`.
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
 
     /// Build a framed message (4-byte header + payload).
     fn frame_message(payload: &[u8]) -> Vec<u8> {
@@ -515,7 +517,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let transport = TcpTransport::from_stream(stream);
+        let transport = TcpTransport::from_stream(stream.into());
 
         let result = transport.receive().await;
         writer_task.await.unwrap();
@@ -635,14 +637,14 @@ mod tests {
 
         let send_task = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
-            let transport = TcpTransport::from_stream(stream);
+            let transport = TcpTransport::from_stream(stream.into());
 
             let payload = vec![0xFE, 0x53, 0x4D, 0x42, 0xDE, 0xAD];
             transport.send(&payload).await.unwrap();
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let recv_transport = TcpTransport::from_stream(stream);
+        let recv_transport = TcpTransport::from_stream(stream.into());
 
         let received = recv_transport.receive().await.unwrap();
         assert_eq!(received, vec![0xFE, 0x53, 0x4D, 0x42, 0xDE, 0xAD]);
@@ -657,7 +659,7 @@ mod tests {
 
         let send_task = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
-            let transport = TcpTransport::from_stream(stream);
+            let transport = TcpTransport::from_stream(stream.into());
 
             transport.send(&[0x01, 0x02]).await.unwrap();
             transport.send(&[0x03, 0x04, 0x05]).await.unwrap();
@@ -665,7 +667,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let recv_transport = TcpTransport::from_stream(stream);
+        let recv_transport = TcpTransport::from_stream(stream.into());
 
         assert_eq!(recv_transport.receive().await.unwrap(), vec![0x01, 0x02]);
         assert_eq!(
@@ -915,7 +917,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let far_end = TcpStream::connect(addr).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        (Arc::new(TcpTransport::from_stream(stream)), far_end)
+        (Arc::new(TcpTransport::from_stream(stream.into())), far_end)
     }
 
     /// Wait (bounded) for the transport's counts to satisfy `cond`.
@@ -1002,13 +1004,13 @@ mod tests {
 
         let send_task = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
-            let transport = TcpTransport::from_stream(stream);
+            let transport = TcpTransport::from_stream(stream.into());
 
             transport.send(&payload_clone).await.unwrap();
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let recv_transport = TcpTransport::from_stream(stream);
+        let recv_transport = TcpTransport::from_stream(stream.into());
 
         let received = recv_transport.receive().await.unwrap();
         assert_eq!(received.len(), payload.len());

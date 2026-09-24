@@ -11,9 +11,9 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use crate::rt::{self, Instant};
 use futures_util::future::{select, Either};
 use log::{debug, trace};
-use tokio::time::Instant;
 
 use crate::client::connection::{Connection, Frame, WaiterGuard};
 use crate::client::credits;
@@ -310,7 +310,7 @@ impl<'a> FileDownload<'a> {
             let frame = match send_at {
                 None => waiting.await?,
                 Some(at) => {
-                    let timer = std::pin::pin!(tokio::time::sleep_until(at));
+                    let timer = std::pin::pin!(rt::sleep_until(at));
                     match select(std::pin::pin!(waiting), timer).await {
                         Either::Left((frame, _)) => frame?,
                         // The next READ is due before the head has landed.

@@ -38,8 +38,16 @@ jobs:
       - name: Run clippy lints
         run: cargo clippy --all-targets -- -D warnings
 
+      # No tokio reactor compiled in: proves nothing outside `src/rt/` reaches for tokio's runtime.
+      - name: Run clippy on a smol-only build
+        run: cargo clippy -p smb2 --no-default-features --features smol --lib --examples -- -D warnings
+
       - name: Run tests
         run: cargo test
+
+      # Both runtimes compiled in: the tokio suite stays on tokio, and the smol tests run with no tokio runtime.
+      - name: Run tests with the smol backend
+        run: cargo test -p smb2 --features smol --lib
 
       - name: Build documentation
         run: cargo doc --no-deps
@@ -63,6 +71,11 @@ jobs:
 
       - name: Run Docker integration tests
         run: cargo test -p smb2 --test docker_integration -- --ignored
+        env:
+          RUST_LOG: smb2=info
+
+      - name: Run Docker integration tests on smol
+        run: cargo test -p smb2 --no-default-features --features smol --test smol_integration -- --ignored
         env:
           RUST_LOG: smb2=info
 
@@ -141,6 +154,11 @@ jobs:
 
       - name: Check compilation on MSRV
         run: cargo check
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Check the smol-only build on MSRV
+        run: cargo check -p smb2 --no-default-features --features smol
         env:
           RUSTFLAGS: "-D warnings"
 

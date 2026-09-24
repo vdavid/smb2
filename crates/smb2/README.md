@@ -18,7 +18,7 @@ we have more control to reach even better speeds.
 
 - Cross-compile without system lib headaches (no `libsmbclient`, no `-sys` crates)
 - Pipelined I/O by default, not as an afterthought
-- Async and runtime-agnostic (uses `futures` traits)
+- Async, on tokio or smol (and, through smol, any other executor)
 - Works anywhere Rust compiles
 
 ## What it does
@@ -313,13 +313,25 @@ Add to your `Cargo.toml`:
 smb2 = "0.25"
 ```
 
-You'll also need an async runtime. The library is runtime-agnostic, but [tokio](https://github.com/tokio-rs/tokio) is
-the most common choice:
+You'll also need an async runtime. smb2 runs on [tokio](https://github.com/tokio-rs/tokio) out of the box:
 
 ```toml
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
+
+To run on [smol](https://github.com/smol-rs/smol) instead, turn the `tokio` feature off and `smol` on. smol brings its
+own reactor and executor threads, so this also works under any other executor (`futures::executor::block_on`,
+`pollster`, and so on):
+
+```toml
+[dependencies]
+smb2 = { version = "0.25", default-features = false, features = ["smol"] }
+smol = "2"
+```
+
+With both features on, each call runs on tokio when it's made inside a tokio runtime and on smol otherwise. smb2 still
+uses tokio's channels and semaphores either way; they work on any executor.
 
 ## API overview
 

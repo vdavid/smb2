@@ -32,6 +32,21 @@
 //! # }
 //! ```
 //!
+//! # Async runtime
+//!
+//! Runs on [tokio](https://tokio.rs) (the `tokio` feature, on by default) or
+//! [smol](https://github.com/smol-rs/smol) (the `smol` feature). With `smol`
+//! on, it also runs under any other executor, since smol brings its own
+//! reactor and executor threads. With both on, each call runs on tokio when
+//! it's made inside a tokio runtime and on smol otherwise, so feature
+//! unification can't put a consumer on the wrong one. A smol-only consumer
+//! leaves tokio's reactor and runtime out of the build (the crate still uses
+//! tokio's channels and semaphores, which work on any executor):
+//!
+//! ```toml
+//! smb2 = { version = "0.25", default-features = false, features = ["smol"] }
+//! ```
+//!
 //! # Modules
 //!
 //! - [`client`] -- High-level API: [`SmbClient`], [`Tree`], [`Pipeline`].
@@ -57,6 +72,7 @@ pub mod msg;
 pub mod name;
 pub mod pack;
 pub mod rpc;
+pub(crate) mod rt;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod transport;

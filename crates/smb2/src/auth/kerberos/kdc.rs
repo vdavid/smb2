@@ -15,11 +15,12 @@
 //! UDP-to-TCP fallback path.
 
 use log::{debug, trace, warn};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
 
 use crate::error::{Error, Result};
+use crate::rt::net::{TcpStream, UdpSocket};
+use crate::rt::{sleep, timeout as with_timeout};
 
 /// Default Kerberos port (RFC 4120).
 const KERBEROS_PORT: u16 = 88;
@@ -87,7 +88,9 @@ pub async fn send_to_kdc(config: &KdcConfig, message: &[u8]) -> Result<Vec<u8>> 
 
 /// Send a Kerberos message via UDP.
 async fn send_udp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u8>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(Error::Io)?;
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+        .await
+        .map_err(Error::Io)?;
 
     let mut last_err = None;
 
@@ -95,11 +98,11 @@ async fn send_udp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u
         if attempt > 0 {
             let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
             debug!("kdc: UDP retry {} after {:?}", attempt, delay);
-            tokio::time::sleep(delay).await;
+            sleep(delay).await;
         }
 
         // Send the raw DER bytes (no framing for UDP).
-        match tokio::time::timeout(timeout, socket.send_to(message, addr)).await {
+        match with_timeout(timeout, socket.send_to(message, addr)).await {
             Ok(Ok(n)) => {
                 trace!("kdc: UDP sent {} bytes", n);
             }
@@ -115,7 +118,7 @@ async fn send_udp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u
 
         // Receive the response.
         let mut buf = vec![0u8; UDP_MAX_SIZE];
-        match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+        match with_timeout(timeout, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, _src))) => {
                 trace!("kdc: UDP received {} bytes", n);
                 buf.truncate(n);
@@ -141,7 +144,7 @@ async fn send_tcp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u
         if attempt > 0 {
             let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
             debug!("kdc: TCP retry {} after {:?}", attempt, delay);
-            tokio::time::sleep(delay).await;
+            sleep(delay).await;
         }
 
         match send_tcp_once(addr, message, timeout).await {
@@ -158,22 +161,23 @@ async fn send_tcp(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u
 /// Single TCP send/receive attempt.
 async fn send_tcp_once(addr: &str, message: &[u8], timeout: Duration) -> Result<Vec<u8>> {
     // Connect with timeout.
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+    let stream = with_timeout(timeout, TcpStream::connect_host(addr))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(Error::Io)?;
 
     // Disable Nagle for lower latency.
     stream.set_nodelay(true).map_err(Error::Io)?;
+    let (mut reader, mut writer) = stream.into_split();
 
     // Send: 4-byte big-endian length prefix + DER bytes.
     let len = message.len() as u32;
     let len_bytes = len.to_be_bytes();
 
-    tokio::time::timeout(timeout, async {
-        stream.write_all(&len_bytes).await.map_err(Error::Io)?;
-        stream.write_all(message).await.map_err(Error::Io)?;
-        stream.flush().await.map_err(Error::Io)?;
+    with_timeout(timeout, async {
+        writer.write_all(&len_bytes).await.map_err(Error::Io)?;
+        writer.write_all(message).await.map_err(Error::Io)?;
+        writer.flush().await.map_err(Error::Io)?;
         trace!("kdc: TCP sent {} bytes", message.len());
         Ok::<(), Error>(())
     })
@@ -182,7 +186,7 @@ async fn send_tcp_once(addr: &str, message: &[u8], timeout: Duration) -> Result<
 
     // Receive: 4-byte big-endian length prefix.
     let mut len_buf = [0u8; 4];
-    tokio::time::timeout(timeout, stream.read_exact(&mut len_buf))
+    with_timeout(timeout, reader.read_exact(&mut len_buf))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|e| {
@@ -203,7 +207,7 @@ async fn send_tcp_once(addr: &str, message: &[u8], timeout: Duration) -> Result<
 
     // Read the response body.
     let mut buf = vec![0u8; resp_len];
-    tokio::time::timeout(timeout, stream.read_exact(&mut buf))
+    with_timeout(timeout, reader.read_exact(&mut buf))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|e| {
@@ -367,8 +371,9 @@ pub async fn discover_kdc(_realm: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
+    // The fake KDCs run on tokio's own sockets.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
 
     // ── DER parsing tests ──────────────────────────────────────────
 

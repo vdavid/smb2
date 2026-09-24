@@ -60,7 +60,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use tokio::time::Instant;
+use crate::rt::Instant;
 
 use crate::client::tuning::{Estimator, Headroom, LearnedHeadroom, RateMeasure, Tuning};
 

@@ -3,8 +3,8 @@
 [![CI](https://github.com/vdavid/smb2/actions/workflows/ci.yml/badge.svg)](https://github.com/vdavid/smb2/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
-Pure-Rust SMB2/3 for talking to a file share over the network. No `libsmbclient`, no FFI, no mounting. Async,
-runtime-agnostic, and faster than the native macOS SMB client on uploads, downloads, listings, and deletes.
+Pure-Rust SMB2/3 for talking to a file share over the network. No `libsmbclient`, no FFI, no mounting. Async on
+tokio or smol, and faster than the native macOS SMB client on uploads, downloads, listings, and deletes.
 
 This repo ships two crates:
 
