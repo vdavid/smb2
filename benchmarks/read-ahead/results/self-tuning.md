@@ -596,8 +596,8 @@ wire time) counts as none. It's now `LearnedHeadroom::SHIPPING`, with the link-c
 - **Its worst cell, a 3 MB/s uplink at +60 ms, isn't about the headroom.** Every link-capacity candidate keeps two or
   three WRITEs queued there, so a `stat` waits 340–520 ms, where `wmax16-del` (the old delivery-paced rate) keeps
   one (160 ms). The five-run recheck repeats it (`wmax16-del` 162 ms, `ref` 344, `wmax16` 343, `wmax16-n25` 524).
-  It's a Part 2 rate question for uploads, and it's left open (see *Follow-ups*). Leave that cell out, and the pick's
-  worst is 55%.
+  It was a regression against 0.25.1's 343 ms, and it's fixed (see *The slow-uplink cell* below: 161 ms now). Leave
+  that cell out, and the pick's worst is 55%.
 
 ### Does learning beat a fixed 100 ms?
 
@@ -607,7 +607,8 @@ fixed headroom would be the honest pick if learning didn't earn its complexity.
 - **Where the learned one wins:**
   - Steady 30 MB/s links, where a fixed 100 ms still queues 3 MB: side `stat` 52 against 125 ms at +1 ms, 66 against
     125 at +5, 52 against 126 with background writers, and 107 against 141 at +20.
-  - Uploads: 72 against 141 ms at 30 MB/s / +5, 72 against 137 with stalls, and 400 against 524 at 3 MB/s / +60.
+  - Uploads: 72 against 141 ms at 30 MB/s / +5, and 72 against 137 with stalls. At 3 MB/s / +60 they tie at 161
+    after the fix below.
   - With stalls, a fixed 100 ms under-covers the 150 ms freezes. Time to the last chunk: 8 MiB took 364 ms against
     307 at 30 MB/s, and 1 MiB took 643 ms against 499 at 3 MB/s.
 - **Where they tie:** 3 MB/s downloads (both one chunk plus the round trip: 162 ms at +5, 344 at +60) and links whose
@@ -626,7 +627,7 @@ are scored by the same rule.
     against 140 at +20.
   - 3 MB/s: 162 against 345 at +5, and 344 against 527 at +60 (also with stalls and with jitter).
 - **Side `stat` p50 during an upload:** 72 ms against 142 at 30 MB/s / +5, and 72 against 141 with stalls. At
-  3 MB/s / +60 it's no better (400–524 against 344–405; see above).
+  3 MB/s / +60 it was no better (400–524 against 344–405) until the fix below, and is 161 against 343 now.
 - **Time to the last chunk (`auto`):** 8 MiB at +60 ms / 30 MB/s in 421 ms against 614, and 4 MiB at +200 ms /
   30 MB/s in 673 ms against 919. Uploading 4 MiB at +60 ms took 622 ms against 843. That's where `quick_read_limit` /
   `quick_write_limit` now compound a file that 0.25.1 streamed.
@@ -634,12 +635,63 @@ are scored by the same rule.
   cap, so the `stat` waits the same 140 ms. Heavy jitter (±40 ms normal at +20) grows the headroom to cover it, which
   is the point.
 
+## The slow-uplink cell: root cause and fix
+
+On the 3 MB/s / +60 ms uplink, a `stat` behind an upload waited 343–520 ms with every link-capacity candidate, against
+343 for 0.25.1 and 161 for the delivery-paced `wmax16-del`. A per-answer trace (`Window::on_delivery` and
+`Window::score`, temporary) ruled out the rate, which read 2.87 MB/s on a 3 MB/s link. Three things stacked on top of
+it:
+
+1. **The round trip was about three times the link's.** NEGOTIATE measured 175–204 ms, where an idle `stat` on the same
+   connection took 66–78 ms: OrbStack's port forward dials the container on the first byte, so NEGOTIATE pays that
+   handshake, and a real server forking a process per connection or waking up does the same. The fallback cap, the
+   fastest WRITE, includes the WRITE's own wire time, a whole 175 ms chunk at 3 MB/s. The target is
+   `rate × (RTT + headroom)`, so the extra ~140 ms was one extra WRITE queued.
+2. **TCP's slow start after idle taught the headroom ~190 ms.** For uploads the sender is the client side, where the
+   grid can't turn off the idle restart. The first WRITEs of each file crossed slowly and read as late answers, and
+   the backlog term then added each late answer's delay to the next one's (245 → 489 → 1,072 ms in the simulator).
+   The windowed max kept that for the whole 8 MiB file.
+3. **The open-loop drain left the slow-start surplus queued.** The window assumes what's on its way drains at the
+   measured rate from each send. With the first WRITEs crossing slower, it counted them as landed, sent more, and
+   nothing ever corrected it: 1.5 MiB stood queued for the rest of the file.
+
+The fix (`5f495d8`):
+
+- The RTT estimate drops to the quickest small request answered.
+- The first flight of a transfer isn't scored, and the backlog term only follows an on-time answer.
+- Uploads correct what's on its way against the WRITEs actually unconfirmed.
+
+Each has a test that went red first. Rerun on the rig, three runs each:
+
+| cell | `ref` (0.25.1) | `fixed100` | `wmax16-del` | `wmax16-n25` (shipping) | `meandev4-n25` |
+|---|---:|---:|---:|---:|---:|
+| up 3 MB/s +60 ms, `stat` p50 | 343 | 161 | 342 | **161** | 161 |
+| up 30 MB/s +5 ms | 141 | 106 | 142 | **52** | 51 |
+| up 30 MB/s +5 ms + stalls | 142 | 106 | 142 | **142** | 52 |
+| up 30 MB/s +60 ms | 141 | 138 | 93 | **106** | 106 |
+| up 30 MB/s +20 ms ±40 ms jitter | 150 | 99 | 154 | **165** | 144 |
+| down 3 MB/s +60 ms | 345 | 343 | 345 | **162** | 162 |
+| down 30 MB/s +5 ms | 142 | 124 | 140 | **52** | 52 |
+| down 30 MB/s +5 ms + stalls | 142 | 125 | 142 | **141** | 90 |
+| down 30 MB/s +60 ms | 143 | 142 | 142 | **139** | 144 |
+
+Throughput is within noise of `ref` in every one of these cells, except the ±40 ms jittered upload, which moves ±10%
+between runs for every candidate.
+
+**One thing moved that the pick depends on:** in the two stall cells, `wmax16-n25` now learns enough headroom to cover
+the 150 ms freezes (a `stat` waits 141–142 ms, the same as 0.25.1, at the best throughput). `meandev4-n25` keeps it at
+52–90 ms, for 2–6% less throughput. On this nine-cell subset, `meandev4-n25` has the least-bad worst cell (45%
+against 175%, the gap being those stall cells scored on listing wait). The full grid hasn't been rerun with the
+fixes, so the pick stands at `wmax16-n25`, which is no worse than 0.25.1 in any cell here. Rerunning the full grid
+with the five finalists (about 30 minutes) would settle it.
+
 ## Follow-ups
 
-1. **Slow-uplink queue depth (Part 2, uploads):** at 3 MB/s / +60 ms, link-capacity pacing keeps 2–3 WRITEs queued
-   where delivery pacing kept one, with no throughput gain. Worth a look at how `WritePipe` times confirmations on a
-   deep uplink queue before the release. It's documented in `write_behind.rs`.
-2. **Real NAS validation (Part 4)**, below.
+1. **Rerun the full grid with the fixes** (the five finalists above) to settle `wmax16-n25` against `meandev4-n25`.
+2. **Downloads keep the open-loop drain.** A NAS whose Linux restarts slow start after idle (the default) would leave
+   a similar surplus behind a download's first flight. The grid turned that off on the server, so it didn't show; the
+   real-NAS run will. The correction needs to know which READs have arrived, which `FileDownload` doesn't track.
+3. **Real NAS validation (Part 4)**, below.
 
 ## Real NAS validation
 
