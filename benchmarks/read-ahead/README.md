@@ -20,7 +20,8 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
   as `auto:<tuning>` on the group's links, on its own container (`smb2-ra-grid`, port 17545) with slow start after
   idle off. Groups: `d30 d3 d300 dfree djitter djitter3 dstall dstall3 dload up30 up3`, each under ten minutes.
 - `./target/release/read-ahead-bench score [--detail] [--control PATTERN]... CSV...`: minimax-regret tables over
-  download and upload CSVs (the scoring is defined in `src/score.rs` and `results/self-tuning.md`).
+  download and upload CSVs (the scoring is defined in `src/score.rs` and `results/self-tuning.md`). `auto:X` scores
+  as `X`; any other tuned variant (`adaptive:X`) keeps its full name, so the two never pool.
 - **Tuning candidates**: any variant takes a `:<tuning>` suffix (`auto:wmax16-n25`, `adaptive:ref`) and then runs with
   that tuning (the bench builds smb2 with the unstable `__bench-tuning` feature) on a connection of its own, so what one
   candidate learns never seeds another. Tuned variants rotate their order every run. Names are in `src/tuning.rs`:
@@ -34,6 +35,7 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
     the shared connection makes the variant after it pay slow start again (Linux restarts it after an idle period), so
     run it on its own.
   - `compound`: one compound CREATE + READ + CLOSE (`read_file_compound_sized`), the single-READ alternative.
+    Skipped for files over `MaxReadSize` (8 MiB on a QNAP).
   - `auto`: `compound` when the file fits `Connection::quick_read_limit`, `adaptive` otherwise.
   - `seq<KiB>`: sequential. `ra<KiB>x<W>`: a fixed window of W READs.
 - Per run: wall time from CREATE to the CLOSE's answer, time to the last chunk (when a consumer has every byte), chunk count, time to first chunk, the longest gap between deliveries, peak
@@ -62,7 +64,16 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
 Against a real NAS (from a machine that can reach it): `SMB_BENCH_SHARE=<share> SMB_BENCH_USER=<user>
 SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>:445 --rtt-ms real --load-writers 0
 --runs 3 --out nas.csv`. `--prep` uploads the test files to `bench/` (the `stat` probe needs `bench/f_65536.bin`) and creates `up/` for `upload`;
-`--load-writers 2` adds the background writers, which write 32 MiB files to `load/`. Delete both folders afterwards.
+`--load-writers 2` adds the background writers, which write 32 MiB files to `load/`. Delete `bench/`, `load/`, and
+`up/` afterwards, and on a QNAP also from `@Recycle/`, where its network recycle bin keeps what SMB deletes.
+
+**Compare tuned candidates under load with the writers in a separate process.** The tuning override is process-wide,
+and each writer's `write_file` takes whatever tuning was applied when that file started. Over a slow link a 32 MiB
+file outlasts a measurement, so in one process the writers mostly run the previous candidate: whichever candidate
+keeps a smaller window then competes against bigger ones, and the other way round. On the NAS over Wi-Fi that swung
+32 MiB downloads by 2×. Start the load in one process (`run --load-writers 2 --runs 100000 --variants compound
+--sizes 65536 --out /dev/null`), then measure the candidates with `--load-writers 0` in another. The Docker grid's
+writers finish a file in about 0.1 s, so there the lag is short.
 
 `results/` holds the median tables (M1 Max, OrbStack, Samba on Alpine 3.21, container capped at two CPUs):
 
@@ -75,5 +86,5 @@ SMB_BENCH_PASS=<pass> ./target/release/read-ahead-bench run --prep --addr <host>
 - `adaptive-uploads.md`: the adaptive write-behind window (0.25.0) against 0.24.4's fixed 32-WRITE window, fixed
   512 KiB windows, and the compound write with and without `quick_write_limit`, on shaped uplinks, 2026-09-23.
 - `self-tuning.md`: ten headroom and rate candidates on a grid of 28 shaped links (RTT, bandwidth, jitter, server
-  stalls, background writers, uploads), picked by minimax regret, 2026-09-24. Samba 4.23 on Alpine 3.24. Has the
-  real-NAS validation command.
+  stalls, background writers, uploads), picked by minimax regret, 2026-09-24. Samba 4.23 on Alpine 3.24. Also the
+  real-NAS validation (a QNAP over Wi-Fi) and its commands.

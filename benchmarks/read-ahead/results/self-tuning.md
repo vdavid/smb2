@@ -807,33 +807,181 @@ Throughput is within noise of `ref` everywhere else.
 
 ## Follow-ups
 
-1. **Downloads keep the open-loop drain.** A NAS whose Linux restarts slow start after idle (the default) would leave
-   a similar surplus behind a download's first flight. The grid turned that off on the server, so it didn't show; the
-   real-NAS run will. The correction needs to know which READs have arrived, which `FileDownload` doesn't track.
-2. **Real NAS validation (Part 4)**, below.
+1. **Downloads keep the open-loop drain.** A server that restarts slow start after idle (the Linux default) could
+   leave a surplus behind a download's first flight. The grid turned that off on the server. The real NAS below has it
+   on, and every download there started after an idle spell, but it didn't show: the side `stat` during an unloaded
+   download was shorter than 0.25.1's, not longer. It could still show where slow start takes many round trips (a
+   WAN). The correction needs to know which READs have arrived, which `FileDownload` doesn't track.
+2. **Settle the two leans on a wired link.** On the NAS over Wi-Fi, loaded 32 MiB downloads (−14%, p ≈ 0.10) and
+   unloaded 8 MiB uploads (p ≈ 0.08) lean against `shipping`, below that link's noise. See *Real NAS validation*.
+3. **A side `stat` sometimes waits out a whole download.** On the NAS, 30–40% of unloaded 32 MiB downloads had one
+   `stat` that waited at least 80% of the ~600 ms transfer, for every candidate alike, `ref` included (17 runs each:
+   `shipping` 7, `ref` 6). A 4 MiB window at 54 MB/s should bound that near 80 ms. It isn't a tuning effect, and the
+   cause (credits, the server's ordering, or the probe's scheduling) isn't established.
 
-## Real NAS validation
+## Real NAS validation (2026-09-24)
 
-*To be filled by the next agent (issue #8, Part 4). Record hardware generically ("QNAP TS-464, QTS 5.x, Samba"), no
-hostnames or share names.*
+Issue #8, Part 4: `shipping` (`meandev4-b33`) against `ref` (0.25.1) on a real NAS, over Wi-Fi.
 
-Command (from a machine that can reach the NAS, credentials from the maintainer's notes, never pasted here):
+**Verdict: the criterion holds.** `shipping` is no worse than 0.25.1 beyond noise in any cell: downloads and uploads,
+with and without load, on throughput, side-`stat` wait, and `auto`'s per-file time. One cell is significantly better
+(the side `stat` during an unloaded download: 61 ms against 92). Two cells lean the other way below the noise (a loaded
+32 MiB download at −14%, and unloaded 8 MiB uploads), and a wired rerun should settle them (*Follow-ups*).
+
+### Rig
+
+- **Server:** QNAP TS-464 (four-core Celeron N5095, 64 GB), QuTS hero 6.0 (ZFS on four HDDs with an NVMe cache),
+  Samba 4.20. `MaxReadSize` 8 MiB, `MaxWriteSize` 1 MiB. TCP slow start after idle on, the Linux default.
+- **A busy server:** its own background jobs (a photo library's indexing) kept the CPU near 100% the whole time, with
+  a load average of 11–14. That's a realistic home NAS, and it's noise.
+- **Client:** an M3 Max laptop on **Wi-Fi only** (802.11ax, 5 GHz, 80 MHz, −67 dBm, 432 Mbit/s PHY rate), ~3.5 ms
+  ping to the NAS. The laptop had no Ethernet link, so there's no wired run. Unloaded, downloads ran at 54 MB/s and
+  uploads at 17–38 MB/s.
+- **Downloads follow an idle spell:** in every interleaved run, each candidate has a connection of its own that sits
+  idle at least 0.6 s (usually seconds) while the others run, so each transfer restarts TCP slow start. That's the case
+  the Docker grid turned off.
+- **The noise floor:** both candidates compound a 4 MiB download here, so they send the identical request, and their
+  medians still came out at 107 and 130 ms. A difference under ~20% in a median isn't signal on this link, so each
+  comparison below also has a Mann–Whitney rank-sum z over the runs (|z| > 1.96 is p < 0.05; negative means `shipping`
+  is lower).
+
+### Under load, the benchmark needed a different design
+
+The first pass (all seven variants, five runs) made loaded downloads look alarming: 32 MiB at 9.3 MB/s for `shipping`
+against 22.3 for `ref`. The cause was the benchmark. The tuning override is process-wide, and the background writers'
+`write_file` takes whichever tuning was applied when its file started. Over Wi-Fi a writer's 32 MiB file takes about
+3 s, longer than a measurement, so during `shipping`'s turn the writers mostly ran `ref`'s bigger windows, and the
+other way round. (A 12-run rerun in the same design gave 19.0 against 17.9 MB/s: a confound on top of Wi-Fi noise.)
+The loaded numbers below come from two designs without it:
+
+- **Fixed load**, the primary one: the writers run in a process of their own on the default tuning, and the
+  candidates are interleaved against them, so both face identical competition.
+- **Solo**: one candidate per process, alternating, so the writers run the candidate under test. That's "every
+  transfer runs this tuning", which is how Cmdr's own transfers would compete with each other.
+
+The writers moved 18–28 MB/s, over the same Wi-Fi.
+
+### Commands
+
+Credentials come from the maintainer's notes and are never pasted here.
 
 ```sh
 cd benchmarks/read-ahead && cargo build --release
 export SMB_BENCH_SHARE=<share> SMB_BENCH_USER=<user> SMB_BENCH_PASS=<pass>
-B=./target/release/read-ahead-bench
+B=./target/release/read-ahead-bench; H=<host>:445
+# First pass, every variant (the loaded rows have the confound above)
 for w in 0 2; do
-  $B run --prep --addr <host>:445 --rtt-ms real --load-writers $w --runs 5 \
+  $B run --prep --addr $H --rtt-ms real --load-writers $w --runs 5 \
     --variants auto:shipping,auto:ref,auto:wmax16-b33,auto:fixed100,compound,adaptive:ref,adaptive:shipping \
-    --sizes 65536,1048576,4194304,8388608,33554432 --out nas-wired.csv
+    --sizes 65536,1048576,4194304,8388608,33554432 --out nas.csv
+  $B upload --addr $H --rtt-ms real --load-writers $w --runs 5 \
+    --variants auto:shipping,auto:ref,auto:wmax16-b33 --sizes 1048576,4194304,8388608,33554432 --out nas-up.csv
 done
-$B upload --addr <host>:445 --rtt-ms real --load-writers 0 --runs 5 \
-  --variants auto:shipping,auto:ref,auto:wmax16-b33 --sizes 1048576,4194304,8388608,33554432 --out nas-wired-up.csv
-$B score --detail nas-wired.csv nas-wired-up.csv
+# No load: shipping against ref, more runs
+$B run --addr $H --rtt-ms real --load-writers 0 --runs 12 --variants auto:shipping,auto:ref \
+  --sizes 1048576,4194304,8388608,33554432 --out ab-down.csv
+$B upload --addr $H --rtt-ms real --load-writers 0 --runs 12 --variants auto:shipping,auto:ref \
+  --sizes 4194304,33554432 --out ab-up.csv                         # and 14 runs of 8388608 alone
+# Fixed load: the writers in a process of their own
+$B run --addr $H --rtt-ms real --load-writers 2 --runs 100000 --variants compound --sizes 65536 --out /dev/null &
+$B run --addr $H --rtt-ms real --load-writers 0 --runs 12 --variants auto:shipping,auto:ref \
+  --sizes 1048576,4194304,8388608,33554432 --out fixed-down.csv   # then 14 runs of 8 and 32 MiB, and 12 of 32 MiB
+                                                                    # with auto:fixed250,auto:wmax16-b33 added
+$B upload --addr $H --rtt-ms real --load-writers 0 --runs 10 --variants auto:shipping,auto:ref \
+  --sizes 4194304,8388608,33554432 --out fixed-up.csv
+kill %1
+# Solo: one candidate per process, four rounds of three runs each
+for i in 1 2 3 4; do for v in auto:shipping auto:ref; do
+  $B run --addr $H --rtt-ms real --load-writers 2 --runs 3 --variants $v \
+    --sizes 1048576,4194304,8388608,33554432 --out solo-down.csv
+  $B upload --addr $H --rtt-ms real --load-writers 2 --runs 3 --variants $v \
+    --sizes 4194304,8388608,33554432 --out solo-up.csv
+done; done
 ```
 
-`shipping` is `meandev4-b33`, `ref` is 0.25.1's behavior, and `wmax16-b33` is the stall-covering alternative. Repeat
-over Wi-Fi into `nas-wifi*.csv` if possible, then delete `bench/`, `load/`, and `up/` from the share. Success:
-`shipping` is no worse than `ref` on throughput or on side-`stat` wait, beyond noise. A real NAS's disk stalls are
-where the stall trade gets tested for real. So is a download right after an idle spell (see *Follow-ups*).
+Then delete `bench/`, `load/`, and `up/` from the share, and from its `@Recycle/`.
+
+### No load
+
+Downloads, 17 runs each (the first pass plus the rerun, both interleaved):
+
+| | `shipping` | `ref` | z |
+|---|---:|---:|---:|
+| 32 MiB, MB/s | 54.5 | 53.8 | 0.29 |
+| side `stat` p50 / max during it, ms | **61** / 514 | 92 / 851 | **−2.70** (p50) |
+| `auto` 1 MiB, last chunk in hand, ms | 55 | 54 | −0.19 |
+| `auto` 4 MiB | 130 | 107 | 0.53 |
+| `auto` 8 MiB | 189 | 192 | −0.71 |
+
+At 54 MB/s both compound 4 MiB every time, and 1 and 8 MiB in 15 and 14 runs of 17, so the per-file rows mostly
+compare the same request. The first pass's other variants, five runs, 32 MiB: `wmax16-b33` 54.0 MB/s with the `stat` at 58 / 86 ms,
+`fixed100` 53.1 at 77 / 109, `adaptive:shipping` 52.1 at 65 / 508, and `adaptive:ref` 56.0 at 71 / 116.
+
+Uploads, 17 runs each (8 MiB: 19):
+
+| | `shipping` | `ref` | z |
+|---|---:|---:|---:|
+| 32 MiB, MB/s | 27.6 | 17.4 | 0.64 |
+| side `stat` p50 / max during it, ms | 95 / 559 | 105 / 1,070 | −1.64 (p50) |
+| `auto` 4 MiB, CLOSE answered, ms | 184 | 303 | −0.46 |
+| `auto` 8 MiB | 913 | 312 | 1.77 |
+
+The 8 MiB upload is bimodal for both candidates: a fast mode near 250 ms and a slow one from 1 to 2.9 s. `shipping`
+landed in the slow mode in 11 runs of 19 and `ref` in seven, which is what moves the median so far. p ≈ 0.08.
+
+### Under load: fixed load (primary)
+
+Downloads, interleaved against writers in a separate process. 32 MiB: 38 runs each, 8 MiB: 26, 1 and 4 MiB: 12.
+
+| | `shipping` | `ref` | z |
+|---|---:|---:|---:|
+| 32 MiB, MB/s | 21.0 | 24.4 | −1.65 |
+| side `stat` p50 / max during it, ms | 214 / 1,277 | 178 / 957 | 0.30 (p50) |
+| longest gap between chunks, median, ms | 392 | 296 | 1.49 |
+| `auto` 1 MiB, last chunk in hand, ms | 332 | 392 | 0.06 |
+| `auto` 4 MiB | 724 | 1,322 | −0.17 |
+| `auto` 8 MiB | 1,456 | 1,386 | 0.71 |
+
+The three 32 MiB sets gave −22%, −20%, and +11% (17.1 against 21.8, 22.1 against 27.8, 23.7 against 21.4). In the
+third, `fixed250` (the link-capacity rate with 0.25.1's fixed 250 ms) ran 21.8 and `wmax16-b33` 19.9, all within that
+set's noise, so it can't tell rate from headroom.
+
+Uploads, 10 runs each:
+
+| | `shipping` | `ref` | z |
+|---|---:|---:|---:|
+| 32 MiB, MB/s | 9.9 | 9.5 | 0.68 |
+| side `stat` p50 / max during it, ms | 235 / 1,576 | 289 / 1,575 | −0.23 (p50) |
+| `auto` 4 MiB, CLOSE answered, ms | 1,889 | 1,463 | 1.29 |
+| `auto` 8 MiB | 1,234 | 1,402 | −0.30 |
+
+### Under load: solo
+
+12 runs each.
+
+| | `shipping` | `ref` | z |
+|---|---:|---:|---:|
+| down 32 MiB, MB/s | 20.5 | 18.0 | 1.21 |
+| down side `stat` p50 / max, ms | 146 / 1,448 | 1,068 / 1,773 | −1.73 (p50) |
+| down `auto` 1 / 4 / 8 MiB, ms | 405 / 269 / 481 | 433 / 817 / 655 | −0.52 / −1.50 / −1.10 |
+| up 32 MiB, MB/s | 8.3 | 8.6 | 0.58 |
+| up side `stat` p50 / max, ms | 741 / 2,064 | 528 / 1,648 | −0.35 (p50) |
+| up `auto` 4 / 8 MiB, ms | 2,267 / 2,121 | 1,641 / 2,669 | 0.29 / −0.64 |
+
+### What leans against `shipping`
+
+Neither reaches p < 0.05, and neither shows in the other design, but both are worth a wired rerun:
+
+- **Loaded 32 MiB download, fixed load: −14% (p ≈ 0.10).** The plausible cause is the trade the grid already
+  measured: the learned headroom stays small between stalls, so it covers them less than a fixed 250 ms (−7% through
+  150 ms freezes in Docker). Here the stalls are the loaded Wi-Fi and the busy NAS, hundreds of ms to seconds long, and
+  `shipping`'s longest gap per download runs longer (median 392 ms against 296, z = 1.49): its pipe ran dry more often.
+  In the solo design, where every transfer runs `shipping`, the deficit is gone (20.5 against 18.0 MB/s).
+- **Unloaded 8 MiB uploads: slow mode more often** (11 of 19 against seven, p ≈ 0.08). 32 MiB uploads on the same
+  runs were faster (27.6 against 17.4 MB/s), and neither loaded design shows it at 8 MiB. No cause identified.
+- **4 MiB uploads under load** lean slower in both designs too (z = 1.29 and 0.29), well inside the noise.
+
+**`auto` compounds 8 MiB more often under load:** `shipping`'s link-capacity rate reads the NAS's bursts (loaded
+32 MiB runs peaked at 45–53 MB/s against a 19 MB/s median), so `quick_read_limit` covered 8 MiB in 15 of 26 fixed-load
+runs, against 12 for `ref`. The time was within noise (1,456 against 1,386 ms), but a compound READ caught in a
+stall is the case to watch. In the confounded first pass, two of them took 4.2 and 12.3 s.
