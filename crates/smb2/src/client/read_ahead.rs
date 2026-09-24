@@ -492,11 +492,15 @@ struct Arrival {
 ///   spell (RFC 5681 § 4.1), at a fraction of the rate, and more queued
 ///   ahead couldn't have made it faster. Scored, one idle spell taught a
 ///   3 MB/s uplink ~190 ms of headroom, which it kept for the whole file.
-/// - **The memory outlasts covered stalls.** Since a covered stall is
-///   invisible, a memory that forgot a stall once it stopped showing would
-///   shrink straight back under it. The windowed max keeps a sample for
-///   `answers` answers or `span` of time, whichever reaches further back.
-///   Until `answers` samples exist, the cold headroom counts as one of them.
+/// - **What ships trades stall coverage for a short queue.** The samples feed
+///   RFC 6298's mean + 4 × deviation, seeded from the first one: a stall now
+///   and then barely moves it, so recurring 150 ms freezes cost ~4–7%
+///   throughput, and a listing waits 52–108 ms through them instead of
+///   ~140. The windowed max (`Estimator::WindowedMax`, 16 answers or 10 s)
+///   covers such stalls, and holds the margin for its whole memory; on the
+///   benchmark grid its worst cell was 170% against 44%
+///   (`benchmarks/read-ahead/results/self-tuning.md`). It stays in the code
+///   for the benchmark and as the stall-covering alternative.
 ///
 /// The memory ([`Lateness`]) is shared with the next transfer the same way on
 /// the connection, so a folder of small files learns as one stream, and the
@@ -1600,6 +1604,20 @@ mod tests {
         }
     }
 
+    /// The shipping learned headroom with the windowed max (16 answers or
+    /// 10 s) in place of the shipped estimator: the benchmark's `wmax16-b33`.
+    /// Tests about how answers are scored use it, since its headroom is the
+    /// latest sample itself.
+    fn windowed_max() -> Headroom {
+        Headroom::Learned(LearnedHeadroom {
+            estimator: Estimator::WindowedMax {
+                answers: 16,
+                span: Duration::from_secs(10),
+            },
+            ..learned()
+        })
+    }
+
     /// An adaptive window with this headroom and the shipping rate measure.
     fn adaptive_with(headroom: Headroom, rtt_seed: Duration) -> Window {
         let tuning = Tuning {
@@ -1836,65 +1854,97 @@ mod tests {
     }
 
     #[test]
-    fn a_noisy_link_learns_a_larger_headroom_and_keeps_the_pipe_full() {
+    fn a_link_whose_server_freezes_trades_a_little_throughput_for_a_short_queue() {
         // 20 MB/s at +20 ms, answers jittered by up to 5 ms, and the server
-        // freezing for 150 ms every second (a NAS disk seeking). A margin at
-        // the floor idles the link for most of every freeze; the learned one
-        // grows to cover them, and runs within a few percent of 0.25.1's
-        // fixed 250 ms. (At 3 MB/s a chunk takes longer than the freeze, so
-        // whether a freeze shows at all is down to where in a chunk it lands.)
+        // freezing for 150 ms every second (a NAS disk seeking). (At 3 MB/s a
+        // chunk takes longer than the freeze, so whether a freeze shows at
+        // all is down to where in a chunk it lands.)
+        //
+        // The windowed max grows to cover the freezes and runs within 3% of
+        // 0.25.1's fixed 250 ms, but holds that margin for its whole memory,
+        // so everything else on the connection waits behind it. What ships,
+        // the mean and deviation, sees one late answer in forty and leaves
+        // most freezes uncovered: a few percent slower, and a shorter queue.
+        // The benchmark grid chose that trade (listings waited 52–108 ms
+        // under freezes against 139–142, for ~7% throughput); this pins
+        // both sides of it so a change that loses more shows up.
         let noisy = || {
             Link::new(20 * MS, 20e6)
                 .with_server_delay(|i| noise(i, 5 * MS))
                 .with_freezes(Duration::from_secs(1), 150 * MS, Duration::from_secs(20))
         };
         let file = 160 << 20;
-        let mut learned_window = adaptive(20 * MS);
-        let learned_run = noisy().download(&mut learned_window, file, CHUNK);
-        assert!(
-            learned_window.headroom() >= 100 * MS,
-            "headroom {:?}",
-            learned_window.headroom()
-        );
         let took = |run: &Run| run.delivered_at.last().unwrap().as_secs_f64();
-        let at_floor = noisy().download(
-            &mut adaptive_with(Headroom::Fixed(learned().floor), 20 * MS),
-            file,
-            CHUNK,
-        );
-        let fixed_250 = noisy().download(
+        let median_queue = |run: &Run| {
+            let mut q = run.queued.clone();
+            q.sort_unstable();
+            q[q.len() / 2]
+        };
+        let fixed_250 = took(&noisy().download(
             &mut adaptive_with(Headroom::Fixed(250 * MS), 20 * MS),
             file,
             CHUNK,
-        );
-        let (learned_s, floor_s, fixed_s) = (took(&learned_run), took(&at_floor), took(&fixed_250));
+        ));
+        let at_floor = took(&noisy().download(
+            &mut adaptive_with(Headroom::Fixed(learned().floor), 20 * MS),
+            file,
+            CHUNK,
+        ));
+
+        let mut windowed_window = adaptive_with(windowed_max(), 20 * MS);
+        let windowed_run = noisy().download(&mut windowed_window, file, CHUNK);
         assert!(
-            learned_s < floor_s && learned_s <= fixed_s * 1.03,
-            "learned {learned_s:.2} s, floor {floor_s:.2} s, fixed 250 ms {fixed_s:.2} s"
+            windowed_window.headroom() >= 100 * MS,
+            "windowed max: headroom {:?}",
+            windowed_window.headroom()
+        );
+        let windowed_s = took(&windowed_run);
+        assert!(
+            windowed_s < at_floor && windowed_s <= fixed_250 * 1.03,
+            "windowed max {windowed_s:.2} s, floor {at_floor:.2} s, fixed 250 ms {fixed_250:.2} s"
+        );
+
+        let mut shipped_window = adaptive(20 * MS);
+        let shipped_run = noisy().download(&mut shipped_window, file, CHUNK);
+        let shipped_s = took(&shipped_run);
+        assert!(
+            shipped_s <= fixed_250 * 1.05,
+            "shipped {shipped_s:.2} s, fixed 250 ms {fixed_250:.2} s"
+        );
+        assert!(
+            median_queue(&shipped_run) < median_queue(&windowed_run),
+            "shipped queues {} bytes, windowed max {}",
+            median_queue(&shipped_run),
+            median_queue(&windowed_run)
         );
     }
 
     #[test]
     fn the_headroom_shrinks_once_the_noise_stops() {
         // The same freezes for the first three seconds, then a quiet link.
-        // Covered freezes leave no trace, so the memory has to outlast the
-        // gaps between them; once the noise stops for longer than that, the
-        // margin goes back to the floor.
-        let link = Link::new(20 * MS, 20e6).with_freezes(
-            Duration::from_secs(1),
-            150 * MS,
-            Duration::from_secs(3),
-        );
-        let mut w = adaptive(20 * MS);
-        let run = link.download(&mut w, 320 << 20, CHUNK);
-        let Estimator::WindowedMax { span, .. } = learned().estimator else {
-            panic!("the windowed max ships");
+        // The windowed max's memory has to outlast the gaps between covered
+        // freezes (they leave no trace); once the noise stops for longer than
+        // that, the margin goes back to the floor. What ships forgets faster,
+        // and ends at the floor too.
+        let link = || {
+            Link::new(20 * MS, 20e6).with_freezes(
+                Duration::from_secs(1),
+                150 * MS,
+                Duration::from_secs(3),
+            )
         };
+        let mut w = adaptive_with(windowed_max(), 20 * MS);
+        let run = link().download(&mut w, 320 << 20, CHUNK);
+        let span = Duration::from_secs(10);
         let quiet_for = *run.delivered_at.last().unwrap() - Duration::from_secs(3);
         assert!(quiet_for > span, "quiet for {quiet_for:?}, memory {span:?}");
         let grew_to = run.headroom.iter().max().unwrap();
         assert!(*grew_to >= 100 * MS, "grew to {grew_to:?}");
         assert_eq!(w.headroom(), learned().floor);
+
+        let mut shipped = adaptive(20 * MS);
+        link().download(&mut shipped, 320 << 20, CHUNK);
+        assert_eq!(shipped.headroom(), learned().floor);
     }
 
     #[test]
@@ -1970,22 +2020,29 @@ mod tests {
 
     #[test]
     fn a_learned_headroom_carries_over_to_the_next_transfer() {
-        // A 2 MiB file is four answers, too few to trust on their own: a fresh
-        // window keeps the cold margin through all of it. After a download
-        // that learned the link is quiet, the next file starts from that.
+        // A 2 MiB file is four answers, too few for the windowed max to trust
+        // on their own: a fresh window keeps the cold margin through all of
+        // it. After a download that learned the link is quiet, the next file
+        // starts from that. (What ships learns from its first answer, so the
+        // difference only shows with the windowed max; the memory is carried
+        // the same way for both.)
+        let tuning = Tuning {
+            headroom: windowed_max(),
+            ..Tuning::SHIPPING
+        };
         let link = Link::new(20 * MS, 50e6);
-        let mut first = adaptive(20 * MS);
+        let mut first = adaptive_with(windowed_max(), 20 * MS);
         link.download(&mut first, 16 << 20, CHUNK);
         let hint = LinkHint {
             rtt: Some(20 * MS),
             rate: None,
             lateness: first.lateness_to_share(),
         };
-        let mut second = Window::new(ReadAhead::Adaptive, CHUNK, hint);
+        let mut second = Window::with_tuning(ReadAhead::Adaptive, CHUNK, hint, tuning);
         link.download(&mut second, 2 << 20, CHUNK);
         assert_eq!(second.headroom(), learned().floor);
 
-        let mut fresh = adaptive(20 * MS);
+        let mut fresh = adaptive_with(windowed_max(), 20 * MS);
         link.download(&mut fresh, 2 << 20, CHUNK);
         assert_eq!(fresh.headroom(), learned().cold);
     }
@@ -1996,10 +2053,12 @@ mod tests {
         // answers mid-transfer. Each is ~245 ms late against the rate the
         // window knew; counting each one's lateness again as backlog ahead of
         // the next compounded it to 1,072 ms (clamped to the 500 ms ceiling).
+        // Measured with the windowed max, whose headroom is the worst sample
+        // itself.
         let link =
             Link::new(60 * MS, 3e6)
                 .with_rate_wobble(|i| if (20..23).contains(&i) { 0.3 } else { 1.0 });
-        let mut w = adaptive(60 * MS);
+        let mut w = adaptive_with(windowed_max(), 60 * MS);
         let run = link.download(&mut w, 16 << 20, CHUNK);
         let peak = run.headroom.iter().max().unwrap();
         assert!(*peak < 400 * MS, "grew to {peak:?}");

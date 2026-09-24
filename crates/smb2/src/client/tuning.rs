@@ -85,16 +85,16 @@ pub struct LearnedHeadroom {
 }
 
 impl LearnedHeadroom {
-    /// What ships (`wmax16-n25` in `benchmarks/read-ahead/results/self-tuning.md`).
-    /// Without the noise tolerance (1 ms, as first shipped) the headroom
-    /// stayed pinned at the queue the cold ramp built, so a steady link
-    /// queued as much as a fixed 250 ms. Two memory lengths (8 and 16
-    /// answers) and a 20 ms floor measured within noise of each other.
+    /// What ships (`meandev4-b33` in `benchmarks/read-ahead/results/self-tuning.md`):
+    /// the least-bad worst cell on the grid, 44% against the windowed max's
+    /// 170% and 0.25.1's 214%. The windowed max holds a stall for 10 s, so
+    /// under recurring 150 ms freezes a listing waited as long as with
+    /// 0.25.1 (139–142 ms against 52–108); the mean and deviation give up
+    /// ~7% throughput there instead. Without the noise tolerance the
+    /// headroom stayed pinned at the queue the cold ramp built, and without
+    /// the backlog share at whatever margin it had.
     pub const SHIPPING: Self = Self {
-        estimator: Estimator::WindowedMax {
-            answers: 16,
-            span: Duration::from_secs(10),
-        },
+        estimator: Estimator::MeanDeviation { k: 4.0 },
         floor: Duration::from_millis(30),
         ceiling: Duration::from_millis(500),
         cold: Duration::from_millis(250),
