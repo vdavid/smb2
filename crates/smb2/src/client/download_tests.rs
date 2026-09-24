@@ -549,15 +549,20 @@ async fn a_learned_headroom_leaves_the_quick_read_limit_alone() {
     // on a quiet link, 16 MB/s still makes 4 MB one READ.
     let mock = Arc::new(MockTransport::new());
     let conn = setup_connection_with_max_read(&mock, 8 << 20);
-    // 64 READs sent together, answered back to back a millisecond apart.
+    // One READ, then 64 sent together once it's answered (the first flight
+    // teaches the headroom nothing), answered back to back a millisecond
+    // apart.
     let mut window = Window::new(ReadAhead::Adaptive, CHUNK, conn.read_link_hint());
     let t0 = tokio::time::Instant::now();
+    window.on_dispatch(t0, CHUNK);
+    let t1 = t0 + Duration::from_millis(5);
+    window.on_delivery(t1, t0, t1, CHUNK, 0);
     for _ in 0..64 {
-        window.on_dispatch(t0, CHUNK);
+        window.on_dispatch(t1, CHUNK);
     }
     for i in 0..64u64 {
-        let at = t0 + Duration::from_millis(5 + i);
-        window.on_delivery(at, t0, at, CHUNK, (63 - i) * u64::from(CHUNK));
+        let at = t1 + Duration::from_millis(5 + i);
+        window.on_delivery(at, t1, at, CHUNK, (63 - i) * u64::from(CHUNK));
     }
     conn.note_read(&window);
     assert!(

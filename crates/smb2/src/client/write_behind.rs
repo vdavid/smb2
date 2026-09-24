@@ -31,10 +31,12 @@
 //! window keeps more queued to cover the next one. A disk that stalls under
 //! writes is exactly what that is for. On a 30 MB/s uplink it halves what a
 //! `stat` waits behind an upload (70 ms against 142 ms, same throughput,
-//! `results/self-tuning.md`). Known gap from the same grid: at 3 MB/s the
-//! link-capacity rate keeps two or three WRITEs queued where the older
-//! delivery-paced rate kept one, so a `stat` waits 340–520 ms there instead
-//! of about 160 ms.
+//! `results/self-tuning.md`), and at 3 MB/s / +60 ms a `stat` waits 161 ms
+//! where 0.25.1's waited 343. An upload corrects what it estimates is still on
+//! its way against the WRITEs actually unconfirmed
+//! (`Window::with_unanswered_in_flight`): without that, the first WRITEs
+//! after an idle spell, crossing in TCP slow start, left a surplus queued for
+//! the rest of the file (1.5 MiB, a `stat` waiting ~520 ms).
 //!
 //! # Why adaptive is the default
 //!

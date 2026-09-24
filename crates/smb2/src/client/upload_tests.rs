@@ -366,6 +366,41 @@ async fn the_quick_write_limit_stays_within_the_compound_write_limit() {
     );
 }
 
+// ── The round trip ─────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn a_small_request_corrects_an_overstated_round_trip() {
+    // NEGOTIATE overstates the round trip whenever the first exchange on a
+    // connection is slow: a server starting a process for it, a proxy dialing
+    // the far end. 175 ms against a 66 ms link on the benchmark rig, which
+    // kept a 3 MB/s uplink two or three WRITEs deep. Any small request's
+    // answer is a round trip too, so the smallest one seen wins.
+    let mock = Arc::new(MockTransport::new());
+    answer_finish(&mock);
+    let conn = setup_connection(&mock);
+    conn.set_estimated_rtt(Some(Duration::from_millis(500)));
+    let writer = FileWriter::new(test_tree(), conn.clone(), test_file_id(), 64 * KIB);
+    upload(writer, Vec::new()).await.unwrap().unwrap();
+    let rtt = conn.estimated_rtt().expect("a round trip");
+    assert!(rtt < Duration::from_millis(500), "still {rtt:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_never_counts_as_a_round_trip() {
+    // A WRITE's answer also waits for its payload to cross the uplink and
+    // reach the disk, so it says nothing about the round trip.
+    let mock = Arc::new(MockTransport::new());
+    answer_writes(&mock, 1, 64 * KIB);
+    let conn = setup_connection(&mock);
+    conn.set_estimated_rtt(Some(Duration::from_millis(500)));
+    let mut writer = FileWriter::new(test_tree(), conn.clone(), test_file_id(), 64 * KIB)
+        .with_write_behind(WriteBehind::Fixed(1));
+    writer.write_chunk(&vec![7; 64 * 1024]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(sent_writes(&mock).len(), 1);
+    assert_eq!(conn.estimated_rtt(), Some(Duration::from_millis(500)));
+}
+
 // ── Every pipelined write path paces the same way ──────────────────────
 
 #[tokio::test(start_paused = true)]

@@ -325,7 +325,10 @@ impl WritePipe {
     fn window(&mut self) -> &mut Window {
         let (policy, chunk) = (self.policy, self.chunk_size);
         let conn = &self.conn;
-        self.window
-            .get_or_insert_with(|| Window::new(policy, chunk, conn.write_link_hint()))
+        // Each confirmation is handled as it lands, so what's in flight is
+        // exactly what the server hasn't answered.
+        self.window.get_or_insert_with(|| {
+            Window::new(policy, chunk, conn.write_link_hint()).with_unanswered_in_flight()
+        })
     }
 }

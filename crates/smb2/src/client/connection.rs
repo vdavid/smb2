@@ -209,6 +209,11 @@ const STALE_WAITER_AFTER: std::time::Duration = std::time::Duration::from_secs(1
 /// delivery replaces it with a measurement.
 const RATE_HINT_TTL: Duration = Duration::from_secs(30);
 
+/// The largest answer whose round trip still counts toward the connection's
+/// RTT estimate (`Inner::note_round_trip`): a `stat`'s or a CLOSE's, not a
+/// payload whose own time on the wire would ride along.
+const ROUND_TRIP_SAMPLE_MAX: usize = 4096;
+
 /// What a transfer left on the connection, unless it's older than
 /// [`RATE_HINT_TTL`].
 fn recent<T: Copy>(noted: &StdMutex<Option<(tokio::time::Instant, T)>>) -> Option<T> {
@@ -1802,7 +1807,8 @@ struct Inner {
     /// `MaxWriteSize` or a different dialect. Keeping the first negotiation's
     /// numbers would size every chunk against a server that no longer exists.
     params: StdMutex<Option<NegotiatedParams>>,
-    /// Estimated round-trip time measured during negotiate.
+    /// Estimated round-trip time: NEGOTIATE's, lowered by the quickest small
+    /// request answered since (`Inner::note_round_trip`).
     estimated_rtt: StdMutex<Option<Duration>>,
     /// The last link rate a download measured on this connection, in bytes
     /// per second, and when. Seeds the next download's read-ahead
@@ -2053,6 +2059,46 @@ impl Inner {
                 w.sent_at = Some(now);
                 w.last_activity = now;
             }
+        }
+    }
+
+    /// Lower the round-trip estimate to `waiter`'s, if its request was a small
+    /// one answered with a small frame.
+    ///
+    /// NEGOTIATE's round trip overstates the link whenever the first exchange
+    /// on a connection is slow: a server starting a process for it, a waking
+    /// NAS, a proxy dialing the far end (175 ms against a 66 ms link on the
+    /// read-ahead benchmark rig). The adaptive windows budget
+    /// `rate × (RTT + headroom)`, so an overstated RTT keeps a slow link a
+    /// chunk or two deeper than it needs, and every listing waits behind it.
+    /// Any small request's answer is a round trip too, so the smallest one
+    /// wins, as TCP's minimum RTT does.
+    ///
+    /// Only what can't understate counts: timed from registration (before the
+    /// bytes reach the socket, so a queue only adds), never a READ or WRITE
+    /// (their payload's own time on the wire rides along) or a request the
+    /// server parked with STATUS_PENDING, and only answers of at most
+    /// [`ROUND_TRIP_SAMPLE_MAX`] bytes. Every sample is at least the real
+    /// round trip, so the minimum can only come down toward it.
+    fn note_round_trip(&self, waiter: &Waiter, response_len: usize) {
+        let small = matches!(
+            waiter.command,
+            Command::Create
+                | Command::Close
+                | Command::QueryInfo
+                | Command::SetInfo
+                | Command::Echo
+                | Command::TreeConnect
+                | Command::TreeDisconnect
+                | Command::Flush
+        );
+        if !small || waiter.async_id.is_some() || response_len > ROUND_TRIP_SAMPLE_MAX {
+            return;
+        }
+        let sample = waiter.registered_at.elapsed();
+        let mut rtt = self.estimated_rtt.lock().unwrap();
+        if let Some(current) = rtt.as_mut() {
+            *current = (*current).min(sample);
         }
     }
 
@@ -2838,7 +2884,8 @@ impl Connection {
         Ok(())
     }
 
-    /// Get the estimated round-trip time.
+    /// Get the estimated round-trip time: NEGOTIATE's, lowered by the
+    /// quickest small request (a `stat`, a CLOSE, an ECHO) answered since.
     pub fn estimated_rtt(&self) -> Option<Duration> {
         *self.inner.estimated_rtt.lock().unwrap()
     }
@@ -5603,7 +5650,11 @@ async fn receiver_loop(
         }
 
         for (msg_id, result) in routable {
-            let maybe_tx = inner.waiters.lock().unwrap().remove(&msg_id).map(|w| w.tx);
+            let waiter = inner.waiters.lock().unwrap().remove(&msg_id);
+            if let (Some(w), Ok(frame)) = (&waiter, &result) {
+                inner.note_round_trip(w, frame.raw.len());
+            }
+            let maybe_tx = waiter.map(|w| w.tx);
             match maybe_tx {
                 Some(tx) => {
                     let was_err = result.is_err();

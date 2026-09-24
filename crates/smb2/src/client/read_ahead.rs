@@ -464,6 +464,16 @@ struct Arrival {
 ///   the benchmark). Idle time under 5 ms or a quarter of the answer's own
 ///   time on the wire, whichever is longer, counts as none
 ///   (`LearnedHeadroom::noise_floor` / `noise_share`).
+/// - **A backlog follows an on-time answer.** After a stall the held answers
+///   come back to back, so only the first is late. Late answers in a row
+///   mean the link slowed, and each waited behind the late one before it,
+///   which is no backlog; counted as one, a three-answer slowdown compounded
+///   to 1,072 ms.
+/// - **The first flight isn't scored.** What a transfer sends before its
+///   first answer lands crosses while TCP restarts slow start after an idle
+///   spell (RFC 5681 § 4.1), at a fraction of the rate, and more queued
+///   ahead couldn't have made it faster. Scored, one idle spell taught a
+///   3 MB/s uplink ~190 ms of headroom, which it kept for the whole file.
 /// - **The memory outlasts covered stalls.** Since a covered stall is
 ///   invisible, a memory that forgot a stall once it stopped showing would
 ///   shrink straight back under it. The windowed max keeps a sample for
@@ -495,8 +505,14 @@ pub(crate) struct Window {
     lateness: Lateness,
     /// Whether this transfer has scored an answer's lateness yet.
     learned: bool,
-    /// The latest answer scored for lateness, by arrival.
-    last_scored: Option<Arrival>,
+    /// The latest answer scored for lateness, by arrival, and how late it
+    /// scored.
+    last_scored: Option<(Arrival, Duration)>,
+    /// When this transfer's first answer landed.
+    first_arrival: Option<Instant>,
+    /// Whether `bytes_in_flight` counts only requests not yet answered
+    /// (`with_unanswered_in_flight`).
+    in_flight_is_unanswered: bool,
     /// When each request still in flight went out, oldest first.
     sent_in_flight: VecDeque<Instant>,
     /// `(when, total bytes delivered by then)`, oldest first. The first entry
@@ -536,12 +552,29 @@ impl Window {
             }),
             learned: false,
             last_scored: None,
+            first_arrival: None,
+            in_flight_is_unanswered: false,
             sent_in_flight: VecDeque::with_capacity(ADAPTIVE_MAX_REQUESTS),
             deliveries: VecDeque::with_capacity(RATE_SAMPLES + 1),
             delivered: 0,
             unarrived: 0.0,
             unarrived_at: None,
         }
+    }
+
+    /// Declare that the `bytes_in_flight` passed to `on_delivery` counts only
+    /// requests not yet answered, so the window can correct its open-loop
+    /// estimate of what's still on its way against it.
+    ///
+    /// True for uploads: `WritePipe` handles each confirmation as it comes.
+    /// Not for downloads: chunks are delivered in file order, so a READ that
+    /// Samba answered early still counts as in flight until the ones ahead of
+    /// it are taken, and correcting against that holds READs back on a
+    /// reordering server until the link really idles (the headroom then
+    /// learned 291 ms on a link that never needed any).
+    pub(crate) fn with_unanswered_in_flight(mut self) -> Self {
+        self.in_flight_is_unanswered = true;
+        self
     }
 
     /// Whether to send a READ of `next_len` bytes, given what's in flight.
@@ -610,6 +643,18 @@ impl Window {
         // Everything delivered has arrived, so what's still on its way is at
         // most what's still in flight.
         self.unarrived = self.unarrived.min(bytes_in_flight as f64);
+        // And, where `bytes_in_flight` counts only unanswered requests, at
+        // least that less what the link could have carried since this answer
+        // landed. The drain alone is open-loop: when the link starts slower
+        // than the rate it assumes (TCP restarting slow start after an idle
+        // spell, another flow on the link), it counts bytes as landed that
+        // are still queued, and the window kept that surplus queued for good
+        // (1.5 MiB, a `stat` waiting ~520 ms, on a 3 MB/s uplink). See
+        // `with_unanswered_in_flight` for why downloads don't get it.
+        if let Some(rate) = self.rate().filter(|_| self.in_flight_is_unanswered) {
+            let since = now.saturating_duration_since(arrived_at).as_secs_f64();
+            self.unarrived = self.unarrived.max(bytes_in_flight as f64 - rate * since);
+        }
 
         let landed = match self.tuning.rate {
             RateMeasure::Deliveries => now,
@@ -632,6 +677,7 @@ impl Window {
             // Nothing is in flight, whatever went unmatched.
             self.sent_in_flight.clear();
         }
+        self.first_arrival = Some(self.first_arrival.map_or(arrived_at, |f| f.min(arrived_at)));
         let arrival = Arrival {
             sent: dispatched_at,
             at: arrived_at,
@@ -686,9 +732,18 @@ impl Window {
         };
         let (mut ideal, on_the_wire) = soonest(&arrival);
         let mut queued_ahead = Duration::ZERO;
-        if let Some(previous) = self.last_scored {
+        if let Some((previous, previous_late)) = self.last_scored {
             ideal = ideal.max(previous.at + on_the_wire);
-            queued_ahead = previous.at.saturating_duration_since(soonest(&previous).0);
+            // A backlog only if the answer before was on time. After a stall,
+            // the held answers come back to back, so only the first is late;
+            // late answers in a row mean the link slowed, and each then waited
+            // behind the late one before it, which is no backlog anything
+            // queued could have used. Counted anyway, every late answer in a
+            // run added onto the next (352, 505, 795 ms on a link that slowed
+            // to a third of its rate for three answers).
+            if previous_late.is_zero() {
+                queued_ahead = previous.at.saturating_duration_since(soonest(&previous).0);
+            }
         }
         let idle = arrival.at.saturating_duration_since(ideal);
         let noise = learned
@@ -699,14 +754,24 @@ impl Window {
         } else {
             idle + queued_ahead
         };
-        self.lateness.observe(late, arrival.at, &learned);
+        // The first flight (everything sent before this transfer's first
+        // answer landed) says how fast TCP ramped, not how the server
+        // behaves: after an idle spell longer than its retransmit timeout,
+        // TCP restarts slow start (RFC 5681 § 4.1), so those answers cross at
+        // a fraction of the rate, and more queued ahead of them couldn't have
+        // made them faster. Scored, one idle spell taught the headroom
+        // ~190 ms that it then kept for the rest of the file.
+        let first_flight = self.first_arrival.is_some_and(|first| arrival.sent < first);
+        if !first_flight {
+            self.lateness.observe(late, arrival.at, &learned);
+            self.learned = true;
+        }
         if self
             .last_scored
-            .is_none_or(|previous| previous.at <= arrival.at)
+            .is_none_or(|(previous, _)| previous.at <= arrival.at)
         {
-            self.last_scored = Some(arrival);
+            self.last_scored = Some((arrival, late));
         }
-        self.learned = true;
     }
 
     /// The rate to pace by, in bytes per second. Before the first delivery,
@@ -1849,6 +1914,55 @@ mod tests {
         let mut fresh = adaptive(20 * MS);
         link.download(&mut fresh, 2 << 20, CHUNK);
         assert_eq!(fresh.headroom(), learned().cold);
+    }
+
+    #[test]
+    fn a_run_of_late_answers_is_not_counted_twice() {
+        // 3 MB/s at +60 ms, the link slowing to a third of its rate for three
+        // answers mid-transfer. Each is ~245 ms late against the rate the
+        // window knew; counting each one's lateness again as backlog ahead of
+        // the next compounded it to 1,072 ms (clamped to the 500 ms ceiling).
+        let link =
+            Link::new(60 * MS, 3e6)
+                .with_rate_wobble(|i| if (20..23).contains(&i) { 0.3 } else { 1.0 });
+        let mut w = adaptive(60 * MS);
+        let run = link.download(&mut w, 16 << 20, CHUNK);
+        let peak = run.headroom.iter().max().unwrap();
+        assert!(*peak < 400 * MS, "grew to {peak:?}");
+    }
+
+    #[test]
+    fn a_link_that_starts_slower_than_the_hint_leaves_no_standing_queue() {
+        // 3 MB/s at +60 ms, counted the way an upload counts (every answer
+        // handled as it lands), on a connection whose last transfer measured
+        // the link and found it quiet. This one starts after an idle spell,
+        // so TCP restarts slow start and the first answers cross at a third
+        // of the rate. Two things went wrong, and the benchmark's 3 MB/s
+        // uplink showed both (1.5 MiB standing, every `stat` waiting ~520 ms
+        // where 0.25.1's waited ~340):
+        // - Those late answers taught the headroom 245 ms, compounding to
+        //   500 ms through the backlog term, and the memory kept it for the
+        //   rest of the file. Nothing queued could have made them faster.
+        // - Draining what's on its way at the hint's rate from each send, the
+        //   window counted the slow bytes as landed, and the surplus it sent
+        //   stayed queued for good.
+        let link = Link::new(60 * MS, 3e6).with_rate_wobble(|i| if i < 3 { 0.3 } else { 1.0 });
+        let mut first = adaptive(60 * MS);
+        Link::new(60 * MS, 3e6).download(&mut first, 16 << 20, CHUNK);
+        let hint = LinkHint {
+            rtt: Some(60 * MS),
+            rate: Some(3e6),
+            lateness: first.lateness_to_share(),
+        };
+        let mut w = Window::new(ReadAhead::Adaptive, CHUNK, hint).with_unanswered_in_flight();
+        let run = link.download(&mut w, 8 << 20, CHUNK);
+        assert_eq!(w.headroom(), learned().floor);
+        let settled = run.queued[run.queued.len() - 8..].iter().max().unwrap();
+        assert!(
+            *settled <= u64::from(CHUNK),
+            "still queues {settled} bytes, headroom {:?}",
+            w.headroom()
+        );
     }
 
     #[test]
