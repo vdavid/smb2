@@ -9397,6 +9397,8 @@ mod send_path_liveness_tests {
 
     #[async_trait::async_trait]
     impl TransportSend for GatedSend {
+        // Rust 1.99 renamed `fetch_update` to `try_update`, which the 1.85 MSRV lacks.
+        #[allow(deprecated)]
         async fn send(&self, data: &[u8]) -> Result<()> {
             if self
                 .stall_first

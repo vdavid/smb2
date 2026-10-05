@@ -1191,6 +1191,8 @@ impl BouncingNas {
 
 #[async_trait]
 impl SessionReviver for BouncingNas {
+    // Rust 1.99 renamed `fetch_update` to `try_update`, which the 1.85 MSRV lacks.
+    #[allow(deprecated)]
     async fn dial(&self) -> Result<(Box<dyn TransportSend>, Box<dyn TransportReceive>)> {
         self.dials.fetch_add(1, Ordering::Relaxed);
         if self.dial_hangs.load(Ordering::Relaxed) {
