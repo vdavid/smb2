@@ -147,6 +147,183 @@ async fn guest_write_read_delete() {
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
 
+/// `SMB2_LEASE_READ_CACHING | SMB2_LEASE_HANDLE_CACHING` (MS-SMB2 § 2.2.13.2.8).
+const LEASE_READ_HANDLE: u32 = 0x01 | 0x02;
+
+/// Open `path` for reading the way the macOS SMB client does after any app
+/// reads a file through the mount: sharing everything, and, with `lease`, under
+/// a read + handle-caching lease, which is what lets macOS keep the file open
+/// for about a minute after the app closed it.
+async fn hold_open(conn: &Connection, tree: &Tree, path: &str, lease: bool) -> smb2::types::FileId {
+    use smb2::msg::create::{
+        CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
+    };
+    use smb2::msg::create_context::{find, pack_contexts, parse_contexts, CreateContext};
+    use smb2::pack::{ReadCursor, Unpack};
+    use smb2::types::flags::FileAccessMask;
+    use smb2::types::status::NtStatus;
+    use smb2::types::{Command, OplockLevel};
+
+    // SMB2_CREATE_REQUEST_LEASE_V2 (MS-SMB2 § 2.2.13.2.10): LeaseKey,
+    // LeaseState, Flags, LeaseDuration, ParentLeaseKey, Epoch, Reserved.
+    let mut lease_v2 = vec![0u8; 52];
+    lease_v2[..16].copy_from_slice(b"cmdr-i307-holder");
+    lease_v2[16..20].copy_from_slice(&LEASE_READ_HANDLE.to_le_bytes());
+    let req = CreateRequest {
+        requested_oplock_level: if lease {
+            OplockLevel::Lease
+        } else {
+            OplockLevel::None
+        },
+        impersonation_level: ImpersonationLevel::Impersonation,
+        desired_access: FileAccessMask::new(
+            FileAccessMask::FILE_READ_DATA
+                | FileAccessMask::FILE_READ_ATTRIBUTES
+                | FileAccessMask::SYNCHRONIZE,
+        ),
+        file_attributes: 0,
+        share_access: ShareAccess(
+            ShareAccess::FILE_SHARE_READ
+                | ShareAccess::FILE_SHARE_WRITE
+                | ShareAccess::FILE_SHARE_DELETE,
+        ),
+        create_disposition: CreateDisposition::FileOpen,
+        create_options: 0x40, // FILE_NON_DIRECTORY_FILE
+        name: path.to_string(),
+        create_contexts: if lease {
+            pack_contexts(&[CreateContext::new(b"RqLs", lease_v2)])
+        } else {
+            vec![]
+        },
+    };
+    let frame = conn
+        .execute(Command::Create, &req, Some(tree.tree_id))
+        .await
+        .expect("holder CREATE");
+    assert_eq!(
+        frame.header.status,
+        NtStatus::SUCCESS,
+        "holder CREATE status"
+    );
+    let resp = CreateResponse::unpack(&mut ReadCursor::new(&frame.body)).expect("CreateResponse");
+    if lease {
+        // The test means nothing unless the server really granted the handle
+        // lease: that's what it asks the holder to give back.
+        assert_eq!(resp.oplock_level, OplockLevel::Lease, "lease not granted");
+        let contexts = parse_contexts(&resp.create_contexts).expect("response contexts");
+        let granted = find(&contexts, b"RqLs").expect("lease context in response");
+        let state = u32::from_le_bytes(granted.data[16..20].try_into().unwrap());
+        assert_eq!(
+            state & LEASE_READ_HANDLE,
+            LEASE_READ_HANDLE,
+            "lease state {state:#x}"
+        );
+    }
+    resp.file_id
+}
+
+/// After any app reads a file through the macOS mount, macOS keeps the file
+/// open under a handle lease for about a minute. A delete that lets that open
+/// stand leaves the file `DELETE_PENDING` the whole time, so writing the same
+/// name again (the next step of an overwrite) fails. Opening for delete
+/// without sharing read or write makes the server ask the holder to give its
+/// handle back first, as macOS does at once, so the name is free right after
+/// the delete returns. Regression test for vdavid/cmdr#307.
+#[tokio::test]
+#[ignore]
+async fn a_delete_asks_a_lingering_lease_holder_to_let_go() {
+    let _ = env_logger::try_init();
+    let path = "i307_lingering_lease.txt";
+
+    let (mut conn, tree) = connect_guest().await;
+    let (mut holder_conn, holder_tree) = connect_guest().await;
+    let _ = tree.delete_file(&mut conn, path).await;
+    tree.write_file(&mut conn, path, b"read through the mount")
+        .await
+        .expect("seed the file");
+    let held = hold_open(&holder_conn, &holder_tree, path, true).await;
+
+    // The holder behaves like macOS: it closes its cached handle when the
+    // server breaks the lease. `done` stops it once the delete has finished
+    // either way, so a missing break can't hang the test.
+    let done = std::sync::Arc::new(tokio::sync::Notify::new());
+    let holder = {
+        let done = done.clone();
+        let conn = holder_conn.clone();
+        let tree = holder_tree.clone();
+        tokio::spawn(async move {
+            let broke = async {
+                while conn
+                    .diagnostics()
+                    .metrics
+                    .unsolicited_notifications_received
+                    == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            let saw_break = tokio::select! {
+                () = broke => true,
+                () = done.notified() => false,
+            };
+            let mut conn = conn;
+            let _ = tree.close_handle(&mut conn, held).await;
+            saw_break
+        })
+    };
+
+    let deleted = tokio::time::timeout(Duration::from_secs(10), tree.delete_file(&mut conn, path))
+        .await
+        .expect("the delete waits on the holder for at most a moment");
+    let rewrite = tree.write_file(&mut conn, path, b"the new file").await;
+    done.notify_one();
+    let saw_break = holder.await.unwrap();
+
+    let _ = tree.delete_file(&mut conn, path).await;
+    let _ = holder_tree.disconnect(&mut holder_conn).await;
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+
+    deleted.expect("delete_file");
+    rewrite.expect("the deleted name is free right away, not DELETE_PENDING");
+    assert!(saw_break, "the server never asked the holder to let go");
+}
+
+/// When another client genuinely has the file open, the exclusive open is
+/// refused with a sharing violation and the delete falls back to sharing
+/// everything: it succeeds exactly as before, and the file goes once the
+/// other client closes it.
+#[tokio::test]
+#[ignore]
+async fn a_delete_still_succeeds_while_another_client_has_the_file_open() {
+    let _ = env_logger::try_init();
+    let path = "i307_genuinely_open.txt";
+
+    let (mut conn, tree) = connect_guest().await;
+    let (mut holder_conn, holder_tree) = connect_guest().await;
+    let _ = tree.delete_file(&mut conn, path).await;
+    tree.write_file(&mut conn, path, b"in use")
+        .await
+        .expect("seed the file");
+    let held = hold_open(&holder_conn, &holder_tree, path, false).await;
+
+    let deleted = tree.delete_file(&mut conn, path).await;
+    holder_tree
+        .close_handle(&mut holder_conn, held)
+        .await
+        .expect("holder close");
+    let after = tree.stat(&mut conn, path).await;
+
+    let _ = holder_tree.disconnect(&mut holder_conn).await;
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+
+    deleted.expect("delete_file falls back to a shared open");
+    assert_eq!(
+        after.unwrap_err().status(),
+        Some(smb2::types::status::NtStatus::OBJECT_NAME_NOT_FOUND),
+        "the file goes once the other client closes it"
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn guest_stat_file() {

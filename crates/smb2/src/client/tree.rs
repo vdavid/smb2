@@ -119,6 +119,11 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// Create option: the target must not be a directory.
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
+/// Share mode that lets every other open keep reading, writing, and deleting.
+const SHARE_ALL: ShareAccess = ShareAccess(
+    ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE | ShareAccess::FILE_SHARE_DELETE,
+);
+
 /// FileBasicInformation class for QUERY_INFO (MS-FSCC 2.4.7).
 pub(super) const FILE_BASIC_INFORMATION: u8 = 4;
 
@@ -795,11 +800,48 @@ impl Tree {
 
     /// Delete a file using a compound request (1 round-trip).
     ///
-    /// Sends CREATE (with `DELETE_ON_CLOSE`) + CLOSE as a single compound
-    /// message. The server deletes the file when the CLOSE completes.
+    /// Sends CREATE + SET_INFO (delete disposition) + CLOSE as a single
+    /// compound message. The server deletes the file when the CLOSE completes.
+    ///
+    /// The CREATE shares only delete access, so the server asks any client
+    /// caching a handle under a lease to give it back first. macOS keeps a
+    /// file open that way for about a minute after any app read it through
+    /// the mount, and a delete that let that open stand left the file
+    /// `STATUS_DELETE_PENDING` the whole time, so writing the same name again
+    /// failed. When another client genuinely has the file open, the server
+    /// refuses the exclusive open, and the delete goes ahead sharing
+    /// everything: the file is gone for good once that client closes it.
     pub async fn delete_file(&self, conn: &mut Connection, path: &str) -> Result<()> {
-        self.delete_compound(conn, path, FILE_NON_DIRECTORY_FILE, "file")
-            .await
+        let exclusive = self
+            .delete_compound(
+                conn,
+                path,
+                FILE_NON_DIRECTORY_FILE,
+                ShareAccess(ShareAccess::FILE_SHARE_DELETE),
+                "file",
+            )
+            .await;
+        match exclusive {
+            // Windows also refuses an op that would go async mid-compound
+            // (waiting on that lease break, here) with STATUS_INTERNAL_ERROR
+            // (MS-SMB2 § 3.3.5.2.7). Either way the CREATE failed, so nothing
+            // was opened and nothing changed: the shared retry is always safe.
+            Err(e)
+                if matches!(
+                    e.status(),
+                    Some(NtStatus::SHARING_VIOLATION | NtStatus::INTERNAL_ERROR)
+                ) =>
+            {
+                debug!(
+                    "tree: exclusive delete of {} refused ({:?}), deleting shared",
+                    path,
+                    e.status()
+                );
+                self.delete_compound(conn, path, FILE_NON_DIRECTORY_FILE, SHARE_ALL, "file")
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// Delete multiple files, one compound request each.
@@ -2191,7 +2233,7 @@ impl Tree {
     /// Sends CREATE (with `DELETE_ON_CLOSE`) + CLOSE as a single compound
     /// message. The directory must be empty.
     pub async fn delete_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
-        self.delete_compound(conn, path, FILE_DIRECTORY_FILE, "directory")
+        self.delete_compound(conn, path, FILE_DIRECTORY_FILE, SHARE_ALL, "directory")
             .await
     }
 
@@ -2201,7 +2243,9 @@ impl Tree {
     /// single round-trip.
     ///
     /// `type_option` selects file vs directory (`FILE_NON_DIRECTORY_FILE`
-    /// or `FILE_DIRECTORY_FILE`). `kind` is used only for log messages.
+    /// or `FILE_DIRECTORY_FILE`), and `share_access` is what the CREATE lets
+    /// other opens keep (see `delete_file`). `kind` is used only for log
+    /// messages.
     ///
     /// Don't switch this back to `FILE_DELETE_ON_CLOSE`. Samba accepts a
     /// delete-on-close CREATE against a non-empty directory, answers both
@@ -2215,6 +2259,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
         type_option: u32,
+        share_access: ShareAccess,
         kind: &str,
     ) -> Result<()> {
         let normalized = self.format_path(path);
@@ -2227,11 +2272,7 @@ impl Tree {
                 FileAccessMask::DELETE | FileAccessMask::FILE_READ_ATTRIBUTES,
             ),
             file_attributes: 0,
-            share_access: ShareAccess(
-                ShareAccess::FILE_SHARE_READ
-                    | ShareAccess::FILE_SHARE_WRITE
-                    | ShareAccess::FILE_SHARE_DELETE,
-            ),
+            share_access,
             create_disposition: CreateDisposition::FileOpen,
             create_options: type_option,
             name: normalized.clone(),
@@ -3831,6 +3872,81 @@ mod tests {
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert!(req.desired_access.contains(FileAccessMask::DELETE));
         assert_ne!(req.create_options & FILE_NON_DIRECTORY_FILE, 0);
+        // Sharing only delete is what makes the server break a lingering
+        // handle lease (vdavid/cmdr#307).
+        assert_eq!(
+            req.share_access,
+            ShareAccess(ShareAccess::FILE_SHARE_DELETE)
+        );
+    }
+
+    /// A compound response whose CREATE failed with `status`, every later op
+    /// cascading the same status.
+    fn failed_delete_compound(status: NtStatus) -> Vec<u8> {
+        let ops = [Command::Create, Command::SetInfo, Command::Close].map(|command| {
+            let mut hdr = Header::new_request(command);
+            hdr.flags.set_response();
+            hdr.credits = 32;
+            hdr.status = status;
+            pack_message(
+                &hdr,
+                &crate::msg::header::ErrorResponse {
+                    error_context_count: 0,
+                    error_data: vec![],
+                },
+            )
+        });
+        build_compound_response_frame(&ops)
+    }
+
+    /// When another client genuinely has the file open, the exclusive open is
+    /// refused, and the delete goes ahead sharing everything, as it always did.
+    #[tokio::test]
+    async fn delete_file_refused_exclusively_retries_shared() {
+        for refusal in [NtStatus::SHARING_VIOLATION, NtStatus::INTERNAL_ERROR] {
+            let mock = Arc::new(MockTransport::new());
+            mock.queue_response(failed_delete_compound(refusal));
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(
+                    FileId {
+                        persistent: 1,
+                        volatile: 2,
+                    },
+                    0,
+                ),
+                build_set_info_response(),
+                build_close_response(),
+            ]));
+
+            let mut conn = setup_connection(&mock);
+            let tree = Tree {
+                tree_id: TreeId(10),
+                share_name: "test".to_string(),
+                server: "test-server".to_string(),
+                is_dfs: false,
+                encrypt_data: false,
+                dfs_origin: None,
+            };
+
+            tree.delete_file(&mut conn, "in-use.txt")
+                .await
+                .unwrap_or_else(|e| panic!("after {refusal:?}: {e}"));
+
+            assert_eq!(mock.sent_count(), 2, "after {refusal:?}");
+            let shares: Vec<ShareAccess> = (0..2)
+                .map(|n| {
+                    let sent = mock.sent_message(n).unwrap();
+                    let mut cursor = ReadCursor::new(&sent);
+                    let _header = Header::unpack(&mut cursor).unwrap();
+                    CreateRequest::unpack(&mut cursor).unwrap().share_access
+                })
+                .collect();
+            assert_eq!(
+                shares,
+                [ShareAccess(ShareAccess::FILE_SHARE_DELETE), SHARE_ALL],
+                "after {refusal:?}"
+            );
+        }
     }
 
     #[tokio::test]

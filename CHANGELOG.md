@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A deleted file's name is free right away, even when macOS has the file cached open** ([cmdr#307](https://github.com/vdavid/cmdr/issues/307)). After any app reads a file through a macOS mount, macOS keeps it open on the server for about a minute. `delete_file` let that open stand, so the file sat in `STATUS_DELETE_PENDING` and writing the same name again failed for up to a minute. `delete_file` now opens the file without sharing read or write, which makes the server ask that client to let go first, and the file is gone at once. When another client genuinely has the file open, the delete goes ahead sharing everything, as before, and the file goes when that client closes it.
+
 ## [0.27.0] - 2026-09-29
 
 ### Breaking
