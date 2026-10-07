@@ -257,6 +257,57 @@ async fn write_and_read_file_on_nas() {
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
 
+/// A writer's own stamp holds through its close on real QNAP firmware, and
+/// every read path reports it. The QNAP is Samba-based, but its build and
+/// filesystem (ext4 on mdraid) aren't the Docker fixture's.
+#[tokio::test]
+#[ignore]
+async fn nas_keeps_the_times_set_on_a_writers_handle() {
+    let _ = env_logger::try_init();
+
+    let (mut conn, tree) = connect_to_nas().await;
+    let tree = std::sync::Arc::new(tree);
+    let path = "smb2_test_set_times.tmp";
+    let modified = smb2::pack::FileTime::from_system_time(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000),
+    );
+
+    let mut writer = tree
+        .create_file_writer(conn.clone(), path)
+        .await
+        .expect("create_file_writer");
+    writer.write_chunk(b"dated").await.expect("write_chunk");
+    writer
+        .set_times(smb2::FileTimes::new().set_modified(modified))
+        .await
+        .expect("set_times on the writer");
+    writer.finish().await.expect("finish");
+
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+    assert_eq!(stat.modified, modified);
+    let (_, info) = tree
+        .read_file_compound_with_info(&mut conn, path)
+        .await
+        .expect("read_file_compound_with_info");
+    assert_eq!(
+        (info.size, info.modified, info.created),
+        (5, modified, stat.created)
+    );
+
+    let created = smb2::pack::FileTime::from_system_time(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_400_000_000),
+    );
+    tree.set_times(&mut conn, path, smb2::FileTimes::new().set_created(created))
+        .await
+        .expect("set_times by path");
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+    assert_eq!((stat.created, stat.modified), (created, modified));
+
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("delete_file failed");
+}
+
 #[tokio::test]
 #[ignore]
 async fn server_side_copy_on_nas() {
