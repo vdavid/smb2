@@ -5,6 +5,14 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.2] - 2026-10-07
+
+### Added
+
+- **Set a file's timestamps, and keep a copy's date with no extra round trips** ([#22](https://github.com/vdavid/smb2/issues/22)). `Tree::set_times` and `SmbClient::set_times` set any of a file's or directory's four times and leave the rest as they are, so you can set only the modification time. Build what to set with `FileTimes`, shaped like `std::fs::FileTimes`: `FileTimes::new().set_modified(t)`, where `t` is a `FileTime` (one `stat` returned, say) or a `SystemTime`. It's one round trip, follows DFS links, and works on directories. A server restamps a file when the handle that wrote it closes, so a writer stamps its own handle with `FileWriter::set_times` before `finish`, and that stamp holds. `Tree::set_handle_times` does the same on any handle you opened. A `FileTime` with its top bit set isn't a date (on the wire it's a handle switch or a forbidden value), so it's refused before anything is sent.
+- **Reads hand out the file's dates, at no extra cost.** Every open already gets the file's size and times back, and now you do too: `FileDownload::info()`, `FileReader::info()`, and the new `read_file_compound_with_info` / `read_file_compound_sized_with_info` (on `Tree`, and the first on `SmbClient`) return a `FileInfo`. A copy no longer needs a `stat` beside the read to learn the source's date. `FileDownload::info()` is `None` only for a download you built with `FileDownload::new` around your own handle.
+- `FileTime` converts from a `SystemTime` with `From`/`Into`.
+
 ## [0.27.1] - 2026-10-05
 
 ### Fixed
