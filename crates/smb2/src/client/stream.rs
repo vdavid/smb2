@@ -20,7 +20,8 @@ use crate::client::connection::{Connection, Frame, WaiterGuard};
 use crate::client::credits;
 use crate::client::read_ahead::{Dispatch, Outstanding, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
-use crate::client::tree::{close_outcome, Tree};
+use crate::client::times::FileTimes;
+use crate::client::tree::{close_outcome, file_info_from_create, FileInfo, Tree};
 pub use crate::client::write_behind::{WriteBehind, UPLOAD_CHUNK_SIZE};
 use crate::client::write_pipe::WritePipe;
 use crate::error::Result;
@@ -103,6 +104,9 @@ pub struct FileDownload<'a> {
     conn: &'a mut Connection,
     file_id: FileId,
     file_size: u64,
+    /// What the CREATE said about the file; `None` for a handle the caller
+    /// opened and passed to [`FileDownload::new`].
+    info: Option<FileInfo>,
     bytes_received: u64,
     chunk_size: u32,
     done: bool,
@@ -178,11 +182,13 @@ impl<'a> FileDownload<'a> {
         tree: Cow<'a, Tree>,
         conn: &'a mut Connection,
         file_id: FileId,
-        file_size: u64,
+        info: FileInfo,
     ) -> Self {
         let max_read = conn.params().map_or(65536, |p| p.max_read_size);
         let chunk_size = crate::DOWNLOAD_CHUNK_SIZE.min(max_read);
-        Self::with_tree(tree, conn, file_id, file_size, chunk_size)
+        let mut download = Self::with_tree(tree, conn, file_id, info.size, chunk_size);
+        download.info = Some(info);
+        download
     }
 
     fn with_tree(
@@ -197,6 +203,7 @@ impl<'a> FileDownload<'a> {
             conn,
             file_id,
             file_size,
+            info: None,
             bytes_received: 0,
             chunk_size: chunk_size.max(1),
             done: false,
@@ -258,6 +265,20 @@ impl<'a> FileDownload<'a> {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.file_size
+    }
+
+    /// The file's metadata as the server reported it when it opened the file:
+    /// size, whether it's a directory, and its creation, modification, and
+    /// access times. It rides on the CREATE that started the download, so it
+    /// costs no extra round trip.
+    ///
+    /// `Some` for every download [`Tree::download`] or
+    /// [`SmbClient::download`](crate::SmbClient::download) started. `None` for
+    /// one built with [`FileDownload::new`] around a handle the caller opened,
+    /// since that handle's CREATE response never passed through here.
+    #[must_use]
+    pub fn info(&self) -> Option<&FileInfo> {
+        self.info.as_ref()
     }
 
     /// Bytes received so far.
@@ -664,7 +685,7 @@ pub struct FileReader {
     tree: Arc<Tree>,
     conn: Connection,
     file_id: FileId,
-    file_size: u64,
+    info: FileInfo,
     max_read: u32,
     resolved_path: Option<String>,
     closed: bool,
@@ -693,7 +714,13 @@ pub async fn open_file_reader(
         .await?;
     let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
-    let mut reader = FileReader::new(tree, conn, created.file_id, created.end_of_file, max_read);
+    let mut reader = FileReader::new(
+        tree,
+        conn,
+        created.file_id,
+        file_info_from_create(&created),
+        max_read,
+    );
     reader.resolved_path = resolved_path;
     Ok(reader)
 }
@@ -707,14 +734,14 @@ impl FileReader {
         tree: Arc<Tree>,
         conn: Connection,
         file_id: FileId,
-        file_size: u64,
+        info: FileInfo,
         max_read: u32,
     ) -> Self {
         Self {
             tree,
             conn,
             file_id,
-            file_size,
+            info,
             max_read,
             resolved_path: None,
             closed: false,
@@ -724,7 +751,16 @@ impl FileReader {
     /// Total file size in bytes, as seen when the handle was opened.
     #[must_use]
     pub fn size(&self) -> u64 {
-        self.file_size
+        self.info.size
+    }
+
+    /// The file's metadata as the server reported it when it opened this
+    /// handle: size, whether it's a directory, and its creation,
+    /// modification, and access times. From the open's own CREATE response,
+    /// so it costs no round trip, and it doesn't change as the file does.
+    #[must_use]
+    pub fn info(&self) -> &FileInfo {
+        &self.info
     }
 
     /// The path the server opened, as it stores it: relative to the share,
@@ -752,10 +788,11 @@ impl FileReader {
         // A read at or past EOF yields no bytes; a read overrunning EOF is
         // clamped so we never ask the server for bytes that don't exist (which
         // would come back as STATUS_END_OF_FILE and complicate the loop).
-        if len == 0 || offset >= self.file_size {
+        let file_size = self.info.size;
+        if len == 0 || offset >= file_size {
             return Ok(Vec::new());
         }
-        let to_read = len.min(self.file_size - offset);
+        let to_read = len.min(file_size - offset);
         let end = offset + to_read;
         let mut out = Vec::with_capacity(to_read as usize);
         let mut pos = offset;
@@ -1417,6 +1454,45 @@ impl FileWriter {
         self.pipe.confirmed()
     }
 
+    /// Set the file's timestamps on this writer's own handle, leaving the
+    /// ones `times` doesn't name as they are. Sends what's buffered and waits
+    /// for every WRITE's answer first, then one SET_INFO.
+    ///
+    /// This is how a copy keeps its source's dates: a server stamps a file
+    /// with the time of its last write when the handle that wrote it closes,
+    /// unless that handle had its times set explicitly. So set them here,
+    /// after the last [`write_chunk`](Self::write_chunk) and before
+    /// [`finish`](Self::finish), and the close leaves them alone. Setting them
+    /// by path ([`Tree::set_times`]) while this writer is open loses to its
+    /// close.
+    ///
+    /// Writes after this call keep the stamp too, on Windows (MS-FSA's
+    /// `UserSetModificationTime`) and Samba (its sticky write time), but
+    /// setting the times last is the order every server agrees on.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree, modified: std::time::SystemTime) -> Result<(), smb2::Error> {
+    /// use smb2::FileTimes;
+    ///
+    /// let mut writer = client.create_file_writer(share, "copy.bin").await?;
+    /// writer.write_chunk(b"contents").await?;
+    /// writer.set_times(FileTimes::new().set_modified(modified)).await?;
+    /// writer.finish().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_times(&mut self, times: FileTimes) -> Result<()> {
+        self.send_pending().await?;
+        if let Err(e) = self.pipe.drain().await {
+            return Err(self.failed(e).await);
+        }
+        self.tree
+            .set_handle_times(&mut self.conn, self.file_id, times)
+            .await
+    }
+
     /// Current transfer progress.
     ///
     /// `total_bytes` is always `None` because push-based writers don't
@@ -1482,11 +1558,11 @@ mod tests {
     use super::*;
     use crate::client::test_helpers::{
         build_close_error_response, build_close_response, build_compound_response_frame,
-        build_create_error_response, build_create_response, build_flush_response,
-        build_query_info_error_response, build_query_info_response, build_read_error_response,
-        build_read_response, build_write_error_response, build_write_response,
-        build_write_response_granting, file_all_information, file_name_information,
-        setup_connection,
+        build_create_error_response, build_create_response, build_create_response_dated,
+        build_flush_response, build_query_info_error_response, build_query_info_response,
+        build_read_error_response, build_read_response, build_set_info_response,
+        build_write_error_response, build_write_response, build_write_response_granting,
+        file_all_information, file_name_information, setup_connection, CREATE_TIMES,
     };
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -1531,6 +1607,62 @@ mod tests {
     }
 
     // ── FileWriter tests ───────────────────────────────────────────────
+
+    /// The commands of every frame sent, in order.
+    fn sent_commands(mock: &MockTransport) -> Vec<Command> {
+        use crate::msg::header::Header;
+        mock.sent_messages()
+            .iter()
+            .map(|bytes| Header::unpack(&mut ReadCursor::new(bytes)).unwrap().command)
+            .collect()
+    }
+
+    /// A writer's times go out on its own handle after every WRITE has been
+    /// answered and before the FLUSH and CLOSE, so the close can't restamp
+    /// the file.
+    #[tokio::test]
+    async fn file_writer_set_times_stamps_its_own_handle_after_the_writes_land() {
+        use crate::msg::header::Header;
+        use crate::msg::set_info::SetInfoRequest;
+        use crate::pack::FileTime;
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(writer_opened(file_id));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_set_info_response());
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let mut writer = test_tree()
+            .create_file_writer(conn, "copy.bin")
+            .await
+            .unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+        let modified = FileTime(133_444_736_000_000_000);
+        writer
+            .set_times(FileTimes::new().set_modified(modified))
+            .await
+            .unwrap();
+        assert_eq!(writer.bytes_written(), 100, "the WRITE was answered first");
+        assert_eq!(writer.finish().await.unwrap(), 100);
+
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::Write,
+                Command::SetInfo,
+                Command::Flush,
+                Command::Close
+            ]
+        );
+        let set = mock.sent_message(2).unwrap();
+        let set = SetInfoRequest::unpack(&mut ReadCursor::new(&set[Header::SIZE..])).unwrap();
+        assert_eq!(set.file_id, file_id);
+        assert_eq!(&set.buffer[16..24], &modified.0.to_le_bytes());
+        assert_eq!(&set.buffer[0..8], &[0; 8], "creation time left alone");
+    }
 
     /// A 1 MiB WRITE charges 16 credits, which a window the server stopped
     /// growing at 8 can never fund. The writer sends what half that window
@@ -2038,6 +2170,34 @@ mod tests {
     }
 
     // ── FileReader tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_reader_reports_the_dates_its_open_returned() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response_dated(test_file_id(), 10),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+        ]));
+        let conn = setup_connection(&mock);
+
+        let reader = test_tree().open_file_reader(conn, "a.bin").await.unwrap();
+        let info = reader.info();
+        let [created, accessed, modified, _] = CREATE_TIMES;
+        assert_eq!(
+            (
+                info.size,
+                info.is_directory,
+                info.created,
+                info.modified,
+                info.accessed
+            ),
+            (10, false, created, modified, accessed)
+        );
+        assert_eq!(reader.size(), 10);
+        assert_eq!(mock.sent_count(), 1, "the dates cost no round trip");
+        drop(reader);
+    }
 
     #[tokio::test]
     async fn file_reader_positioned_reads_one_open_one_close() {

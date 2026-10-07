@@ -27,6 +27,8 @@ we have more control to reach even better speeds.
 - List directories, read files, write files, delete, rename, stat, create directories
 - Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds, compound delete/rename/stat)
 - Batch helpers for deleting, renaming, and stat-ing many files in one call
+- Setting a file's timestamps (any of them, leaving the rest alone), and reads that hand out the file's dates at no
+  extra cost, so a copy keeps its source's modification date
 - Pipelined I/O with sliding window for large file transfers
 - SMB 2.x (HMAC-SHA256) and 3.x (AES-CMAC, AES-GMAC) signing, and encryption (AES-128/256-CCM/GCM)
 - LZ4 compression
@@ -350,6 +352,11 @@ For when you want to do one thing and get the result:
 - `client.delete_files(&share, &paths)`: Delete many files, one result each
 - `client.stat(&mut share, path)`: Get file metadata
 - `client.stat_files(&share, &paths)`: Batch stat
+- `client.set_times(&share, path, FileTimes::new().set_modified(t))`: Set a file's timestamps, leaving the ones you
+  don't name alone. On a writer you're about to finish, `writer.set_times(...)` instead, so its close can't restamp
+  the file
+- `client.read_file_compound_with_info(&mut share, path)`: Read a small file plus its size and dates, in the same
+  round trip. Downloads and file readers carry the same dates (`download.info()`, `reader.info()`)
 - `client.rename(&share, from, to)`: Rename a file
 - `client.rename_files(&mut share, &renames)`: Batch rename
 - `client.create_directory(&share, path)`: Create a directory

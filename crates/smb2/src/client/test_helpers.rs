@@ -108,6 +108,42 @@ pub(crate) fn build_create_response(file_id: FileId, end_of_file: u64) -> Vec<u8
     pack_message(&h, &body)
 }
 
+/// The four times [`build_create_response_dated`] reports, all distinct so a
+/// test can tell which field landed where: creation, last access, last write,
+/// change.
+pub(crate) const CREATE_TIMES: [FileTime; 4] = [
+    FileTime(132_000_000_000_000_000),
+    FileTime(133_100_000_000_000_000),
+    FileTime(133_000_000_000_000_000),
+    FileTime(133_200_000_000_000_000),
+];
+
+/// [`build_create_response`] for a file the server reports [`CREATE_TIMES`]
+/// for.
+pub(crate) fn build_create_response_dated(file_id: FileId, end_of_file: u64) -> Vec<u8> {
+    let mut h = Header::new_request(Command::Create);
+    h.flags.set_response();
+    h.credits = 32;
+
+    let [creation_time, last_access_time, last_write_time, change_time] = CREATE_TIMES;
+    let body = CreateResponse {
+        oplock_level: OplockLevel::None,
+        flags: 0,
+        create_action: CreateAction::FileOpened,
+        creation_time,
+        last_access_time,
+        last_write_time,
+        change_time,
+        allocation_size: 0,
+        end_of_file,
+        file_attributes: 0x20, // FILE_ATTRIBUTE_ARCHIVE
+        file_id,
+        create_contexts: vec![],
+    };
+
+    pack_message(&h, &body)
+}
+
 /// Build a CREATE response carrying a chain of create contexts.
 pub(crate) fn build_create_response_with_contexts(
     file_id: FileId,

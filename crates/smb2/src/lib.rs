@@ -120,6 +120,9 @@ pub use client::tree::{
     DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
 };
 
+// Which of a file's timestamps to set (`Tree::set_times`).
+pub use client::times::FileTimes;
+
 // What a path resolved to on the server (`Tree::resolve`), and which file it is.
 pub use client::durable::FileIdentity;
 pub use client::resolve::Resolved;

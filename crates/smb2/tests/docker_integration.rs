@@ -347,6 +347,213 @@ async fn guest_stat_file() {
     tree.disconnect(&mut conn).await.expect("disconnect failed");
 }
 
+// ── Timestamps (smb-guest) ──────────────────────────────────────────
+
+/// A whole-second `FileTime`, `unix_secs` after 1970, so no server rounds it.
+fn filetime(unix_secs: u64) -> smb2::pack::FileTime {
+    smb2::pack::FileTime::from_system_time(std::time::UNIX_EPOCH + Duration::from_secs(unix_secs))
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_set_times_sets_only_the_times_asked_for() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let path = "docker_test_set_times.tmp";
+    tree.write_file(&mut conn, path, b"dated")
+        .await
+        .expect("write_file");
+    let before = tree.stat(&mut conn, path).await.expect("stat");
+
+    let modified = filetime(1_500_000_000);
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_modified(modified),
+    )
+    .await
+    .expect("set_times(modified)");
+    let after = tree.stat(&mut conn, path).await.expect("stat");
+    assert_eq!(after.modified, modified);
+    assert_eq!(after.created, before.created, "creation time left alone");
+
+    let created = filetime(1_400_000_000);
+    tree.set_times(&mut conn, path, smb2::FileTimes::new().set_created(created))
+        .await
+        .expect("set_times(created)");
+    let after = tree.stat(&mut conn, path).await.expect("stat");
+    assert_eq!(after.created, created);
+    assert_eq!(after.modified, modified, "modification time left alone");
+
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("delete_file");
+    tree.disconnect(&mut conn).await.expect("disconnect");
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_set_times_on_a_directory() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let path = "docker_test_set_times_dir";
+    let _ = tree.delete_directory(&mut conn, path).await;
+    tree.create_directory(&mut conn, path)
+        .await
+        .expect("create_directory");
+
+    let modified = filetime(1_300_000_000);
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_modified(modified),
+    )
+    .await
+    .expect("set_times on a directory");
+    let info = tree.stat(&mut conn, path).await.expect("stat");
+    assert!(info.is_directory);
+    assert_eq!(info.modified, modified);
+
+    tree.delete_directory(&mut conn, path)
+        .await
+        .expect("delete_directory");
+}
+
+/// Every read path hands out the date the server's CREATE response carried,
+/// and it's the date `stat` reports.
+#[tokio::test]
+#[ignore]
+async fn guest_reads_hand_out_the_files_dates() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let path = "docker_test_read_dates.tmp";
+    tree.write_file(&mut conn, path, b"twelve bytes")
+        .await
+        .expect("write_file");
+    let modified = filetime(1_600_000_000);
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_modified(modified),
+    )
+    .await
+    .expect("set_times");
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+
+    let (data, info) = tree
+        .read_file_compound_with_info(&mut conn, path)
+        .await
+        .expect("read_file_compound_with_info");
+    assert_eq!(data, b"twelve bytes");
+    assert_eq!(
+        (info.size, info.modified, info.created),
+        (12, modified, stat.created)
+    );
+
+    let download = tree.download(&mut conn, path).await.expect("download");
+    let info = download
+        .info()
+        .expect("a download the crate opened knows")
+        .clone();
+    assert_eq!(drain(download).await, b"twelve bytes");
+    assert_eq!((info.size, info.modified), (12, modified));
+
+    let reader = std::sync::Arc::new(tree.clone())
+        .open_file_reader(conn.clone(), path)
+        .await
+        .expect("open_file_reader");
+    assert_eq!((reader.info().size, reader.info().modified), (12, modified));
+    reader.close().await.expect("close");
+
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("delete_file");
+}
+
+/// A writer that stamps its own handle keeps the stamp through its close,
+/// including writes that come after the stamp (Samba's sticky write time).
+#[tokio::test]
+#[ignore]
+async fn guest_a_writer_keeps_the_times_set_on_its_handle() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let tree = std::sync::Arc::new(tree);
+    let modified = filetime(1_200_000_000);
+
+    let last = "docker_test_writer_stamp_last.tmp";
+    let mut writer = tree
+        .create_file_writer(conn.clone(), last)
+        .await
+        .expect("writer");
+    writer.write_chunk(b"contents").await.expect("write_chunk");
+    writer
+        .set_times(smb2::FileTimes::new().set_modified(modified))
+        .await
+        .expect("set_times");
+    writer.finish().await.expect("finish");
+    assert_eq!(
+        tree.stat(&mut conn, last).await.expect("stat").modified,
+        modified
+    );
+
+    let first = "docker_test_writer_stamp_first.tmp";
+    let mut writer = tree
+        .create_file_writer(conn.clone(), first)
+        .await
+        .expect("writer");
+    writer
+        .set_times(smb2::FileTimes::new().set_modified(modified))
+        .await
+        .expect("set_times");
+    writer
+        .write_chunk(b"written after the stamp")
+        .await
+        .expect("write_chunk");
+    writer.finish().await.expect("finish");
+    assert_eq!(
+        tree.stat(&mut conn, first).await.expect("stat").modified,
+        modified
+    );
+
+    for path in [last, first] {
+        tree.delete_file(&mut conn, path)
+            .await
+            .expect("delete_file");
+    }
+}
+
+/// The ordering `Tree::set_times` documents: a stamp by path while a writer
+/// still holds the file open loses to that writer's close.
+#[tokio::test]
+#[ignore]
+async fn guest_a_stamp_by_path_loses_to_an_open_writers_close() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let tree = std::sync::Arc::new(tree);
+    let path = "docker_test_stamp_under_writer.tmp";
+    let modified = filetime(1_100_000_000);
+
+    let mut writer = tree
+        .create_file_writer(conn.clone(), path)
+        .await
+        .expect("writer");
+    writer.write_chunk(b"contents").await.expect("write_chunk");
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_modified(modified),
+    )
+    .await
+    .expect("set_times by path");
+    writer.finish().await.expect("finish");
+
+    let info = tree.stat(&mut conn, path).await.expect("stat");
+    assert_ne!(info.modified, modified, "the close restamped the file");
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("delete_file");
+}
+
 /// The 8.3 alias Samba hands out for `path` (`FileAlternateNameInformation`,
 /// class 21). Samba's aliases are hash-mangled, so a test asks rather than
 /// guesses.
@@ -2848,6 +3055,40 @@ async fn dfs_link_download_reads_the_target() {
     )
     .await;
     assert_eq!(String::from_utf8_lossy(&root).trim(), "root");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_link_set_times_reaches_the_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let path = "data/_dfs_link_set_times.tmp";
+    client
+        .write_file(&tree, path, b"dated")
+        .await
+        .expect("write_file");
+
+    let modified = filetime(1_000_000_000);
+    client
+        .set_times(&tree, path, smb2::FileTimes::new().set_modified(modified))
+        .await
+        .expect("set_times through the link");
+    assert_eq!(tree.share_name, "dfs", "the caller's tree stays put");
+
+    let info = client
+        .stat(&mut tree, path)
+        .await
+        .expect("stat through the link");
+    assert_eq!(info.modified, modified);
+    let (_, read) = client
+        .read_file_compound_with_info(&mut tree, path)
+        .await
+        .expect("read through the link");
+    assert_eq!(read.modified, modified);
+
+    client.delete_file(&tree, path).await.expect("delete_file");
 }
 
 #[tokio::test]

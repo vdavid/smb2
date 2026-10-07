@@ -61,6 +61,13 @@ impl FileTime {
     }
 }
 
+impl From<SystemTime> for FileTime {
+    /// [`FileTime::from_system_time`].
+    fn from(t: SystemTime) -> Self {
+        Self::from_system_time(t)
+    }
+}
+
 impl Pack for FileTime {
     fn pack(&self, cursor: &mut WriteCursor) {
         cursor.write_u64_le(self.0);

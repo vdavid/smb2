@@ -132,6 +132,7 @@ src/
     copy.rs               # Server-side copy API (FSCTL_SRV_COPYCHUNK): resume-key + copychunk, batched convenience
     durable.rs            # Durable handles: open, reclaim, and the two proofs that make a resume safe
     resolve.rs            # Tree::resolve: which file the server opened, and its stored name (classes 48 + 18)
+    times.rs              # FileTimes + Tree::set_times / set_handle_times (SET_INFO class 4); dates a read's CREATE already got
     fault_injection_tests.rs # Hostile-but-plausible servers: one that goes silent, one that goes away and comes back
     socket_lifecycle_tests.rs # The socket closes when the connection is finished with, over real loopback sockets
     smol_runtime_tests.rs # The same connection on smol with no tokio runtime: round trip, deadline, socket teardown

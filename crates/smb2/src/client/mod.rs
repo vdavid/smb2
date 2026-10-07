@@ -28,6 +28,7 @@ mod socket_lifecycle_tests;
 pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_helpers;
+pub mod times;
 pub mod tree;
 pub(crate) mod tuning;
 #[cfg(test)]
@@ -52,6 +53,7 @@ pub use resolve::Resolved;
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
+pub use times::FileTimes;
 pub use tree::{DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
@@ -1354,6 +1356,21 @@ impl SmbClient {
         .map(|(value, _)| value)
     }
 
+    /// [`read_file_compound`](Self::read_file_compound), plus the file's
+    /// metadata (size, times) from the same CREATE response, at no extra
+    /// cost. See [`Tree::read_file_compound_with_info`].
+    pub async fn read_file_compound_with_info(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+    ) -> Result<(Vec<u8>, FileInfo)> {
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.read_file_compound_with_info(&mut conn, &path).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
     /// Read a file using pipelined I/O (faster for large files).
     pub async fn read_file_pipelined(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
         self.replaying(tree, path, |mut conn, tree, path| async move {
@@ -1563,6 +1580,33 @@ impl SmbClient {
         results
     }
 
+    /// Set a file's or directory's timestamps, leaving the ones `times`
+    /// doesn't name as they are. See [`Tree::set_times`], including why a
+    /// writer's own times are best set with
+    /// [`FileWriter::set_times`](crate::FileWriter::set_times).
+    ///
+    /// Follows a DFS link; `tree` stays on its own share.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// use std::time::{Duration, SystemTime};
+    /// use smb2::FileTimes;
+    ///
+    /// let taken = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+    /// client.set_times(share, "photos/beach.jpg", FileTimes::new().set_modified(taken)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_times(&mut self, tree: &Tree, path: &str, times: FileTimes) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.set_times(&mut conn, &path, times).await
+        })
+        .await
+        .map(|(done, _)| done)
+    }
+
     /// Create a directory on the given share.
     pub async fn create_directory(&mut self, tree: &Tree, path: &str) -> Result<()> {
         self.beside_tree(tree, path, |mut conn, tree, path| async move {
@@ -1617,14 +1661,14 @@ impl SmbClient {
         tree: &'a Tree,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let ((file_id, file_size), moved_to) = self
+        let ((file_id, info), moved_to) = self
             .beside_tree(tree, path, |mut conn, tree, path| async move {
-                tree.open_file(&mut conn, &path).await
+                tree.open_for_read(&mut conn, &path).await
             })
             .await?;
         let tree = moved_to.map_or(Cow::Borrowed(tree), |link| Cow::Owned(link.tree));
         let conn = self.connections.for_tree(&tree)?;
-        Ok(FileDownload::of_open_file(tree, conn, file_id, file_size))
+        Ok(FileDownload::of_open_file(tree, conn, file_id, info))
     }
 
     /// Start a streaming file upload with progress tracking.

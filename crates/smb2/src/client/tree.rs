@@ -555,6 +555,50 @@ impl Tree {
         path: &str,
         expected_size: u64,
     ) -> Result<Vec<u8>> {
+        self.read_file_compound_sized_with_info(conn, path, expected_size)
+            .await
+            .map(|(data, _)| data)
+    }
+
+    /// [`read_file_compound`](Self::read_file_compound), plus the file's
+    /// metadata as the server reported it when it opened the file: size,
+    /// whether it's a directory, and its creation, modification, and access
+    /// times.
+    ///
+    /// The CREATE response carries all of it, so this costs nothing over the
+    /// plain read: same single round trip, same bytes on the wire. Reach for
+    /// it rather than a [`stat`](Self::stat) beside the read when a copy needs
+    /// the source's dates.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(conn: &mut smb2::client::Connection, tree: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// let (data, info) = tree.read_file_compound_with_info(conn, "notes.txt").await?;
+    /// println!("{} bytes, modified {:?}", data.len(), info.modified.to_system_time());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_file_compound_with_info(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<(Vec<u8>, FileInfo)> {
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        self.read_file_compound_sized_with_info(conn, path, max_read as u64)
+            .await
+    }
+
+    /// [`read_file_compound_sized`](Self::read_file_compound_sized), plus the
+    /// file's metadata from the same CREATE response, as
+    /// [`read_file_compound_with_info`](Self::read_file_compound_with_info)
+    /// describes.
+    pub async fn read_file_compound_sized_with_info(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        expected_size: u64,
+    ) -> Result<(Vec<u8>, FileInfo)> {
         let normalized = self.format_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         // Ask for what the caller expects, capped by what one READ can carry
@@ -710,7 +754,7 @@ impl Tree {
         }
 
         trace!("tree: read_file_compound done, read {} bytes", data.len());
-        Ok(data)
+        Ok((data, file_info_from_create(&create_resp)))
     }
 
     /// Read a file's contents using a compound request (1 round-trip).
@@ -1873,12 +1917,12 @@ impl Tree {
         conn: &'a mut Connection,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let (file_id, file_size) = self.open_file(conn, path).await?;
+        let (file_id, info) = self.open_for_read(conn, path).await?;
         Ok(FileDownload::of_open_file(
             std::borrow::Cow::Borrowed(self),
             conn,
             file_id,
-            file_size,
+            info,
         ))
     }
 
@@ -2413,6 +2457,17 @@ impl Tree {
     /// drop, or by calling the internal close path). Leaking the handle
     /// wastes server resources.
     pub async fn open_file(&self, conn: &mut Connection, path: &str) -> Result<(FileId, u64)> {
+        let (file_id, info) = self.open_for_read(conn, path).await?;
+        Ok((file_id, info.size))
+    }
+
+    /// [`open_file`](Self::open_file), keeping everything the CREATE response
+    /// said about the file.
+    pub(crate) async fn open_for_read(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<(FileId, FileInfo)> {
         let req = self.read_open_request(path);
         let frame = conn
             .execute(Command::Create, &req, Some(self.tree_id))
@@ -2427,7 +2482,7 @@ impl Tree {
 
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
-        Ok((resp.file_id, resp.end_of_file))
+        Ok((resp.file_id, file_info_from_create(&resp)))
     }
 
     /// The CREATE [`open_file`](Self::open_file) and a
@@ -3168,6 +3223,19 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
         modified,
         accessed,
     })
+}
+
+/// The [`FileInfo`] a CREATE response already answers: every open reports the
+/// file's size, attributes, and times, so a read that opened the file needs no
+/// `stat` to know them.
+pub(crate) fn file_info_from_create(resp: &CreateResponse) -> FileInfo {
+    FileInfo {
+        size: resp.end_of_file,
+        is_directory: resp.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        created: resp.creation_time,
+        modified: resp.last_write_time,
+        accessed: resp.last_access_time,
+    }
 }
 
 /// Parse `FileBothDirectoryInformation` entries from raw bytes.
@@ -7756,5 +7824,102 @@ mod tests {
         handle_b.await.expect("task b panicked");
 
         assert_eq!(mock.sent_count(), 6); // 2 CREATE + 2 READ + 2 CLOSE
+    }
+
+    // ── Dates from the CREATE a read already sent ───────────────────────
+
+    #[tokio::test]
+    async fn a_compound_read_hands_out_the_dates_its_create_returned() {
+        use crate::client::test_helpers::{build_create_response_dated, CREATE_TIMES};
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response_dated(file_id, 5),
+            build_read_response(NtStatus::SUCCESS, vec![1, 2, 3, 4, 5]),
+            build_close_response(),
+        ]));
+
+        let (data, info) = tree
+            .read_file_compound_with_info(&mut conn, "dated.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(data, [1, 2, 3, 4, 5]);
+        let [created, accessed, modified, _] = CREATE_TIMES;
+        assert_eq!(
+            (
+                info.size,
+                info.is_directory,
+                info.created,
+                info.modified,
+                info.accessed
+            ),
+            (5, false, created, modified, accessed)
+        );
+        assert_eq!(mock.sent_count(), 2, "tree connect + one compound, no stat");
+    }
+
+    #[tokio::test]
+    async fn a_download_hands_out_the_dates_its_create_returned() {
+        use crate::client::test_helpers::{build_create_response_dated, CREATE_TIMES};
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        mock.queue_response(build_create_response_dated(file_id, 3));
+        mock.queue_response(build_read_response(NtStatus::SUCCESS, vec![7, 8, 9]));
+        mock.queue_response(build_close_response());
+
+        let download = tree.download(&mut conn, "dated.bin").await.unwrap();
+        let info = download
+            .info()
+            .expect("Tree::download knows the dates")
+            .clone();
+        assert_eq!(download.collect().await.unwrap(), [7, 8, 9]);
+
+        let [created, accessed, modified, _] = CREATE_TIMES;
+        assert_eq!(
+            (info.size, info.created, info.modified, info.accessed),
+            (3, created, modified, accessed)
+        );
+    }
+
+    /// A download around a handle the caller opened never saw a CREATE
+    /// response, so it doesn't pretend to know the dates.
+    #[tokio::test]
+    async fn a_download_of_a_callers_handle_knows_no_dates() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(7),
+            share_name: "share".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+            dfs_origin: None,
+        };
+        let download = FileDownload::new(
+            &tree,
+            &mut conn,
+            FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            3,
+            65536,
+        );
+        assert!(download.info().is_none());
     }
 }
