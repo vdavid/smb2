@@ -558,4 +558,4 @@ curl -sfL "https://raw.githubusercontent.com/awakecoding/openspecs/publish/$S/$S
 - [MS-SMB2 spec](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/): primary reference
 - [mtp-rs](https://github.com/vdavid/mtp-rs): architecture template
 - [smb-rs](https://github.com/oll3/smb-rs): reference implementation, sanity check only
-- [docs/releasing.md](docs/releasing.md) — how to publish a new version to crates.io
+- [docs/releasing.md](docs/releasing.md) — how to publish a new version to crates.io, and how `smb2-cli-v*` tags build prebuilt CLI binaries and the Homebrew formula via dist

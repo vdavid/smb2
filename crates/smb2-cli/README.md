@@ -26,9 +26,25 @@ Every command also prints JSON, which makes it pleasant to drive from a script o
 
 ## Install
 
+No Rust toolchain needed. On macOS or Linux, with [Homebrew](https://brew.sh):
+
 ```sh
-cargo install smb2-cli
+brew install vdavid/tap/smb2
 ```
+
+Or with the install script (macOS and Linux):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/vdavid/smb2/releases/latest/download/smb2-cli-installer.sh | sh
+```
+
+On Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/vdavid/smb2/releases/latest/download/smb2-cli-installer.ps1 | iex"
+```
+
+Prebuilt binaries for each platform are on [GitHub Releases](https://github.com/vdavid/smb2/releases). If you have Rust, `cargo install smb2-cli` works too.
 
 The binary is called `smb2`.
 

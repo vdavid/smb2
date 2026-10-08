@@ -21,3 +21,7 @@ repository = "https://github.com/vdavid/smb2"
 [profile.release]
 lto = "thin"
 strip = true
+
+# The profile `dist` builds release binaries with (see dist-workspace.toml).
+[profile.dist]
+inherits = "release"

@@ -11,7 +11,7 @@ This repo ships two crates:
 | Crate | What it is | Page |
 |---|---|---|
 | **[`smb2`](crates/smb2/)** | The library. Use it from your own Rust code. | [crates.io](https://crates.io/crates/smb2) · [docs.rs](https://docs.rs/smb2) |
-| **[`smb2-cli`](crates/smb2-cli/)** | A ready-made `smb2` binary. `cargo install smb2-cli`. | [crates.io](https://crates.io/crates/smb2-cli) |
+| **[`smb2-cli`](crates/smb2-cli/)** | A ready-made `smb2` binary. `brew install vdavid/tap/smb2`. | [crates.io](https://crates.io/crates/smb2-cli) |
 
 For the API, the benchmarks, the protocol features covered, and the servers it's tested against, see the
 [`smb2` README](crates/smb2/README.md).

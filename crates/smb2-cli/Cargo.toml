@@ -10,6 +10,7 @@ keywords = ["smb", "smb2", "smb3", "cifs", "cli"]
 categories = ["command-line-utilities", "network-programming", "filesystem"]
 readme = "README.md"
 documentation = "https://docs.rs/smb2-cli"
+homepage = "https://github.com/vdavid/smb2"
 
 exclude = [
     # Agent tooling, not source a consumer installing the binary wants. Restored
