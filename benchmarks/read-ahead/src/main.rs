@@ -21,6 +21,32 @@ mod upload;
 /// `--trace-dir` is set: log every probe and dump a timeline per run.
 static TRACING: AtomicBool = AtomicBool::new(false);
 
+/// `--probe-conn separate`: the side `stat` runs on a connection (and session)
+/// of its own instead of a clone of the transfer's, the shape a consumer gets
+/// by giving its transfers their own session (cmdr#133).
+static SEPARATE_PROBE: std::sync::OnceLock<(smb2::client::Connection, smb2::Tree)> = std::sync::OnceLock::new();
+
+/// The connection and tree the side `stat` runs on: the separate probe session
+/// when `--probe-conn separate` set one up, else a clone of `conn` and `tree`.
+pub(crate) fn probe_target(conn: &smb2::client::Connection, tree: &smb2::Tree) -> (smb2::client::Connection, smb2::Tree) {
+    SEPARATE_PROBE.get().cloned().unwrap_or_else(|| (conn.clone(), tree.clone()))
+}
+
+/// Opens the separate probe session when `--probe-conn separate` asks for one.
+/// The client is leaked on purpose: it has to outlive every measurement.
+pub(crate) async fn setup_probe_conn(args: &[String], addr: &str) {
+    match arg(args, "--probe-conn", "same").as_str() {
+        "same" => {}
+        "separate" => {
+            let client = Box::leak(Box::new(connect(addr).await));
+            let tree = client.connect_share(&share()).await.expect("probe share");
+            let _ = SEPARATE_PROBE.set((client.connection_mut().clone(), tree));
+            eprintln!("side stat on a separate connection");
+        }
+        other => panic!("--probe-conn takes same or separate, got {other}"),
+    }
+}
+
 /// How long a side `stat` may take before the probe records where it is.
 const STUCK_AFTER: Duration = Duration::from_millis(100);
 
@@ -149,8 +175,7 @@ async fn measure(client: &mut SmbClient, tree: &smb2::Tree, path: &str, size_hin
 
     let stop = Arc::new(AtomicBool::new(false));
     let probe = {
-        let mut c = conn.clone();
-        let t = tree.clone();
+        let (mut c, t) = probe_target(conn, tree);
         let stop = stop.clone();
         tokio::spawn(async move {
             let mut lat = Vec::new();
@@ -344,6 +369,7 @@ async fn run(args: &[String]) {
         trace::install();
         TRACING.store(true, Ordering::Relaxed);
     }
+    setup_probe_conn(args, &addr).await;
     let mut client = connect(&addr).await;
     let mut tree = client.connect_share(&share()).await.expect("share");
     if args.iter().any(|a| a == "--prep") {

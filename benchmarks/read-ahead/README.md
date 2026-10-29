@@ -49,6 +49,9 @@ against a local Samba in Docker, with latency and bandwidth injected by `tc nete
   bytes in flight, the p50/max latency of a `stat` issued every 20 ms on a clone of the same connection during the
   download, and (8 MiB+ files) the latency of a `stat` right after dropping a download at 25%.
 - Every run's bytes are checksummed and compared across variants, so a wrong read fails the run.
+- `--probe-conn separate` (`PROBE_CONN=separate` for `run.sh`, both directions) runs the side `stat` on a connection
+  and session of its own instead of a clone of the transfer's: what a consumer gains by giving its transfers their own
+  session (cmdr#133). On a shaped link the two still share netem's one FIFO queue.
 
 ## Uploads
 

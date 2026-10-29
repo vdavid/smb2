@@ -91,7 +91,7 @@ for rtt in $RTTS; do
     docker exec -d -e STALL_MS="${STALL_MS:-150}" -e STALL_EVERY_MS="${STALL_EVERY_MS:-1000}" "$C" /stall.sh
   fi
   for load in ${LOADS:-0 $WRITERS}; do
-    "$BIN" "$MODE" --addr "127.0.0.1:$SMB_BENCH_PORT" --rtt-ms "$rtt" --load-writers "$load" --runs "$RUNS" --out "$OUT" ${VARIANTS:+--variants "$VARIANTS"} ${SIZES:+--sizes "$SIZES"}
+    "$BIN" "$MODE" --addr "127.0.0.1:$SMB_BENCH_PORT" --rtt-ms "$rtt" --load-writers "$load" --runs "$RUNS" --out "$OUT" ${VARIANTS:+--variants "$VARIANTS"} ${SIZES:+--sizes "$SIZES"} ${PROBE_CONN:+--probe-conn "$PROBE_CONN"}
     docker exec "$C" sh -c 'rm -f /shares/public/load/* /shares/public/up/*'
   done
   stop_stalls

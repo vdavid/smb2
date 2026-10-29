@@ -97,8 +97,7 @@ async fn measure(client: &mut SmbClient, tree: &Arc<smb2::Tree>, path: &str, dat
 
     let stop = Arc::new(AtomicBool::new(false));
     let probe = {
-        let mut c = conn.clone();
-        let t = tree.clone();
+        let (mut c, t) = crate::probe_target(&conn, tree);
         let stop = stop.clone();
         tokio::spawn(async move {
             let mut lat = Vec::new();
@@ -173,6 +172,7 @@ pub async fn run(args: &[String]) {
         })
         .collect();
 
+    crate::setup_probe_conn(args, &addr).await;
     // A connection per tuning, as for downloads; untuned variants share one.
     let mut conns: BTreeMap<String, (SmbClient, Arc<smb2::Tree>)> = BTreeMap::new();
     for t in variants.iter().map(|(_, _, t)| t.clone().unwrap_or_default()) {
