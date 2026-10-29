@@ -1882,12 +1882,13 @@ impl SmbClient {
     /// Start a streaming file download (memory-efficient for large files).
     ///
     /// Returns a [`FileDownload`] that yields chunks one at a time without
-    /// buffering the entire file in memory. Each call to
-    /// [`next_chunk`](FileDownload::next_chunk) sends one READ request.
+    /// buffering the entire file in memory, with the same adaptive read-ahead
+    /// window as [`Tree::download`].
     ///
-    /// The connection is borrowed mutably for the lifetime of the download,
-    /// so no other operations can run concurrently. This prevents accidental
-    /// interleaving of SMB messages.
+    /// The client stays borrowed for the download's life. To hold it for the
+    /// open alone (to run other calls meanwhile, or to spawn the download onto
+    /// its own task), use [`open_file_download`](Self::open_file_download),
+    /// which this delegates to.
     ///
     /// Follows a DFS link: the download reads from the link's target, and
     /// `tree` stays on its own share.
@@ -1915,17 +1916,65 @@ impl SmbClient {
         tree: &'a Tree,
         path: &str,
     ) -> Result<FileDownload<'a>> {
+        self.open_file_download(tree, path).await
+    }
+
+    /// Start a streaming file download that doesn't borrow the client.
+    ///
+    /// The same download as [`download`](Self::download) (chunked, with the
+    /// adaptive read-ahead window of [`Tree::download`]), but the returned
+    /// [`FileDownload`] owns a clone of the connection and of the tree it
+    /// reads from (both cheap), so it's `'static` and the client is held for
+    /// the CREATE only, like [`open_file_reader`](Self::open_file_reader).
+    /// Several downloads opened this way stream over one SMB session in
+    /// parallel.
+    ///
+    /// Follows a DFS link: the download reads from the link's target, and
+    /// `tree` stays on its own share. It's the call for a consumer that would
+    /// otherwise read a link's target through a
+    /// [`FileReader`](stream::FileReader) (positioned reads, no read-ahead)
+    /// only to avoid holding the client.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+    /// let mut download = client.open_file_download(share, "big_video.mp4").await?;
+    /// let task = tokio::spawn(async move {
+    ///     let mut total = 0;
+    ///     while let Some(chunk) = download.next_chunk().await {
+    ///         total += chunk?.len();
+    ///     }
+    ///     Ok::<_, smb2::Error>(total)
+    /// });
+    /// // The client is free for other calls while the download runs.
+    /// let entries = client.list_directory(share, "").await?;
+    /// # let _ = (task, entries);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_file_download(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+    ) -> Result<FileDownload<'static>> {
         // Pinned before the open, and handed out with the handle: the
-        // download sends only on the session its handle belongs to.
-        let ((file_id, info, conn), moved_to) = self
+        // download sends only on the session its handle belongs to. The tree
+        // comes back owned: the caller's, or the link's target when the call
+        // was redirected (the caller's own tree never moves).
+        let ((file_id, info, conn, tree), _) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
                 let mut conn = tree.pinned_conn(&conn).pinned_to_session();
                 let (file_id, info) = tree.open_for_read(&mut conn, &path).await?;
-                Ok((file_id, info, conn))
+                Ok((file_id, info, conn, tree))
             })
             .await?;
-        let tree = moved_to.map_or(Cow::Borrowed(tree), |link| Cow::Owned(link.tree));
-        Ok(FileDownload::of_open_file(tree, conn, file_id, info))
+        Ok(FileDownload::of_open_file(
+            Cow::Owned(tree),
+            conn,
+            file_id,
+            info,
+        ))
     }
 
     /// Start a streaming file upload with progress tracking.
@@ -2859,6 +2908,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum LinkCall {
         Download,
+        OpenFileDownload,
         UploadSmall,
         UploadLarge,
         Watch,
@@ -2873,8 +2923,9 @@ mod tests {
     }
 
     impl LinkCall {
-        const ALL: [LinkCall; 12] = [
+        const ALL: [LinkCall; 13] = [
             LinkCall::Download,
+            LinkCall::OpenFileDownload,
             LinkCall::UploadSmall,
             LinkCall::UploadLarge,
             LinkCall::Watch,
@@ -2915,6 +2966,7 @@ mod tests {
             let mut next = || chunks.next().map(Ok);
             match self {
                 LinkCall::Download => client.download(tree, path).await.map(drop),
+                LinkCall::OpenFileDownload => client.open_file_download(tree, path).await.map(drop),
                 LinkCall::UploadSmall => client.upload(tree, path, b"hi").await.map(drop),
                 LinkCall::UploadLarge => client.upload(tree, path, &large).await.map(drop),
                 LinkCall::Watch => client.watch(tree, path, false).await.map(drop),
@@ -2981,7 +3033,11 @@ mod tests {
     /// second `STATUS_PATH_NOT_COVERED` is the caller's answer.
     #[tokio::test(start_paused = true)]
     async fn a_link_is_followed_only_once() {
-        for call in [LinkCall::Download, LinkCall::CreateFileWriter] {
+        for call in [
+            LinkCall::Download,
+            LinkCall::OpenFileDownload,
+            LinkCall::CreateFileWriter,
+        ] {
             let mock = Arc::new(MockTransport::new());
             let mut client = make_mock_client(&mock, SessionId(0x77)).await;
             mock.queue_response(path_not_covered(call.first_frame_ops()));
@@ -3014,7 +3070,11 @@ mod tests {
     /// path the caller asked for.
     #[tokio::test(start_paused = true)]
     async fn a_failed_link_referral_hands_back_the_original_error() {
-        for call in [LinkCall::Download, LinkCall::CreateFileWriter] {
+        for call in [
+            LinkCall::Download,
+            LinkCall::OpenFileDownload,
+            LinkCall::CreateFileWriter,
+        ] {
             let mock = Arc::new(MockTransport::new());
             let mut client = make_mock_client(&mock, SessionId(0x77)).await;
             mock.queue_response(path_not_covered(call.first_frame_ops()));
@@ -3210,6 +3270,7 @@ mod tests {
     fn dfs_following_futures_stay_send(client: &mut SmbClient, tree: &mut Tree) {
         fn send<T: Send>(_: T) {}
         send(client.download(tree, "f"));
+        send(client.open_file_download(tree, "f"));
         send(client.watch(tree, "f", false));
         send(client.open_directory_reader(tree, "f"));
         send(client.list_directory_with(tree, "f", ListOptions::new()));
@@ -3217,6 +3278,39 @@ mod tests {
         send(client.resume_file_writer(tree, "f", &resumable_checkpoint()));
         send(client.delete_files(tree, &["f"]));
         send(client.read_file_with_progress(tree, "f", |_| ControlFlow::Continue(())));
+    }
+
+    /// `open_file_download`'s download borrows nothing, so a consumer can hold
+    /// the client for the open alone and spawn the download onto its own task.
+    #[allow(dead_code, clippy::let_underscore_future)]
+    fn an_unborrowed_download_is_static_and_send(download: FileDownload<'static>) {
+        fn spawnable<T: Send + 'static>(_: T) {}
+        spawnable(download);
+    }
+
+    /// The download `open_file_download` hands back outlives the borrow of the
+    /// client it was opened through, and reads from the link's target with
+    /// the adaptive read-ahead window `Tree::download` uses.
+    #[tokio::test(start_paused = true)]
+    async fn an_unborrowed_download_through_a_link_outlives_the_client_borrow() {
+        use crate::client::test_helpers::*;
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        mock.queue_response(path_not_covered(1));
+        queue_link_referral(&mock);
+        mock.queue_response(build_create_response(FileId::SENTINEL, 0));
+
+        let tree = a_dfs_root_tree();
+        let download = client
+            .open_file_download(&tree, "data/f.bin")
+            .await
+            .expect("open through the link");
+        // The client is free again while the download lives.
+        drop(client);
+
+        assert!(matches!(download.read_ahead(), crate::ReadAhead::Adaptive));
+        assert_eq!(download.size(), 0);
+        assert_eq!(creates_on(&mock), [Some(TreeId(1)), Some(LINK_TARGET_TREE)]);
     }
 
     // ── DFS namespace roots ───────────────────────────────────────────

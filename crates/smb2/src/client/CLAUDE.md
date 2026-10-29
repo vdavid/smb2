@@ -440,12 +440,17 @@ Full behavioral detail lives in the `copy.rs` module rustdoc.
 
 ## Streaming download entry points
 
-Two symmetric ways to start a `FileDownload`:
+Three ways to start a `FileDownload`, all reading the same way (below):
 
-- `SmbClient::download(&mut self, &Tree, path)` — convenience wrapper that borrows the client's internal `Connection`.
-- `Tree::download(&self, &mut Connection, path)` — takes the `Connection` directly. Use this when you hold a
-  `conn.clone()` and want to drive concurrent downloads on the same SMB session (each clone pairs with one outstanding
-  download; the receiver task multiplexes responses by `MessageId`). `SmbClient::download` delegates here.
+- `SmbClient::open_file_download(&mut self, &Tree, path) -> FileDownload<'static>` — follows a DFS link, and the
+  download owns a clone of the connection and of the tree it reads from (the link's target, when redirected), so the
+  client is held for the CREATE only. The link-following call for a consumer that keeps its client behind a lock: before
+  it, the only unborrowed way through a link was `FileReader`, positioned reads with no read-ahead.
+- `SmbClient::download(&mut self, &Tree, path)` — the same, borrowing the client for the download's life (kept for its
+  signature); delegates to `open_file_download`.
+- `Tree::download(&self, &mut Connection, path)` — takes the `Connection` directly, no link following. Use this when
+  you hold a `conn.clone()` and want to drive concurrent downloads on the same SMB session (each clone pairs with one
+  outstanding download; the receiver task multiplexes responses by `MessageId`).
 
 **How a download reads** (`stream.rs` + `read_ahead.rs`; the why and the numbers are in `read_ahead.rs`'s module doc and `benchmarks/read-ahead/results/`):
 

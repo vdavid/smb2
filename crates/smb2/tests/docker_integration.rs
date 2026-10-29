@@ -3663,6 +3663,46 @@ async fn dfs_link_download_reads_the_target() {
     assert_eq!(String::from_utf8_lossy(&root).trim(), "root");
 }
 
+/// `open_file_download` holds the client for the open alone: the downloads
+/// stream from the link's target on their own tasks while the client serves
+/// another call, and the caller's tree stays on the root share.
+#[tokio::test]
+#[ignore]
+async fn dfs_link_open_file_download_streams_without_the_client() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+
+    let hello = client
+        .open_file_download(&tree, "data/hello.txt")
+        .await
+        .expect("open through the link");
+    let nested = client
+        .open_file_download(&tree, "data/subdir/nested.txt")
+        .await
+        .expect("second open through the link");
+    assert!(matches!(hello.read_ahead(), smb2::ReadAhead::Adaptive));
+    let hello = tokio::spawn(drain(hello));
+    let nested = tokio::spawn(drain(nested));
+
+    // The client is free while both downloads run.
+    let root = client
+        .read_file(&mut tree, "Root-File.txt")
+        .await
+        .expect("read from the root share meanwhile");
+    assert_eq!(String::from_utf8_lossy(&root).trim(), "root");
+
+    let hello = hello.await.expect("hello task");
+    let nested = nested.await.expect("nested task");
+    assert_eq!(
+        String::from_utf8_lossy(&hello).trim(),
+        "Hello from DFS target!"
+    );
+    assert_eq!(String::from_utf8_lossy(&nested).trim(), "Nested file");
+    assert_eq!(tree.share_name, "dfs");
+}
+
 #[tokio::test]
 #[ignore]
 async fn dfs_link_set_times_reaches_the_target() {

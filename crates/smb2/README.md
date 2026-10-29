@@ -382,6 +382,7 @@ For when you want to do one thing and get the result:
 - `client.delete_directory(&share, path)`: Remove a directory
 - `client.delete_link(&share, path)`: Remove a junction or symlink, leaving its target alone
 - `client.download(&share, path)`: Streaming download with progress (memory-efficient)
+- `client.open_file_download(&share, path)`: The same download, holding the client for the open only, so you can spawn it and keep using the client
 - `client.upload(&share, path, data)`: Streaming upload with progress
 - `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)
 - `client.create_file_writer(&share, path)`: A writer you push chunks into at your own pace. `writer.flush_checkpoint()`
