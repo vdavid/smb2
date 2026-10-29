@@ -7,9 +7,15 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.36.1] - 2026-10-29
+
 ### Added
 
 - **`SmbClient::open_file_download(&mut self, tree, path) -> Result<FileDownload<'static>>`: a download that follows DFS links without borrowing the client.** It reads the same way as `download` and `Tree::download` (512 KiB chunks, adaptive read-ahead window), but the download owns its connection and tree, so the client is held for the open only. You can spawn it onto its own task, run other calls meanwhile, or stream several files over one session. Before this, the only way through a DFS link that didn't hold the client for the whole file was `open_file_reader`, positioned reads with no read-ahead, which made downloads through a link slower than the same files on an ordinary share (#26). `SmbClient::download` now delegates to it and behaves as before.
+
+### Notes
+
+- smb2-cli 0.5.1 builds against this release, with no changes of its own.
 
 ## [0.36.0] - 2026-10-27
 
