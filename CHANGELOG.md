@@ -7,6 +7,21 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.36.2] - 2026-10-30
+
+### Added
+
+- **`SmbClient::resolve_dfs_link(&mut self, tree, path) -> Result<Option<DfsLink>>`: where a path behind a DFS link really lives.** `DfsLink` carries the link's target `tree` (connected and pooled, so its `server` and `share_name` name the target), the `path` on it, and the `link_path` (the link folder on your share, so you can route a whole folder at once). It answers from the referral cache when it can, else with one referral round trip, and costs nothing on a share that isn't in a DFS tree. It's `None` outside every link. With **`SmbClient::connection_for(&self, tree) -> Result<Connection>`**, also new, you can call `Tree` methods on the target directly, on your own task, instead of sending them to your share first and having each refused (#27).
+
+### Fixed
+
+- **A call through a DFS link no longer pays a refused request every time.** Every call through a link sent its request to your share first, got `STATUS_PATH_NOT_COVERED`, and only then went to the link's target, even when the referral cache already knew the link: one extra round trip per call, so a 1,000-file copy out of a link cost 1,000 of them. Now only the first call through a link is refused; the rest go straight to the target while the referral is fresh (MS-DFSC § 3.1.4.1), and a referral past its TTL is asked for again (#21).
+- **Moving a file between folders inside a DFS link works.** `rename`, `rename_with`, and `rename_files` moved a file behind a link only within one folder, and a move like `data/a/x.txt` to `data/b/x.txt` failed with `STATUS_PATH_NOT_COVERED`. Any destination inside the same link folder works now. A destination outside the link is a move to another share, which no single SMB rename can do, so it still reports `STATUS_PATH_NOT_COVERED` (#21).
+
+### Notes
+
+- smb2-cli 0.5.2 builds against this release, with no changes of its own; `smb2 mv` picks up the move fix.
+
 ## [0.36.1] - 2026-10-29
 
 ### Added
