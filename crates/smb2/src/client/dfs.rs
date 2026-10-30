@@ -311,6 +311,10 @@ struct CachedReferral {
 /// touches, and each entry is a few hundred bytes.
 const MAX_CACHE_ENTRIES: usize = 256;
 
+/// The fewest components a link's cache prefix has: server, share, and the
+/// link folder. A namespace root's has two.
+const LINK_MIN_COMPONENTS: usize = 3;
+
 /// DFS referral cache and path resolver.
 ///
 /// Maintains a cache of DFS referral responses keyed by path prefix.
@@ -412,6 +416,63 @@ impl DfsResolver {
     /// `\\dom\nsfoo\x` (MS-DFSC § 3.1.4.1: "Whole path components are used in
     /// the match").
     pub(crate) fn resolve_from_cache(&self, unc_path: &str) -> Option<Vec<ResolvedPath>> {
+        self.lookup(unc_path, 1)
+    }
+
+    /// The DFS link covering `unc_path` (`\\server\share\link\...`), from the
+    /// cache alone: MS-DFSC § 3.1.4.1's check before a request goes out, so a
+    /// path known to sit behind a link goes straight to its target instead
+    /// of being refused first. Counts as a cache hit.
+    ///
+    /// Only a link's entry answers: its prefix names a folder inside a share,
+    /// so at least three components. A namespace root's `\\dom\ns` covers
+    /// every path under it too, and taking it would send the call back to
+    /// the share it was refused on. An expired entry is a miss, so the call
+    /// falls back to the refused CREATE and a fresh referral.
+    pub(crate) fn link_from_cache(&self, unc_path: &str) -> Option<Vec<ResolvedPath>> {
+        let resolved = self.lookup(unc_path, LINK_MIN_COMPONENTS)?;
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        trace!("dfs: link cache hit path={unc_path:?}");
+        Some(resolved)
+    }
+
+    /// The DFS link covering `unc_path`, from the cache or else a referral
+    /// request over `conn`.
+    ///
+    /// `Ok(None)` when the server names no link there: it refused the
+    /// referral (Samba 4.20 answers a path outside every link with
+    /// `STATUS_OBJECT_PATH_NOT_FOUND`, MS-DFSC § 3.2.5.5 says
+    /// `STATUS_NOT_FOUND`; verified against the `smb-dfs-root` fixture,
+    /// 2026-10-30), or its answer covers no link. `Err` is the exchange
+    /// itself failing.
+    pub(crate) async fn resolve_link(
+        &mut self,
+        conn: &mut Connection,
+        unc_path: &str,
+    ) -> Result<Option<Vec<ResolvedPath>>> {
+        if let Some(resolved) = self.link_from_cache(unc_path) {
+            return Ok(Some(resolved));
+        }
+        let referral_path = unc_path.strip_prefix('\\').unwrap_or(unc_path);
+        debug!("dfs: cache miss, sending a referral request path={referral_path:?}");
+        let resp = match get_dfs_referral(conn, referral_path).await {
+            Ok(resp) => resp,
+            Err(Error::Protocol {
+                status,
+                command: Command::Ioctl,
+            }) => {
+                trace!("dfs: no link here ({status:?}) path={referral_path:?}");
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        self.referrals_resolved.fetch_add(1, Ordering::Relaxed);
+        self.cache_referral(referral_path, &resp);
+        Ok(self.lookup(unc_path, LINK_MIN_COMPONENTS))
+    }
+
+    /// Longest-prefix match over entries of at least `min_components`.
+    fn lookup(&self, unc_path: &str, min_components: usize) -> Option<Vec<ResolvedPath>> {
         let components = path_components(unc_path);
         let now = Instant::now();
 
@@ -419,6 +480,7 @@ impl DfsResolver {
         let mut best: Option<&CachedReferral> = None;
         for entry in self.cache.values() {
             if entry.expires_at > now
+                && entry.prefix.len() >= min_components
                 && prefix_matches(&entry.prefix, &components)
                 && best.is_none_or(|b| entry.prefix.len() > b.prefix.len())
             {
@@ -1123,6 +1185,50 @@ pub(crate) mod tests {
 
         let result = resolver.resolve_from_cache(r"\\domain\dfs\file.txt");
         assert!(result.is_none(), "expired entry should not match");
+    }
+
+    /// A link lookup answers from a link's entry (a folder inside a share),
+    /// matched case-insensitively, and counts as a cache hit.
+    #[test]
+    fn a_link_lookup_answers_from_a_cached_link() {
+        let mut resolver = DfsResolver::new();
+        let resp = make_referral(r"\srv\dfs\data", &[(r"\\fs02\files", 600)]);
+        resolver.cache_referral(r"\srv\dfs\data", &resp);
+
+        let found = resolver
+            .link_from_cache(r"\\srv\dfs\DATA\Sub\f.txt")
+            .expect("the link's entry covers it");
+        assert_eq!(found[0].share, "files");
+        assert_eq!(found[0].remaining_path, r"Sub\f.txt");
+        assert_eq!(found[0].link_depth(), 1);
+        assert_eq!(resolver.counters().0, 1, "a cache hit");
+        assert!(resolver.link_from_cache(r"\\srv\dfs\other\f").is_none());
+    }
+
+    /// A namespace root's entry (`\\dom\ns`, from `connect_share`) covers
+    /// every path under it, and isn't a link: a link lookup that took it
+    /// would send the call back to the same share and be refused again.
+    #[test]
+    fn a_link_lookup_skips_a_root_entry() {
+        let mut resolver = DfsResolver::new();
+        let resp = make_referral(r"\dom\ns", &[(r"\\dom\ns", 600)]);
+        resolver.cache_referral(r"\dom\ns", &resp);
+
+        assert!(resolver.resolve_from_cache(r"\\dom\ns\data\f").is_some());
+        assert!(resolver.link_from_cache(r"\\dom\ns\data\f").is_none());
+    }
+
+    /// An expired link is a miss, so the call goes back to asking the share
+    /// (and its refused CREATE) rather than trusting a stale target.
+    #[test]
+    fn a_link_lookup_skips_an_expired_link() {
+        let mut resolver = DfsResolver::new();
+        let mut entry = expired_entry();
+        entry.prefix.push("data".to_string());
+        entry.dfs_path_prefix = r"\\domain\dfs\data".to_string();
+        resolver.cache.insert(entry.dfs_path_prefix.clone(), entry);
+
+        assert!(resolver.link_from_cache(r"\\domain\dfs\data\f").is_none());
     }
 
     #[test]

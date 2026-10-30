@@ -406,6 +406,31 @@ pub struct DfsOrigin {
     pub target: String,
 }
 
+/// Where a path behind a DFS link really lives, from
+/// [`SmbClient::resolve_dfs_link`](crate::SmbClient::resolve_dfs_link).
+///
+/// The target's server and share are [`tree`](Self::tree)'s
+/// [`server`](Tree::server) and [`share_name`](Tree::share_name).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DfsLink {
+    /// The link's target share, connected and pooled by the client. Every
+    /// `SmbClient` call takes it as is; for [`Tree`]'s own methods, its
+    /// connection is
+    /// [`SmbClient::connection_for`](crate::SmbClient::connection_for).
+    pub tree: Tree,
+    /// The path on [`tree`](Self::tree) that the caller's path names: past
+    /// the link folder, under the target's own folder when the link points
+    /// inside its share. Empty for the link folder itself (the target's
+    /// root).
+    pub path: String,
+    /// The link folder on the caller's share, as the caller's path spells it
+    /// (`data`, or `projects/data`). Every path under it lives on
+    /// [`tree`](Self::tree) too, for as long as the server's referral says
+    /// (its TTL).
+    pub link_path: String,
+}
+
 /// A connection to a specific share (tree connect).
 ///
 /// `#[non_exhaustive]`: only the library produces a `Tree`, so nothing is lost

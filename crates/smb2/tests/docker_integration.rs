@@ -3820,6 +3820,121 @@ async fn dfs_link_batches_follow_the_link_item_by_item() {
     );
 }
 
+/// `resolve_dfs_link` names the link's target share and the path on it, and a
+/// `Tree` method sent there on the target's own connection reads the file
+/// without going near the root share. A path outside the link is `None`.
+#[tokio::test]
+#[ignore]
+async fn dfs_link_resolver_names_the_target() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let tree = client.connect_share("dfs").await.expect("connect_share");
+
+    let link = client
+        .resolve_dfs_link(&tree, "data/hello.txt")
+        .await
+        .expect("resolve_dfs_link")
+        .expect("data/hello.txt sits behind the link");
+    assert_eq!(link.tree.share_name, "files");
+    assert_eq!(link.tree.server, DFS_TARGET_ADDR);
+    assert_eq!(link.path, "hello.txt");
+    assert_eq!(link.link_path, "data");
+
+    let mut conn = client
+        .connection_for(&link.tree)
+        .expect("the target's connection");
+    let hello = link
+        .tree
+        .read_file(&mut conn, &link.path)
+        .await
+        .expect("read on the target directly");
+    assert_eq!(
+        String::from_utf8_lossy(&hello).trim(),
+        "Hello from DFS target!"
+    );
+
+    let outside = client
+        .resolve_dfs_link(&tree, "Root-File.txt")
+        .await
+        .expect("resolve_dfs_link outside the link");
+    assert!(outside.is_none(), "{outside:?}");
+    assert_eq!(tree.share_name, "dfs");
+}
+
+/// Once a link is known, a call through it goes straight to the target: the
+/// root share's server sees nothing, where it used to refuse every call.
+#[tokio::test]
+#[ignore]
+async fn dfs_link_a_known_link_skips_the_root_share() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    client
+        .read_file(&mut tree, "data/hello.txt")
+        .await
+        .expect("first read through the link");
+
+    let sent = |client: &SmbClient| client.connection().diagnostics().metrics.requests_sent;
+    let before = sent(&client);
+    let nested = client
+        .read_file(&mut tree, "data/subdir/nested.txt")
+        .await
+        .expect("second read through the link");
+    assert_eq!(String::from_utf8_lossy(&nested).trim(), "Nested file");
+    client
+        .stat(&mut tree, "data/hello.txt")
+        .await
+        .expect("stat through the link");
+    assert_eq!(sent(&client), before, "the root share's server was asked");
+}
+
+/// A move between folders inside a link renames on the link's target, where
+/// both folders really are.
+#[tokio::test]
+#[ignore]
+async fn dfs_link_a_move_across_folders_inside_the_link() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let (a, b) = ("data/_dfs_move_a", "data/_dfs_move_b");
+    let (from, to) = ("data/_dfs_move_a/x.txt", "data/_dfs_move_b/x.txt");
+    for dir in [a, b] {
+        let _ = client.create_directory(&tree, dir).await;
+    }
+    client
+        .write_file(&tree, from, b"moved")
+        .await
+        .expect("write_file");
+
+    client
+        .rename(&tree, from, to)
+        .await
+        .expect("a move inside the link");
+
+    let moved = client
+        .read_file(&mut tree, to)
+        .await
+        .expect("read the moved file");
+    assert_eq!(moved, b"moved");
+    let gone = client.stat(&mut tree, from).await;
+    assert!(
+        gone.as_ref()
+            .is_err_and(|e| e.kind() == smb2::ErrorKind::NotFound),
+        "{gone:?}"
+    );
+
+    client.delete_file(&tree, to).await.expect("cleanup file");
+    for dir in [a, b] {
+        client
+            .delete_directory(&tree, dir)
+            .await
+            .expect("cleanup dir");
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn dfs_link_watch_sees_changes_on_the_target() {

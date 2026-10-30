@@ -61,7 +61,8 @@ pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress, WriteCheckpoint};
 pub use times::FileTimes;
 pub use tree::{
-    DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions, Tree,
+    DfsLink, DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions,
+    Tree,
 };
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
@@ -81,7 +82,7 @@ use crate::error::Result;
 use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
 use crate::types::status::NtStatus;
-use crate::types::{FileId, SessionId, TreeId};
+use crate::types::{FileId, SessionId};
 use crate::Error;
 use connections::{ConnectionEntry, Connections};
 
@@ -422,60 +423,20 @@ pub(crate) fn host_of(addr: &str) -> &str {
     }
 }
 
-/// Where a rename of `from` to `to` lands on a DFS link's target, given that
-/// the referral turned `from` into `remaining` there.
-///
-/// SET_INFO's destination is share-relative and carries no DFS prefix, so it
-/// has to move with the source. Within one directory that's unambiguous: same
-/// directory as `remaining`, `to`'s name. `None` for anything else, which may
-/// leave the link altogether and can't be one rename.
-fn link_rename_target(from: &str, to: &str, remaining: &str) -> Option<String> {
-    fn split(path: &str) -> (Vec<&str>, &str) {
-        let mut parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-        let name = parts.pop().unwrap_or_default();
-        (parts, name)
-    }
-    let (from_dir, _) = split(from);
-    let (to_dir, name) = split(to);
-    let (target_dir, _) = split(remaining);
-    if from_dir != to_dir || name.is_empty() {
-        return None;
-    }
-    Some(
-        target_dir
-            .into_iter()
-            .chain(std::iter::once(name))
-            .collect::<Vec<_>>()
-            .join("/"),
+/// `path` on `tree` as the UNC path a link referral is asked for and the
+/// referral cache is keyed by: `\\host\share\a\b`.
+fn link_unc(tree: &Tree, path: &str) -> String {
+    // The referral lookup and the tree-connect path have to name the same
+    // server, so this goes through the one derivation (`host_of`). Encoded,
+    // not just slash-flipped: the referral lookup and the CREATE that follows
+    // have to agree on where a component ends, and a `\` that came from a
+    // *name* is U+F026 in both (`crate::name`).
+    format!(
+        "\\\\{}\\{}\\{}",
+        host_of(&tree.server),
+        tree.share_name,
+        crate::name::encode_path(path)
     )
-}
-
-/// The rename op both `rename` and `rename_files` run: `to` as given on the
-/// caller's own tree, moved along with `from` on a link's target.
-async fn rename_on(
-    mut conn: Connection,
-    tree: Tree,
-    path: String,
-    caller: (TreeId, String),
-    from: &str,
-    to: &str,
-    options: RenameOptions,
-) -> Result<()> {
-    let on_caller_tree = (tree.tree_id, &tree.server) == (caller.0, &caller.1);
-    if on_caller_tree {
-        return tree.rename_with(&mut conn, &path, to, options).await;
-    }
-    match link_rename_target(from, to, &path) {
-        Some(target_to) => {
-            tree.rename_with(&mut conn, &path, &target_to, options)
-                .await
-        }
-        // The server's own answer: this rename can't follow the link.
-        None => Err(Error::Protocol {
-            status: NtStatus::PATH_NOT_COVERED,
-            command: crate::types::Command::Create,
-        }),
-    }
 }
 
 /// What [`SmbClient::follow_dfs_link`] came back with.
@@ -490,35 +451,71 @@ struct Followed<T> {
 struct Link {
     /// The link's target share, pooled (`Connections::link_tree`).
     tree: Tree,
-    /// How many leading components of the caller's path the link folder
-    /// takes up.
-    covers: usize,
-    /// How many leading components of a path on `tree` stand for that same
-    /// folder: nonzero when the link points at a folder inside its share.
-    target_prefix: usize,
+    /// The link folder, as the caller's path spells it (`data`, `a/data`).
+    link_folder: Vec<String>,
+    /// The same folder on `tree`: empty when the link points at its target
+    /// share's root, `sub` for a link to `\\fs02\files\sub`.
+    target_folder: Vec<String>,
 }
 
 impl Link {
     fn new(tree: Tree, caller_path: &str, remaining: &str, link_depth: usize) -> Self {
-        let caller = components(caller_path).len();
-        let covers = link_depth.min(caller);
-        let target_prefix = components(remaining).len().saturating_sub(caller - covers);
+        let caller = components(caller_path);
+        let covers = link_depth.min(caller.len());
+        let remaining = components(remaining);
+        let target_prefix = remaining.len().saturating_sub(caller.len() - covers);
         Link {
             tree,
-            covers,
-            target_prefix,
+            link_folder: caller[..covers].iter().map(|c| c.to_string()).collect(),
+            target_folder: remaining[..target_prefix]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
         }
     }
 
     /// `target_path`, a path relative to the link's target share, in the
     /// caller's terms: relative to the caller's own share, link folder first.
-    fn caller_path(&self, caller_path: &str, target_path: &str) -> String {
-        components(caller_path)
-            .into_iter()
-            .take(self.covers)
-            .chain(components(target_path).into_iter().skip(self.target_prefix))
+    fn caller_path(&self, target_path: &str) -> String {
+        self.link_folder
+            .iter()
+            .map(String::as_str)
+            .chain(
+                components(target_path)
+                    .into_iter()
+                    .skip(self.target_folder.len()),
+            )
             .collect::<Vec<_>>()
             .join("/")
+    }
+
+    /// `caller_path`, a path on the caller's share, as a path on the link's
+    /// target, when it sits inside the link folder. `None` for a path outside
+    /// the link, or the link folder itself, which has no name on the target.
+    ///
+    /// The folder matches case-insensitively, as DFS paths do (MS-DFSC
+    /// § 3.1.4.1).
+    fn target_path(&self, caller_path: &str) -> Option<String> {
+        let caller = components(caller_path);
+        let inside = caller.len() > self.link_folder.len()
+            && self
+                .link_folder
+                .iter()
+                .zip(&caller)
+                .all(|(link, c)| link.to_lowercase() == c.to_lowercase());
+        inside.then(|| {
+            self.target_folder
+                .iter()
+                .map(String::as_str)
+                .chain(caller[self.link_folder.len()..].iter().copied())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+    }
+
+    /// The link folder in the caller's terms, `/`-joined.
+    fn link_path(&self) -> String {
+        self.link_folder.join("/")
     }
 }
 
@@ -1082,6 +1079,87 @@ impl SmbClient {
         self.connections.primary_mut()
     }
 
+    /// The connection `tree` lives on, for calling [`Tree`]'s own methods
+    /// without holding the client: the primary for a tree on the server this
+    /// client connected to, the pooled one for a DFS target's tree (such as
+    /// [`DfsLink::tree`]). A clone is cheap and shares everything.
+    ///
+    /// [`Error::Disconnected`] when that connection is gone: a reconnect
+    /// drops every DFS connection, so `connect_share` (or
+    /// [`resolve_dfs_link`](Self::resolve_dfs_link)) again.
+    pub fn connection_for(&self, tree: &Tree) -> Result<Connection> {
+        self.connections.for_tree_ref(tree).cloned()
+    }
+
+    /// Where `path` on `tree` really lives when it sits behind a DFS link: the
+    /// link's target share (connected and pooled), the path on it, and the
+    /// link folder. `None` when it doesn't sit behind one.
+    ///
+    /// Every `SmbClient` call already follows links, so this is for a
+    /// consumer that calls [`Tree`]'s own methods, on its own task or its own
+    /// connection: it can send them to the target directly rather than to
+    /// `tree`, where each would be refused with `STATUS_PATH_NOT_COVERED`
+    /// first. `tree` itself never moves.
+    ///
+    /// What it costs:
+    /// - **Nothing on the wire** when DFS is off ([`ClientConfig::dfs_enabled`]),
+    ///   `tree` isn't a DFS share ([`Tree::is_dfs`]), or `path` is the share's
+    ///   root.
+    /// - **Nothing on the wire** when the referral cache already knows the
+    ///   link (any earlier call through it, or this one, put it there; it
+    ///   lasts for the referral's TTL). The target's tree connect is pooled,
+    ///   so it's paid once per target share.
+    /// - **One referral round trip** otherwise. A path outside every link
+    ///   isn't remembered, so ask once per folder rather than per file:
+    ///   everything under [`DfsLink::link_path`] lives on the same target.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DfsNoReachableTarget`] when the link is real and none of its
+    /// targets answered; otherwise whatever stopped the referral exchange.
+    /// A server that refuses the referral is saying there's no link there,
+    /// which is `Ok(None)`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// let (tree, path, mut conn) = match client.resolve_dfs_link(share, "data/report.pdf").await? {
+    ///     Some(link) => {
+    ///         let conn = client.connection_for(&link.tree)?;
+    ///         (link.tree, link.path, conn)
+    ///     }
+    ///     None => (share.clone(), "data/report.pdf".to_string(), client.connection_for(share)?),
+    /// };
+    /// // The client is free again; the stat goes straight to where the file is.
+    /// let info = tree.stat(&mut conn, &path).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resolve_dfs_link(&mut self, tree: &Tree, path: &str) -> Result<Option<DfsLink>> {
+        if !self.config.dfs_enabled || !tree.is_dfs || components(path).is_empty() {
+            return Ok(None);
+        }
+        let found = match self.cached_link(tree, path).await {
+            Some(found) => found?,
+            None => {
+                let unc_path = link_unc(tree, path);
+                let conn = self.connections.for_tree(tree)?;
+                let Some(resolved_list) = self.dfs_resolver.resolve_link(conn, &unc_path).await?
+                else {
+                    return Ok(None);
+                };
+                self.connect_link(&resolved_list, path, unc_path).await?
+            }
+        };
+        let (link, remaining) = found;
+        Ok(Some(DfsLink {
+            link_path: link.link_path(),
+            tree: link.tree,
+            path: remaining,
+        }))
+    }
+
     // ── DFS helpers ───────────────────────────────────────────────────
 
     /// Run `op` on `tree` and `path`, and when the server answers that `path`
@@ -1105,6 +1183,11 @@ impl SmbClient {
     /// effect (a progress callback, a pulled source chunk): the trigger is a
     /// refused CREATE (`is_dfs_link`), so running the rest afterwards, on the
     /// tree this returns, makes a redirect before any of it certain.
+    ///
+    /// A path the referral cache already places behind a link goes straight
+    /// to the link's target (MS-DFSC § 3.1.4.1), the same place the refusal
+    /// would have sent it, minus the refused round trip. A cold cache or an
+    /// expired entry takes the refusal path.
     async fn follow_dfs_link<T, F, Fut>(
         &mut self,
         tree: &Tree,
@@ -1115,6 +1198,26 @@ impl SmbClient {
         F: FnMut(Connection, Tree, String) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
+        match self.cached_link(tree, path).await {
+            Some(Ok((link, remaining))) => {
+                let result = match self.connections.for_tree(&link.tree) {
+                    Ok(conn) => op(conn.clone(), link.tree.clone(), remaining).await,
+                    Err(e) => Err(e),
+                };
+                return Followed {
+                    result,
+                    moved_to: Some(link),
+                };
+            }
+            Some(Err(e)) => {
+                return Followed {
+                    result: Err(e),
+                    moved_to: None,
+                }
+            }
+            None => {}
+        }
+
         let first = match self.connections.for_tree(tree) {
             Ok(conn) => op(conn.clone(), tree.clone(), path.to_string()).await,
             Err(e) => Err(e),
@@ -1229,25 +1332,42 @@ impl SmbClient {
     /// each target in turn, and says [`Error::DfsNoReachableTarget`] when the
     /// referral named targets and none of them answered.
     async fn redirect(&mut self, tree: &Tree, original_path: &str) -> Result<(Link, String)> {
-        // The referral lookup and the tree-connect path have to name the same
-        // server, so this goes through the one derivation (`host_of`).
-        let hostname = host_of(&tree.server).to_string();
-        let share = tree.share_name.clone();
-        // Encoded, not just slash-flipped: the referral lookup and the CREATE
-        // that follows have to agree on where a component ends, and a `\` that
-        // came from a *name* is U+F026 in both (`crate::name`).
-        let normalized = crate::name::encode_path(original_path);
-        let unc_path = format!("\\\\{}\\{}\\{}", hostname, share, normalized);
-
+        let unc_path = link_unc(tree, original_path);
         debug!("dfs: resolving path={unc_path:?}");
 
         // Resolve the referral (uses cache or IOCTL).
         let conn = self.connections.for_tree(tree)?;
-        let resolved_list = self.dfs_resolver.resolve(conn, &unc_path).await?;
+        let resolved_list = self
+            .dfs_resolver
+            .resolve_link(conn, &unc_path)
+            .await?
+            .ok_or_else(|| Error::invalid_data("DFS: the referral names no link"))?;
+        self.connect_link(&resolved_list, original_path, unc_path)
+            .await
+    }
 
-        // Try each target (multi-target failover).
+    /// [`redirect`](Self::redirect) from the referral cache alone: `None`
+    /// when the cache doesn't place `path` behind a link (or DFS is off),
+    /// and nothing goes on the wire for it.
+    async fn cached_link(&mut self, tree: &Tree, path: &str) -> Option<Result<(Link, String)>> {
+        if !self.config.dfs_enabled {
+            return None;
+        }
+        let unc_path = link_unc(tree, path);
+        let resolved_list = self.dfs_resolver.link_from_cache(&unc_path)?;
+        Some(self.connect_link(&resolved_list, path, unc_path).await)
+    }
+
+    /// Connect the first of a link's targets that answers (multi-target
+    /// failover), and the path the referral leaves on it.
+    async fn connect_link(
+        &mut self,
+        resolved_list: &[dfs::ResolvedPath],
+        original_path: &str,
+        unc_path: String,
+    ) -> Result<(Link, String)> {
         let mut last_error = None;
-        for resolved in &resolved_list {
+        for resolved in resolved_list {
             let target_addr = self.target_addr(resolved);
             match self.link_target_tree(&target_addr, &resolved.share).await {
                 Ok(new_tree) => {
@@ -1723,7 +1843,7 @@ impl SmbClient {
             })
             .await?;
         if let Some(link) = link {
-            resolved.path = link.caller_path(path, &resolved.path);
+            resolved.path = link.caller_path(&resolved.path);
         }
         Ok(resolved)
     }
@@ -1754,9 +1874,10 @@ impl SmbClient {
 
     /// Rename a file or directory on the given share.
     ///
-    /// Behind a DFS link, a rename within one directory follows the link;
-    /// any other keeps the server's `STATUS_PATH_NOT_COVERED`, since its
-    /// destination may not be behind the same link.
+    /// Behind a DFS link, a rename follows the link when `to` sits inside the
+    /// same link folder, across subfolders too (`data/a/x` to `data/b/x`). A
+    /// `to` outside it would be a move to another share, which no single SMB
+    /// rename can do, so it keeps the server's `STATUS_PATH_NOT_COVERED`.
     pub async fn rename(&mut self, tree: &Tree, from: &str, to: &str) -> Result<()> {
         self.rename_with(tree, from, to, RenameOptions::default())
             .await
@@ -1788,12 +1909,41 @@ impl SmbClient {
         to: &str,
         options: RenameOptions,
     ) -> Result<()> {
+        // Two steps behind a link: following it says where `from` lives, and
+        // the rename's destination, which SET_INFO takes share-relative with
+        // no DFS prefix, needs the same link to move along with it. So the
+        // op renames only on the caller's own tree, and on a link's target
+        // hands the path back for the rename below.
         let caller = (tree.tree_id, tree.server.clone());
-        self.beside_tree(tree, from, |conn, target, path| {
-            rename_on(conn, target, path, caller.clone(), from, to, options)
-        })
-        .await
-        .map(|(done, _)| done)
+        let mut op = |mut conn: Connection, on: Tree, path: String| {
+            let on_caller_tree = (on.tree_id, &on.server) == (caller.0, &caller.1);
+            async move {
+                if !on_caller_tree {
+                    return Ok(Some(path));
+                }
+                on.rename_with(&mut conn, &path, to, options)
+                    .await
+                    .map(|()| None)
+            }
+        };
+        let followed = self.follow_dfs_link(tree, from, &mut op).await;
+        let (remaining, link) = match (followed.result?, followed.moved_to) {
+            (None, _) => return Ok(()),
+            (Some(remaining), Some(link)) => (remaining, link),
+            (Some(_), None) => return Err(Error::invalid_data("DFS: a rename lost its link")),
+        };
+        // A destination outside the link is a move between shares, which no
+        // single SMB rename can do: the server's own answer stands.
+        let Some(target_to) = link.target_path(to) else {
+            return Err(Error::Protocol {
+                status: NtStatus::PATH_NOT_COVERED,
+                command: crate::types::Command::Create,
+            });
+        };
+        let mut conn = self.connections.for_tree(&link.tree)?.clone();
+        link.tree
+            .rename_with(&mut conn, &remaining, &target_to, options)
+            .await
     }
 
     /// Rename multiple files on the given share.
@@ -1821,14 +1971,8 @@ impl SmbClient {
         options: RenameOptions,
     ) -> Vec<Result<()>> {
         let mut results = Vec::with_capacity(renames.len());
-        let caller = (tree.tree_id, tree.server.clone());
         for (from, to) in renames {
-            let result = self
-                .beside_tree(tree, from, |conn, target, path| {
-                    rename_on(conn, target, path, caller.clone(), from, to, options)
-                })
-                .await;
-            results.push(result.map(|(done, _)| done));
+            results.push(self.rename_with(tree, from, to, options).await);
         }
         results
     }
@@ -3133,7 +3277,8 @@ mod tests {
 
     /// A batch follows a link for the items behind it, asking for the referral
     /// and connecting the target share once, and keeps every other item, and
-    /// the caller's tree, on the share it named.
+    /// the caller's tree, on the share it named. Only the first linked item
+    /// is refused: the rest go straight to the target from the cache.
     #[tokio::test(start_paused = true)]
     async fn a_batch_follows_a_link_once_and_keeps_the_rest_on_its_share() {
         let mock = Arc::new(MockTransport::new());
@@ -3142,8 +3287,7 @@ mod tests {
         mock.queue_response(path_not_covered(3));
         queue_link_referral(&mock);
         mock.queue_response(deleted());
-        // data/b: refused, then straight to the target from the cache.
-        mock.queue_response(path_not_covered(3));
+        // data/b: straight to the target, the cache knows the link.
         mock.queue_response(deleted());
         // plain.txt: an ordinary file in the root share.
         mock.queue_response(deleted());
@@ -3159,7 +3303,6 @@ mod tests {
             [
                 Some(TreeId(1)),
                 Some(LINK_TARGET_TREE),
-                Some(TreeId(1)),
                 Some(LINK_TARGET_TREE),
                 Some(TreeId(1)),
             ]
@@ -3173,6 +3316,165 @@ mod tests {
             "IPC$ and the target share, once each"
         );
         assert_eq!(tree.tree_id, TreeId(1), "the caller's tree stays put");
+        mock.assert_fully_consumed();
+    }
+
+    /// Every call after the first through a link skips the refused CREATE,
+    /// the single-file ones included (MS-DFSC § 3.1.4.1's cache check).
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_link_sends_no_refused_create() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        mock.queue_response(path_not_covered(3));
+        queue_link_referral(&mock);
+        mock.queue_response(deleted());
+        mock.queue_response(deleted());
+        mock.queue_response(deleted());
+
+        let tree = a_dfs_root_tree();
+        for path in ["data/a", "DATA/sub/b", "data/c"] {
+            client.delete_file(&tree, path).await.expect(path);
+        }
+
+        assert_eq!(
+            creates_on(&mock),
+            [
+                Some(TreeId(1)),
+                Some(LINK_TARGET_TREE),
+                Some(LINK_TARGET_TREE),
+                Some(LINK_TARGET_TREE),
+            ]
+        );
+        assert_eq!(client.diagnostics().client.metrics.dfs_cache_hits, 2);
+        mock.assert_fully_consumed();
+    }
+
+    /// A move between folders inside one link renames on the link's target,
+    /// with the destination moved onto the target too.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_across_folders_inside_a_link_renames_on_its_target() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        mock.queue_response(path_not_covered(3));
+        queue_link_referral(&mock);
+        mock.queue_response(deleted());
+
+        let tree = a_dfs_root_tree();
+        client
+            .rename(&tree, "data/a/x.txt", "data/b/x.txt")
+            .await
+            .expect("a move inside the link");
+
+        assert_eq!(creates_on(&mock), [Some(TreeId(1)), Some(LINK_TARGET_TREE)]);
+        let rename = mock.sent_messages().last().cloned().expect("the rename");
+        let to: Vec<u8> = "b\\x.txt"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert!(
+            rename.windows(to.len()).any(|w| w == to.as_slice()),
+            "the destination isn't the target's b\\x.txt"
+        );
+        mock.assert_fully_consumed();
+    }
+
+    /// A move out of a link would be a move to another share, which no
+    /// single rename does: the server's answer stands, and nothing is renamed
+    /// on the target.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_out_of_a_link_keeps_the_servers_answer() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        mock.queue_response(path_not_covered(3));
+        queue_link_referral(&mock);
+
+        let tree = a_dfs_root_tree();
+        let outcome = client.rename(&tree, "data/x.txt", "x.txt").await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::Protocol {
+                    status: NtStatus::PATH_NOT_COVERED,
+                    command: Command::Create,
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(creates_on(&mock), [Some(TreeId(1))]);
+        mock.assert_fully_consumed();
+    }
+
+    /// `resolve_dfs_link` names the link's target tree and the path on it,
+    /// asks the server once, and answers from the cache after that.
+    #[tokio::test(start_paused = true)]
+    async fn resolve_dfs_link_finds_the_target_and_caches_it() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        queue_link_referral(&mock);
+        let tree = a_dfs_root_tree();
+
+        let link = client
+            .resolve_dfs_link(&tree, "data/Sub/f.bin")
+            .await
+            .expect("resolve")
+            .expect("behind the link");
+        assert_eq!(link.tree.tree_id, LINK_TARGET_TREE);
+        assert_eq!(link.tree.share_name, "files");
+        assert_eq!(link.path, "Sub/f.bin");
+        assert_eq!(link.link_path, "data");
+
+        let sent = mock.sent_messages().len();
+        let again = client
+            .resolve_dfs_link(&tree, "DATA/other")
+            .await
+            .expect("resolve")
+            .expect("still behind the link");
+        assert_eq!(
+            (again.tree.tree_id, again.path.as_str()),
+            (LINK_TARGET_TREE, "other")
+        );
+        assert_eq!(again.link_path, "DATA");
+        assert_eq!(mock.sent_messages().len(), sent, "the cache answered");
+
+        // A call through the link now goes straight to the target.
+        mock.queue_response(deleted());
+        client.delete_file(&tree, "data/x").await.expect("delete");
+        assert_eq!(creates_on(&mock), [Some(LINK_TARGET_TREE)]);
+        assert_eq!(tree.tree_id, TreeId(1), "the caller's tree stays put");
+        mock.assert_fully_consumed();
+    }
+
+    /// A path no link covers is `None`: for free on a share that isn't in a
+    /// DFS tree or at the share's root, and from the server's refusal on one
+    /// that is.
+    #[tokio::test(start_paused = true)]
+    async fn resolve_dfs_link_is_none_outside_a_link() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let sent = mock.sent_messages().len();
+
+        let plain = Tree {
+            is_dfs: false,
+            ..a_dfs_root_tree()
+        };
+        assert!(client
+            .resolve_dfs_link(&plain, "data/f")
+            .await
+            .unwrap()
+            .is_none());
+        let tree = a_dfs_root_tree();
+        assert!(client.resolve_dfs_link(&tree, "/").await.unwrap().is_none());
+        assert_eq!(mock.sent_messages().len(), sent, "nothing on the wire");
+
+        // What Samba answers for a path outside every link.
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        mock.queue_response(build_ioctl_refusal(NtStatus::OBJECT_PATH_NOT_FOUND));
+        assert!(client
+            .resolve_dfs_link(&tree, "plain.txt")
+            .await
+            .unwrap()
+            .is_none());
         mock.assert_fully_consumed();
     }
 
@@ -3220,48 +3522,35 @@ mod tests {
     /// folder, so it opens the same file on the caller's tree.
     #[test]
     fn a_target_path_maps_back_through_the_link() {
-        let link = |covers, target_prefix| Link {
-            tree: a_dfs_root_tree(),
-            covers,
-            target_prefix,
-        };
         // `data` -> `\\fs02\files`: data/HELLO.TXT is hello.txt there.
-        assert_eq!(
-            link(1, 0).caller_path("data/HELLO.TXT", "hello.txt"),
-            "data/hello.txt"
-        );
+        let link = Link::new(a_dfs_root_tree(), "data/HELLO.TXT", "HELLO.TXT", 1);
+        assert_eq!(link.caller_path("hello.txt"), "data/hello.txt");
         // `a/data` -> `\\fs02\files\sub`: a/data/x/f is sub/x/f there.
-        assert_eq!(
-            link(2, 1).caller_path("a/data/X/f", "sub/x/f"),
-            "a/data/x/f"
-        );
+        let link = Link::new(a_dfs_root_tree(), "a/data/X/f", "sub/X/f", 2);
+        assert_eq!(link.caller_path("sub/x/f"), "a/data/x/f");
+        assert_eq!(link.link_path(), "a/data");
         // The link folder itself.
-        assert_eq!(link(1, 0).caller_path("data", ""), "data");
+        let link = Link::new(a_dfs_root_tree(), "data", "", 1);
+        assert_eq!(link.caller_path(""), "data");
     }
 
     /// A rename's destination is share-relative, so behind a link it has to
-    /// move with the source: inside one directory that's unambiguous, and
-    /// anything else is refused rather than guessed at.
+    /// move with the source: anywhere inside the link folder maps onto the
+    /// target, across subfolders too, and a path outside it (another share,
+    /// as far as the server is concerned) or the link folder itself doesn't.
     #[test]
-    fn a_rename_behind_a_link_keeps_its_directory() {
-        assert_eq!(
-            link_rename_target("data/a.txt", "data/b.txt", "a.txt").as_deref(),
-            Some("b.txt")
-        );
-        assert_eq!(
-            link_rename_target("data/sub/a.txt", "data/sub/b.txt", "deep/sub/a.txt").as_deref(),
-            Some("deep/sub/b.txt")
-        );
-        assert_eq!(
-            link_rename_target("/data/a.txt", "data/b.txt/", "a.txt").as_deref(),
-            Some("b.txt")
-        );
-        // Out of the directory, possibly out of the link: no single rename.
-        assert_eq!(link_rename_target("data/a.txt", "b.txt", "a.txt"), None);
-        assert_eq!(
-            link_rename_target("data/a.txt", "data/sub/b.txt", "a.txt"),
-            None
-        );
+    fn a_path_inside_the_link_maps_onto_its_target() {
+        let link = Link::new(a_dfs_root_tree(), "data/a/x.txt", "a/x.txt", 1);
+        assert_eq!(link.target_path("data/b/x.txt").as_deref(), Some("b/x.txt"));
+        assert_eq!(link.target_path("/DATA/y.txt/").as_deref(), Some("y.txt"));
+        assert_eq!(link.target_path("b/x.txt"), None, "outside the link");
+        assert_eq!(link.target_path("database/x"), None, "a whole component");
+        assert_eq!(link.target_path("data"), None, "the link folder itself");
+
+        // A link to a folder inside its target share keeps that folder.
+        let link = Link::new(a_dfs_root_tree(), "p/data/a/x", "deep/a/x", 2);
+        assert_eq!(link.target_path("p/data/b/x").as_deref(), Some("deep/b/x"));
+        assert_eq!(link.target_path("data/b/x"), None);
     }
 
     /// Consumers spawn these on multi-threaded runtimes, so following a link

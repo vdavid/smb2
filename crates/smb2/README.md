@@ -43,7 +43,7 @@ we have more control to reach even better speeds.
 - File watching (CHANGE_NOTIFY for live directory updates)
 - Disk space queries (total, free, used)
 - DFS: namespace roots (`\\domain\namespace`), links inside a share, and multi-target failover, all resolved
-  transparently
+  transparently, plus `SmbClient::resolve_dfs_link` to ask where a path behind a link really lives
 - Reconnection after network failures
 - Auto-flush on writes (data safety for family photos and company docs)
 - Filenames carrying characters SMB2 forbids (`?`, `*`, `"`, `:`, `<`, `>`, `\`, `|`, a trailing space or period),

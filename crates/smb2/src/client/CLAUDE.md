@@ -257,8 +257,7 @@ plus a replay after reviving a dead session, for the reads, listings, `stat`, an
   `FileWriter`, `Watcher`); a path the target returns (`Resolved::path`) goes back through `Link::caller_path`, which
   swaps the target's folder for the caller's link folder using the referral's depth (`ResolvedPath::link_depth`).
 - **One tree connect per target share** (`Connections::link_tree`, stamped with the connection's generation, dropped by
-  `disconnect_share` and on reconnect) (`Connections::link_tree`, stamped with the connection's generation, dropped by `disconnect_share` and on
-  reconnect). ❌ Don't tree-connect per call here: a handle can't disconnect its tree, so every copy out of a link would
+  `disconnect_share` and on reconnect). ❌ Don't tree-connect per call here: a handle can't disconnect its tree, so every copy out of a link would
   leak one.
 - **Once only.** A target answering `STATUS_PATH_NOT_COVERED` in turn is the caller's answer.
 - ❌ **Only a refused CREATE triggers it** (`is_dfs_link`), never `ErrorKind::DfsReferral` on any command. That's what
@@ -267,10 +266,22 @@ plus a replay after reviving a dead session, for the reads, listings, `stat`, an
 - ❌ **The op gets owned clones** (`Connection`, `Tree`, `String`). An `AsyncFnMut` over borrowed arguments reads better
   and compiles, but rustc can't prove its future `Send` (higher-ranked lifetimes), and consumers spawn these calls.
   `dfs_following_futures_stay_send` fails if it regresses.
-- **Batches follow item by item** like every other call: the first linked item pays the referral, the rest hit the cache,
-  and items outside the link run on the caller's share.
-- **A rename carries its destination along** only within one directory (`link_rename_target`): SET_INFO's destination is
-  share-relative, and anything else may leave the link. Otherwise it keeps `STATUS_PATH_NOT_COVERED`.
+- **A known link skips the refusal** (MS-DFSC § 3.1.4.1): `follow_dfs_link` first asks `cached_link`, and a path the
+  referral cache places behind a link goes straight to the target, the same place the refusal would send it. Only the
+  first call through a link pays the refused CREATE; a cold cache or an expired entry falls back to it, so a stale target
+  is never reused past its TTL. Batches follow item by item like every other call; items outside the link run on the
+  caller's share. `a_cached_link_sends_no_refused_create` and Docker `dfs_link_a_known_link_skips_the_root_share` pin it.
+- ❌ **A link lookup takes only a link's entry** (`DfsResolver::link_from_cache` / `resolve_link`: a prefix of 3+
+  components). A namespace root's `\\dom\ns` entry from `connect_share` covers every path under it too, and taking it
+  would send the call back to the share that just refused it.
+- **`resolve_dfs_link` is the same lookup, public**: cache, else one referral (a refused referral IOCTL means "no link
+  here", `Ok(None)`), then the pooled target tree, returned as a `DfsLink` with `link_path` so a consumer can route a
+  whole folder. Free on a share without `Tree::is_dfs`. `connection_for` hands out the target tree's connection for
+  `Tree` methods. A path outside every link isn't negatively cached: a consumer asks per folder, not per file.
+- **A rename moves its destination with the link** (`Link::target_path`): SET_INFO's destination is share-relative, so
+  `rename_with` follows the link for `from`, then renames on the target with `to` mapped through the same link,
+  across subfolders too. A `to` outside the link folder (or the folder itself) keeps `STATUS_PATH_NOT_COVERED`: that's a
+  move between shares, which no single rename does.
 - **`Pipeline` doesn't follow links**: it reports `STATUS_PATH_NOT_COVERED` per op, since a hidden referral would break
   its one-op, one-exchange contract. Its rustdoc says so.
 
