@@ -99,9 +99,9 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      # Only smb-auth: the CLI suite needs one fixture, not all 16.
-      - name: Start the SMB fixture
-        run: ./crates/smb2/tests/docker/start.sh internal smb-auth
+      # Only smb-auth and smb-fruit: the CLI suite needs two fixtures, not all 16 (same as `just test-cli-e2e`).
+      - name: Start the SMB fixtures
+        run: ./crates/smb2/tests/docker/start.sh internal smb-auth smb-fruit
 
       - name: Run CLI end-to-end tests
         run: cargo test -p smb2-cli --test e2e -- --ignored
