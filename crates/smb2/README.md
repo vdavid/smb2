@@ -43,7 +43,8 @@ we have more control to reach even better speeds.
 - File watching (CHANGE_NOTIFY for live directory updates)
 - Disk space queries (total, free, used)
 - DFS: namespace roots (`\\domain\namespace`), links inside a share, and multi-target failover, all resolved
-  transparently, plus `SmbClient::resolve_dfs_link` to ask where a path behind a link really lives
+  transparently, plus `SmbClient::resolve_dfs_link` to ask where a path behind a link really lives. A referral signs in on
+  a different server only when `ClientConfig::dfs_target_policy` allows it
 - Reconnection after network failures
 - Auto-flush on writes (data safety for family photos and company docs)
 - Filenames carrying characters SMB2 forbids (`?`, `*`, `"`, `:`, `<`, `>`, `\`, `|`, a trailing space or period),
@@ -318,7 +319,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.37"
+smb2 = "0.38"
 ```
 
 You'll also need an async runtime. smb2 runs on [tokio](https://github.com/tokio-rs/tokio) out of the box:
@@ -334,7 +335,7 @@ own reactor and executor threads, so this also works under any other executor (`
 
 ```toml
 [dependencies]
-smb2 = { version = "0.37", default-features = false, features = ["smol"] }
+smb2 = { version = "0.38", default-features = false, features = ["smol"] }
 smol = "2"
 ```
 

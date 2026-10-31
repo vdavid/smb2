@@ -3367,6 +3367,7 @@ async fn dfs_client() -> SmbClient {
         compression: false,
         dfs_enabled: true,
         dfs_target_overrides: overrides,
+        dfs_target_policy: smb2::DfsTargetPolicy::FollowAll,
         connect_options: None,
         ..Default::default()
     })
@@ -7097,11 +7098,58 @@ async fn dfs_namespace_client(addr: &str) -> SmbClient {
         compression: false,
         dfs_enabled: true,
         dfs_target_overrides: overrides,
+        dfs_target_policy: smb2::DfsTargetPolicy::FollowAll,
         connect_options: None,
         ..Default::default()
     })
     .await
     .unwrap_or_else(|e| panic!("SmbClient::connect to {addr} failed: {e}"))
+}
+
+/// The default policy against a real referral: the link's target is another
+/// host, so the path is refused with both names, and the share's own files stay
+/// open. Consent for the pair lets the same path through.
+#[tokio::test]
+#[ignore]
+async fn dfs_link_to_another_host_needs_consent() {
+    let connect = |policy: smb2::DfsTargetPolicy| async move {
+        let mut overrides = HashMap::new();
+        overrides.insert("smb-dfs-target".to_string(), DFS_TARGET_ADDR.to_string());
+        SmbClient::connect(ClientConfig {
+            addr: DFS_ROOT_ADDR.to_string(),
+            timeout: TIMEOUT,
+            dfs_target_overrides: overrides,
+            dfs_target_policy: policy,
+            ..Default::default()
+        })
+        .await
+        .expect("SmbClient::connect to smb-dfs-root failed")
+    };
+
+    let mut refused = connect(smb2::DfsTargetPolicy::SameServerOnly).await;
+    let mut share = refused.connect_share("dfs").await.unwrap();
+    let err = refused
+        .list_directory(&mut share, "data")
+        .await
+        .expect_err("the link's target is another host");
+    match &err {
+        smb2::Error::DfsTargetNotAllowed { target, .. } => assert_eq!(target, "smb-dfs-target"),
+        other => panic!("expected DfsTargetNotAllowed, got {other:?}"),
+    }
+    assert!(
+        refused.list_directory(&mut share, "").await.is_ok(),
+        "the share itself stays up"
+    );
+
+    let mut allowed = connect(smb2::DfsTargetPolicy::Ask(std::sync::Arc::new(|sign_in| {
+        sign_in.target == "smb-dfs-target"
+    })))
+    .await;
+    let mut share = allowed.connect_share("dfs").await.unwrap();
+    allowed
+        .list_directory(&mut share, "data")
+        .await
+        .expect("consent for the pair lets it through");
 }
 
 /// The headline. Before this, `connect_share` on a namespace root returned

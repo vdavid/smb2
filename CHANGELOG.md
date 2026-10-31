@@ -7,6 +7,20 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-10-31
+
+### Security
+
+- **A DFS referral can no longer send your credentials to a different server by default.** A referral comes from the server, and following one dialed the host it named and signed in there, so a malicious or compromised share could point a link, a namespace root, or an Interlink at a machine of its own and capture the sign-in. A client now follows a referral only to its own server, and answers anything else with the new `Error::DfsTargetNotAllowed { path, server, target }` (kind `ErrorKind::DfsTargetNotAllowed`, not retryable) without dialing. Hosts compare after ASCII case, one trailing dot, and an IP's spelling; a short name and its FQDN, or a name and its IP, count as different.
+
+### Breaking
+
+- **Following a referral to another server now takes `ClientConfig::dfs_target_policy`.** `DfsTargetPolicy::SameServerOnly` is the default, `DfsTargetPolicy::Ask(Arc<dyn Fn(&DfsSignIn) -> bool + Send + Sync>)` decides per `(server, target)` pair and is asked on every use, so taking a consent back stops a link on its next call and a target's automatic reconnect too, and `DfsTargetPolicy::FollowAll` is the old behavior. A struct literal without `..Default::default()` needs the new field.
+
+### Notes
+
+- No smb2-cli release goes with this one. The CLI in the repo builds against 0.38.0 with the default policy, so once it's next released it refuses a link to another server. The published smb2-cli 0.5.2 stays on 0.36.2.
+
 ## [0.37.0] - 2026-10-31
 
 ### Breaking

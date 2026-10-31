@@ -101,7 +101,7 @@ pub use error::{Error, ErrorKind, Result};
 pub use name::{decode_name, decode_path, encode_name, encode_path};
 
 // High-level client
-pub use client::{connect, ClientConfig, SmbClient};
+pub use client::{connect, ClientConfig, DfsSignIn, DfsTargetPolicy, SmbClient};
 
 // Streaming I/O
 pub use client::stream::{

@@ -28,6 +28,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `pipeline.rs` | `Pipeline` / `Op` / `OpResult` -- batched concurrent operations (the core feature) |
 | `shares.rs` | Share enumeration via IPC$ + srvsvc RPC |
 | `dfs.rs` | DFS referral IOCTL helper, `DfsResolver` with TTL-based referral cache |
+| `dfs_policy.rs` | `DfsTargetPolicy`: whether a referral may send this client's credentials to a different host, and `same_server` |
 | `copy.rs` | Server-side copy (`FSCTL_SRV_COPYCHUNK`): resume-key + copychunk primitives, batched range/whole-file convenience, `ResumeKey` / `CopyChunk` / `ServerSideCopyLimits` public types |
 | `durable.rs` | Durable handles: `open_file_durable` / `reclaim_durable_handle`, `DurableHandle`, `FileIdentity`, and the two-proof rule that makes a resume safe |
 | `resolve.rs` | `Tree::resolve` / `Resolved` (which file the server opened, and its stored name), plus `open_and_name`, the CREATE + name-query compound behind `FileReader` / `FileWriter::resolved_path` |
@@ -266,6 +267,10 @@ plus a replay after reviving a dead session, for the reads, listings, `stat`, an
 - ❌ **The op gets owned clones** (`Connection`, `Tree`, `String`). An `AsyncFnMut` over borrowed arguments reads better
   and compiles, but rustc can't prove its future `Send` (higher-ranked lifetimes), and consumers spawn these calls.
   `dfs_following_futures_stay_send` fails if it regresses.
+- ❗ **A referral can't send credentials to a different host without `ClientConfig::dfs_target_policy`** (`dfs_policy.rs`). A referral comes from the server, and following one signs in where it says, so a malicious share could name a machine of its own and collect the sign-in. The default, `SameServerOnly`, answers `Error::DfsTargetNotAllowed` (kind `DfsTargetNotAllowed`, not retryable, and `follow_dfs_link` lets it replace the server's answer) and dials nothing. Three places ask: `ensure_connection` (the one dial, namespace roots and Interlinks included), `link_target_tree` (ahead of the pool, so a consent taken back stops a link on its next call), and a target's `ClientReviver::dial`. `Ask` runs inside the client's call, so ❌ it answers from memory; a consumer asks a person when the error comes back.
+  - `same_server` needs proof: the same host once ASCII case, one trailing dot, and an IP's spelling are set aside, and the same port. ❌ A short name and its FQDN, or a name and its IP, are different: a wrong "same" hands a password to a stranger. A link that lands on the primary connection dials nothing and never asks.
+  - A refused target falls through to a permitted one, and with none left the refusal outranks an unreachable target.
+  - `dfs_consent` in `client/mod.rs` pins all of it against a counting listener (0 accepted connections), and Docker `dfs_link_to_another_host_needs_consent` against a real referral.
 - **A known link skips the refusal** (MS-DFSC § 3.1.4.1): `follow_dfs_link` first asks `cached_link`, and a path the
   referral cache places behind a link goes straight to the target, the same place the refusal would send it. Only the
   first call through a link pays the refused CREATE; a cold cache or an expired entry falls back to it, so a stale target

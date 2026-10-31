@@ -425,6 +425,26 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// A DFS referral points at a different server, and
+    /// [`ClientConfig::dfs_target_policy`](crate::ClientConfig::dfs_target_policy)
+    /// doesn't allow signing in there. Nothing went to that server.
+    ///
+    /// From a call through a link, it refuses that path alone: the share is fine.
+    /// From [`connect_share`](crate::SmbClient::connect_share) on a namespace root,
+    /// the target IS the share.
+    ///
+    /// Classifies as [`ErrorKind::DfsTargetNotAllowed`]. Not retryable: the answer
+    /// only changes when the policy does.
+    #[error("the DFS referral for {path} points at {target}, not {server}, and signing in there isn't allowed")]
+    DfsTargetNotAllowed {
+        /// The path or namespace the call asked about, as the caller spelled it.
+        path: String,
+        /// The host this client connected to ([`DfsSignIn::server`](crate::DfsSignIn::server)).
+        server: String,
+        /// The host the referral named ([`DfsSignIn::target`](crate::DfsSignIn::target)).
+        target: String,
+    },
+
     /// A DFS path kept referring us somewhere else, so we stopped following.
     ///
     /// A namespace that points at itself, or a chain of Interlinks with no end
@@ -756,6 +776,10 @@ pub enum ErrorKind {
     /// path and carry on. Only [`Error::DfsTargetUnreachable`] has it.
     /// Retryable.
     DfsTargetUnreachable,
+    /// A DFS referral points at a different server, and the client's
+    /// `dfs_target_policy` doesn't allow signing in there. Nothing went there.
+    /// Only [`Error::DfsTargetNotAllowed`] has it. Not retryable.
+    DfsTargetNotAllowed,
     /// Invalid data or malformed response.
     InvalidData,
     /// The file is too large for a single-read path.
@@ -847,6 +871,8 @@ impl Error {
             // The share's own connection is fine; only this link's far side
             // isn't, and reconnecting to the share wouldn't help.
             Error::DfsTargetUnreachable { .. } => ErrorKind::DfsTargetUnreachable,
+            // Nothing happened to any connection: the policy said no.
+            Error::DfsTargetNotAllowed { .. } => ErrorKind::DfsTargetNotAllowed,
             // A namespace that refers in circles is a server misconfiguration
             // with nothing behind it to find.
             Error::DfsTooManyReferrals { .. } => ErrorKind::NotFound,

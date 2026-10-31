@@ -10,6 +10,7 @@ mod connections;
 pub mod copy;
 pub(crate) mod credits;
 pub(crate) mod dfs;
+mod dfs_policy;
 pub mod diagnostics;
 pub mod directory;
 #[cfg(test)]
@@ -47,6 +48,7 @@ pub use connection::{
     CompoundOp, Connection, Frame, NegotiatedParams, ReconnectEvent, ReconnectObserver,
     ReconnectPolicy, SessionReviver,
 };
+pub use dfs_policy::{DfsSignIn, DfsTargetPolicy};
 pub use diagnostics::{
     ClientInfo, ClientMetricsSnapshot, CompressionInfo, ConnectionDiagnostics, CreditInfo,
     DfsCacheEntry, Diagnostics, EncryptionInfo, InboundProgress, Liveness, MetricsSnapshot,
@@ -153,6 +155,14 @@ pub struct ClientConfig {
     /// Default: empty (use the server hostname from the referral
     /// with port 445).
     pub dfs_target_overrides: std::collections::HashMap<String, String>,
+    /// Who decides whether this client may sign in to a server a DFS referral
+    /// named, when the two aren't provably the same server.
+    ///
+    /// **Security:** a referral comes from the server, and following one sends
+    /// these credentials wherever it says, so a malicious share could collect
+    /// them. The default, [`DfsTargetPolicy::SameServerOnly`], refuses those with
+    /// [`Error::DfsTargetNotAllowed`] and dials nothing.
+    pub dfs_target_policy: DfsTargetPolicy,
     /// How the TCP connect is spread across the addresses
     /// [`addr`](Self::addr) resolves to.
     ///
@@ -225,6 +235,7 @@ impl std::fmt::Debug for ClientConfig {
             compression,
             dfs_enabled,
             dfs_target_overrides,
+            dfs_target_policy,
             connect_options,
             response_timeout,
             previous_session_id,
@@ -239,6 +250,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("compression", compression)
             .field("dfs_enabled", dfs_enabled)
             .field("dfs_target_overrides", dfs_target_overrides)
+            .field("dfs_target_policy", dfs_target_policy)
             .field("connect_options", connect_options)
             .field("response_timeout", response_timeout)
             .field("previous_session_id", previous_session_id)
@@ -284,6 +296,7 @@ impl Default for ClientConfig {
             compression: true,
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
+            dfs_target_policy: DfsTargetPolicy::default(),
             connect_options: None,
             response_timeout: Some(connection::RESPONSE_TIMEOUT),
             previous_session_id: None,
@@ -308,6 +321,18 @@ struct ClientReviver {
     username: String,
     password: String,
     domain: String,
+    /// For a DFS target: what has to allow the sign-in, every time. A reviver
+    /// holds the password and dials from any connection clone, so it asks like
+    /// the client's own dial does. `None` on the primary: its server is the one
+    /// the caller chose.
+    dfs_gate: Option<RevivalGate>,
+}
+
+/// What a DFS target's reviver asks before it dials.
+struct RevivalGate {
+    policy: DfsTargetPolicy,
+    primary_addr: String,
+    named: String,
 }
 
 impl ClientReviver {
@@ -320,8 +345,19 @@ impl ClientReviver {
     /// A DFS target lives at its own address with its own session, so it needs
     /// its own reviver; `config.addr` would dial the namespace server back.
     /// Everything else (credentials, timeout, compression) is the client's.
+    fn for_target(config: &ClientConfig, named: &str, addr: String) -> Self {
+        let mut reviver = Self::for_addr(config, addr);
+        reviver.dfs_gate = Some(RevivalGate {
+            policy: config.dfs_target_policy.clone(),
+            primary_addr: config.addr.clone(),
+            named: named.to_string(),
+        });
+        reviver
+    }
+
     fn for_addr(config: &ClientConfig, addr: String) -> Self {
         Self {
+            dfs_gate: None,
             addr,
             connect_options: config.connect_options(),
             compression: config.compression,
@@ -340,6 +376,11 @@ impl connection::SessionReviver for ClientReviver {
         Box<dyn crate::transport::TransportSend>,
         Box<dyn crate::transport::TransportReceive>,
     )> {
+        if let Some(gate) = &self.dfs_gate {
+            gate.policy
+                .check(&gate.primary_addr, &gate.named, &self.addr)
+                .map_err(|sign_in| dfs_target_not_allowed(&gate.named, sign_in))?;
+        }
         let transport = std::sync::Arc::new(
             crate::transport::TcpTransport::connect_with(&self.addr, self.connect_options.clone())
                 .await?,
@@ -357,6 +398,19 @@ impl connection::SessionReviver for ClientReviver {
         // an `SmbClient` that has one cached picks the new keys up.
         Session::setup(conn, &self.username, &self.password, &self.domain).await?;
         Ok(())
+    }
+}
+
+/// The error for a sign-in [`DfsTargetPolicy`] refused.
+fn dfs_target_not_allowed(path: &str, sign_in: DfsSignIn) -> Error {
+    debug!(
+        "dfs: not signing in to a different server without consent server={:?} target={:?} path={path:?}",
+        sign_in.server, sign_in.target
+    );
+    Error::DfsTargetNotAllowed {
+        path: path.to_string(),
+        server: sign_in.server,
+        target: sign_in.target,
     }
 }
 
@@ -706,9 +760,11 @@ impl SmbClient {
             // typo in a share name, and telling that person about DFS is
             // worse than telling them nothing. Only the one outcome that is
             // genuinely about DFS survives.
-            Err(err @ (Error::DfsNoReachableTarget { .. } | Error::DfsTooManyReferrals { .. })) => {
-                Err(err)
-            }
+            Err(
+                err @ (Error::DfsNoReachableTarget { .. }
+                | Error::DfsTooManyReferrals { .. }
+                | Error::DfsTargetNotAllowed { .. }),
+            ) => Err(err),
             Err(err) => {
                 debug!(
                     "dfs: no namespace behind the share, reporting the refusal share={share_name:?}: {err}"
@@ -766,7 +822,7 @@ impl SmbClient {
         let mut path = requested.to_string();
 
         for _ in 0..MAX_DFS_HOPS {
-            let targets = self.root_referral(&path).await?;
+            let targets = self.root_referral(&path, requested).await?;
 
             // The chain ended without naming anywhere to go. ❌ This has to
             // leave by its own exit: sharing one with the hop limit below
@@ -797,6 +853,7 @@ impl SmbClient {
             // nothing after the loop has to work out how we got there.
             let target_count = targets.len();
             let mut last_error: Option<Error> = None;
+            let mut refused: Option<Error> = None;
 
             for target in &targets {
                 // A root target is `\\server\share` and nothing more
@@ -813,7 +870,10 @@ impl SmbClient {
                 }
 
                 let target_addr = self.target_addr(target);
-                match self.connect_target(&target_addr, &target.share).await {
+                match self
+                    .connect_target(&target.server, &target_addr, &target.share, requested)
+                    .await
+                {
                     Ok(mut tree) => {
                         self.dfs_resolver.note_target_worked(target);
                         tree.dfs_origin = Some(DfsOrigin {
@@ -826,6 +886,9 @@ impl SmbClient {
                         );
                         return Ok(tree);
                     }
+                    Err(err @ Error::DfsTargetNotAllowed { .. }) => {
+                        refused.get_or_insert(err);
+                    }
                     Err(err) => {
                         debug!(
                             "dfs: target refused namespace={requested:?} addr={target_addr:?}: {err}"
@@ -835,6 +898,11 @@ impl SmbClient {
                 }
             }
 
+            // A target it may not sign in to outranks one that didn't answer: only
+            // the first is something the caller can change.
+            if let Some(refused) = refused {
+                return Err(refused);
+            }
             return match last_error {
                 Some(source) => Err(Error::DfsNoReachableTarget {
                     namespace: requested.to_string(),
@@ -860,14 +928,18 @@ impl SmbClient {
 
     /// Ask the server that owns `path` for a referral, resolving from cache
     /// when it is already known.
-    async fn root_referral(&mut self, path: &str) -> Result<Vec<dfs::ResolvedPath>> {
+    async fn root_referral(
+        &mut self,
+        path: &str,
+        requested: &str,
+    ) -> Result<Vec<dfs::ResolvedPath>> {
         // The referral goes to the server naming the path, which after an
         // Interlink is not the one the caller started on.
         let host = path.trim_start_matches('\\');
         let host = host.split('\\').next().unwrap_or(host);
         let addr = self.dfs_addr_for_host(host);
 
-        self.ensure_connection(&addr).await?;
+        self.ensure_connection(host, &addr, requested).await?;
         let conn = self.connections.for_addr(&addr)?;
         self.dfs_resolver.resolve(conn, path).await
     }
@@ -900,8 +972,14 @@ impl SmbClient {
     }
 
     /// Connect (pooling the connection) and tree-connect one referral target.
-    async fn connect_target(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
-        self.ensure_connection(target_addr).await?;
+    async fn connect_target(
+        &mut self,
+        named: &str,
+        target_addr: &str,
+        share: &str,
+        asked: &str,
+    ) -> Result<Tree> {
+        self.ensure_connection(named, target_addr, asked).await?;
         self.ensure_tree(target_addr, share).await
     }
 
@@ -1234,7 +1312,7 @@ impl SmbClient {
 
         let (moved_to, remaining) = match self.redirect(tree, path).await {
             Ok(redirected) => redirected,
-            Err(e @ Error::DfsTargetUnreachable { .. }) => {
+            Err(e @ (Error::DfsTargetUnreachable { .. } | Error::DfsTargetNotAllowed { .. })) => {
                 return Followed {
                     result: Err(e),
                     moved_to: None,
@@ -1375,9 +1453,18 @@ impl SmbClient {
     ) -> Result<(Link, String)> {
         let mut last_error = None;
         let mut share_connection_lost = None;
+        let mut refused = None;
         for resolved in resolved_list {
             let target_addr = self.target_addr(resolved);
-            match self.link_target_tree(&target_addr, &resolved.share).await {
+            match self
+                .link_target_tree(
+                    &resolved.server,
+                    &target_addr,
+                    &resolved.share,
+                    original_path,
+                )
+                .await
+            {
                 Ok(new_tree) => {
                     // Remember which target worked, so a failover survives
                     // the next lookup instead of re-walking the dead one.
@@ -1388,6 +1475,9 @@ impl SmbClient {
                     let link =
                         Link::new(new_tree, original_path, &remaining, resolved.link_depth());
                     return Ok((link, remaining));
+                }
+                Err(e @ Error::DfsTargetNotAllowed { .. }) => {
+                    refused.get_or_insert(e);
                 }
                 Err(e) => {
                     debug!(
@@ -1409,6 +1499,11 @@ impl SmbClient {
 
         if let Some(lost) = share_connection_lost {
             return Err(lost);
+        }
+        // A target it may not sign in to outranks one that didn't answer: only the
+        // first is something the caller can change.
+        if let Some(refused) = refused {
+            return Err(refused);
         }
         match last_error {
             Some(source) => Err(Error::DfsTargetUnreachable {
@@ -1452,17 +1547,54 @@ impl SmbClient {
 
     /// A link's target share, connected once and pooled
     /// (`Connections::link_tree`).
-    async fn link_target_tree(&mut self, target_addr: &str, share: &str) -> Result<Tree> {
+    ///
+    /// Asks [`DfsTargetPolicy`] ahead of the pool too, so a consent taken back
+    /// stops the link on its next call.
+    async fn link_target_tree(
+        &mut self,
+        named: &str,
+        target_addr: &str,
+        share: &str,
+        asked: &str,
+    ) -> Result<Tree> {
+        self.check_dfs_target(named, target_addr, asked)?;
         if let Some(tree) = self.connections.link_tree(target_addr, share) {
             return Ok(tree);
         }
-        let tree = self.connect_target(target_addr, share).await?;
+        let tree = self
+            .connect_target(named, target_addr, share, asked)
+            .await?;
         self.connections.remember_link_tree(&tree);
         Ok(tree)
     }
 
-    /// Ensure a connection exists in the pool for the given server address.
-    async fn ensure_connection(&mut self, target_addr: &str) -> Result<()> {
+    /// Whether [`DfsTargetPolicy`] allows dialing `target_addr`, which a referral
+    /// named `named`, on behalf of a call about `asked`. Running on the primary
+    /// connection dials nothing, so it needs no answer.
+    fn check_dfs_target(&self, named: &str, target_addr: &str, asked: &str) -> Result<()> {
+        if self.connections.is_primary(target_addr) {
+            return Ok(());
+        }
+        self.config
+            .dfs_target_policy
+            .check(self.connections.primary_server(), named, target_addr)
+            .map_err(|sign_in| dfs_target_not_allowed(asked, sign_in))
+    }
+
+    /// Ensure a connection exists in the pool for the given server address,
+    /// which a referral named `named`.
+    ///
+    /// ❌ **The one place this client signs in to another server, and it asks
+    /// [`DfsTargetPolicy`] first.** Nothing else may dial a target: a referral
+    /// comes from the server, so it can name a machine that collects the
+    /// credentials sent here.
+    async fn ensure_connection(
+        &mut self,
+        named: &str,
+        target_addr: &str,
+        asked: &str,
+    ) -> Result<()> {
+        self.check_dfs_target(named, target_addr, asked)?;
         if self.connections.is_primary(target_addr) {
             return Ok(()); // Already have primary connection.
         }
@@ -1495,8 +1627,9 @@ impl SmbClient {
         // connection that mattered. The reviver is built for this address, not
         // `config.addr`, which would dial the namespace server back.
         if self.config.auto_reconnect {
-            conn.set_reviver(Some(std::sync::Arc::new(ClientReviver::for_addr(
+            conn.set_reviver(Some(std::sync::Arc::new(ClientReviver::for_target(
                 &self.config,
+                named,
                 target_addr.to_string(),
             ))));
         }
@@ -2804,6 +2937,8 @@ mod tests {
             compression: true,
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
+            // These tests are about following; `dfs_consent` is about whether to.
+            dfs_target_policy: DfsTargetPolicy::FollowAll,
             connect_options: None,
             ..Default::default()
         };
@@ -4943,6 +5078,306 @@ mod tests {
         );
     }
 
+    /// Whether a referral may send this client's credentials to another host.
+    ///
+    /// Each test points a referral at `evil-host`, mapped to a real listener,
+    /// and counts the connections it accepts: none means no credentials went
+    /// anywhere, by construction.
+    mod dfs_consent {
+        use super::*;
+        use std::sync::atomic::AtomicBool;
+
+        /// A listener that counts connections and hangs up on each.
+        async fn counting_listener() -> (String, Arc<AtomicU64>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let accepted = Arc::new(AtomicU64::new(0));
+            let counter = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(socket);
+                }
+            });
+            (addr, accepted)
+        }
+
+        async fn client_with(
+            mock: &Arc<MockTransport>,
+            policy: DfsTargetPolicy,
+        ) -> (SmbClient, Arc<AtomicU64>) {
+            let mut client = make_mock_client(mock, SessionId(0x77)).await;
+            let (addr, accepted) = counting_listener().await;
+            client.config.dfs_target_policy = policy;
+            client
+                .config
+                .dfs_target_overrides
+                .insert("evil-host".to_string(), addr);
+            (client, accepted)
+        }
+
+        fn queue_evil_link(mock: &MockTransport) {
+            mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+            mock.queue_response(build_referral(
+                3,
+                0,
+                r"\test-server\dfs\data",
+                &[r"\evil-host\loot"],
+                0,
+            ));
+        }
+
+        fn assert_refused(err: &Error, path: &str) {
+            match err {
+                Error::DfsTargetNotAllowed {
+                    path: asked,
+                    server,
+                    target,
+                } => {
+                    assert_eq!(asked, path);
+                    assert_eq!(server, "test-server");
+                    assert_eq!(target, "evil-host");
+                }
+                other => panic!("expected DfsTargetNotAllowed, got {other:?}"),
+            }
+            assert_eq!(err.kind(), crate::ErrorKind::DfsTargetNotAllowed);
+            assert!(!err.is_retryable(), "only a change of policy helps");
+        }
+
+        #[tokio::test]
+        async fn the_default_policy_is_refusal() {
+            assert!(matches!(
+                ClientConfig::default().dfs_target_policy,
+                DfsTargetPolicy::SameServerOnly
+            ));
+        }
+
+        /// The headline. A followed call and the resolver both refuse, typed,
+        /// and the other host hears nothing, then or from the cached referral.
+        #[tokio::test]
+        async fn a_different_host_hears_nothing_without_consent() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, accepted) = client_with(&mock, DfsTargetPolicy::SameServerOnly).await;
+            let tree = a_dfs_root_tree();
+
+            mock.queue_response(path_not_covered(3));
+            queue_evil_link(&mock);
+            let followed = client.delete_file(&tree, "data/a").await.unwrap_err();
+            assert_refused(&followed, "data/a");
+
+            let resolved = client
+                .resolve_dfs_link(&tree, "data/b")
+                .await
+                .expect_err("cached referral, still refused");
+            assert_refused(&resolved, "data/b");
+
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+            mock.assert_fully_consumed();
+        }
+
+        #[tokio::test]
+        async fn the_person_saying_no_is_the_same_as_the_default() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, accepted) =
+                client_with(&mock, DfsTargetPolicy::Ask(Arc::new(|_| false))).await;
+            queue_evil_link(&mock);
+
+            let err = client
+                .resolve_dfs_link(&a_dfs_root_tree(), "data/a")
+                .await
+                .unwrap_err();
+
+            assert_refused(&err, "data/a");
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        }
+
+        /// What proves the counter counts: with consent the same call does dial.
+        #[tokio::test]
+        async fn consent_for_the_pair_lets_the_dial_through() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, accepted) = client_with(
+                &mock,
+                DfsTargetPolicy::Ask(Arc::new(|sign_in| {
+                    sign_in.server == "test-server" && sign_in.target == "evil-host"
+                })),
+            )
+            .await;
+            queue_evil_link(&mock);
+
+            let err = client
+                .resolve_dfs_link(&a_dfs_root_tree(), "data/a")
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.kind(), crate::ErrorKind::DfsTargetUnreachable);
+            assert!(accepted.load(Ordering::SeqCst) >= 1);
+        }
+
+        /// A link on the share's own server never asks, whatever its case or
+        /// trailing dot: it runs on the connection the client already has.
+        #[tokio::test]
+        async fn a_link_on_the_shares_own_server_goes_through() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, _) =
+                client_with(&mock, DfsTargetPolicy::Ask(Arc::new(|_| panic!("asked")))).await;
+            queue_link_referral(&mock);
+
+            let link = client
+                .resolve_dfs_link(&a_dfs_root_tree(), "data/a")
+                .await
+                .expect("resolve")
+                .expect("behind the link");
+
+            assert_eq!(link.tree.tree_id, LINK_TARGET_TREE);
+        }
+
+        /// Forgetting takes effect on the next call: a pooled target isn't
+        /// handed out, though nothing new would have been sent to it.
+        #[tokio::test]
+        async fn forgetting_consent_stops_handing_out_a_pooled_target() {
+            let mock = Arc::new(MockTransport::new());
+            let allowed = Arc::new(AtomicBool::new(true));
+            let answer = Arc::clone(&allowed);
+            let (mut client, accepted) = client_with(
+                &mock,
+                DfsTargetPolicy::Ask(Arc::new(move |_| answer.load(Ordering::SeqCst))),
+            )
+            .await;
+            let addr = client.config.dfs_target_overrides["evil-host"].clone();
+            let target_mock = Arc::new(MockTransport::new());
+            pool_extra_connection(&mut client, &addr, &target_mock);
+            client
+                .connections
+                .remember_link_tree(&a_dfs_target_tree(&addr, "loot"));
+            let tree = a_dfs_root_tree();
+            queue_evil_link(&mock);
+
+            let link = client.resolve_dfs_link(&tree, "data/a").await.unwrap();
+            assert!(link.is_some(), "allowed: the pooled target serves it");
+
+            allowed.store(false, Ordering::SeqCst);
+            let err = client.resolve_dfs_link(&tree, "data/a").await.unwrap_err();
+            assert_refused(&err, "data/a");
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        }
+
+        /// A namespace root takes the same gate, and the caller hears why rather
+        /// than the refused tree connect it would otherwise get.
+        #[tokio::test]
+        async fn a_namespace_root_on_a_different_host_hears_nothing_without_consent() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, accepted) = client_with(&mock, DfsTargetPolicy::SameServerOnly).await;
+            mock.queue_response(build_tree_connect_refusal(
+                NtStatus::BAD_NETWORK_NAME,
+                false,
+            ));
+            mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+            mock.queue_response(build_root_referral(
+                r"\test-server\projects",
+                &[r"\evil-host\loot"],
+                0x02,
+            ));
+
+            let err = client.connect_share("projects").await.unwrap_err();
+
+            assert_refused(&err, r"\\test-server\projects");
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        }
+
+        /// An Interlink sends the next referral to the host it names, which is a
+        /// sign-in on that host before any target comes into it.
+        #[tokio::test]
+        async fn an_interlink_to_a_different_host_hears_nothing_without_consent() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, accepted) = client_with(&mock, DfsTargetPolicy::SameServerOnly).await;
+            mock.queue_response(build_tree_connect_refusal(
+                NtStatus::BAD_NETWORK_NAME,
+                false,
+            ));
+            mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+            mock.queue_response(build_root_referral(
+                r"\test-server\projects",
+                &[r"\evil-host\ns"],
+                0x01,
+            ));
+
+            let err = client.connect_share("projects").await.unwrap_err();
+
+            assert_refused(&err, r"\\test-server\projects");
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        }
+
+        /// A refused target doesn't stop a permitted one; with no permitted one
+        /// left the refusal is the answer, ahead of any unreachable target.
+        #[tokio::test]
+        async fn a_refused_target_falls_through_to_the_shares_own_server() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, accepted) = client_with(&mock, DfsTargetPolicy::SameServerOnly).await;
+            mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+            mock.queue_response(build_referral(
+                3,
+                0,
+                r"\test-server\dfs\data",
+                &[r"\evil-host\loot", r"\test-server\files"],
+                0,
+            ));
+            mock.queue_response(build_tree_connect_response(
+                LINK_TARGET_TREE,
+                ShareType::Disk,
+            ));
+
+            let link = client
+                .resolve_dfs_link(&a_dfs_root_tree(), "data/a")
+                .await
+                .expect("resolve")
+                .expect("behind the link");
+
+            assert_eq!(link.tree.tree_id, LINK_TARGET_TREE);
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn a_refusal_outranks_a_target_that_doesnt_answer() {
+            let mock = Arc::new(MockTransport::new());
+            let (mut client, _) = client_with(&mock, DfsTargetPolicy::SameServerOnly).await;
+            mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+            mock.queue_response(build_referral(
+                3,
+                0,
+                r"\test-server\dfs\data",
+                &[r"\test-server\files", r"\evil-host\loot"],
+                0,
+            ));
+            mock.queue_response(build_tree_connect_refusal(NtStatus::ACCESS_DENIED, false));
+
+            let err = client
+                .resolve_dfs_link(&a_dfs_root_tree(), "data/a")
+                .await
+                .unwrap_err();
+
+            assert_refused(&err, "data/a");
+        }
+
+        /// A target's reviver holds the password and dials on its own, from any
+        /// connection clone. It asks too, so forgetting reaches a revival.
+        #[tokio::test]
+        async fn a_targets_reviver_asks_before_it_dials() {
+            use crate::client::connection::SessionReviver;
+            let (addr, accepted) = counting_listener().await;
+            let config = ClientConfig {
+                addr: "test-server:445".to_string(),
+                dfs_target_policy: DfsTargetPolicy::Ask(Arc::new(|_| false)),
+                ..Default::default()
+            };
+            let reviver = ClientReviver::for_target(&config, "evil-host", addr);
+
+            let err = reviver.dial().await.err().expect("refused");
+
+            assert_eq!(err.kind(), crate::ErrorKind::DfsTargetNotAllowed);
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        }
+    }
+
     /// A DFS target connection is dialed long after `connect`, so it takes the
     /// deadline the primary has NOW, including anything the consumer set on it
     /// since, rather than falling back to the default.
@@ -4955,10 +5390,12 @@ mod tests {
             .set_response_timeout(Some(Duration::from_millis(200)));
         let target = silent_server().await;
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.ensure_connection(&target))
-                .await
-                .expect("dialing a DFS target must give up within the primary's deadline");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.ensure_connection(&target, &target, ""),
+        )
+        .await
+        .expect("dialing a DFS target must give up within the primary's deadline");
 
         assert!(
             matches!(
