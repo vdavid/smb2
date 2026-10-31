@@ -7,6 +7,21 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-10-31
+
+### Breaking
+
+- **A DFS link whose target can't be reached is no longer `ErrorKind::ConnectionLost`** ([#28](https://github.com/vdavid/smb2/issues/28)). It's the new `Error::DfsTargetUnreachable { path, target_count, source }`, kind `ErrorKind::DfsTargetUnreachable` (still retryable), because the connection to your share is fine: refuse that one path and keep your session. Before, a consumer reconnecting on `ConnectionLost` treated one dead link as the whole share gone. If you matched `Error::DfsNoReachableTarget` from a call through a link or from `resolve_dfs_link`, match the new variant. A namespace root whose targets are all down stays `Error::DfsNoReachableTarget` and `ConnectionLost`, since there the target is the share.
+
+### Fixed
+
+- **A link's target connection dropping under a call says the same thing.** A call on a link's target (followed, or on a `DfsLink::tree`) that loses that connection returns `Error::DfsTargetUnreachable` with `target_count` 1 and the loss as its `source`. A link on the share's own server, with that connection gone, still reports the lost connection.
+- **A DFS link's target comes back after it dropped.** The client kept the dead connection pooled, so with `auto_reconnect` off every later call through that link failed until the whole client was rebuilt. The next call now dials the target again.
+
+### Notes
+
+- No smb2-cli release goes with this one: the CLI in the repo builds against 0.37.0, and the published smb2-cli 0.5.2 stays on 0.36.2.
+
 ## [0.36.2] - 2026-10-30
 
 ### Added
