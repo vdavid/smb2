@@ -7,6 +7,29 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-10-31
+
+### Breaking
+
+- **`FileNotifyAction` has three new variants and is now `#[non_exhaustive]`**: `StreamAdded`, `StreamRemoved`, and `StreamModified` (actions 6-8), which used to fail the whole batch of events as invalid data. An exhaustive `match` needs a `_` arm.
+
+### Added
+
+- **Named streams, on files and folders, DFS links included** ([#9](https://github.com/vdavid/smb2/issues/9)): `list_streams`, `read_stream`, `write_stream`, and `delete_stream` on `Tree` and `SmbClient`. A stream name travels apart from its path, so a `:` in a file name stays a name character. `write_stream` never creates a missing file, and a stream op works on a file another client has open.
+- **macOS extended attributes, stored the way macOS's own SMB client stores them**: `get_xattr`, `set_xattr`, `remove_xattr`, and `list_xattrs`. A Finder tag written here reads through a mount byte for byte, and the other way round, proved on a QNAP. `com.apple.FinderInfo` and `com.apple.ResourceFork` map onto `AFP_AfpInfo` and `AFP_Resource`. `get_xattr` is `Ok(None)` when the file has no such attribute and `ErrorKind::NotFound` when the file is gone. The crate stays byte-level: no plists, no tag model.
+- **Reading one xattr from many files overlaps on one connection**: `get_xattr_many` and `set_xattr_many` give results in input order, each independent of the others, and `Tree::get_xattr_each` hands them over as they finish, so one slow file doesn't hold back a listing. 2,000 files took 1.7 s against a QNAP, 6.3 times the speed of `getxattr` through a macOS mount over the same route. `BatchOptions::assume_paths_exist` reads "not found" as "no attribute" for paths you just listed, at one round trip per file.
+- **`Tree::fs_attributes` and `SmbClient::fs_attributes`**: whether a share has named streams, its file system's name, and its longest name.
+- **`Tree::watch_with` and `SmbClient::watch_with`**: `WatchOptions::metadata` also reports xattr and stream changes, so another client's tag shows up. `watch` behaves as before.
+- **`Error::StreamDeleteIgnored`**: a QNAP answers success to deleting `com.apple.metadata:_kMDItemUserTags` or `AFP_Resource` and keeps them, for macOS's own client too. `delete_stream` and `remove_xattr` check, and say so with kind `ErrorKind::Unsupported`. To clear Finder tags, write what macOS writes: a plist holding an empty array.
+- **`Error::NamedStreamsUnsupported`**: what a stream op answers on a share with no named streams, kind `ErrorKind::Unsupported`.
+- **`smb-consumer-fruit` in the `testing` feature** (port 10495, `TestServers::fruit_client`): a server with `vfs_fruit` and named streams. `TestServers::start_all` now also starts it and `smb-consumer-maxreadsize`, which it left out.
+- **smb2-cli 0.6.0: `smb2 xattr` and `smb2 streams`.** `xattr` works like macOS's command (`-l`, `-p NAME`, `-w NAME VALUE`, `-x`, `-d NAME`), with `-j`, `--from-file`, `--json`, and `--dry-run`.
+
+### Notes
+
+- smb2-cli 0.6.0 also picks up 0.37.0 and 0.38.0, so it now refuses a DFS link to another server.
+- Server behavior and every number above: `docs/notes/named-streams-and-xattrs.md`. No Windows server was tested.
+
 ## [0.38.0] - 2026-10-31
 
 ### Security
