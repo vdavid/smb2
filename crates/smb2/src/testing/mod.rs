@@ -116,6 +116,7 @@ const DEFAULT_LINUX_PORT: u16 = 10491;
 const DEFAULT_FLAKY_PORT: u16 = 10492;
 const DEFAULT_SLOW_PORT: u16 = 10493;
 const DEFAULT_MAXREADSIZE_PORT: u16 = 10494;
+const DEFAULT_FRUIT_PORT: u16 = 10495;
 
 /// Resolve a port from an environment variable, falling back to a default.
 fn port(env_var: &str, default: u16) -> u16 {
@@ -205,6 +206,12 @@ pub fn maxreadsize_port() -> u16 {
     port("SMB_CONSUMER_MAXREADSIZE_PORT", DEFAULT_MAXREADSIZE_PORT)
 }
 
+/// Port for `smb-consumer-fruit`, the server with named streams and macOS's
+/// `vfs_fruit`. Overridden by `SMB_CONSUMER_FRUIT_PORT`.
+pub fn fruit_port() -> u16 {
+    port("SMB_CONSUMER_FRUIT_PORT", DEFAULT_FRUIT_PORT)
+}
+
 // ── Embedded files ──────────────────────────────────────────────────────
 
 // docker-compose.yml
@@ -285,6 +292,10 @@ const MAXREADSIZE_DOCKERFILE: &str =
     include_str!("fixtures/consumer/smb-consumer-maxreadsize/Dockerfile");
 const MAXREADSIZE_SMB_CONF: &str =
     include_str!("fixtures/consumer/smb-consumer-maxreadsize/smb.conf");
+
+// smb-consumer-fruit
+const FRUIT_DOCKERFILE: &str = include_str!("fixtures/consumer/smb-consumer-fruit/Dockerfile");
+const FRUIT_SMB_CONF: &str = include_str!("fixtures/consumer/smb-consumer-fruit/smb.conf");
 
 // ── Embedded file manifest ──────────────────────────────────────────────
 
@@ -491,6 +502,17 @@ fn embedded_files() -> Vec<EmbeddedFile> {
             contents: SLOW_ENTRYPOINT,
             executable: true,
         },
+        // fruit
+        EmbeddedFile {
+            relative_path: "smb-consumer-fruit/Dockerfile",
+            contents: FRUIT_DOCKERFILE,
+            executable: false,
+        },
+        EmbeddedFile {
+            relative_path: "smb-consumer-fruit/smb.conf",
+            contents: FRUIT_SMB_CONF,
+            executable: false,
+        },
         // maxreadsize
         EmbeddedFile {
             relative_path: "smb-consumer-maxreadsize/Dockerfile",
@@ -576,6 +598,8 @@ impl Profile {
                 "smb-consumer-linux",
                 "smb-consumer-flaky",
                 "smb-consumer-slow",
+                "smb-consumer-maxreadsize",
+                "smb-consumer-fruit",
             ],
         }
     }
@@ -599,7 +623,7 @@ impl TestServers {
     /// Start the minimal set: guest + auth containers.
     ///
     /// This is the fastest option (~2 seconds). Use [`start_all`](Self::start_all)
-    /// if you need all 14 containers.
+    /// if you need all 16 containers.
     pub async fn start() -> Result<Self> {
         let servers = Self::prepare(Profile::Minimal)?;
         servers.compose_up()?;
@@ -607,7 +631,7 @@ impl TestServers {
         Ok(servers)
     }
 
-    /// Start all 14 consumer containers.
+    /// Start all 16 consumer containers.
     pub async fn start_all() -> Result<Self> {
         let servers = Self::prepare(Profile::All)?;
         servers.compose_up()?;
@@ -703,6 +727,14 @@ impl TestServers {
     pub async fn many_files_client(&self) -> Result<SmbClient> {
         self.require_service("smb-consumer-manyfiles")?;
         let addr = format!("127.0.0.1:{}", manyfiles_port());
+        connect_guest(&addr).await
+    }
+
+    /// Server with named streams and macOS's `vfs_fruit`. Tests Finder tags and
+    /// other xattrs (share `public`).
+    pub async fn fruit_client(&self) -> Result<SmbClient> {
+        self.require_service("smb-consumer-fruit")?;
+        let addr = format!("127.0.0.1:{}", fruit_port());
         connect_guest(&addr).await
     }
 
@@ -985,11 +1017,13 @@ mod tests {
             DEFAULT_LINUX_PORT,
             DEFAULT_FLAKY_PORT,
             DEFAULT_SLOW_PORT,
+            DEFAULT_MAXREADSIZE_PORT,
+            DEFAULT_FRUIT_PORT,
         ];
         for p in ports {
             assert!(
-                (10480..=10493).contains(&p),
-                "port {p} outside expected range 10480-10493"
+                (10480..=10495).contains(&p),
+                "port {p} outside expected range 10480-10495"
             );
         }
     }
@@ -1011,6 +1045,8 @@ mod tests {
             DEFAULT_LINUX_PORT,
             DEFAULT_FLAKY_PORT,
             DEFAULT_SLOW_PORT,
+            DEFAULT_MAXREADSIZE_PORT,
+            DEFAULT_FRUIT_PORT,
         ];
         let mut seen = std::collections::HashSet::new();
         for p in ports {
@@ -1085,7 +1121,7 @@ mod tests {
         // Verify top-level compose file.
         assert!(dir.join("docker-compose.yml").exists());
 
-        // Verify all 15 container directories exist with Dockerfiles.
+        // Verify all 16 container directories exist with Dockerfiles.
         let containers = [
             "smb-consumer-guest",
             "smb-consumer-auth",
@@ -1102,6 +1138,7 @@ mod tests {
             "smb-consumer-flaky",
             "smb-consumer-slow",
             "smb-consumer-maxreadsize",
+            "smb-consumer-fruit",
         ];
         for name in containers {
             let dockerfile = dir.join(name).join("Dockerfile");
@@ -1189,9 +1226,9 @@ mod tests {
     }
 
     #[test]
-    fn all_profile_includes_14_services() {
+    fn all_profile_includes_16_services() {
         let services = Profile::All.services();
-        assert_eq!(services.len(), 14);
+        assert_eq!(services.len(), 16);
     }
 
     #[test]
@@ -1240,9 +1277,9 @@ mod tests {
     #[test]
     fn embedded_files_count() {
         let files = embedded_files();
-        // 1 compose + 15 containers * (Dockerfile + smb.conf) = 31
-        // + 6 extra scripts = 37
-        assert_eq!(files.len(), 37, "expected 37 embedded files");
+        // 1 compose + 16 containers * (Dockerfile + smb.conf) = 33
+        // + 6 extra scripts = 39
+        assert_eq!(files.len(), 39, "expected 39 embedded files");
     }
 
     #[test]

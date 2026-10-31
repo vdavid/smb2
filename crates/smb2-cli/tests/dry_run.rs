@@ -98,6 +98,23 @@ fn get_plans_the_download_without_connecting_or_writing() {
 }
 
 #[test]
+fn xattr_writes_and_deletes_plan_without_connecting() {
+    let target = format!("{DEAD_SHARE}/a.txt");
+    let stdout = expect_dry(&[
+        "--guest",
+        "--dry-run",
+        "xattr",
+        "-w",
+        "user.a",
+        "hi",
+        &target,
+    ]);
+    assert!(stdout.contains("xattr -w user.a (2 bytes)"), "{stdout}");
+    let stdout = expect_dry(&["--guest", "--dry-run", "xattr", "-d", "user.a", &target]);
+    assert!(stdout.contains("xattr -d user.a"), "{stdout}");
+}
+
+#[test]
 fn rm_plans_the_deletion_without_connecting() {
     let stdout = expect_dry(&["--guest", "--dry-run", "rm", &format!("{DEAD_SHARE}/junk")]);
     assert!(stdout.contains("rm //127.0.0.1:1/share/junk"), "{stdout:?}");

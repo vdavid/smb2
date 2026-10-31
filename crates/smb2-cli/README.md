@@ -84,7 +84,18 @@ smb2 mv //raspi/PiHDD/old.txt //raspi/PiHDD/new.txt
 smb2 mv --replace //raspi/PiHDD/notes.tmp //raspi/PiHDD/notes.txt  # over a file that's there
 smb2 rm //raspi/PiHDD/junk.txt
 smb2 rmdir //raspi/PiHDD/empty-dir
+
+# Extended attributes and named streams
+smb2 xattr //raspi/PiHDD/notes.txt                   # attribute names
+smb2 xattr -l //raspi/PiHDD/notes.txt                # names and values
+smb2 xattr -p user.note //raspi/PiHDD/notes.txt
+smb2 xattr -w user.note hello //raspi/PiHDD/notes.txt
+smb2 xattr -x -w user.note 68656c6c6f //raspi/PiHDD/notes.txt  # the value as hex
+smb2 xattr -d user.note //raspi/PiHDD/notes.txt
+smb2 streams //raspi/PiHDD/notes.txt                 # the raw stream list
 ```
+
+`xattr` works like macOS's own command and stores attributes the way macOS's SMB client does, so a Finder tag is the same bytes under the same name either way. `-w` never creates a missing file. `-d` on an attribute that isn't there succeeds. It takes `-j` and `--from-file` like the other batch commands, and `--json` reports values as `valueHex`.
 
 `ls` prints as the server answers, a batch of a few hundred entries at a time, in the order the server lists them. So a folder of 100,000 files starts showing up after one round trip, and `smb2 ls … | head` stops listing as soon as `head` has enough. Pass `--sort` to get the rows sorted by path instead; that waits for the whole listing first. `--json` is always sorted, since a JSON array is only useful once it's complete. `-R` lists each directory to the end before going into its subdirectories. Measured against a QNAP NAS on a LAN, `ls -R` over 15,250 photos printed its first line after 0.15 s instead of 7.6 s, and finished in the same time as before.
 
@@ -102,7 +113,7 @@ smb2 rmdir //raspi/PiHDD/empty-dir
 
 Transfers stream in both directions, so size isn't a limit and neither is your memory: a 600 MB `get` runs in about 60 MB of RAM, and `put` is the same the other way.
 
-`--json` works on every command. `--dry-run` works on everything that writes (`mkdir`, `rm`, `rmdir`, `mv`, `put`, and `get`): it prints what would happen and makes no connection at all.
+`--json` works on every command. `--dry-run` works on everything that writes (`mkdir`, `rm`, `rmdir`, `mv`, `put`, `get`, and `xattr -w` / `-d`): it prints what would happen and makes no connection at all.
 
 ## Batches
 

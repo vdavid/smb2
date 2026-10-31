@@ -74,7 +74,7 @@ async fn run_jobs(
         match outcome {
             Outcome::Failed(message) => failed.push((path, message)),
             Outcome::AlreadyThere => already_there += 1,
-            Outcome::Done | Outcome::Stat(_) => {}
+            Outcome::Done | Outcome::Stat(_) | Outcome::Xattrs(_) => {}
         }
     }
     Ok(Report {

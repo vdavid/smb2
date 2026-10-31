@@ -92,6 +92,12 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10463:445"
 
+  smb-fruit:
+    build:
+      context: smb-fruit
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10464:445"
+
   smb-weirdnames:
     build:
       context: smb-weirdnames

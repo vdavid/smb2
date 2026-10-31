@@ -17,6 +17,9 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `read_ahead.rs` | `ReadAhead` (the public knob) and `Window`, the pure controller that decides when a transfer sends its next request, for downloads and uploads alike (`Pacing` is what both knobs map onto); `Lateness`, the learned-headroom memory; `DOWNLOAD_CHUNK_SIZE`, `ADAPTIVE_MAX_IN_FLIGHT`, `QUICK_FRAME_BUDGET` |
 | `tuning.rs` | `Tuning`, the window's tunables (headroom, rate measure) behind `Tuning::current()`; crate-private, re-exported as `smb2::__bench` under the unstable `__bench-tuning` feature |
 | `write_behind.rs` | `WriteBehind` (the upload knob), `UPLOAD_CHUNK_SIZE`, the one-frame write cut-off behind `Connection::quick_write_limit`, and what a WRITE's answer measures |
+| `streams.rs` | Named streams on `Tree`: `list_streams`, `read_stream`, `write_stream`, `delete_stream`, plus `fs_attributes`. `Tree::stream_wire_name` is the one place a path and a stream name meet |
+| `xattr.rs` | macOS xattrs on `Tree`, stored as `smbfs` stores them: `get_xattr`, `set_xattr`, `remove_xattr`, `list_xattrs`, `get_xattr_many`, `get_xattr_each`, `set_xattr_many`. The name mapping and the `AFP_AfpInfo` layout. Byte-level: no plists, no tag model |
+| `batch.rs` | The pipelined per-path engine: `run`, `window_for`, `BatchOptions`, `BatchResults` |
 | `write_pipe.rs` | `WritePipe`, the one engine every pipelined upload runs on: window, write budget, dispatch, confirmations, the upload rate hint |
 | `download_tests.rs` | `FileDownload` against the mock: order, short reads, EOF, errors, window bounds, cancel safety, answers out of order, adaptive timing on tokio's paused clock |
 | `upload_tests.rs` | Uploads against the mock: chunk size, the cold window, adaptive timing, fixed windows, the upload rate hint and `quick_write_limit`, every write path pacing alike, `write_chunk` cancel safety |
@@ -200,7 +203,7 @@ Full rationale in `connection.rs` on `KEEPALIVE_AFTER` and `Connection::echo_pro
 Table, rationale, and the empirical evidence: `src/name.rs` module docs. What matters at this layer:
 
 - **`Tree::format_path` is the one outbound encode point**, and every method taking a caller path calls it at its own boundary. ❌ Nothing may hand an already-formatted path to another method: a second pass turns the wire path's `\` separators into U+F026 name characters and prepends the DFS prefix twice. The four `open_*` helpers format their own argument, which is what makes double-encoding unreachable rather than merely avoided.
-- **Decoding has to cover every site a name arrives at, or the two halves disagree** and a listing hands back names that nothing can open. Today: `parse_directory_entries` (`tree.rs`, single components → `decode_name`, for both listing classes), `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`), and `resolved_name` (`resolve.rs`, share-relative paths → `decode_path`). ❌ Adding an info class that carries a name means adding a decode there too.
+- **Decoding has to cover every site a name arrives at, or the two halves disagree** and a listing hands back names that nothing can open. Today: `parse_directory_entries` (`tree.rs`, single components → `decode_name`, for both listing classes), `parse_stream_information` (`streams.rs`, stream names → `decode_name`), `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`), and `resolved_name` (`resolve.rs`, share-relative paths → `decode_path`). ❌ Adding an info class that carries a name means adding a decode there too.
 - **What is deliberately NOT mapped**: share names, tree-connect paths, the `srvsvc` pipe name, DFS referral *server* and *share* fields, and the `*` search pattern in QUERY_DIRECTORY. Those aren't file names, and the wildcard is meant to be a wildcard.
 - **`/` is the only separator a caller can write.** A `\` is a name character (U+F026). `Tree::rename`'s target, `SmbClient::upload`, `Tree::download`, and the DFS remaining-path all go through the same codec so one convention holds end to end.
 - **DFS referral paths are encoded too** (`SmbClient::redirect`), because the lookup and the CREATE that follows have to agree on where a component ends; the remaining path comes back through `decode_path` into caller form.
@@ -225,6 +228,21 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 `execute_compound` returns `Result<Vec<Result<Frame>>>`. The outer `Result` is "did the compound hit the wire"; the inner one is per-sub-op (waiter-level: session expired, signature verify, connection dropped mid-await). Sub-op protocol status codes (`STATUS_OBJECT_NAME_NOT_FOUND` etc.) ride in the inner frame's `header.status`, not the inner `Result`. Per MS-SMB2 3.3.4.1.3 the server MAY split the compound response across multiple transport frames (Samba, QNAP, Windows Server in some cases); the receiver task routes each sub-response by `MessageId` so the per-waiter `oneshot::Receiver`s resolve independently and `execute_compound` reassembles the result vector in submission order.
 
 Most callers use a small `all_or_first_err` helper (see `tree.rs`) that propagates the first inner `Err` as the outer `Err` and hands back a `Vec<Frame>` indexable per sub-op. It takes the expected frame count and errors on a mismatch, because every caller indexes fixed positions (`responses[2]`) straight afterwards and a short chain would otherwise panic. Tolerating partial failure (for example, CREATE ok, READ fails → issue standalone CLOSE with the create's returned `FileId`) keeps the individual inner `Result`s.
+
+## Named streams and xattrs
+
+Evidence for every server claim here: `docs/notes/named-streams-and-xattrs.md`.
+
+- **A stream name never goes through `format_path`.** It travels as its own argument and `stream_wire_name` joins them (AGENTS.md pitfall 40). ❌ Don't let `:` through `encode_path`.
+- **`write_stream` probes the file first** (CREATE + CLOSE), because a stream CREATE that may create also creates the file. ❌ Don't drop the probe to save the round trip: a tag written to a file someone just deleted would bring back an empty file.
+- **`delete_stream` checks with a listing**, because a QNAP answers success for `_kMDItemUserTags` and `AFP_Resource` and keeps them (`Error::StreamDeleteIgnored`). ❌ Don't trust the status alone, and don't fall back to an empty value here: what "cleared" looks like is the consumer's format.
+- **A refused WRITE deletes the stream.** The CREATE has already emptied it, and an empty value reads as a real one.
+- **`get_xattr` lists first, without `assume_paths_exist`**: measured faster than reading first when few files carry the attribute, and it tells a missing file apart. With the option, it reads straight away.
+- **`OBJECT_NAME_INVALID` on a stream CREATE means no named streams** (`Error::NamedStreamsUnsupported`), since both names went out mapped to a legal form.
+
+## The pipelined engine (`batch.rs`)
+
+`batch::run(count, window, item)` drives item futures with `buffer_unordered` and yields `(index, Result)` as each finishes; `collect_in_order` is the thin wrapper. The closure picks the `Connection` and `Tree`, so nothing assumes one connection. `window_for` keeps a batch inside half the credit ceiling. Decision/Why: no per-item timeout, since a stalled `smbd` is a working server and the connection's liveness handling already tells slow from dead. `stat_files`, `delete_files`, and `rename_files` don't use it yet.
 
 ## Batch operations
 

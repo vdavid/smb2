@@ -94,6 +94,27 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_stream_information_parse"
+path = "fuzz_targets/fuzz_stream_information_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_fs_attributes_parse"
+path = "fuzz_targets/fuzz_fs_attributes_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_afp_info_parse"
+path = "fuzz_targets/fuzz_afp_info_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_query_info_response_parse"
 path = "fuzz_targets/fuzz_query_info_response_parse.rs"
 test = false

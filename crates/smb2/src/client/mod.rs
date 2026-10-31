@@ -5,6 +5,7 @@
 //! sessions, [`Tree`] for share access with file operations, and [`Pipeline`]
 //! for batched concurrent operations.
 
+pub mod batch;
 pub mod connection;
 mod connections;
 pub mod copy;
@@ -32,6 +33,7 @@ mod socket_lifecycle_tests;
 #[cfg(test)]
 mod stale_handle_tests;
 pub mod stream;
+pub mod streams;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 pub mod times;
@@ -42,8 +44,10 @@ mod upload_tests;
 pub mod watcher;
 pub mod write_behind;
 pub(crate) mod write_pipe;
+pub mod xattr;
 
 pub use crate::crypto::encryption::Cipher;
+pub use batch::{BatchOptions, BatchResults};
 pub use connection::{
     CompoundOp, Connection, Frame, NegotiatedParams, ReconnectEvent, ReconnectObserver,
     ReconnectPolicy, SessionReviver,
@@ -61,12 +65,13 @@ pub use resolve::Resolved;
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress, WriteCheckpoint};
+pub use streams::{FsAttributes, StreamInfo};
 pub use times::FileTimes;
 pub use tree::{
     DfsLink, DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions,
     Tree,
 };
-pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
+pub use watcher::{FileNotifyAction, FileNotifyEvent, WatchOptions, Watcher};
 
 // Re-export high-level client types.
 // (SmbClient, ClientConfig, and connect are defined below in this file.)
@@ -2747,6 +2752,239 @@ impl SmbClient {
         })
         .await
         .map(|(watcher, _)| watcher)
+    }
+
+    /// [`watch`](Self::watch) with [`WatchOptions`]: recursion, and whether to
+    /// hear about xattr and named-stream changes. See [`Tree::watch_with`].
+    ///
+    /// Follows a DFS link like `watch`.
+    pub async fn watch_with(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        options: WatchOptions,
+    ) -> Result<Watcher> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.watch_with(&mut conn, &path, options).await
+        })
+        .await
+        .map(|(watcher, _)| watcher)
+    }
+
+    /// List a file's or directory's named streams. See [`Tree::list_streams`].
+    ///
+    /// Follows a DFS link and replays after a reconnect, like `stat`.
+    pub async fn list_streams(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<StreamInfo>> {
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.list_streams(&mut conn, &path).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Read a whole named stream. See [`Tree::read_stream`].
+    ///
+    /// Follows a DFS link and replays after a reconnect, like `stat`.
+    pub async fn read_stream(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        stream: &str,
+    ) -> Result<Vec<u8>> {
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.read_stream(&mut conn, &path, stream).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Replace a named stream's content. See [`Tree::write_stream`].
+    ///
+    /// Follows a DFS link. Not replayed after a reconnect, like every write.
+    pub async fn write_stream(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        stream: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.write_stream(&mut conn, &path, stream, data).await
+        })
+        .await
+        .map(|(done, _)| done)
+    }
+
+    /// Delete a named stream. See [`Tree::delete_stream`].
+    ///
+    /// Follows a DFS link. Not replayed after a reconnect, like every delete.
+    pub async fn delete_stream(&mut self, tree: &Tree, path: &str, stream: &str) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.delete_stream(&mut conn, &path, stream).await
+        })
+        .await
+        .map(|(done, _)| done)
+    }
+
+    /// What this share's file system says about itself. See
+    /// [`Tree::fs_attributes`].
+    pub async fn fs_attributes(&mut self, tree: &mut Tree) -> Result<FsAttributes> {
+        self.replaying(tree, "", |mut conn, tree, _| async move {
+            tree.fs_attributes(&mut conn).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Read an xattr. `Ok(None)` when the file has no such attribute. See
+    /// [`Tree::get_xattr`].
+    ///
+    /// Follows a DFS link and replays after a reconnect, like `stat`.
+    pub async fn get_xattr(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.get_xattr(&mut conn, &path, name).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Write an xattr. See [`Tree::set_xattr`].
+    ///
+    /// Follows a DFS link. Not replayed after a reconnect, like every write.
+    pub async fn set_xattr(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.set_xattr(&mut conn, &path, name, value).await
+        })
+        .await
+        .map(|(done, _)| done)
+    }
+
+    /// Remove an xattr. See [`Tree::remove_xattr`].
+    ///
+    /// Follows a DFS link. Not replayed after a reconnect, like every delete.
+    pub async fn remove_xattr(&mut self, tree: &Tree, path: &str, name: &str) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.remove_xattr(&mut conn, &path, name).await
+        })
+        .await
+        .map(|(done, _)| done)
+    }
+
+    /// List a file's xattr names. See [`Tree::list_xattrs`].
+    ///
+    /// Follows a DFS link and replays after a reconnect, like `stat`.
+    pub async fn list_xattrs(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<String>> {
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.list_xattrs(&mut conn, &path).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Read one xattr from many files, overlapped on one connection. Results
+    /// are in input order, each independent of the others. See
+    /// [`Tree::get_xattr_many`].
+    ///
+    /// Replays after a reconnect, like `stat`. Items behind a DFS link follow
+    /// it, one at a time, asking for the referral once per batch. For a whole
+    /// folder behind a link, get its target with
+    /// [`resolve_dfs_link`](Self::resolve_dfs_link) and call
+    /// [`Tree::get_xattr_many`] on it, which overlaps them.
+    pub async fn get_xattr_many(
+        &mut self,
+        tree: &mut Tree,
+        paths: &[&str],
+        name: &str,
+        options: BatchOptions,
+    ) -> Vec<Result<Option<Vec<u8>>>> {
+        let mut conn = match self.connections.for_tree(tree) {
+            Ok(conn) => conn.clone(),
+            Err(_) => return self.orphaned_batch(tree, paths.len()),
+        };
+        let mut results = tree
+            .get_xattr_many(&mut conn, paths, name, options.clone())
+            .await;
+
+        // A revived session takes the whole remainder at the pipelined pace.
+        let gone: Vec<usize> = (0..paths.len())
+            .filter(|&i| matches!(&results[i], Err(e) if self.session_is_gone(tree, e)))
+            .collect();
+        if !gone.is_empty() && self.recover_tree(tree).await.is_ok() {
+            if let Ok(conn) = self.connections.for_tree(tree) {
+                let mut conn = conn.clone();
+                let retry: Vec<&str> = gone.iter().map(|&i| paths[i]).collect();
+                let again = tree
+                    .get_xattr_many(&mut conn, &retry, name, options.clone())
+                    .await;
+                for (&index, result) in gone.iter().zip(again) {
+                    results[index] = result;
+                }
+            }
+        }
+
+        for (index, path) in paths.iter().enumerate() {
+            if matches!(&results[index], Err(e) if self.is_dfs_link(e)) {
+                results[index] = self
+                    .replaying(tree, path, |mut conn, tree, path| async move {
+                        tree.get_xattr(&mut conn, &path, name).await
+                    })
+                    .await
+                    .map(|(value, _)| value);
+            }
+        }
+        results
+    }
+
+    /// Write one xattr on many files, overlapped on one connection, each with
+    /// its own value. See [`Tree::set_xattr_many`].
+    ///
+    /// Not replayed after a reconnect, like every write. Items behind a DFS
+    /// link follow it, one at a time.
+    pub async fn set_xattr_many(
+        &mut self,
+        tree: &Tree,
+        items: &[(&str, &[u8])],
+        name: &str,
+        options: BatchOptions,
+    ) -> Vec<Result<()>> {
+        let mut conn = match self.connections.for_tree(tree) {
+            Ok(conn) => conn.clone(),
+            Err(_) => return self.orphaned_batch(tree, items.len()),
+        };
+        let mut results = tree.set_xattr_many(&mut conn, items, name, options).await;
+        for (index, (path, value)) in items.iter().enumerate() {
+            if matches!(&results[index], Err(e) if self.is_dfs_link(e)) {
+                results[index] = self
+                    .beside_tree(tree, path, |mut conn, tree, path| async move {
+                        tree.set_xattr(&mut conn, &path, name, value).await
+                    })
+                    .await
+                    .map(|(done, _)| done);
+            }
+        }
+        results
+    }
+
+    /// One "this tree isn't on this client" error per item.
+    fn orphaned_batch<T>(&mut self, tree: &Tree, count: usize) -> Vec<Result<T>> {
+        (0..count)
+            .map(|_| {
+                self.connections
+                    .for_tree(tree)
+                    .map(|_| unreachable!("the caller found this tree orphaned"))
+            })
+            .collect()
     }
 
     /// Disconnect from a share.

@@ -22,6 +22,9 @@
 //! - [`fuzz_create_request_parse`] / [`fuzz_create_response_parse`]
 //!   -- CreateContext list lives inside these bodies.
 //! - [`fuzz_query_info_response_parse`] -- opaque output buffer sharp edge.
+//! - [`fuzz_stream_information_parse`] / [`fuzz_fs_attributes_parse`] /
+//!   [`fuzz_afp_info_parse`] -- what a server says about a file's named streams,
+//!   its file system, and Finder's info.
 //! - [`fuzz_directory_entries_parse`] -- a QUERY_DIRECTORY output buffer, as
 //!   both listing classes, chained by server-supplied offsets.
 //! - [`fuzz_error_context_walk`] -- a server-controlled chain of lengths
@@ -181,6 +184,21 @@ pub fn fuzz_create_response_parse(data: &[u8]) {
 pub fn fuzz_query_info_response_parse(data: &[u8]) {
     let mut cursor = ReadCursor::new(data);
     let _ = crate::msg::query_info::QueryInfoResponse::unpack(&mut cursor);
+}
+
+/// Fuzz the `FILE_STREAM_INFORMATION` chain, walked by server-supplied offsets.
+pub fn fuzz_stream_information_parse(data: &[u8]) {
+    let _ = crate::client::streams::parse_stream_information(data);
+}
+
+/// Fuzz `FILE_FS_ATTRIBUTE_INFORMATION`, with its server-supplied name length.
+pub fn fuzz_fs_attributes_parse(data: &[u8]) {
+    let _ = crate::client::streams::parse_fs_attributes(data);
+}
+
+/// Fuzz the `AFP_AfpInfo` stream parser that FinderInfo comes out of.
+pub fn fuzz_afp_info_parse(data: &[u8]) {
+    let _ = crate::client::xattr::finder_info_from_afp_info(data);
 }
 
 /// Fuzz the directory-listing entry parser, as both classes a listing asks

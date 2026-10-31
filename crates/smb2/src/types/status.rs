@@ -188,6 +188,10 @@ nt_status_codes! {
     /// does not implement a requested FSCTL such as server-side copy.
     NOT_SUPPORTED = 0xC000_00BB, "STATUS_NOT_SUPPORTED";
 
+    /// A limit of the underlying file system, such as a stream too big for
+    /// the xattr that backs it.
+    FILE_SYSTEM_LIMITATION = 0xC000_0427, "STATUS_FILE_SYSTEM_LIMITATION";
+
     /// The network path cannot be located.
     BAD_NETWORK_PATH = 0xC000_00BE, "STATUS_BAD_NETWORK_PATH";
 

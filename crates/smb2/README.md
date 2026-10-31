@@ -27,6 +27,9 @@ we have more control to reach even better speeds.
 - List directories, read files, write files, delete, rename, stat, create directories
 - Compound requests (CREATE+READ+CLOSE in 1 round-trip, 4-way write compounds, compound delete/rename/stat)
 - Batch helpers for deleting, renaming, and stat-ing many files in one call
+- Named streams, and macOS extended attributes stored the way macOS's own SMB client stores them, so Finder tags written
+  here show in Finder and the other way round. Reading one attribute from many files overlaps on one connection and hands
+  results over as they finish
 - Setting a file's timestamps (any of them, leaving the rest alone) and its Hidden and Read-only attributes, and reads
   that hand out the file's dates and attributes at no extra cost, so a copy keeps its source's modification date and
   flags
@@ -319,7 +322,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.38"
+smb2 = "0.39"
 ```
 
 You'll also need an async runtime. smb2 runs on [tokio](https://github.com/tokio-rs/tokio) out of the box:
@@ -335,7 +338,7 @@ own reactor and executor threads, so this also works under any other executor (`
 
 ```toml
 [dependencies]
-smb2 = { version = "0.38", default-features = false, features = ["smol"] }
+smb2 = { version = "0.39", default-features = false, features = ["smol"] }
 smol = "2"
 ```
 
@@ -370,6 +373,11 @@ For when you want to do one thing and get the result:
   change times (`changed` moves on a metadata-only change that `modified` misses)
 - `client.stat_with_identity(&mut share, path)`: The same, plus the file's `FileIdentity` (index number and volume serial) in the same round trip, to tell "the same file" from "a file with the same name". It matches the identity a `WriteCheckpoint` carries
 - `client.stat_files(&share, &paths)`: Batch stat
+- `client.list_streams(&mut share, path)`, `read_stream`, `write_stream`, `delete_stream`: Named streams
+- `client.fs_attributes(&mut share)`: What the share's file system says about itself, including named-stream support
+- `client.get_xattr(&mut share, path, name)`, `set_xattr`, `remove_xattr`, `list_xattrs`: macOS xattrs
+- `client.get_xattr_many(&mut share, &paths, name, options)`, `set_xattr_many`: The same over many files, overlapped.
+  `tree.get_xattr_each` hands results over as they finish
 - `client.set_times(&share, path, FileTimes::new().set_modified(t))`: Set a file's timestamps, leaving the ones you
   don't name alone. On a writer you're about to finish, `writer.set_times(...)` instead, so its close can't restamp
   the file. `FileTimes::set_attributes(...)` sets Hidden or Read-only in the same frame

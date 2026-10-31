@@ -29,6 +29,8 @@ const SENSITIVE: &[&str] = &[
     // Paths and file names.
     "path",
     "wire_path",
+    "stream",
+    "wire_name",
     "normalized",
     "unc_path",
     "referral_path",

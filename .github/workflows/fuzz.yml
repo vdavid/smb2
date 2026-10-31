@@ -39,6 +39,9 @@ jobs:
           - fuzz_create_request_parse
           - fuzz_create_response_parse
           - fuzz_query_info_response_parse
+          - fuzz_stream_information_parse
+          - fuzz_fs_attributes_parse
+          - fuzz_afp_info_parse
           - fuzz_dfs_referral_response_parse
 
     steps:

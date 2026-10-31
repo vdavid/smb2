@@ -24,7 +24,7 @@ use crate::target::Target;
     about = "List, move, and delete files on an SMB share without mounting it",
     after_help = "Targets look like //host/share/path. Passwords come from --password-command, \
                   SMB2_PASS, or a prompt. -j goes after the subcommand, on the commands that \
-                  spread work over connections: stat, mkdir, rm, rmdir, mv."
+                  spread work over connections: stat, mkdir, rm, rmdir, mv, xattr."
 )]
 struct Cli {
     #[command(flatten)]
@@ -113,6 +113,32 @@ enum Commands {
         #[command(flatten)]
         concurrency: pool::Concurrency,
     },
+    /// Read and change extended attributes, stored the way macOS stores them on
+    /// SMB, so Finder sees them. With no flag, lists each path's attribute names.
+    Xattr {
+        targets: Vec<String>,
+        #[command(flatten)]
+        input: batch::BatchInput,
+        #[command(flatten)]
+        concurrency: pool::Concurrency,
+        /// List attributes with their values.
+        #[arg(short = 'l', conflicts_with_all = ["print", "write", "delete"])]
+        list: bool,
+        /// Print one attribute's value.
+        #[arg(short = 'p', value_name = "NAME", conflicts_with_all = ["write", "delete"])]
+        print: Option<String>,
+        /// Write one attribute.
+        #[arg(short = 'w', num_args = 2, value_names = ["NAME", "VALUE"], conflicts_with = "delete")]
+        write: Option<Vec<String>>,
+        /// Delete one attribute. Deleting one that isn't there succeeds.
+        #[arg(short = 'd', value_name = "NAME")]
+        delete: Option<String>,
+        /// Print values as hex, and read `-w`'s VALUE as hex.
+        #[arg(short = 'x')]
+        hex: bool,
+    },
+    /// List a path's named streams.
+    Streams { target: String },
     /// Print a file to stdout.
     Cat { target: String },
     /// Download a file.
@@ -230,6 +256,40 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Xattr {
+            targets,
+            input,
+            concurrency,
+            list,
+            print,
+            write,
+            delete,
+            hex,
+        } => {
+            let action = commands::xattr::Action::from_flags(
+                *list,
+                print.as_ref(),
+                write.as_ref(),
+                delete.as_ref(),
+                *hex,
+            )?;
+            commands::xattr::xattr(
+                targets,
+                input,
+                &credentials,
+                action,
+                commands::xattr::Options {
+                    concurrency: concurrency.workers(),
+                    hex: *hex,
+                    as_json: cli.json,
+                    dry_run: cli.dry_run,
+                },
+            )
+            .await
+        }
+        Commands::Streams { target } => {
+            commands::xattr::streams(&Target::parse(target)?, &credentials, cli.json).await
+        }
         Commands::Cat { target } => {
             commands::transfer::cat(&Target::parse(target)?, &credentials).await
         }
@@ -326,6 +386,7 @@ mod tests {
             vec!["smb2", "rm", "//host/share/a"],
             vec!["smb2", "rmdir", "//host/share/a"],
             vec!["smb2", "mv", "//host/share/a", "//host/share/b"],
+            vec!["smb2", "xattr", "//host/share/a"],
         ]
     }
 
@@ -333,6 +394,7 @@ mod tests {
     fn commands_that_open_one_connection() -> Vec<Vec<&'static str>> {
         vec![
             vec!["smb2", "ls", "//host/share/a"],
+            vec!["smb2", "streams", "//host/share/a"],
             vec!["smb2", "cat", "//host/share/a"],
             vec!["smb2", "get", "//host/share/a"],
             vec!["smb2", "put", "./a", "//host/share/a"],

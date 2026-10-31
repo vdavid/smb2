@@ -99,8 +99,8 @@ test-consumer:
 
 # Run the CLI end-to-end tests against a live Samba fixture (starts/stops it automatically)
 test-cli-e2e:
-    @echo "[*] Starting the smb-auth fixture..."
-    @./crates/smb2/tests/docker/start.sh internal smb-auth
+    @echo "[*] Starting the smb-auth and smb-fruit fixtures..."
+    @./crates/smb2/tests/docker/start.sh internal smb-auth smb-fruit
     @echo "[*] Running CLI end-to-end tests..."
     @cargo test -p smb2-cli --test e2e -- --ignored --quiet && \
         (echo "[*] Stopping containers..." && ./crates/smb2/tests/docker/stop.sh && echo "[+] CLI end-to-end tests passed") || \

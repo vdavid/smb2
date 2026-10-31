@@ -1222,3 +1222,196 @@ fn a_wrong_password_fails() {
         .expect("running the smb2 binary");
     assert_eq!(output.status.code(), Some(1));
 }
+
+// ── xattr and streams (smb-fruit) ────────────────────────────────────
+//
+// The only tests here that need a server with named streams, so they talk to
+// `smb-fruit` as guest, and the library is the oracle again.
+
+const FRUIT: &str = "//127.0.0.1:10464/public";
+
+/// Runs the binary as guest against `smb-fruit`, requiring exit 0.
+fn fruit_ok(args: &[&str]) -> String {
+    let output = fruit_run(args);
+    assert!(
+        output.status.success(),
+        "`smb2 {}` exited {:?}\nstderr: {}",
+        args.join(" "),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn fruit_run(args: &[&str]) -> Output {
+    let mut all = vec!["--guest"];
+    all.extend_from_slice(args);
+    Command::new(env!("CARGO_BIN_EXE_smb2"))
+        .args(all)
+        .env_remove("SMB2_USER")
+        .env_remove("SMB2_PASS")
+        .env_remove("SMB2_PASS_COMMAND")
+        .output()
+        .expect("running the smb2 binary")
+}
+
+/// One connection for these tests, on its own runtime, and a fresh file named
+/// after the test.
+fn fruit_file(name: &str) -> (tokio::runtime::Runtime, SmbClient, Tree, String) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("building a tokio runtime");
+    let (client, tree, path) = runtime.block_on(async {
+        let mut client = smb2::connect("127.0.0.1:10464", "", "")
+            .await
+            .expect("connecting to smb-fruit; is the fixture running?");
+        let mut tree = client.connect_share("public").await.unwrap();
+        let path = format!("cli-e2e-{name}.txt");
+        client.write_file(&tree, &path, b"x").await.unwrap();
+        for attribute in client.list_xattrs(&mut tree, &path).await.unwrap() {
+            client.remove_xattr(&tree, &path, &attribute).await.unwrap();
+        }
+        (client, tree, path)
+    });
+    (runtime, client, tree, path)
+}
+
+#[test]
+#[ignore]
+fn xattr_writes_what_the_library_reads_and_back() {
+    let (runtime, mut client, mut tree, path) = fruit_file("xattr_round_trip");
+    let target = format!("{FRUIT}/{path}");
+
+    fruit_ok(&[
+        "xattr",
+        "-w",
+        "com.apple.metadata:_kMDItemUserTags",
+        "hello",
+        &target,
+    ]);
+    let stored =
+        runtime.block_on(client.get_xattr(&mut tree, &path, "com.apple.metadata:_kMDItemUserTags"));
+    assert_eq!(stored.unwrap().as_deref(), Some(&b"hello"[..]));
+
+    assert_eq!(
+        fruit_ok(&[
+            "xattr",
+            "-p",
+            "com.apple.metadata:_kMDItemUserTags",
+            &target
+        ])
+        .trim(),
+        "hello"
+    );
+    assert_eq!(
+        fruit_ok(&[
+            "xattr",
+            "-p",
+            "com.apple.metadata:_kMDItemUserTags",
+            "-x",
+            &target
+        ])
+        .trim(),
+        "68656c6c6f"
+    );
+    assert_eq!(
+        fruit_ok(&["xattr", &target]).trim(),
+        "com.apple.metadata:_kMDItemUserTags"
+    );
+    assert_eq!(
+        fruit_ok(&["xattr", "-l", &target]).trim(),
+        "com.apple.metadata:_kMDItemUserTags: hello"
+    );
+
+    fruit_ok(&[
+        "xattr",
+        "-d",
+        "com.apple.metadata:_kMDItemUserTags",
+        &target,
+    ]);
+    fruit_ok(&[
+        "xattr",
+        "-d",
+        "com.apple.metadata:_kMDItemUserTags",
+        &target,
+    ]);
+    let stored =
+        runtime.block_on(client.get_xattr(&mut tree, &path, "com.apple.metadata:_kMDItemUserTags"));
+    assert_eq!(stored.unwrap(), None);
+    runtime.block_on(client.delete_file(&tree, &path)).unwrap();
+}
+
+#[test]
+#[ignore]
+fn xattr_w_x_takes_hex_and_json_reports_hex() {
+    let (runtime, client, tree, path) = fruit_file("xattr_hex");
+    let target = format!("{FRUIT}/{path}");
+    fruit_ok(&["xattr", "-x", "-w", "user.a", "00 ff", &target]);
+    let json: serde_json::Value =
+        serde_json::from_str(&fruit_ok(&["--json", "xattr", "-l", &target])).unwrap();
+    assert_eq!(json[0]["attributes"][0]["name"], "user.a");
+    assert_eq!(json[0]["attributes"][0]["valueHex"], "00ff");
+    let mut client = client;
+    runtime.block_on(client.delete_file(&tree, &path)).unwrap();
+}
+
+#[test]
+#[ignore]
+fn xattr_p_on_a_missing_attribute_fails_and_names_it() {
+    let (runtime, mut client, tree, path) = fruit_file("xattr_missing");
+    let target = format!("{FRUIT}/{path}");
+    let output = fruit_run(&["xattr", "-p", "user.none", &target]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no such xattr: user.none"));
+    runtime.block_on(client.delete_file(&tree, &path)).unwrap();
+}
+
+#[test]
+#[ignore]
+fn xattr_batches_over_the_pool_with_one_failure_on_its_own() {
+    let (runtime, mut client, tree, first) = fruit_file("xattr_batch_a");
+    let (_rt, mut other, other_tree, second) = fruit_file("xattr_batch_b");
+    let targets = [
+        format!("{FRUIT}/{first}"),
+        format!("{FRUIT}/cli-e2e-not-there.txt"),
+        format!("{FRUIT}/{second}"),
+    ];
+    let output = fruit_run(&[
+        "xattr",
+        "-j",
+        "3",
+        "-w",
+        "user.a",
+        "v",
+        &targets[0],
+        &targets[1],
+        &targets[2],
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cli-e2e-not-there.txt"));
+    assert_eq!(
+        fruit_ok(&["xattr", "-p", "user.a", &targets[2]]).trim(),
+        "v"
+    );
+    runtime.block_on(client.delete_file(&tree, &first)).unwrap();
+    _rt.block_on(other.delete_file(&other_tree, &second))
+        .unwrap();
+}
+
+#[test]
+#[ignore]
+fn streams_lists_names_and_sizes() {
+    let (runtime, mut client, tree, path) = fruit_file("streams_list");
+    let target = format!("{FRUIT}/{path}");
+    runtime
+        .block_on(client.write_stream(&tree, &path, "user.s", b"abc"))
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&fruit_ok(&["--json", "streams", &target])).unwrap();
+    assert_eq!(json[0]["name"], "user.s");
+    assert_eq!(json[0]["size"], 3);
+    assert!(fruit_ok(&["streams", &target]).contains("user.s"));
+    runtime.block_on(client.delete_file(&tree, &path)).unwrap();
+}

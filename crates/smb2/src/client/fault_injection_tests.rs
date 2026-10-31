@@ -907,7 +907,7 @@ async fn a_real_watcher_on_a_dead_server_is_told_instead_of_waiting_forever() {
             persistent: 1,
             volatile: 2,
         },
-        true,
+        crate::client::watcher::WatchOptions::new().recursive(true),
     );
     let watching = tokio::spawn(async move { watcher.next_events().await });
 
@@ -958,7 +958,7 @@ async fn a_subscription_the_server_forgot_is_re_issued_rather_than_trusted_forev
             persistent: 1,
             volatile: 2,
         },
-        true,
+        crate::client::watcher::WatchOptions::new().recursive(true),
     );
     let watching = tokio::spawn(async move { watcher.next_events().await });
 
@@ -1050,7 +1050,7 @@ async fn a_long_poll_with_the_refresh_off_keeps_one_subscription_forever() {
             persistent: 1,
             volatile: 2,
         },
-        true,
+        crate::client::watcher::WatchOptions::new().recursive(true),
     );
     let watching = tokio::spawn(async move { watcher.next_events().await });
 

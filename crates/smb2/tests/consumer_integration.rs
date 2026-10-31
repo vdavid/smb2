@@ -64,6 +64,10 @@ fn windows_addr() -> String {
     format!("127.0.0.1:{}", testing::windows_port())
 }
 
+fn fruit_addr() -> String {
+    format!("127.0.0.1:{}", testing::fruit_port())
+}
+
 fn synology_addr() -> String {
     format!("127.0.0.1:{}", testing::synology_port())
 }
@@ -655,4 +659,39 @@ async fn unicode_list_directory_decodes_names_smb2_cannot_carry() {
     assert_eq!(nested, b"nested\n");
 
     client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+/// A consumer's Finder tag, on a share with named streams.
+#[tokio::test]
+#[ignore]
+async fn fruit_a_tag_round_trips_on_a_seeded_file() {
+    const TAG: &str = "com.apple.metadata:_kMDItemUserTags";
+    let mut client = connect_guest(&fruit_addr()).await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+
+    assert!(
+        client
+            .fs_attributes(&mut tree)
+            .await
+            .expect("fs_attributes")
+            .supports_named_streams
+    );
+    client
+        .set_xattr(&tree, "readme.txt", TAG, b"a plist")
+        .await
+        .expect("set_xattr");
+    let tags = client
+        .get_xattr_many(
+            &mut tree,
+            &["readme.txt", "documents"],
+            TAG,
+            smb2::BatchOptions::new(),
+        )
+        .await;
+    assert_eq!(tags[0].as_ref().unwrap().as_deref(), Some(&b"a plist"[..]));
+    assert_eq!(*tags[1].as_ref().unwrap(), None);
+    client
+        .remove_xattr(&tree, "readme.txt", TAG)
+        .await
+        .expect("remove_xattr");
 }

@@ -126,6 +126,9 @@ src/
     tuning.rs             # The controller's tunables; `smb2::__bench` under the unstable `__bench-tuning` feature
     write_behind.rs       # WriteBehind (the upload knob), UPLOAD_CHUNK_SIZE, the one-frame write cut-off
     write_pipe.rs         # WritePipe: the one engine every pipelined upload runs on
+    streams.rs            # Named streams on Tree, and fs_attributes
+    xattr.rs              # macOS xattrs on Tree, stored the way smbfs stores them, and the bulk calls
+    batch.rs              # The pipelined per-path engine: BatchOptions, BatchResults
     download_tests.rs     # FileDownload against the mock (order, cancel safety, closing, adaptive timing, rate hint)
     upload_tests.rs       # Uploads against the mock (chunk size, adaptive timing, fixed windows, rate hint, cancel safety)
     directory.rs          # DirectoryReader: a listing one server batch at a time, cancel-safe; list_directory collects through it
@@ -252,7 +255,7 @@ discards the late-arriving response silently. See `docs/connection-actor.md` for
 | Transport trait      | Split send/receive                         | The writer task and the receiver task each own one half, so a send never waits on a receive |
 | Workspace            | Library + CLI crates                       | A library change and the CLI change it needs land in one commit      |
 | I/O performance      | Pipelined reads/writes as core feature     | Not an optimization, the reason the lib exists                       |
-| Batch operations     | Loops over the single-item calls           | Convenience, not throughput; see `client/CLAUDE.md` § Batch operations |
+| Batch operations     | Loops over the single-item calls, except the xattr calls on `client/batch.rs` | Convenience, not throughput; see `client/CLAUDE.md` § Batch operations and § The pipelined engine |
 | Compression          | Unchained LZ4 only (`lz4_flex`, pure Rust) | LZNT1 is legacy, and chained compression is rarely used              |
 | Scope                | Client only, SMB 2.0.2 and up, TCP only    | No server, no SMB1, no QUIC or RDMA; see `crates/smb2/README.md` § Limitations |
 | Testing              | TDD with mock transport                    | Spec-driven tests first                                              |
@@ -347,6 +350,8 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 39. **A referral is the server telling this client where to send its password** ✅ -- Following a DFS referral dials the host it names and signs in there, and the referral comes from the server, so a malicious share can name a machine of its own and collect the credentials. `ClientConfig::dfs_target_policy` stands in between, defaulting to `SameServerOnly`: a different host gets nothing, not even a TCP connect, and the call answers `Error::DfsTargetNotAllowed`. ❌ Nothing but `ensure_connection` may dial a target, and a target's reviver asks too. ❌ "The same server" takes proof (ASCII case, one trailing dot, an IP's spelling, same port), since a wrong "same" hands a password to a stranger. Spans `client/dfs_policy.rs` + `client/mod.rs`; see `client/CLAUDE.md` § DFS.
 
+40. **A stream name travels apart from its path, and a stream CREATE can create the file** ✅ -- `encode_path` maps every `:` to U+F022 because a `:` in a file name is legitimate (pitfall 23), so `f.txt:stream` in a path is one ordinary name. ❌ Never let `:` through it: `Tree::stream_wire_name` joins `format_path(path)` and `encode_name(stream)`, which also gets DFS right and is exactly what macOS `smbfs` sends for `com.apple.metadata:_kMDItemUserTags`. Mapping the stream's own `:` also means no stream name can reach `::$DATA`, so `delete_stream` can't delete a file; an empty name is refused because `f.txt:` would name the file. And `FILE_OVERWRITE_IF` on a stream of a missing file creates the file, so `write_stream` probes first. Spans `name.rs` + `client/streams.rs` + `client/xattr.rs` + `client/batch.rs`; see `client/CLAUDE.md` § Named streams and xattrs and `docs/notes/named-streams-and-xattrs.md`.
+
 ## Testing
 
 See `tests/CLAUDE.md` for the full testing guide. Quick reference:
@@ -363,7 +368,7 @@ starts one container rather than 16.
 
 ### Docker test containers
 
-18 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+19 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
@@ -385,11 +390,12 @@ starts one container rather than 16.
 | smb-dfs-namespace     | 10460 | DFS *namespace root*: `msdfs proxy` makes TreeConnect refuse with `STATUS_BAD_NETWORK_NAME`, and only a V3 root referral over IPC$ says where the storage is. Plus a plain share, so a test can prove an ordinary connect still costs nothing |
 | smb-dfs-failover      | 10461 | Two root targets, the first unreachable: multi-target failover and the `TargetHint` that remembers which one worked |
 | smb-smallcredits      | 10462 | `smb2 max credits = 64`: the credit ceiling, fail-fast on unfundable charges, chunks sized to the window |
+| smb-fruit             | 10464 | `catia fruit streams_xattr`: named streams, macOS xattrs, FinderInfo in `AFP_AfpInfo` |
 | smb-samba415          | 10463 | Samba 4.15.13, whose smbd crashes on a FLUSH anywhere but last in a compound (pitfall 33): small-file writes keep the connection |
 
 ### Consumer test containers
 
-14 Samba containers embedded in the crate under `src/testing/fixtures/consumer/`, used by apps that depend on smb2 to test their SMB integration. Exposed via the `smb2::testing` module (requires `testing` feature flag). They live in `src/` (not `tests/`) because the published crate embeds them via `include_str!`.
+16 Samba containers embedded in the crate under `src/testing/fixtures/consumer/`, used by apps that depend on smb2 to test their SMB integration. Exposed via the `smb2::testing` module (requires `testing` feature flag). They live in `src/` (not `tests/`) because the published crate embeds them via `include_str!`.
 
 | Container              | Port  | What it tests                                 |
 |------------------------|-------|-----------------------------------------------|
@@ -408,6 +414,7 @@ starts one container rather than 16.
 | smb-consumer-flaky     | 10492 | Error recovery UI, reconnect handling         |
 | smb-consumer-slow      | 10493 | Loading spinners, progress bars, timeouts     |
 | smb-consumer-maxreadsize | 10494 | Streaming-fallback chunking (64 KB max read/write) |
+| smb-consumer-fruit     | 10495 | Named streams and macOS's `vfs_fruit`: Finder tags and other xattrs |
 
 ### Tested hardware
 

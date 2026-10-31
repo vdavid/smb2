@@ -3552,6 +3552,12 @@ impl Connection {
             .store(true, Ordering::Release);
     }
 
+    /// What the crate may charge at once for something it sizes itself: half
+    /// the ceiling, once the server has shown one (`credits.rs`).
+    pub(crate) fn comfortable_charge(&self) -> Option<u16> {
+        self.inner.credits.comfortable_charge()
+    }
+
     /// `max` bytes, lowered to what half the window funds once the server has
     /// shown a ceiling, after `riders` credits for the other requests in the
     /// same compound. 0 when the riders alone take that budget.

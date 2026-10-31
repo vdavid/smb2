@@ -32,6 +32,7 @@ const DFS_NAMESPACE_ADDR: &str = "127.0.0.1:10460";
 const DFS_FAILOVER_ADDR: &str = "127.0.0.1:10461";
 const SMALLCREDITS_ADDR: &str = "127.0.0.1:10462";
 const SAMBA415_ADDR: &str = "127.0.0.1:10463";
+const FRUIT_ADDR: &str = "127.0.0.1:10464";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -7590,4 +7591,595 @@ async fn samba415_small_writes_keep_the_connection() {
         or_dump(tree.delete_file(&mut conn, path).await, &probe, path);
     }
     or_dump(tree.delete_directory(&mut conn, dir).await, &probe, dir);
+}
+
+// ── Named streams and macOS xattrs (smb-fruit) ───────────────────────
+//
+// `catia fruit streams_xattr`, what a Mac-friendly NAS runs. What macOS itself
+// does against the same names is proved on real hardware, by the `#[ignore]`
+// interop tests in `tests/integration.rs`: `docs/notes/named-streams-and-xattrs.md`.
+
+const TAG_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
+
+async fn connect_fruit() -> (Connection, Tree) {
+    let mut conn = Connection::connect(FRUIT_ADDR, TIMEOUT)
+        .await
+        .expect("failed to connect to smb-fruit");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("guest session setup failed");
+    let tree = Tree::connect(&mut conn, "public")
+        .await
+        .expect("tree connect to 'public' failed");
+    (conn, tree)
+}
+
+/// A fresh folder holding `f.txt` (content `content`) and a subfolder `sub`.
+async fn fruit_scratch(conn: &mut Connection, tree: &Tree, name: &str) -> String {
+    let dir = format!("_test_fruit_{name}");
+    if let Ok(entries) = tree.list_directory(conn, &dir).await {
+        for entry in entries.iter().filter(|e| e.name != "." && e.name != "..") {
+            let path = format!("{dir}/{}", entry.name);
+            if entry.is_directory {
+                let _ = tree.delete_directory(conn, &path).await;
+            } else {
+                let _ = tree.delete_file(conn, &path).await;
+            }
+        }
+    }
+    let _ = tree.create_directory(conn, &dir).await;
+    tree.write_file(conn, &format!("{dir}/f.txt"), b"content")
+        .await
+        .unwrap();
+    let _ = tree.create_directory(conn, &format!("{dir}/sub")).await;
+    dir
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_says_it_has_named_streams() {
+    let (mut conn, tree) = connect_fruit().await;
+    let attributes = tree.fs_attributes(&mut conn).await.unwrap();
+    assert!(attributes.supports_named_streams);
+    assert!(attributes.max_component_length > 0);
+    assert!(!attributes.file_system_name.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_a_stream_round_trips_and_a_shorter_value_leaves_nothing_behind() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "round_trip").await;
+    let file = format!("{dir}/f.txt");
+
+    assert!(tree
+        .list_streams(&mut conn, &file)
+        .await
+        .unwrap()
+        .is_empty());
+    tree.write_stream(&mut conn, &file, TAG_XATTR, b"a long value")
+        .await
+        .unwrap();
+    tree.write_stream(&mut conn, &file, TAG_XATTR, b"short")
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.read_stream(&mut conn, &file, TAG_XATTR).await.unwrap(),
+        b"short"
+    );
+
+    let streams = tree.list_streams(&mut conn, &file).await.unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].name, TAG_XATTR);
+    assert_eq!(streams[0].size, 5);
+
+    tree.delete_stream(&mut conn, &file, TAG_XATTR)
+        .await
+        .unwrap();
+    assert!(tree
+        .list_streams(&mut conn, &file)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        tree.read_file(&mut conn, &file).await.unwrap(),
+        b"content",
+        "the file's own content is not a stream it can lose"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_folders_carry_streams_too() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "folders").await;
+    let sub = format!("{dir}/sub");
+    tree.set_xattr(&mut conn, &sub, TAG_XATTR, b"tagged folder")
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &format!("{sub}/"), TAG_XATTR)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"tagged folder"[..])
+    );
+    assert_eq!(
+        tree.list_xattrs(&mut conn, &sub).await.unwrap(),
+        [TAG_XATTR]
+    );
+    tree.remove_xattr(&mut conn, &sub, TAG_XATTR).await.unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &sub, TAG_XATTR).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_a_file_name_with_a_colon_keeps_its_streams_apart() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "colon").await;
+    let file = format!("{dir}/a:b.txt");
+    tree.write_file(&mut conn, &file, b"named with a colon")
+        .await
+        .unwrap();
+    tree.set_xattr(&mut conn, &file, "user.note", b"note")
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, "user.note")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"note"[..])
+    );
+    assert_eq!(
+        tree.read_file(&mut conn, &file).await.unwrap(),
+        b"named with a colon"
+    );
+    tree.delete_file(&mut conn, &file).await.unwrap();
+}
+
+/// What a stream CREATE allowed to create does to a missing file is the reason
+/// `write_stream` checks first. The file must stay missing.
+#[tokio::test]
+#[ignore]
+async fn fruit_a_write_never_creates_the_file() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "no_ghost").await;
+    let gone = format!("{dir}/gone.txt");
+
+    let err = tree
+        .set_xattr(&mut conn, &gone, TAG_XATTR, b"x")
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), smb2::ErrorKind::NotFound);
+    let err = tree.stat(&mut conn, &gone).await.unwrap_err();
+    assert_eq!(err.kind(), smb2::ErrorKind::NotFound);
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_get_xattr_tells_no_attribute_from_no_file() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "tell_apart").await;
+    let file = format!("{dir}/f.txt");
+
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, TAG_XATTR).await.unwrap(),
+        None
+    );
+    for missing in [format!("{dir}/gone.txt"), format!("{dir}/no-dir/gone.txt")] {
+        let err = tree
+            .get_xattr(&mut conn, &missing, TAG_XATTR)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), smb2::ErrorKind::NotFound, "{missing}");
+    }
+    // Removing what isn't there succeeds on a file, and not on no file.
+    tree.remove_xattr(&mut conn, &file, TAG_XATTR)
+        .await
+        .unwrap();
+    let err = tree
+        .remove_xattr(&mut conn, &format!("{dir}/gone.txt"), TAG_XATTR)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), smb2::ErrorKind::NotFound);
+}
+
+/// Tagging a file someone else has open is the everyday case, and no sharing
+/// violation may come of it.
+#[tokio::test]
+#[ignore]
+async fn fruit_streams_work_on_a_file_someone_has_open() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "shared").await;
+    let file = format!("{dir}/f.txt");
+    let (mut other_conn, other_tree) = connect_fruit().await;
+    let (handle, _) = other_tree.open_file(&mut other_conn, &file).await.unwrap();
+
+    tree.set_xattr(&mut conn, &file, TAG_XATTR, b"while open")
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, TAG_XATTR)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"while open"[..])
+    );
+    tree.remove_xattr(&mut conn, &file, TAG_XATTR)
+        .await
+        .unwrap();
+
+    other_tree
+        .close_handle(&mut other_conn, handle)
+        .await
+        .unwrap();
+}
+
+/// `streams_xattr` stops at the file system's xattr size. The server emptied the
+/// stream before refusing the data, so a zero-length value must not stay behind
+/// reading as a real one.
+#[tokio::test]
+#[ignore]
+async fn fruit_a_refused_write_leaves_no_stream() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "too_big").await;
+    let file = format!("{dir}/f.txt");
+
+    let err = tree
+        .write_stream(&mut conn, &file, "user.big", &vec![1u8; 200 * 1024])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.status(),
+        Some(smb2::types::status::NtStatus::FILE_SYSTEM_LIMITATION)
+    );
+    assert!(tree
+        .list_streams(&mut conn, &file)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_finder_info_lives_in_afp_info_and_keeps_the_rest_of_it() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "finder_info").await;
+    let file = format!("{dir}/f.txt");
+    let finder_info = [7u8; 32];
+
+    tree.set_xattr(&mut conn, &file, smb2::XATTR_FINDER_INFO, &finder_info)
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, smb2::XATTR_FINDER_INFO)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&finder_info[..])
+    );
+    assert_eq!(
+        tree.list_xattrs(&mut conn, &file).await.unwrap(),
+        [smb2::XATTR_FINDER_INFO]
+    );
+
+    let raw = tree
+        .read_stream(&mut conn, &file, "AFP_AfpInfo")
+        .await
+        .unwrap();
+    assert_eq!(raw.len(), 60);
+    assert_eq!(&raw[..8], b"AFP\0\0\0\x01\0");
+    assert_eq!(&raw[16..48], &finder_info);
+
+    // vfs_fruit removes the stream for an all-zero FinderInfo.
+    tree.set_xattr(&mut conn, &file, smb2::XATTR_FINDER_INFO, &[0u8; 32])
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, smb2::XATTR_FINDER_INFO)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let err = tree
+        .set_xattr(&mut conn, &file, smb2::XATTR_FINDER_INFO, &[1u8; 31])
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), smb2::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_a_resource_fork_round_trips() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "resource_fork").await;
+    let file = format!("{dir}/f.txt");
+    tree.set_xattr(&mut conn, &file, smb2::XATTR_RESOURCE_FORK, b"rsrc")
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, smb2::XATTR_RESOURCE_FORK)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"rsrc"[..])
+    );
+    assert_eq!(
+        tree.list_xattrs(&mut conn, &file).await.unwrap(),
+        [smb2::XATTR_RESOURCE_FORK]
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_the_bulk_calls_keep_input_order_and_each_items_own_result() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "bulk").await;
+    let paths: Vec<String> = (0..200).map(|i| format!("{dir}/n{i}.txt")).collect();
+    for path in &paths {
+        tree.write_file(&mut conn, path, b"x").await.unwrap();
+    }
+
+    let values: Vec<Vec<u8>> = (0..100).map(|i| format!("tag {i}").into_bytes()).collect();
+    let items: Vec<(&str, &[u8])> = paths
+        .iter()
+        .zip(&values)
+        .map(|(path, value)| (path.as_str(), value.as_slice()))
+        .collect();
+    let written = tree
+        .set_xattr_many(&mut conn, &items, TAG_XATTR, smb2::BatchOptions::new())
+        .await;
+    assert!(written.iter().all(Result::is_ok));
+
+    let gone = format!("{dir}/gone.txt");
+    let mut asked: Vec<&str> = paths.iter().map(String::as_str).collect();
+    asked.insert(150, &gone);
+
+    let exact = tree
+        .get_xattr_many(&mut conn, &asked, TAG_XATTR, smb2::BatchOptions::new())
+        .await;
+    assert_eq!(exact.len(), 201);
+    for (index, value) in values.iter().enumerate() {
+        assert_eq!(
+            exact[index].as_ref().unwrap().as_ref(),
+            Some(value),
+            "{index}"
+        );
+    }
+    assert_eq!(*exact[100].as_ref().unwrap(), None);
+    assert_eq!(
+        exact[150].as_ref().unwrap_err().kind(),
+        smb2::ErrorKind::NotFound
+    );
+
+    // The fast path reads the same, and a missing file as no attribute.
+    let fast = tree
+        .get_xattr_many(
+            &mut conn,
+            &asked,
+            TAG_XATTR,
+            smb2::BatchOptions::new().assume_paths_exist(true),
+        )
+        .await;
+    assert_eq!(*fast[0].as_ref().unwrap(), Some(values[0].clone()));
+    assert_eq!(*fast[150].as_ref().unwrap(), None);
+
+    // Handed over as they finish: every index once, whatever the order.
+    let mut each = tree.get_xattr_each(&mut conn, &asked, TAG_XATTR, smb2::BatchOptions::new());
+    let mut seen = vec![false; asked.len()];
+    while let Some((index, _)) = each.next().await {
+        assert!(!seen[index], "index {index} answered twice");
+        seen[index] = true;
+    }
+    assert!(seen.iter().all(|s| *s));
+}
+
+/// The crate rule: what it sizes itself fits in half the credit ceiling.
+#[tokio::test]
+#[ignore]
+async fn smallcredits_a_bulk_read_fits_the_window() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_smallcredits().await;
+    let dir = "_test_smallcredits_bulk_xattrs";
+    let _ = tree.create_directory(&mut conn, dir).await;
+    let paths: Vec<String> = (0..300).map(|i| format!("{dir}/n{i}.txt")).collect();
+    for path in &paths {
+        or_dump(tree.write_file(&mut conn, path, b"x").await, &conn, "write");
+    }
+    let asked: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let credit_starvations = conn.diagnostics().metrics.credit_starvations;
+    for options in [
+        smb2::BatchOptions::new(),
+        smb2::BatchOptions::new().assume_paths_exist(true),
+    ] {
+        let results = tree
+            .get_xattr_many(&mut conn, &asked, TAG_XATTR, options)
+            .await;
+        assert_eq!(results.len(), 300);
+    }
+    assert_eq!(
+        conn.diagnostics().metrics.credit_starvations,
+        credit_starvations
+    );
+    for path in &paths {
+        let _ = tree.delete_file(&mut conn, path).await;
+    }
+    let _ = tree.delete_directory(&mut conn, dir).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_a_metadata_watch_hears_about_another_clients_tag() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "notify").await;
+    let file = format!("{dir}/f.txt");
+
+    let mut watcher = tree
+        .watch_with(&mut conn, &dir, smb2::WatchOptions::new().metadata(true))
+        .await
+        .unwrap();
+    // Tag the file from another connection, once the watch has had time to arm.
+    let tagging = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (mut other_conn, other_tree) = connect_fruit().await;
+        other_tree
+            .set_xattr(&mut other_conn, &file, TAG_XATTR, b"from elsewhere")
+            .await
+            .unwrap();
+    });
+    let events = tokio::time::timeout(Duration::from_secs(5), watcher.next_events())
+        .await
+        .expect("a metadata watch should hear about a tag")
+        .unwrap();
+    println!("events: {events:?}");
+    tagging.await.unwrap();
+    assert!(
+        events.iter().any(|e| e.filename.starts_with("f.txt")),
+        "{events:?}"
+    );
+}
+
+/// Streams and xattrs behind a DFS link reach the link's target, one at a time
+/// and in a batch.
+#[tokio::test]
+#[ignore]
+async fn dfs_link_streams_and_xattrs_reach_the_target() {
+    let _ = env_logger::try_init();
+    let mut client = dfs_client().await;
+    let mut tree = client.connect_share("dfs").await.expect("connect_share");
+    let path = "data/_dfs_link_streams.tmp";
+    client
+        .write_file(&tree, path, b"x")
+        .await
+        .expect("write_file");
+
+    client
+        .write_stream(&tree, path, "user.s", b"stream")
+        .await
+        .expect("write_stream through the link");
+    assert_eq!(
+        client.read_stream(&mut tree, path, "user.s").await.unwrap(),
+        b"stream"
+    );
+    assert_eq!(
+        client.list_streams(&mut tree, path).await.unwrap()[0].name,
+        "user.s"
+    );
+    client
+        .delete_stream(&tree, path, "user.s")
+        .await
+        .expect("delete_stream through the link");
+    assert!(client
+        .list_streams(&mut tree, path)
+        .await
+        .unwrap()
+        .is_empty());
+
+    client
+        .set_xattr(&tree, path, TAG_XATTR, b"tag")
+        .await
+        .expect("set_xattr through the link");
+    assert_eq!(
+        client
+            .get_xattr(&mut tree, path, TAG_XATTR)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"tag"[..])
+    );
+
+    // A batch whose items are behind a link answers each of them, in order.
+    let value: &[u8] = b"batched";
+    let written = client
+        .set_xattr_many(
+            &tree,
+            &[(path, value)],
+            TAG_XATTR,
+            smb2::BatchOptions::new(),
+        )
+        .await;
+    assert!(written[0].is_ok(), "{written:?}");
+    let read = client
+        .get_xattr_many(
+            &mut tree,
+            &[path, "data/_no_such_file.tmp"],
+            TAG_XATTR,
+            smb2::BatchOptions::new(),
+        )
+        .await;
+    assert_eq!(read[0].as_ref().unwrap().as_deref(), Some(value));
+    assert_eq!(
+        read[1].as_ref().unwrap_err().kind(),
+        smb2::ErrorKind::NotFound
+    );
+
+    client
+        .remove_xattr(&tree, path, TAG_XATTR)
+        .await
+        .expect("remove_xattr through the link");
+    assert_eq!(tree.share_name, "dfs", "the caller's tree stays put");
+    client.delete_file(&tree, path).await.expect("delete_file");
+}
+
+// ── A server with no stream support (smb-guest) ──────────────────────
+
+/// A plain Samba has no streams module, so it refuses a stream's name
+/// (`STATUS_OBJECT_NAME_INVALID`). That can only mean "no streams" here, since
+/// the path and the stream name are both mapped to a legal form on the way out.
+#[tokio::test]
+#[ignore]
+async fn plain_samba_has_no_streams_and_says_so_cleanly() {
+    let (mut conn, tree) = connect_guest().await;
+    let dir = "_test_plain_streams";
+    let _ = tree.create_directory(&mut conn, dir).await;
+    let file = format!("{dir}/f.txt");
+    tree.write_file(&mut conn, &file, b"content").await.unwrap();
+
+    assert!(
+        !tree
+            .fs_attributes(&mut conn)
+            .await
+            .unwrap()
+            .supports_named_streams
+    );
+
+    use smb2::ErrorKind::Unsupported;
+    let read = tree.read_stream(&mut conn, &file, "user.a").await;
+    assert_eq!(read.unwrap_err().kind(), Unsupported);
+    let write = tree.write_stream(&mut conn, &file, "user.a", b"x").await;
+    assert_eq!(write.unwrap_err().kind(), Unsupported);
+    let delete = tree.delete_stream(&mut conn, &file, "user.a").await;
+    assert_eq!(delete.unwrap_err().kind(), Unsupported);
+    let set = tree.set_xattr(&mut conn, &file, "user.a", b"x").await;
+    assert_eq!(set.unwrap_err().kind(), Unsupported);
+
+    // Listing finds nothing, so an xattr read is the honest "not there".
+    assert!(tree
+        .list_streams(&mut conn, &file)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, "user.a").await.unwrap(),
+        None
+    );
+    let many = tree
+        .get_xattr_many(
+            &mut conn,
+            &[file.as_str()],
+            "user.a",
+            smb2::BatchOptions::new(),
+        )
+        .await;
+    assert_eq!(*many[0].as_ref().unwrap(), None);
+
+    assert_eq!(tree.read_file(&mut conn, &file).await.unwrap(), b"content");
+    let _ = tree.delete_file(&mut conn, &file).await;
+    let _ = tree.delete_directory(&mut conn, dir).await;
 }

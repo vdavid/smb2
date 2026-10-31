@@ -22,8 +22,10 @@ use crate::client::Frame;
 use crate::error::Result;
 use crate::msg::change_notify::{
     ChangeNotifyRequest, ChangeNotifyResponse, FILE_NOTIFY_CHANGE_ATTRIBUTES,
-    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, SMB2_WATCH_TREE,
+    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_EA,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_NOTIFY_CHANGE_STREAM_NAME, FILE_NOTIFY_CHANGE_STREAM_SIZE,
+    FILE_NOTIFY_CHANGE_STREAM_WRITE, SMB2_WATCH_TREE,
 };
 use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
@@ -38,6 +40,56 @@ const DEFAULT_COMPLETION_FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
     | FILE_NOTIFY_CHANGE_LAST_WRITE
     | FILE_NOTIFY_CHANGE_CREATION;
 
+/// What [`WatchOptions::metadata`] adds to the default filter.
+const METADATA_COMPLETION_FILTER: u32 = FILE_NOTIFY_CHANGE_EA
+    | FILE_NOTIFY_CHANGE_STREAM_NAME
+    | FILE_NOTIFY_CHANGE_STREAM_SIZE
+    | FILE_NOTIFY_CHANGE_STREAM_WRITE;
+
+/// How [`Tree::watch_with`](crate::Tree::watch_with) watches a directory.
+///
+/// ```
+/// let options = smb2::WatchOptions::new().recursive(true).metadata(true);
+/// # let _ = options;
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WatchOptions {
+    pub(crate) recursive: bool,
+    pub(crate) metadata: bool,
+}
+
+impl WatchOptions {
+    /// The defaults: this directory only, and the changes [`Tree::watch`](crate::Tree::watch)
+    /// reports.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Watch the entire subtree.
+    pub fn recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive;
+        self
+    }
+
+    /// Also hear about xattr and named-stream changes (`FILE_NOTIFY_CHANGE_EA`
+    /// and the three `FILE_NOTIFY_CHANGE_STREAM_*` bits), so another client's
+    /// Finder tag shows up. Off by default, since a server may then wake a watch
+    /// for every change to any file's metadata.
+    pub fn metadata(mut self, metadata: bool) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    fn completion_filter(self) -> u32 {
+        if self.metadata {
+            DEFAULT_COMPLETION_FILTER | METADATA_COMPLETION_FILTER
+        } else {
+            DEFAULT_COMPLETION_FILTER
+        }
+    }
+}
+
 /// Default output buffer length for CHANGE_NOTIFY responses (64 KB).
 const OUTPUT_BUFFER_LENGTH: u32 = 65536;
 
@@ -46,6 +98,7 @@ const OUTPUT_BUFFER_LENGTH: u32 = 65536;
 /// These correspond to the `Action` field in `FILE_NOTIFY_INFORMATION`
 /// (MS-FSCC section 2.4.42).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileNotifyAction {
     /// A file was added to the directory.
     Added,
@@ -57,6 +110,12 @@ pub enum FileNotifyAction {
     RenamedOldName,
     /// A file was renamed (this is the new name).
     RenamedNewName,
+    /// A named stream was added to a file.
+    StreamAdded,
+    /// A named stream was removed from a file.
+    StreamRemoved,
+    /// A named stream's content changed.
+    StreamModified,
 }
 
 impl FileNotifyAction {
@@ -68,6 +127,9 @@ impl FileNotifyAction {
             0x0000_0003 => Ok(FileNotifyAction::Modified),
             0x0000_0004 => Ok(FileNotifyAction::RenamedOldName),
             0x0000_0005 => Ok(FileNotifyAction::RenamedNewName),
+            0x0000_0006 => Ok(FileNotifyAction::StreamAdded),
+            0x0000_0007 => Ok(FileNotifyAction::StreamRemoved),
+            0x0000_0008 => Ok(FileNotifyAction::StreamModified),
             other => Err(Error::invalid_data(format!(
                 "unknown FILE_NOTIFY_INFORMATION action: {other:#010X}"
             ))),
@@ -81,6 +143,9 @@ impl std::fmt::Display for FileNotifyAction {
             FileNotifyAction::Added => write!(f, "added"),
             FileNotifyAction::Removed => write!(f, "removed"),
             FileNotifyAction::Modified => write!(f, "modified"),
+            FileNotifyAction::StreamAdded => write!(f, "stream added"),
+            FileNotifyAction::StreamRemoved => write!(f, "stream removed"),
+            FileNotifyAction::StreamModified => write!(f, "stream modified"),
             FileNotifyAction::RenamedOldName => write!(f, "renamed (old name)"),
             FileNotifyAction::RenamedNewName => write!(f, "renamed (new name)"),
         }
@@ -141,7 +206,7 @@ pub struct Watcher {
     tree: Tree,
     conn: Connection,
     file_id: FileId,
-    recursive: bool,
+    options: WatchOptions,
     /// The in-flight CHANGE_NOTIFY. Populated lazily on the first
     /// `next_events()` call and re-populated before awaiting each response,
     /// so there is always exactly one outstanding request on the wire from
@@ -160,13 +225,18 @@ pub struct Watcher {
 
 impl Watcher {
     /// Create a new watcher (called by `Tree::watch`).
-    pub(crate) fn new(tree: Tree, conn: Connection, file_id: FileId, recursive: bool) -> Self {
+    pub(crate) fn new(
+        tree: Tree,
+        conn: Connection,
+        file_id: FileId,
+        options: WatchOptions,
+    ) -> Self {
         let conn = tree.pinned_conn(&conn).pinned_to_session();
         Watcher {
             tree,
             conn,
             file_id,
-            recursive,
+            options,
             pending: None,
             closed: false,
         }
@@ -276,12 +346,16 @@ impl Watcher {
     /// returns the request is on the wire — the caller can rely on the
     /// "outstanding on the wire" invariant for whatever comes next.
     async fn dispatch_next(&self) -> Result<WaiterGuard> {
-        let flags = if self.recursive { SMB2_WATCH_TREE } else { 0 };
+        let flags = if self.options.recursive {
+            SMB2_WATCH_TREE
+        } else {
+            0
+        };
         let req = ChangeNotifyRequest {
             flags,
             output_buffer_length: OUTPUT_BUFFER_LENGTH,
             file_id: self.file_id,
-            completion_filter: DEFAULT_COMPLETION_FILTER,
+            completion_filter: self.options.completion_filter(),
         };
         self.conn
             .dispatch(Command::ChangeNotify, &req, Some(self.tree.tree_id))
@@ -594,6 +668,35 @@ mod tests {
             format!("{}", FileNotifyAction::RenamedNewName),
             "renamed (new name)"
         );
+    }
+
+    #[test]
+    fn stream_actions_are_typed() {
+        for (raw, action) in [
+            (6, FileNotifyAction::StreamAdded),
+            (7, FileNotifyAction::StreamRemoved),
+            (8, FileNotifyAction::StreamModified),
+        ] {
+            assert_eq!(FileNotifyAction::from_u32(raw).unwrap(), action);
+        }
+    }
+
+    #[test]
+    fn the_default_filter_stays_as_it_was() {
+        assert_eq!(
+            WatchOptions::new().completion_filter(),
+            DEFAULT_COMPLETION_FILTER
+        );
+        let metadata = WatchOptions::new().metadata(true).completion_filter();
+        for bit in [
+            FILE_NOTIFY_CHANGE_EA,
+            FILE_NOTIFY_CHANGE_STREAM_NAME,
+            FILE_NOTIFY_CHANGE_STREAM_SIZE,
+            FILE_NOTIFY_CHANGE_STREAM_WRITE,
+        ] {
+            assert_ne!(metadata & bit, 0);
+            assert_eq!(DEFAULT_COMPLETION_FILTER & bit, 0);
+        }
     }
 
     #[test]
@@ -938,7 +1041,7 @@ mod loss_window_tests {
                 persistent: 0x1111,
                 volatile: 0x2222,
             },
-            true,
+            WatchOptions::new().recursive(true),
         );
         let mut delivered: Vec<String> = Vec::new();
         while let Ok(events) = watcher.next_events().await {
@@ -1023,7 +1126,7 @@ mod close_on_drop_tests {
         mock.queue_response(build_flush_response());
         let mut conn = setup_connection(&mock);
 
-        drop(Watcher::new(tree(), conn.clone(), DIR, false));
+        drop(Watcher::new(tree(), conn.clone(), DIR, WatchOptions::new()));
         tree()
             .flush_handle(&mut conn, FileId::default())
             .await
@@ -1039,7 +1142,7 @@ mod close_on_drop_tests {
         mock.queue_response(build_flush_response());
         let mut conn = setup_connection(&mock);
 
-        Watcher::new(tree(), conn.clone(), DIR, false)
+        Watcher::new(tree(), conn.clone(), DIR, WatchOptions::new())
             .close()
             .await
             .unwrap();

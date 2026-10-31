@@ -47,6 +47,23 @@ pub enum Job {
     /// Create a directory, treating "it's already there" as success, which is
     /// what `mkdir -p` means.
     CreateDirectoryIfMissing(String),
+    /// A path's xattr names.
+    XattrNames(String),
+    /// A path's xattr names and values.
+    XattrList(String),
+    XattrGet {
+        path: String,
+        name: String,
+    },
+    XattrSet {
+        path: String,
+        name: String,
+        value: Vec<u8>,
+    },
+    XattrRemove {
+        path: String,
+        name: String,
+    },
 }
 
 /// What a job produced.
@@ -56,6 +73,8 @@ pub enum Outcome {
     /// A `mkdir -p` found the directory already there, so it had nothing to do.
     AlreadyThere,
     Stat(FileInfo),
+    /// Attribute names, each with its value when one was asked for.
+    Xattrs(Vec<(String, Option<Vec<u8>>)>),
     Failed(String),
 }
 
@@ -173,7 +192,39 @@ async fn execute(client: &mut SmbClient, tree: &mut Tree, job: &Job) -> Outcome 
         Job::DeleteDirectory(path) => report(client.delete_directory(tree, path).await),
         Job::CreateDirectory(path) => create_directory(client, tree, path, false).await,
         Job::CreateDirectoryIfMissing(path) => create_directory(client, tree, path, true).await,
+        Job::XattrNames(path) => match client.list_xattrs(tree, path).await {
+            Ok(names) => Outcome::Xattrs(names.into_iter().map(|name| (name, None)).collect()),
+            Err(error) => Outcome::Failed(error.to_string()),
+        },
+        Job::XattrList(path) => list_xattrs(client, tree, path).await,
+        Job::XattrGet { path, name } => match client.get_xattr(tree, path, name).await {
+            Ok(Some(value)) => Outcome::Xattrs(vec![(name.clone(), Some(value))]),
+            Ok(None) => Outcome::Failed(format!("no such xattr: {name}")),
+            Err(error) => Outcome::Failed(error.to_string()),
+        },
+        Job::XattrSet { path, name, value } => {
+            report(client.set_xattr(tree, path, name, value).await)
+        }
+        Job::XattrRemove { path, name } => report(client.remove_xattr(tree, path, name).await),
     }
+}
+
+/// Every attribute of a path, with its value. One that vanished since the list
+/// just isn't there.
+async fn list_xattrs(client: &mut SmbClient, tree: &mut Tree, path: &str) -> Outcome {
+    let names = match client.list_xattrs(tree, path).await {
+        Ok(names) => names,
+        Err(error) => return Outcome::Failed(error.to_string()),
+    };
+    let mut attributes = Vec::with_capacity(names.len());
+    for name in names {
+        match client.get_xattr(tree, path, &name).await {
+            Ok(Some(value)) => attributes.push((name, Some(value))),
+            Ok(None) => {}
+            Err(error) => return Outcome::Failed(format!("reading {name}: {error}")),
+        }
+    }
+    Outcome::Xattrs(attributes)
 }
 
 /// Creates a directory, asking what holds the name when the server says it's

@@ -129,6 +129,29 @@ impl std::fmt::Display for SignatureFailure {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The server answered a stream's delete with success and kept the stream.
+    /// A QNAP does this for `com.apple.metadata:_kMDItemUserTags` and
+    /// `AFP_Resource`, to macOS's own client too. For Finder tags, write what
+    /// macOS writes to clear them: a plist holding an empty array. Kind
+    /// [`ErrorKind::Unsupported`]. Not retryable.
+    #[error("the server kept stream {stream:?} of {path:?} after reporting it deleted")]
+    StreamDeleteIgnored {
+        /// The path, as the caller gave it.
+        path: String,
+        /// The stream the server kept.
+        stream: String,
+    },
+
+    /// The server refused a stream's name: this share has no named streams. A
+    /// plain Samba with no `streams_*` module answers this way, with
+    /// `STATUS_OBJECT_NAME_INVALID`. Kind [`ErrorKind::Unsupported`]. Not
+    /// retryable.
+    #[error("this share has no named streams (path {path:?})")]
+    NamedStreamsUnsupported {
+        /// The path whose stream the server refused, as the caller gave it.
+        path: String,
+    },
+
     /// The data is malformed or does not match the expected format.
     #[error("Invalid data: {message}")]
     InvalidData {
@@ -818,7 +841,8 @@ pub enum ErrorKind {
     /// copy. Consumers branch on this to fall back to a client-side path (for
     /// server-side copy, a plain read-then-write). Maps from
     /// `STATUS_NOT_SUPPORTED`, `STATUS_INVALID_DEVICE_REQUEST`, and
-    /// `STATUS_NOT_IMPLEMENTED`.
+    /// `STATUS_NOT_IMPLEMENTED`, and from [`Error::NamedStreamsUnsupported`] and
+    /// [`Error::StreamDeleteIgnored`].
     Unsupported,
     /// An interrupted upload can't resume from its checkpoint: write the
     /// file again from the start. Only [`Error::ResumeRefused`] has it, and
@@ -853,6 +877,9 @@ impl Error {
     /// NTSTATUS codes. For the underlying status code, use [`status()`](Self::status).
     pub fn kind(&self) -> ErrorKind {
         match self {
+            Error::NamedStreamsUnsupported { .. } | Error::StreamDeleteIgnored { .. } => {
+                ErrorKind::Unsupported
+            }
             Error::InvalidData { .. } => ErrorKind::InvalidData,
             Error::Auth { .. } => ErrorKind::AuthRequired,
             Error::SignatureInvalid { .. } => ErrorKind::SignatureInvalid,

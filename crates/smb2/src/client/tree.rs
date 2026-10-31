@@ -128,7 +128,7 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 pub(super) const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Share mode that lets every other open keep reading, writing, and deleting.
-const SHARE_ALL: ShareAccess = ShareAccess(
+pub(super) const SHARE_ALL: ShareAccess = ShareAccess(
     ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE | ShareAccess::FILE_SHARE_DELETE,
 );
 
@@ -823,8 +823,22 @@ impl Tree {
         path: &str,
         expected_size: u64,
     ) -> Result<(Vec<u8>, FileInfo)> {
+        let wire_name = self.format_path(path);
+        self.read_compound_named(conn, path, wire_name, expected_size)
+            .await
+    }
+
+    /// CREATE + READ + CLOSE on a name already in wire form: a file's
+    /// (`format_path`), or a named stream's (`streams.rs`). `path` is what
+    /// the caller asked for, kept for the log lines.
+    pub(super) async fn read_compound_named(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        wire_name: String,
+        expected_size: u64,
+    ) -> Result<(Vec<u8>, FileInfo)> {
         let conn = &mut self.pinned_conn(conn);
-        let normalized = self.format_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         // Ask for what the caller expects, capped by what one READ can carry
         // and floored at one byte: a zero-length READ charges zero credits,
@@ -851,7 +865,7 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: 0,
-            name: normalized.clone(),
+            name: wire_name,
             create_contexts: vec![],
         };
 
@@ -1045,10 +1059,24 @@ impl Tree {
         path: &str,
         recursive: bool,
     ) -> Result<crate::client::watcher::Watcher> {
+        let options = crate::client::watcher::WatchOptions::new().recursive(recursive);
+        self.watch_with(conn, path, options).await
+    }
+
+    /// [`watch`](Self::watch) with [`WatchOptions`](crate::WatchOptions), which
+    /// can also ask for xattr and named-stream changes. A server reports a
+    /// stream's change under its file's name, or under `file:stream`; the notes
+    /// have what each one does (`docs/notes/named-streams-and-xattrs.md`).
+    pub async fn watch_with(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        options: crate::client::watcher::WatchOptions,
+    ) -> Result<crate::client::watcher::Watcher> {
         let conn = &mut self.pinned_conn(conn);
         debug!(
-            "tree: watch path={:?}, recursive={}, tree_id={}",
-            path, recursive, self.tree_id
+            "tree: watch path={:?}, options={:?}, tree_id={}",
+            path, options, self.tree_id
         );
 
         // Pinned before the open, so the watcher never subscribes on a
@@ -1067,7 +1095,7 @@ impl Tree {
             self.clone(),
             conn,
             file_id,
-            recursive,
+            options,
         ))
     }
 

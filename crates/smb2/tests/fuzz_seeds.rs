@@ -477,6 +477,44 @@ fn generate_fuzz_seeds() {
         &build_simple_create_response(),
     );
 
+    // ── fuzz_stream_information_parse ───────────────────────────────
+    {
+        // Two chained entries: the default stream, and a Finder tag.
+        let mut chain = Vec::new();
+        for (name, next) in [("::$DATA", 40u32), (":a\u{F022}b:$DATA", 0)] {
+            let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let start = chain.len();
+            chain.extend_from_slice(&next.to_le_bytes());
+            chain.extend_from_slice(&(units.len() as u32).to_le_bytes());
+            chain.extend_from_slice(&63u64.to_le_bytes());
+            chain.extend_from_slice(&512u64.to_le_bytes());
+            chain.extend_from_slice(&units);
+            chain.resize(start + next.max(24 + units.len() as u32) as usize, 0);
+        }
+        write_seed("fuzz_stream_information_parse", "two_entries", &chain);
+        write_seed("fuzz_stream_information_parse", "empty", &[]);
+    }
+
+    // ── fuzz_fs_attributes_parse ────────────────────────────────────
+    {
+        let name: Vec<u8> = "NTFS".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut info = Vec::new();
+        info.extend_from_slice(&0x0004_0000u32.to_le_bytes());
+        info.extend_from_slice(&255u32.to_le_bytes());
+        info.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        info.extend_from_slice(&name);
+        write_seed("fuzz_fs_attributes_parse", "ntfs", &info);
+    }
+
+    // ── fuzz_afp_info_parse ─────────────────────────────────────────
+    {
+        let mut afp = vec![0u8; 60];
+        afp[..8].copy_from_slice(b"AFP\0\0\0\x01\0");
+        afp[12] = 0x80;
+        write_seed("fuzz_afp_info_parse", "valid", &afp);
+        write_seed("fuzz_afp_info_parse", "short", &afp[..20]);
+    }
+
     // ── fuzz_query_info_response_parse ──────────────────────────────
     write_seed(
         "fuzz_query_info_response_parse",

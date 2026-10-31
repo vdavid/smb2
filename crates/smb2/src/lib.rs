@@ -127,6 +127,13 @@ pub use client::tree::{
 pub use client::times::FileTimes;
 pub use types::flags::FileAttributes;
 
+// Named streams, macOS xattrs, and the pipelined calls over them.
+pub use client::batch::{BatchOptions, BatchResults};
+pub use client::streams::{FsAttributes, StreamInfo};
+pub use client::xattr::{
+    stream_xattr_name, xattr_stream_name, XATTR_FINDER_INFO, XATTR_RESOURCE_FORK,
+};
+
 // What kind of reparse point (junction, symlink, cloud placeholder) an entry is.
 pub use types::reparse::ReparseTag;
 
@@ -153,7 +160,7 @@ pub use client::diagnostics::{
 };
 
 // File watching
-pub use client::watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
+pub use client::watcher::{FileNotifyAction, FileNotifyEvent, WatchOptions, Watcher};
 
 // Share enumeration
 pub use rpc::srvsvc::ShareInfo;

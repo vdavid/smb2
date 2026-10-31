@@ -2727,3 +2727,375 @@ async fn nas_stores_an_illegal_name_the_way_macos_does() {
         .await
         .expect("cleanup the test directory");
 }
+
+// ── Named streams and macOS xattrs, on real hardware ───────────────────
+//
+// The tests that prove the feature: macOS's own SMB client and this crate agree
+// byte for byte. They need the same NAS mounted (`SMB2_TEST_NAS_MOUNT`, like
+// `/Volumes/naspi`), and go through `/usr/bin/xattr` on that mount. Run on a Mac:
+//
+// SMB2_TEST_NAS_MOUNT=/Volumes/naspi cargo test -p smb2 --test integration -- \
+//     --ignored --nocapture macos_ nas_streams
+//
+// Each test owns one scratch folder at the share's root and removes it. Results:
+// `docs/notes/named-streams-and-xattrs.md`.
+
+const TAG_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
+
+/// What macOS wrote for one tag named "Red" through a `/Volumes` mount, with the
+/// API Finder's tags go through (`NSURLTagNamesKey`), read off the QNAP on
+/// 2026-10-31.
+const RED_TAG_PLIST: &[u8] = b"bplist00\xa1\x01URed\n6\x08\n\0\0\0\0\0\0\x01\x01\0\0\0\0\0\0\0\x02\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x10";
+
+/// What macOS writes when the last tag comes off: a plist holding an empty array.
+/// It never deletes the attribute.
+const NO_TAGS_PLIST: &[u8] =
+    b"bplist00\xa0\x08\0\0\0\0\0\0\x01\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x09";
+
+/// An xattr the QNAP really deletes.
+const DELETABLE_XATTR: &str = "com.example.interop";
+
+/// Runs `/usr/bin/xattr` and returns stdout, requiring it to succeed.
+fn mac_xattr(args: &[&str]) -> String {
+    let output = std::process::Command::new("/usr/bin/xattr")
+        .args(args)
+        .output()
+        .expect("running /usr/bin/xattr");
+    assert!(
+        output.status.success(),
+        "xattr {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// What `xattr -px` prints, as bytes.
+fn parse_mac_hex(text: &str) -> Vec<u8> {
+    let digits: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    digits
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(&pair.iter().collect::<String>(), 16).unwrap())
+        .collect()
+}
+
+fn to_mac_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Waits for a change another client made to show, and says how long it took.
+/// It showed within 25 ms on the QNAP (2026-10-31), and a change that never shows
+/// fails the test.
+async fn eventually<F, Fut>(what: &str, mut holds: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let started = std::time::Instant::now();
+    while !holds().await {
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "{what} never showed"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    println!("{what}: showed after {:?}", started.elapsed());
+}
+
+/// A connection, the share-relative scratch folder, and its path on the mount.
+/// Empties and recreates the folder.
+async fn interop_scratch(name: &str) -> Option<(Connection, Tree, String, String)> {
+    let mount = env_opt("SMB2_TEST_NAS_MOUNT")?;
+    let (mut conn, tree) = connect_to_nas().await;
+    let dir = format!("_smb2_interop_{name}");
+    remove_scratch(&mut conn, &tree, &dir).await;
+    tree.create_directory(&mut conn, &dir).await.unwrap();
+    let on_mount = format!("{mount}/{dir}");
+    Some((conn, tree, dir, on_mount))
+}
+
+async fn remove_scratch(conn: &mut Connection, tree: &Tree, dir: &str) {
+    let Ok(entries) = tree.list_directory(conn, dir).await else {
+        return;
+    };
+    for entry in entries.iter().filter(|e| e.name != "." && e.name != "..") {
+        let path = format!("{dir}/{}", entry.name);
+        if entry.is_directory {
+            let _ = tree.delete_directory(conn, &path).await;
+        } else {
+            let _ = tree.delete_file(conn, &path).await;
+        }
+    }
+    let _ = tree.delete_directory(conn, dir).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn macos_reads_the_tag_this_crate_wrote_byte_for_byte() {
+    let Some((mut conn, tree, dir, on_mount)) = interop_scratch("tag_to_mac").await else {
+        println!("SKIP: SMB2_TEST_NAS_MOUNT isn't set");
+        return;
+    };
+    for (path, make_dir) in [
+        (format!("{dir}/f.txt"), false),
+        (format!("{dir}/sub"), true),
+    ] {
+        if make_dir {
+            tree.create_directory(&mut conn, &path).await.unwrap();
+        } else {
+            tree.write_file(&mut conn, &path, b"x").await.unwrap();
+        }
+        tree.set_xattr(&mut conn, &path, TAG_XATTR, RED_TAG_PLIST)
+            .await
+            .unwrap();
+        let mounted = path.replacen(&dir, &on_mount, 1);
+        assert_eq!(
+            parse_mac_hex(&mac_xattr(&["-px", TAG_XATTR, &mounted])),
+            RED_TAG_PLIST,
+            "{path}"
+        );
+        // Removing it here is removing it there, once the mount looks again. On
+        // a name this server deletes: see `nas_keeps_a_finder_tag_it_says_it_deleted`.
+        tree.set_xattr(&mut conn, &path, DELETABLE_XATTR, b"v")
+            .await
+            .unwrap();
+        tree.remove_xattr(&mut conn, &path, DELETABLE_XATTR)
+            .await
+            .unwrap();
+        eventually(&format!("the removal on the mount, {path}"), || async {
+            !mac_xattr(&[&mounted]).contains(DELETABLE_XATTR)
+        })
+        .await;
+    }
+    remove_scratch(&mut conn, &tree, &dir).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn macos_tags_read_back_here_byte_for_byte() {
+    let Some((mut conn, tree, dir, on_mount)) = interop_scratch("tag_from_mac").await else {
+        println!("SKIP: SMB2_TEST_NAS_MOUNT isn't set");
+        return;
+    };
+    for (path, make_dir) in [
+        (format!("{dir}/f.txt"), false),
+        (format!("{dir}/sub"), true),
+    ] {
+        if make_dir {
+            tree.create_directory(&mut conn, &path).await.unwrap();
+        } else {
+            tree.write_file(&mut conn, &path, b"x").await.unwrap();
+        }
+        let mounted = path.replacen(&dir, &on_mount, 1);
+        mac_xattr(&["-wx", TAG_XATTR, &to_mac_hex(RED_TAG_PLIST), &mounted]);
+        assert_eq!(
+            tree.get_xattr(&mut conn, &path, TAG_XATTR)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(RED_TAG_PLIST),
+            "{path}"
+        );
+        assert!(tree
+            .list_xattrs(&mut conn, &path)
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == TAG_XATTR));
+        mac_xattr(&["-w", DELETABLE_XATTR, "v", &mounted]);
+        mac_xattr(&["-d", DELETABLE_XATTR, &mounted]);
+        let (check_tree, check_conn) = (tree.clone(), conn.clone());
+        eventually(&format!("the mount's removal, {path}"), || {
+            let (tree, mut conn) = (check_tree.clone(), check_conn.clone());
+            let path = path.clone();
+            async move {
+                tree.get_xattr(&mut conn, &path, DELETABLE_XATTR)
+                    .await
+                    .unwrap()
+                    .is_none()
+            }
+        })
+        .await;
+    }
+    remove_scratch(&mut conn, &tree, &dir).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn macos_and_this_crate_agree_on_finder_info() {
+    let Some((mut conn, tree, dir, on_mount)) = interop_scratch("finder_info").await else {
+        println!("SKIP: SMB2_TEST_NAS_MOUNT isn't set");
+        return;
+    };
+    // Type, creator, and flags. macOS doesn't hand back what it considers its own
+    // from the rest: reading through a mount gives zeros for the location, and
+    // its date-added fields in the last 16 bytes.
+    let mut finder_info = vec![0u8; 32];
+    finder_info[..10].copy_from_slice(b"TESTCREA\x01\x02");
+
+    // From here to there.
+    let ours = format!("{dir}/ours.txt");
+    tree.write_file(&mut conn, &ours, b"x").await.unwrap();
+    tree.set_xattr(&mut conn, &ours, smb2::XATTR_FINDER_INFO, &finder_info)
+        .await
+        .unwrap();
+    let mounted = format!("{on_mount}/ours.txt");
+    assert_eq!(
+        parse_mac_hex(&mac_xattr(&["-px", smb2::XATTR_FINDER_INFO, &mounted]))[..10],
+        finder_info[..10]
+    );
+
+    // From there to here, and the stream is the one this crate says it is.
+    let theirs = format!("{dir}/theirs.txt");
+    tree.write_file(&mut conn, &theirs, b"x").await.unwrap();
+    let mounted = format!("{on_mount}/theirs.txt");
+    mac_xattr(&[
+        "-wx",
+        smb2::XATTR_FINDER_INFO,
+        &to_mac_hex(&finder_info),
+        &mounted,
+    ]);
+    assert_eq!(
+        tree.get_xattr(&mut conn, &theirs, smb2::XATTR_FINDER_INFO)
+            .await
+            .unwrap(),
+        Some(finder_info.clone())
+    );
+    let raw = tree
+        .read_stream(&mut conn, &theirs, "AFP_AfpInfo")
+        .await
+        .unwrap();
+    assert_eq!(raw.len(), 60);
+    assert_eq!(&raw[..8], b"AFP\0\0\0\x01\0");
+    assert_eq!(raw[16..48], finder_info[..]);
+
+    remove_scratch(&mut conn, &tree, &dir).await;
+}
+
+/// The QNAP answers success to a delete of this one name and keeps it, for
+/// macOS's own client too. The crate has to say so, and clearing tags the way
+/// macOS does has to work.
+#[tokio::test]
+#[ignore]
+async fn nas_keeps_a_finder_tag_it_says_it_deleted() {
+    let (mut conn, tree) = connect_to_nas().await;
+    let dir = "_smb2_interop_nas_kept_tag";
+    remove_scratch(&mut conn, &tree, dir).await;
+    tree.create_directory(&mut conn, dir).await.unwrap();
+    let file = format!("{dir}/f.txt");
+    tree.write_file(&mut conn, &file, b"x").await.unwrap();
+
+    tree.set_xattr(&mut conn, &file, TAG_XATTR, RED_TAG_PLIST)
+        .await
+        .unwrap();
+    let err = tree
+        .remove_xattr(&mut conn, &file, TAG_XATTR)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, smb2::Error::StreamDeleteIgnored { .. }),
+        "{err:?}"
+    );
+    assert_eq!(err.kind(), smb2::ErrorKind::Unsupported);
+
+    tree.set_xattr(&mut conn, &file, TAG_XATTR, NO_TAGS_PLIST)
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, TAG_XATTR)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(NO_TAGS_PLIST)
+    );
+    remove_scratch(&mut conn, &tree, dir).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn nas_streams_round_trip_big_and_small_and_leave_the_file_alone() {
+    let (mut conn, tree) = connect_to_nas().await;
+    let dir = "_smb2_interop_nas_streams";
+    remove_scratch(&mut conn, &tree, dir).await;
+    tree.create_directory(&mut conn, dir).await.unwrap();
+    let file = format!("{dir}/f.txt");
+    tree.write_file(&mut conn, &file, b"content").await.unwrap();
+
+    assert!(
+        tree.fs_attributes(&mut conn)
+            .await
+            .unwrap()
+            .supports_named_streams
+    );
+
+    // QNAP's `streams_depot` takes a stream past what an xattr could hold.
+    let big: Vec<u8> = (0..=255u8).cycle().take(200 * 1024).collect();
+    tree.write_stream(&mut conn, &file, "user.big", &big)
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.read_stream(&mut conn, &file, "user.big")
+            .await
+            .unwrap(),
+        big
+    );
+    assert_eq!(
+        tree.get_xattr(&mut conn, &file, "user.big")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&big[..])
+    );
+    tree.delete_stream(&mut conn, &file, "user.big")
+        .await
+        .unwrap();
+
+    let gone = format!("{dir}/gone.txt");
+    let err = tree
+        .set_xattr(&mut conn, &gone, TAG_XATTR, b"x")
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), smb2::ErrorKind::NotFound);
+    assert_eq!(
+        tree.stat(&mut conn, &gone).await.unwrap_err().kind(),
+        smb2::ErrorKind::NotFound
+    );
+
+    assert_eq!(tree.read_file(&mut conn, &file).await.unwrap(), b"content");
+    remove_scratch(&mut conn, &tree, dir).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn nas_a_metadata_watch_hears_about_a_tag() {
+    let (mut conn, tree) = connect_to_nas().await;
+    let dir = "_smb2_interop_nas_watch";
+    remove_scratch(&mut conn, &tree, dir).await;
+    tree.create_directory(&mut conn, dir).await.unwrap();
+    let file = format!("{dir}/f.txt");
+    tree.write_file(&mut conn, &file, b"x").await.unwrap();
+
+    let mut watcher = tree
+        .watch_with(&mut conn, dir, smb2::WatchOptions::new().metadata(true))
+        .await
+        .unwrap();
+    let tagging = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (mut other_conn, other_tree) = connect_to_nas().await;
+        other_tree
+            .set_xattr(&mut other_conn, &file, TAG_XATTR, RED_TAG_PLIST)
+            .await
+            .unwrap();
+    });
+    let events = tokio::time::timeout(Duration::from_secs(5), watcher.next_events()).await;
+    tagging.await.unwrap();
+    println!("events: {events:?}");
+    let events = events
+        .expect("a metadata watch should hear about a tag")
+        .unwrap();
+    assert!(
+        events.iter().any(|e| e.filename.starts_with("f.txt")),
+        "{events:?}"
+    );
+    let _ = watcher.close().await;
+    remove_scratch(&mut conn, &tree, dir).await;
+}
