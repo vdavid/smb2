@@ -1115,7 +1115,7 @@ impl SmbClient {
     ///
     /// # Errors
     ///
-    /// [`Error::DfsNoReachableTarget`] when the link is real and none of its
+    /// [`Error::DfsTargetUnreachable`] when the link is real and none of its
     /// targets answered; otherwise whatever stopped the referral exchange.
     /// A server that refuses the referral is saying there's no link there,
     /// which is `Ok(None)`.
@@ -1149,7 +1149,7 @@ impl SmbClient {
                 else {
                     return Ok(None);
                 };
-                self.connect_link(&resolved_list, path, unc_path).await?
+                self.connect_link(&resolved_list, path).await?
             }
         };
         let (link, remaining) = found;
@@ -1170,7 +1170,7 @@ impl SmbClient {
     /// target answering `STATUS_PATH_NOT_COVERED` in turn is the caller's
     /// answer. ❌ A referral that can't be had never replaces the server's
     /// answer (see `client/CLAUDE.md` § DFS); the one exception is
-    /// [`Error::DfsNoReachableTarget`], where the link is real and its storage
+    /// [`Error::DfsTargetUnreachable`], where the link is real and its storage
     /// isn't reachable.
     ///
     /// `op` gets clones of the connection and tree (both cheap) and an owned
@@ -1234,7 +1234,7 @@ impl SmbClient {
 
         let (moved_to, remaining) = match self.redirect(tree, path).await {
             Ok(redirected) => redirected,
-            Err(e @ Error::DfsNoReachableTarget { .. }) => {
+            Err(e @ Error::DfsTargetUnreachable { .. }) => {
                 return Followed {
                     result: Err(e),
                     moved_to: None,
@@ -1276,7 +1276,10 @@ impl SmbClient {
         Fut: Future<Output = Result<T>>,
     {
         let followed = self.follow_dfs_link(tree, path, &mut op).await;
-        Ok((followed.result?, followed.moved_to))
+        match followed.result {
+            Ok(value) => Ok((value, followed.moved_to)),
+            Err(e) => Err(self.link_loss(tree, path, followed.moved_to.as_ref(), e)),
+        }
     }
 
     /// [`beside_tree`](Self::beside_tree) for the calls that also run again after
@@ -1300,11 +1303,17 @@ impl SmbClient {
         let followed = self.follow_dfs_link(tree, path, &mut op).await;
         match followed.result {
             Err(e) if followed.moved_to.is_none() && self.session_is_gone(tree, &e) => {
-                self.recover_tree(tree).await?;
+                if let Err(e) = self.recover_tree(tree).await {
+                    return Err(self.link_loss(tree, path, None, e));
+                }
                 let conn = self.connections.for_tree(tree)?.clone();
-                Ok((op(conn, tree.clone(), path.to_string()).await?, None))
+                match op(conn, tree.clone(), path.to_string()).await {
+                    Ok(value) => Ok((value, None)),
+                    Err(e) => Err(self.link_loss(tree, path, None, e)),
+                }
             }
-            result => Ok((result?, followed.moved_to)),
+            Err(e) => Err(self.link_loss(tree, path, followed.moved_to.as_ref(), e)),
+            Ok(value) => Ok((value, followed.moved_to)),
         }
     }
 
@@ -1329,7 +1338,7 @@ impl SmbClient {
     ///
     /// Returns the link (its target tree, and how it maps paths) and the path
     /// the referral leaves on the target. Tries
-    /// each target in turn, and says [`Error::DfsNoReachableTarget`] when the
+    /// each target in turn, and says [`Error::DfsTargetUnreachable`] when the
     /// referral named targets and none of them answered.
     async fn redirect(&mut self, tree: &Tree, original_path: &str) -> Result<(Link, String)> {
         let unc_path = link_unc(tree, original_path);
@@ -1342,8 +1351,7 @@ impl SmbClient {
             .resolve_link(conn, &unc_path)
             .await?
             .ok_or_else(|| Error::invalid_data("DFS: the referral names no link"))?;
-        self.connect_link(&resolved_list, original_path, unc_path)
-            .await
+        self.connect_link(&resolved_list, original_path).await
     }
 
     /// [`redirect`](Self::redirect) from the referral cache alone: `None`
@@ -1355,7 +1363,7 @@ impl SmbClient {
         }
         let unc_path = link_unc(tree, path);
         let resolved_list = self.dfs_resolver.link_from_cache(&unc_path)?;
-        Some(self.connect_link(&resolved_list, path, unc_path).await)
+        Some(self.connect_link(&resolved_list, path).await)
     }
 
     /// Connect the first of a link's targets that answers (multi-target
@@ -1364,9 +1372,9 @@ impl SmbClient {
         &mut self,
         resolved_list: &[dfs::ResolvedPath],
         original_path: &str,
-        unc_path: String,
     ) -> Result<(Link, String)> {
         let mut last_error = None;
+        let mut share_connection_lost = None;
         for resolved in resolved_list {
             let target_addr = self.target_addr(resolved);
             match self.link_target_tree(&target_addr, &resolved.share).await {
@@ -1386,18 +1394,59 @@ impl SmbClient {
                         "dfs: target refused server={:?} share={:?} addr={:?}: {}",
                         resolved.server, resolved.share, target_addr, e
                     );
-                    last_error = Some(e);
+                    // A target on the share's own server, with that connection
+                    // gone, is the share's loss, and the caller has to hear it.
+                    if self.connections.is_primary(&target_addr)
+                        && self.connections.primary().is_disconnected()
+                    {
+                        share_connection_lost = Some(e);
+                    } else {
+                        last_error = Some(e);
+                    }
                 }
             }
         }
 
+        if let Some(lost) = share_connection_lost {
+            return Err(lost);
+        }
         match last_error {
-            Some(source) => Err(Error::DfsNoReachableTarget {
-                namespace: unc_path,
+            Some(source) => Err(Error::DfsTargetUnreachable {
+                path: original_path.to_string(),
                 target_count: resolved_list.len(),
                 source: Box::new(source),
             }),
             None => Err(Error::invalid_data("DFS: no targets in referral")),
+        }
+    }
+
+    /// What a call's failure says once its target is known: when `err` is a
+    /// lost connection and the tree it ran on is a link's target (`moved_to`
+    /// when it was redirected, else the tree it was given), that's the link's
+    /// loss, and the share's own connection is fine. The pool lets the dead
+    /// connection go, so the next call through the link dials afresh.
+    fn link_loss(&mut self, tree: &Tree, path: &str, moved_to: Option<&Link>, err: Error) -> Error {
+        use crate::ErrorKind;
+        if !matches!(
+            err.kind(),
+            ErrorKind::ConnectionLost | ErrorKind::SessionExpired
+        ) {
+            return err;
+        }
+        let target = moved_to.map_or(tree, |link| &link.tree);
+        if !self.connections.is_link_tree(target) {
+            return err;
+        }
+        debug!(
+            "dfs: a link's target connection is lost server={:?} share={:?} path={path:?}: {err}",
+            target.server, target.share_name
+        );
+        let server = target.server.clone();
+        self.connections.forget_lost_target(&server);
+        Error::DfsTargetUnreachable {
+            path: path.to_string(),
+            target_count: 1,
+            source: Box::new(err),
         }
     }
 
@@ -1417,6 +1466,7 @@ impl SmbClient {
         if self.connections.is_primary(target_addr) {
             return Ok(()); // Already have primary connection.
         }
+        self.connections.forget_dead_target(target_addr);
         if self.connections.extra(target_addr).is_some() {
             return Ok(()); // Already in pool.
         }
@@ -1927,7 +1977,11 @@ impl SmbClient {
             }
         };
         let followed = self.follow_dfs_link(tree, from, &mut op).await;
-        let (remaining, link) = match (followed.result?, followed.moved_to) {
+        let outcome = match followed.result {
+            Ok(outcome) => outcome,
+            Err(e) => return Err(self.link_loss(tree, from, followed.moved_to.as_ref(), e)),
+        };
+        let (remaining, link) = match (outcome, followed.moved_to) {
             (None, _) => return Ok(()),
             (Some(remaining), Some(link)) => (remaining, link),
             (Some(_), None) => return Err(Error::invalid_data("DFS: a rename lost its link")),
@@ -1941,9 +1995,11 @@ impl SmbClient {
             });
         };
         let mut conn = self.connections.for_tree(&link.tree)?.clone();
-        link.tree
+        let renamed = link
+            .tree
             .rename_with(&mut conn, &remaining, &target_to, options)
-            .await
+            .await;
+        renamed.map_err(|e| self.link_loss(tree, from, Some(&link), e))
     }
 
     /// Rename multiple files on the given share.
@@ -3443,6 +3499,153 @@ mod tests {
         assert_eq!(creates_on(&mock), [Some(LINK_TARGET_TREE)]);
         assert_eq!(tree.tree_id, TreeId(1), "the caller's tree stays put");
         mock.assert_fully_consumed();
+    }
+
+    /// A link whose targets all refuse is the link's problem: the connection
+    /// to the caller's share is fine, so it must not read as a lost one
+    /// (vdavid/smb2#28). `resolve_dfs_link` and a followed call say the same.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_with_no_reachable_target_is_not_a_lost_connection() {
+        use crate::ErrorKind;
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let tree = a_dfs_root_tree();
+
+        mock.queue_response(path_not_covered(3));
+        mock.queue_response(build_tree_connect_response(TreeId(2), ShareType::Pipe));
+        mock.queue_response(build_referral(
+            3,
+            0,
+            r"\test-server\dfs\data",
+            &[r"\test-server\files"],
+            0,
+        ));
+        mock.queue_response(build_tree_connect_refusal(NtStatus::ACCESS_DENIED, false));
+        let err = client.delete_file(&tree, "data/a").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DfsTargetUnreachable);
+        assert!(err.is_retryable(), "the target may be back later");
+        match err {
+            Error::DfsTargetUnreachable {
+                path,
+                target_count,
+                source,
+            } => {
+                assert_eq!(path, "data/a");
+                assert_eq!(target_count, 1);
+                assert_eq!(source.kind(), ErrorKind::AccessDenied);
+            }
+            other => panic!("expected DfsTargetUnreachable, got {other:?}"),
+        }
+
+        mock.queue_response(build_tree_connect_refusal(NtStatus::ACCESS_DENIED, false));
+        let err = client
+            .resolve_dfs_link(&tree, "data/b")
+            .await
+            .expect_err("no target answers");
+        assert_eq!(err.kind(), ErrorKind::DfsTargetUnreachable);
+        mock.assert_fully_consumed();
+    }
+
+    /// A namespace root is the share itself: nothing else is connected, so
+    /// its dead storage keeps reading as a lost connection.
+    #[test]
+    fn a_namespace_with_no_reachable_target_stays_a_lost_connection() {
+        let err = Error::DfsNoReachableTarget {
+            namespace: r"\\dom\ns".to_string(),
+            target_count: 1,
+            source: Box::new(Error::Disconnected),
+        };
+        assert_eq!(err.kind(), crate::ErrorKind::ConnectionLost);
+    }
+
+    /// A link that points at the share's own server, with that connection
+    /// gone: this IS the lost connection, and saying "the link's target" would
+    /// hide it from whoever reconnects on `ConnectionLost`.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_on_the_shares_own_dead_connection_says_the_connection_is_lost() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let tree = a_dfs_root_tree();
+        queue_link_referral(&mock);
+        client
+            .resolve_dfs_link(&tree, "data/a")
+            .await
+            .expect("resolve")
+            .expect("behind the link");
+
+        client.connections.primary().mark_dead();
+
+        let err = client
+            .resolve_dfs_link(&tree, "data/a")
+            .await
+            .expect_err("the connection is gone");
+        assert_eq!(err.kind(), crate::ErrorKind::ConnectionLost);
+    }
+
+    /// A target's connection dying under a call through a link is the link's
+    /// loss too. The pool lets go of it, so the next call dials afresh rather
+    /// than failing on the dead connection for the rest of the client's life.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_target_connection_is_the_links_and_leaves_the_pool() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let target_mock = Arc::new(MockTransport::new());
+        pool_extra_connection(&mut client, "fs02:445", &target_mock);
+        let target = a_dfs_target_tree("fs02:445", "files");
+        client.connections.remember_link_tree(&target);
+
+        client
+            .connections
+            .for_tree_ref(&target)
+            .unwrap()
+            .mark_dead();
+        let err = client.delete_file(&target, "a").await.unwrap_err();
+
+        assert_eq!(err.kind(), crate::ErrorKind::DfsTargetUnreachable);
+        assert!(client.connections.extra("fs02:445").is_none());
+        assert!(client.connections.link_tree("fs02:445", "files").is_none());
+    }
+
+    /// A pooled target whose connection died while idle isn't handed out, so
+    /// the next lookup connects again.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_pooled_target_tree_is_not_handed_out() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let target_mock = Arc::new(MockTransport::new());
+        pool_extra_connection(&mut client, "fs02:445", &target_mock);
+        let target = a_dfs_target_tree("fs02:445", "files");
+        client.connections.remember_link_tree(&target);
+        assert!(client.connections.link_tree("fs02:445", "files").is_some());
+
+        client
+            .connections
+            .for_tree_ref(&target)
+            .unwrap()
+            .mark_dead();
+
+        assert!(client.connections.link_tree("fs02:445", "files").is_none());
+    }
+
+    /// A tree that isn't a link's target (a namespace root's, here) keeps its
+    /// lost connection: it's the share itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_connection_on_a_namespace_target_stays_a_lost_connection() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let target_mock = Arc::new(MockTransport::new());
+        pool_extra_connection(&mut client, "fs02:445", &target_mock);
+        let target = a_dfs_target_tree("fs02:445", "files");
+
+        client
+            .connections
+            .for_tree_ref(&target)
+            .unwrap()
+            .mark_dead();
+        let err = client.delete_file(&target, "a").await.unwrap_err();
+
+        assert_eq!(err.kind(), crate::ErrorKind::ConnectionLost);
+        assert!(client.connections.extra("fs02:445").is_some());
     }
 
     /// A path no link covers is `None`: for free on a share that isn't in a

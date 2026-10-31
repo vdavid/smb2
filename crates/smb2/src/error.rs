@@ -392,6 +392,39 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// A path sits behind a DFS link inside the share, and the link's target
+    /// can't be reached.
+    ///
+    /// Says the link's other server is out of reach, ❌ never that the
+    /// connection to the caller's share dropped, which is still fine. Other
+    /// paths on the share keep working, so a consumer's useful response is to
+    /// refuse this one path and leave its session alone. The next call through
+    /// the link dials the target again.
+    ///
+    /// Two places return it: a call or
+    /// [`SmbClient::resolve_dfs_link`](crate::SmbClient::resolve_dfs_link) that
+    /// tried every target the referral named, and a call whose target
+    /// connection dropped under it (`target_count` is 1, `source` says how). A
+    /// link that points at the share's own server, on a connection that's gone,
+    /// reports that loss instead: there it is the share's connection.
+    ///
+    /// A namespace root's targets being down is
+    /// [`DfsNoReachableTarget`](Self::DfsNoReachableTarget): there the target
+    /// IS the share.
+    ///
+    /// Classifies as [`ErrorKind::DfsTargetUnreachable`] and reports as
+    /// retryable: a target that is down now may be up later.
+    #[error("the DFS link behind {path} has {target_count} target(s), none reachable")]
+    DfsTargetUnreachable {
+        /// The path the call asked about, as the caller spelled it, relative
+        /// to the tree the call was given.
+        path: String,
+        /// How many targets were tried.
+        target_count: usize,
+        /// Why the last one failed.
+        source: Box<Error>,
+    },
+
     /// A DFS path kept referring us somewhere else, so we stopped following.
     ///
     /// A namespace that points at itself, or a chain of Interlinks with no end
@@ -620,6 +653,7 @@ impl Error {
                 | Error::DurableHandleLost { .. }
                 | Error::HandleInvalidated { .. }
                 | Error::DfsNoReachableTarget { .. }
+                | Error::DfsTargetUnreachable { .. }
                 | Error::ConnectFailed { .. }
                 | Error::Protocol {
                     status: NtStatus::INSUFFICIENT_RESOURCES,
@@ -717,6 +751,11 @@ pub enum ErrorKind {
     SessionExpired,
     /// The path requires DFS referral resolution.
     DfsReferral,
+    /// The path sits behind a DFS link whose target can't be reached. The
+    /// connection to the share is fine, so ❌ don't reconnect on it: refuse this
+    /// path and carry on. Only [`Error::DfsTargetUnreachable`] has it.
+    /// Retryable.
+    DfsTargetUnreachable,
     /// Invalid data or malformed response.
     InvalidData,
     /// The file is too large for a single-read path.
@@ -805,6 +844,9 @@ impl Error {
             // The namespace resolved; its storage is unreachable. That is a
             // connectivity answer, and the target may be back later.
             Error::DfsNoReachableTarget { .. } => ErrorKind::ConnectionLost,
+            // The share's own connection is fine; only this link's far side
+            // isn't, and reconnecting to the share wouldn't help.
+            Error::DfsTargetUnreachable { .. } => ErrorKind::DfsTargetUnreachable,
             // A namespace that refers in circles is a server misconfiguration
             // with nothing behind it to find.
             Error::DfsTooManyReferrals { .. } => ErrorKind::NotFound,

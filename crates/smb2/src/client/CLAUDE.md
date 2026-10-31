@@ -288,7 +288,24 @@ plus a replay after reviving a dead session, for the reads, listings, `stat`, an
 - ❌ **A failed referral must never replace the original error**, for a root or a link. The overwhelmingly common cause
   of `STATUS_BAD_NETWORK_NAME` is a mistyped share name, and telling that person about DFS is worse than telling them
   nothing. A referral that fails, is empty, or names nothing connectable gives back the refusal. The one exception is
-  `Error::DfsNoReachableTarget`: the namespace or link is real, and its storage is not reachable.
+  a real namespace or link whose storage is not reachable (next bullet).
+- **Two errors for "the storage is out of reach", because they ask for different responses.** A namespace root's targets
+  being down is `Error::DfsNoReachableTarget`, kind `ConnectionLost`: the target IS the share, so reconnecting is right.
+  A link's is `Error::DfsTargetUnreachable`, kind `DfsTargetUnreachable`: the share's connection is fine, so a consumer
+  refuses that one path and keeps its session. ❌ A link's loss never reads as `ConnectionLost`, or one dead link makes
+  the whole share look disconnected (vdavid/smb2#28). Three things make that hold:
+  - **`SmbClient::link_loss` also covers a target dying under a call**, on any call through `beside_tree`, `replaying`,
+    or `rename_with`, including a consumer running a `SmbClient` call on a `DfsLink::tree` directly. It's keyed on
+    `Connections::is_link_tree`, so a namespace root's tree on the same pool keeps `ConnectionLost`.
+  - **A link on the share's own server, with that connection gone, stays the lost connection** (`connect_link`), since
+    there it is the share's.
+  - **The pool lets a lost target go** (`forget_lost_target`, and `link_tree` / `ensure_connection` skip one dead for
+    good), so the next call dials afresh. Without it a client with `auto_reconnect: false` keeps failing on that
+    connection until it's rebuilt, which is what a consumer's lost-share reconnect used to do by accident. A connection
+    with a reviver stays: it may carry a namespace root too, and its trees heal in place.
+  - **Known limit**: a handle already open through a link (`FileReader`, `FileDownload`, a writer) owns the target's
+    connection and reports its loss as that connection's error, since a handle has no link to name. A `DfsLink::tree`
+    held across a loss reads `Error::Disconnected`, so resolve per call.
 - **The trigger is gated on the negotiated `SMB2_GLOBAL_CAP_DFS`**, so a plain NAS pays zero extra round-trips when
   someone mistypes a share name.
 - ❌ **Never gate on `ServerType`.** Samba answers a root referral with `0` and header flags `0x02` where Windows

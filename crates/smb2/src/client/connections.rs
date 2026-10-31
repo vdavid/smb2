@@ -69,11 +69,53 @@ impl Connections {
     /// writer through a link would otherwise TREE_CONNECT again and never
     /// disconnect, since the handle holding the tree can't. The generation
     /// check drops a tree whose connection came back on a new session, where
-    /// its id means nothing.
+    /// its id means nothing, and a connection that's dead for good isn't handed
+    /// out at all, or a target that dropped would stay dead for the client's
+    /// whole life.
     pub(crate) fn link_tree(&self, addr: &str, share: &str) -> Option<Tree> {
         let (generation, tree) = self.link_trees.get(&link_key(addr, share))?;
         let conn = self.for_tree_ref(tree).ok()?;
-        (conn.generation() == *generation).then(|| tree.clone())
+        (conn.generation() == *generation && !dead_for_good(conn)).then(|| tree.clone())
+    }
+
+    /// Whether `tree` is a target a DFS link led to, which is what makes its
+    /// connection's loss the link's rather than the share's.
+    pub(crate) fn is_link_tree(&self, tree: &Tree) -> bool {
+        tree.server != self.primary_server
+            && self
+                .link_trees
+                .values()
+                .any(|(_, known)| known.server == tree.server && known.tree_id == tree.tree_id)
+    }
+
+    /// Let go of a link target's connection that was lost, so the next call
+    /// through the link dials afresh. One a reviver can bring back stays: it
+    /// may carry a namespace root's traffic too, and its trees heal in place.
+    pub(crate) fn forget_lost_target(&mut self, addr: &str) {
+        if self
+            .extra
+            .get(addr)
+            .is_some_and(|entry| !entry.conn.can_reconnect())
+        {
+            self.drop_target(addr);
+        }
+    }
+
+    /// [`forget_lost_target`](Self::forget_lost_target) for a dial about to
+    /// reuse the pool: only a connection that's already dead for good goes.
+    pub(crate) fn forget_dead_target(&mut self, addr: &str) {
+        if self
+            .extra
+            .get(addr)
+            .is_some_and(|entry| dead_for_good(&entry.conn))
+        {
+            self.drop_target(addr);
+        }
+    }
+
+    fn drop_target(&mut self, addr: &str) {
+        self.extra.remove(addr);
+        self.link_trees.retain(|_, (_, known)| known.server != addr);
     }
 
     /// Remember the tree a DFS link led to, for [`link_tree`](Self::link_tree).
@@ -178,6 +220,11 @@ impl Connections {
         self.extra.clear();
         self.link_trees.clear();
     }
+}
+
+/// A connection that's down with no reviver to bring it back.
+fn dead_for_good(conn: &Connection) -> bool {
+    conn.is_disconnected() && !conn.can_reconnect()
 }
 
 /// Share names are case-insensitive on every SMB server.
