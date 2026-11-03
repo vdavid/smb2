@@ -322,7 +322,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.39"
+smb2 = "0.40"
 ```
 
 You'll also need an async runtime. smb2 runs on [tokio](https://github.com/tokio-rs/tokio) out of the box:
@@ -378,6 +378,10 @@ For when you want to do one thing and get the result:
 - `client.get_xattr(&mut share, path, name)`, `set_xattr`, `remove_xattr`, `list_xattrs`: macOS xattrs
 - `client.get_xattr_many(&mut share, &paths, name, options)`, `set_xattr_many`: The same over many files, overlapped.
   `tree.get_xattr_each` hands results over as they finish
+- `tree.download_with_streams(&mut conn, path)`, `tree.read_file_compound_sized_with_streams(...)`: A read that lists
+  the file's named streams in its own frame, then `tree.get_xattrs(&mut conn, path, &listed)` reads them all,
+  overlapped, and `tree.set_xattrs_on_new_file(...)` writes a copy's xattrs on its fresh destination: what a copy that
+  keeps Finder tags needs, at no extra round trip for a file that has none
 - `client.set_times(&share, path, FileTimes::new().set_modified(t))`: Set a file's timestamps, leaving the ones you
   don't name alone. On a writer you're about to finish, `writer.set_times(...)` instead, so its close can't restamp
   the file. `FileTimes::set_attributes(...)` sets Hidden or Read-only in the same frame

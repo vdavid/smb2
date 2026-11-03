@@ -49,7 +49,7 @@ const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
 
 /// What one stream listing asks for first: one credit's worth, far more than
 /// any real file's stream list.
-const STREAM_LIST_BUFFER: u32 = 65536;
+pub(super) const STREAM_LIST_BUFFER: u32 = 65536;
 
 /// What a listing the first buffer couldn't hold asks for, capped by the
 /// server's `MaxTransactSize`.
@@ -156,6 +156,43 @@ fn named_data_stream(raw: &str) -> Result<Option<&str>> {
     Ok(Some(name))
 }
 
+/// A related QUERY_INFO for the open file's stream list, holding up to `buffer`
+/// bytes of answer.
+pub(super) fn stream_list_request(buffer: u32) -> QueryInfoRequest {
+    QueryInfoRequest {
+        info_type: InfoType::File,
+        file_info_class: FILE_STREAM_INFORMATION,
+        output_buffer_length: buffer,
+        additional_information: 0,
+        flags: 0,
+        file_id: FileId::SENTINEL,
+        input_buffer: vec![],
+    }
+}
+
+/// The stream list a compounded [`stream_list_request`] answered, or `None`
+/// when it didn't: refused (no named streams), or cut short (a list too long
+/// for the buffer, which would read as "no such stream", pitfall 10). The
+/// caller's bytes don't depend on it, so a bad answer is logged and dropped.
+pub(super) fn stream_list_answer(frame: &Frame, path: &str) -> Option<Vec<StreamInfo>> {
+    if frame.header.status != NtStatus::SUCCESS {
+        trace!(
+            "streams: a compounded listing answered {:?} path={path:?}",
+            frame.header.status
+        );
+        return None;
+    }
+    let parsed = QueryInfoResponse::unpack(&mut ReadCursor::new(&frame.body))
+        .and_then(|resp| parse_stream_information(&resp.output_buffer));
+    match parsed {
+        Ok(streams) => Some(streams),
+        Err(e) => {
+            debug!("streams: a compounded listing didn't parse ({e}) path={path:?}");
+            None
+        }
+    }
+}
+
 /// Parse `FILE_FS_ATTRIBUTE_INFORMATION` (MS-FSCC § 2.5.1).
 pub(crate) fn parse_fs_attributes(data: &[u8]) -> Result<FsAttributes> {
     const FIXED: usize = 12;
@@ -211,7 +248,7 @@ fn protocol(status: NtStatus, command: Command) -> Error {
 /// What a refused stream CREATE means. Both the path and the stream name went
 /// out mapped to a legal form, so a server calling the name invalid has no named
 /// streams: that's what a Samba without a streams module answers.
-fn no_streams_if_refused<T>(result: Result<T>, path: &str) -> Result<T> {
+pub(super) fn no_streams_if_refused<T>(result: Result<T>, path: &str) -> Result<T> {
     match result {
         Err(Error::Protocol {
             status: NtStatus::OBJECT_NAME_INVALID,
@@ -308,15 +345,7 @@ impl Tree {
         path: &str,
         buffer: u32,
     ) -> Result<Option<Vec<StreamInfo>>> {
-        let query = QueryInfoRequest {
-            info_type: InfoType::File,
-            file_info_class: FILE_STREAM_INFORMATION,
-            output_buffer_length: buffer,
-            additional_information: 0,
-            flags: 0,
-            file_id: FileId::SENTINEL,
-            input_buffer: vec![],
-        };
+        let query = stream_list_request(buffer);
         let wire_name = self.format_path(path.trim_end_matches('/'));
         let frame = self.query_compound(conn, wire_name, 0, &query).await?;
         match frame.header.status {
@@ -567,7 +596,7 @@ impl Tree {
     }
 
     /// CREATE(`FILE_OVERWRITE_IF`) + WRITE + CLOSE, or the chunked form.
-    async fn write_stream_named(
+    pub(super) async fn write_stream_named(
         &self,
         conn: &mut Connection,
         wire_name: String,
@@ -1329,5 +1358,261 @@ mod tests {
         let err = tree.list_streams(&mut conn, "f.txt").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unsupported);
         assert_eq!(sent(&mock, 2).0, [Command::Close]);
+    }
+
+    // ── Streams for copies ────────────────────────────────────────────
+
+    /// The QUERY_INFO class of the request at `index`, for the one that has it.
+    fn query_class(mock: &MockTransport, index: usize) -> u8 {
+        let bytes = mock.sent_message(index).unwrap();
+        let mut offset = 0usize;
+        loop {
+            let mut cursor = ReadCursor::new(&bytes[offset..]);
+            let header = Header::unpack(&mut cursor).unwrap();
+            if header.command == Command::QueryInfo {
+                return QueryInfoRequest::unpack(&mut cursor)
+                    .unwrap()
+                    .file_info_class;
+            }
+            assert_ne!(header.next_command, 0, "no QUERY_INFO in request {index}");
+            offset += header.next_command as usize;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compound_read_lists_the_streams_after_its_read_in_one_frame() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 3),
+            build_read_response(vec![1, 2, 3]),
+            build_query_info_response(stream_entry(&format!(":{TAG_WIRE}:$DATA"), 63, 0)),
+            build_close_response(),
+        ]));
+        let (data, info, streams) = tree
+            .read_file_compound_sized_with_streams(&mut conn, "f.txt", 3)
+            .await
+            .unwrap();
+        assert_eq!(data, [1, 2, 3]);
+        assert_eq!(info.size, 3);
+        assert_eq!(streams.unwrap()[0].name, TAG);
+        // After the READ, so a refused listing can't take the read with it.
+        assert_eq!(
+            sent(&mock, 1).0,
+            [
+                Command::Create,
+                Command::Read,
+                Command::QueryInfo,
+                Command::Close
+            ]
+        );
+        assert_eq!(query_class(&mock, 1), FILE_STREAM_INFORMATION);
+        assert_eq!(mock.sent_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_listing_still_reads_and_closes_the_handle_it_left_open() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 3),
+            build_read_response(vec![1, 2, 3]),
+            build_query_info_error_response(NtStatus::INVALID_PARAMETER),
+            build_close_error_response(NtStatus::INVALID_PARAMETER),
+        ]));
+        mock.queue_response(build_close_response());
+        let (data, _, streams) = tree
+            .read_file_compound_sized_with_streams(&mut conn, "f.txt", 3)
+            .await
+            .unwrap();
+        assert_eq!(data, [1, 2, 3]);
+        assert_eq!(streams, None);
+        assert_eq!(sent(&mock, 2).0, [Command::Close]);
+    }
+
+    #[tokio::test]
+    async fn an_overflowed_listing_reads_as_unknown_never_as_none() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 3),
+            build_read_response(vec![1, 2, 3]),
+            build_query_info_response_with_status(
+                NtStatus::BUFFER_OVERFLOW,
+                stream_entry(":a:$DATA", 1, 0),
+            ),
+            build_close_response(),
+        ]));
+        let (_, _, streams) = tree
+            .read_file_compound_sized_with_streams(&mut conn, "f.txt", 3)
+            .await
+            .unwrap();
+        assert_eq!(streams, None);
+        assert_eq!(mock.sent_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_plain_compound_read_asks_for_no_listing() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 3),
+            build_read_response(vec![1, 2, 3]),
+            build_close_response(),
+        ]));
+        tree.read_file_compound_sized_with_info(&mut conn, "f.txt", 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            sent(&mock, 1).0,
+            [Command::Create, Command::Read, Command::Close]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_lists_the_streams_with_its_open() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 0),
+            build_query_info_response(stream_entry(":AFP_AfpInfo:$DATA", 60, 0)),
+        ]));
+        let download = tree
+            .download_with_streams(&mut conn, "f.txt")
+            .await
+            .unwrap();
+        assert_eq!(download.streams().unwrap()[0].name, "AFP_AfpInfo");
+        assert_eq!(sent(&mock, 1).0, [Command::Create, Command::QueryInfo]);
+        assert_eq!(query_class(&mock, 1), FILE_STREAM_INFORMATION);
+    }
+
+    #[tokio::test]
+    async fn a_download_whose_listing_is_refused_opens_all_the_same() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 0),
+            build_query_info_error_response(NtStatus::INVALID_PARAMETER),
+        ]));
+        let download = tree
+            .download_with_streams(&mut conn, "f.txt")
+            .await
+            .unwrap();
+        assert_eq!(download.streams(), None);
+        assert_eq!(download.size(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_xattrs_unwraps_finder_info_and_sizes_the_read_to_the_listing() {
+        let (mock, mut conn, tree) = connected().await;
+        let mut afp_info = vec![0u8; 60];
+        afp_info[..8].copy_from_slice(&[b'A', b'F', b'P', 0, 0, 0, 1, 0]);
+        afp_info[16] = 0xAB;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 60),
+            build_read_response(afp_info),
+            build_close_response(),
+        ]));
+        let listed = [StreamInfo {
+            name: "AFP_AfpInfo".to_string(),
+            size: 60,
+            allocation_size: 60,
+        }];
+        let read = tree.get_xattrs(&mut conn, "f.txt", &listed).await;
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].0, crate::XATTR_FINDER_INFO);
+        let value = read[0].1.as_ref().unwrap();
+        assert_eq!(value.len(), 32);
+        assert_eq!(value[0], 0xAB);
+        let (commands, create) = sent(&mock, 1);
+        assert_eq!(commands, [Command::Create, Command::Read, Command::Close]);
+        assert_eq!(create.unwrap().name, "f.txt:AFP_AfpInfo");
+    }
+
+    #[tokio::test]
+    async fn get_xattrs_leaves_out_a_stream_gone_since_the_listing() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            crate::client::test_helpers::build_read_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+            build_close_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
+        ]));
+        let listed = [StreamInfo {
+            name: TAG.to_string(),
+            size: 4,
+            allocation_size: 4,
+        }];
+        assert!(tree
+            .get_xattrs(&mut conn, "f.txt", &listed)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn xattrs_on_a_new_file_skip_the_probe_and_wrap_finder_info_fresh() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 0),
+            build_write_response(60),
+            build_close_response(),
+        ]));
+        let finder_info = [0x11u8; 32];
+        let written = tree
+            .set_xattrs_on_new_file(
+                &mut conn,
+                "dir/.tmp",
+                &[(crate::XATTR_FINDER_INFO, finder_info.as_slice())],
+            )
+            .await;
+        assert!(written[0].is_ok(), "{written:?}");
+        // One compound, no probe and no read of an old AfpInfo.
+        assert_eq!(mock.sent_count(), 2);
+        let (commands, create) = sent(&mock, 1);
+        assert_eq!(commands, [Command::Create, Command::Write, Command::Close]);
+        let create = create.unwrap();
+        assert_eq!(create.name, "dir\\.tmp:AFP_AfpInfo");
+        assert_eq!(
+            create.create_disposition,
+            CreateDisposition::FileOverwriteIf
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_file_xattr_leaves_no_stream_behind() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 0),
+            build_write_error_response(NtStatus::FILE_SYSTEM_LIMITATION),
+            build_close_response(),
+        ]));
+        // The delete, then its check.
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 0),
+            build_set_info_response(),
+            build_close_response(),
+        ]));
+        mock.queue_response(empty_listing());
+        let written = tree
+            .set_xattrs_on_new_file(&mut conn, "f.txt", &[(TAG, b"tags".as_slice())])
+            .await;
+        assert_eq!(
+            written[0].as_ref().unwrap_err().status(),
+            Some(NtStatus::FILE_SYSTEM_LIMITATION)
+        );
+        assert_eq!(
+            sent(&mock, 2).0,
+            [Command::Create, Command::SetInfo, Command::Close]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_share_without_streams_says_so_for_a_new_file_xattr() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_error_response(NtStatus::OBJECT_NAME_INVALID),
+            build_write_error_response(NtStatus::OBJECT_NAME_INVALID),
+            build_close_error_response(NtStatus::OBJECT_NAME_INVALID),
+        ]));
+        let written = tree
+            .set_xattrs_on_new_file(&mut conn, "f.txt", &[(TAG, b"tags".as_slice())])
+            .await;
+        assert!(
+            matches!(written[..], [Err(Error::NamedStreamsUnsupported { .. })]),
+            "{written:?}"
+        );
     }
 }

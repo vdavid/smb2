@@ -8183,3 +8183,227 @@ async fn plain_samba_has_no_streams_and_says_so_cleanly() {
     let _ = tree.delete_file(&mut conn, &file).await;
     let _ = tree.delete_directory(&mut conn, dir).await;
 }
+
+// ── Streams for copies: listed with the open, written on a fresh file ──
+
+/// 32 bytes of FinderInfo with a type and creator, the way a custom icon or a
+/// label leaves them.
+fn some_finder_info() -> Vec<u8> {
+    let mut info = vec![0u8; 32];
+    info[..8].copy_from_slice(b"TEXTttxt");
+    info[8] = 0x04; // kHasCustomIcon's byte
+    info
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_a_compound_read_lists_the_files_streams_in_the_same_frame() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "compound_streams").await;
+    let tagged = format!("{dir}/f.txt");
+    let plain = format!("{dir}/plain.txt");
+    tree.write_file(&mut conn, &plain, b"plain").await.unwrap();
+    tree.set_xattr(&mut conn, &tagged, TAG_XATTR, b"tags")
+        .await
+        .unwrap();
+
+    let (data, _, streams) = tree
+        .read_file_compound_sized_with_streams(&mut conn, &tagged, 7)
+        .await
+        .unwrap();
+    assert_eq!(data, b"content");
+    let streams = streams.expect("the server answers the listing");
+    assert!(
+        streams.iter().any(|s| s.name == TAG_XATTR && s.size == 4),
+        "{streams:?}"
+    );
+
+    let (data, _, streams) = tree
+        .read_file_compound_sized_with_streams(&mut conn, &plain, 5)
+        .await
+        .unwrap();
+    assert_eq!(data, b"plain");
+    assert_eq!(streams, Some(vec![]));
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_a_download_lists_the_files_streams_with_its_open() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "download_streams").await;
+    let file = format!("{dir}/f.txt");
+    tree.set_xattr(&mut conn, &file, TAG_XATTR, b"tags")
+        .await
+        .unwrap();
+
+    let mut download = tree.download_with_streams(&mut conn, &file).await.unwrap();
+    let streams = download.streams().expect("listed").to_vec();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = download.next_chunk().await {
+        bytes.extend(chunk.unwrap());
+    }
+    assert_eq!(bytes, b"content");
+    assert!(streams.iter().any(|s| s.name == TAG_XATTR), "{streams:?}");
+    drop(download);
+
+    // A plain download asks nothing.
+    let download = tree.download(&mut conn, &file).await.unwrap();
+    assert!(download.streams().is_none());
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_get_xattrs_reads_every_listed_one_finder_info_unwrapped() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "get_xattrs").await;
+    let file = format!("{dir}/f.txt");
+    // Small: the fixture's file system keeps all of a file's xattrs in one 4 KiB block.
+    let fork = vec![7u8; 1_000];
+    tree.set_xattr(&mut conn, &file, TAG_XATTR, b"tags")
+        .await
+        .unwrap();
+    tree.set_xattr(
+        &mut conn,
+        &file,
+        smb2::XATTR_FINDER_INFO,
+        &some_finder_info(),
+    )
+    .await
+    .unwrap();
+    tree.set_xattr(&mut conn, &file, smb2::XATTR_RESOURCE_FORK, &fork)
+        .await
+        .unwrap();
+
+    let listed = tree.list_streams(&mut conn, &file).await.unwrap();
+    let read: HashMap<String, Vec<u8>> = tree
+        .get_xattrs(&mut conn, &file, &listed)
+        .await
+        .into_iter()
+        .map(|(name, value)| (name, value.unwrap()))
+        .collect();
+    assert_eq!(read[TAG_XATTR], b"tags");
+    assert_eq!(read[smb2::XATTR_FINDER_INFO], some_finder_info());
+    assert_eq!(read[smb2::XATTR_RESOURCE_FORK], fork);
+
+    // A stream gone since the listing is left out, not an error.
+    tree.remove_xattr(&mut conn, &file, TAG_XATTR)
+        .await
+        .unwrap();
+    let read = tree.get_xattrs(&mut conn, &file, &listed).await;
+    assert!(read.iter().all(|(name, _)| name != TAG_XATTR), "{read:?}");
+    assert!(read.iter().all(|(_, value)| value.is_ok()), "{read:?}");
+}
+
+/// What a copy does on its destination: the bytes through a writer, the xattrs
+/// beside it while the writer still holds the file, the dates on the writer's
+/// handle, then the landing rename. Pins three server facts a copy relies on:
+/// a stream opens while the writer holds the file with no sharing, the
+/// writer's own date stamp outlasts the stream writes, and the rename keeps
+/// the streams.
+#[tokio::test]
+#[ignore]
+async fn fruit_xattrs_on_a_new_file_beside_its_open_writer_survive_the_dates_and_the_rename() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "new_file").await;
+    let tree = std::sync::Arc::new(tree);
+    let temp = format!("{dir}/.copy.tmp");
+    let landed = format!("{dir}/landed.txt");
+    let modified = filetime(1_200_000_000);
+    let finder_info = some_finder_info();
+
+    let mut writer = tree.create_file_writer(conn.clone(), &temp).await.unwrap();
+    writer.write_chunk(b"copied bytes").await.unwrap();
+    let written = tree
+        .set_xattrs_on_new_file(
+            &mut conn,
+            &temp,
+            &[
+                (TAG_XATTR, b"tags".as_slice()),
+                (smb2::XATTR_FINDER_INFO, finder_info.as_slice()),
+                ("user.empty", b"".as_slice()),
+            ],
+        )
+        .await;
+    assert!(written.iter().all(Result::is_ok), "{written:?}");
+    writer
+        .set_times(smb2::FileTimes::new().set_modified(modified))
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+    tree.rename(&mut conn, &temp, &landed).await.unwrap();
+
+    assert_eq!(
+        tree.stat(&mut conn, &landed).await.unwrap().modified,
+        modified
+    );
+    assert_eq!(
+        tree.get_xattr(&mut conn, &landed, TAG_XATTR).await.unwrap(),
+        Some(b"tags".to_vec())
+    );
+    assert_eq!(
+        tree.get_xattr(&mut conn, &landed, smb2::XATTR_FINDER_INFO)
+            .await
+            .unwrap(),
+        Some(finder_info)
+    );
+    assert_eq!(
+        tree.get_xattr(&mut conn, &landed, "user.empty")
+            .await
+            .unwrap(),
+        Some(vec![])
+    );
+    assert_eq!(
+        tree.read_file(&mut conn, &landed).await.unwrap(),
+        b"copied bytes"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn fruit_xattrs_on_a_new_folder() {
+    let (mut conn, tree) = connect_fruit().await;
+    let dir = fruit_scratch(&mut conn, &tree, "new_folder").await;
+    let folder = format!("{dir}/sub");
+    let written = tree
+        .set_xattrs_on_new_file(&mut conn, &folder, &[(TAG_XATTR, b"tags".as_slice())])
+        .await;
+    assert!(written.iter().all(Result::is_ok), "{written:?}");
+    assert_eq!(
+        tree.get_xattr(&mut conn, &folder, TAG_XATTR).await.unwrap(),
+        Some(b"tags".to_vec())
+    );
+}
+
+/// A share with no streams module: the read still works, and the listing it
+/// carried says the file has none. A write answers `NamedStreamsUnsupported`,
+/// each item alone.
+#[tokio::test]
+#[ignore]
+async fn guest_a_share_without_streams_still_reads_and_refuses_new_file_xattrs() {
+    let (mut conn, tree) = connect_guest().await;
+    let file = "docker_test_no_streams_for_copies.txt";
+    tree.write_file(&mut conn, file, b"bytes").await.unwrap();
+
+    let (data, _, streams) = tree
+        .read_file_compound_sized_with_streams(&mut conn, file, 5)
+        .await
+        .unwrap();
+    assert_eq!(data, b"bytes");
+    // Samba answers the class with the default stream alone.
+    assert_eq!(streams, Some(vec![]));
+    let mut download = tree.download_with_streams(&mut conn, file).await.unwrap();
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), b"bytes");
+    drop(download);
+
+    let written = tree
+        .set_xattrs_on_new_file(&mut conn, file, &[(TAG_XATTR, b"tags".as_slice())])
+        .await;
+    assert!(
+        matches!(
+            written[..],
+            [Err(smb2::Error::NamedStreamsUnsupported { .. })]
+        ),
+        "{written:?}"
+    );
+    let _ = tree.delete_file(&mut conn, file).await;
+}

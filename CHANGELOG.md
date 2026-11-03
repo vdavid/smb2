@@ -7,6 +7,14 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-11-03
+
+### Added
+
+- **A read can list the file's named streams in its own frame**: `Tree::download_with_streams` (with `FileDownload::streams`) and `Tree::read_file_compound_sized_with_streams`. So a copy that keeps Finder tags learns which xattrs a file has at no extra round trip, and a file with none costs nothing more. The listing goes after the READ in the compound, so a server that refuses it still hands back the bytes.
+- **`Tree::get_xattrs`**: every xattr such a listing names, read overlapped, one round trip for the lot when they're small. FinderInfo comes out of its `AFP_AfpInfo` envelope, and a stream removed since the listing is left out.
+- **`Tree::set_xattrs_on_new_file`**: a copy's xattrs onto the file or folder it has just created, overlapped, without `set_xattr`'s existence check or FinderInfo's read-back. A stream opens beside a writer holding the file, and a rename keeps them. ❗ It creates a missing file, so it's only for a path you just made.
+
 ## [0.39.0] - 2026-10-31
 
 ### Breaking

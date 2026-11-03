@@ -114,6 +114,9 @@ pub struct FileDownload<'a> {
     /// What the CREATE said about the file; `None` for a handle the caller
     /// opened and passed to [`FileDownload::new`].
     info: Option<FileInfo>,
+    /// The file's named streams, listed in the open's own frame; `None`
+    /// unless [`Tree::download_with_streams`] asked and the server answered.
+    streams: Option<Vec<crate::client::streams::StreamInfo>>,
     bytes_received: u64,
     chunk_size: u32,
     done: bool,
@@ -212,6 +215,15 @@ impl<'a> FileDownload<'a> {
         download
     }
 
+    /// The listing a [`Tree::download_with_streams`] open got back.
+    pub(crate) fn with_streams(
+        mut self,
+        streams: Option<Vec<crate::client::streams::StreamInfo>>,
+    ) -> Self {
+        self.streams = streams;
+        self
+    }
+
     fn with_tree(
         tree: Cow<'a, Tree>,
         conn: Connection,
@@ -227,6 +239,7 @@ impl<'a> FileDownload<'a> {
             file_id,
             file_size,
             info: None,
+            streams: None,
             bytes_received: 0,
             chunk_size: chunk_size.max(1),
             done: false,
@@ -303,6 +316,16 @@ impl<'a> FileDownload<'a> {
     #[must_use]
     pub fn info(&self) -> Option<&FileInfo> {
         self.info.as_ref()
+    }
+
+    /// The file's named streams (its xattrs, on a Mac-friendly share), from
+    /// the same frame as the open. `Some` only for a download
+    /// [`Tree::download_with_streams`] started on a server that answered the
+    /// listing; `None` says nothing about the file, only that the list isn't
+    /// known here, and [`Tree::list_streams`] asks again.
+    #[must_use]
+    pub fn streams(&self) -> Option<&[crate::client::streams::StreamInfo]> {
+        self.streams.as_deref()
     }
 
     /// Bytes received so far.

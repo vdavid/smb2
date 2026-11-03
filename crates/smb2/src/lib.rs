@@ -131,7 +131,7 @@ pub use types::flags::FileAttributes;
 pub use client::batch::{BatchOptions, BatchResults};
 pub use client::streams::{FsAttributes, StreamInfo};
 pub use client::xattr::{
-    stream_xattr_name, xattr_stream_name, XATTR_FINDER_INFO, XATTR_RESOURCE_FORK,
+    stream_xattr_name, xattr_stream_name, XattrRead, XATTR_FINDER_INFO, XATTR_RESOURCE_FORK,
 };
 
 // What kind of reparse point (junction, symlink, cloud placeholder) an entry is.

@@ -33,6 +33,7 @@ Not checked by eye: the Finder window itself. David's tag-color dot in Finder is
 - **A plain Samba** reports the bit off, lists no streams (so `get_xattr` is `Ok(None)`), and refuses a stream's name with `STATUS_OBJECT_NAME_INVALID`, which `smb2` reports as `Error::NamedStreamsUnsupported`.
 - **A missing stream and a missing file answer alike** (`STATUS_OBJECT_NAME_NOT_FOUND`), and a missing parent folder answers `STATUS_OBJECT_PATH_NOT_FOUND`.
 - **Streams on folders and the share root work** on both servers. A stream op on a file another client has open works, since every open shares everything.
+- **For a copy** (`smb-fruit` and `smb-guest`, 2026-11-03, `fruit_*` and `guest_a_share_without_streams_*` in `tests/docker_integration.rs`): a stream opens while a `FileWriter` holds the file with no sharing; a date set on the writer's handle after the stream writes is the one the file keeps, though each stream write bumps it on `streams_xattr`; a rename keeps every stream; and a plain Samba answers FileStreamInformation with the default stream alone, so a listing compounded onto a read reads "none" there. `smb-fruit`'s file system keeps all of a file's xattrs in one 4 KiB block: past that a write answers `STATUS_DISK_FULL`.
 - **A metadata watch** (`WatchOptions::metadata`) reports another client's tag as `Modified` under the plain file name on both servers. Neither sent the stream actions (6–8), which are typed anyway for servers that do.
 
 ## How fast

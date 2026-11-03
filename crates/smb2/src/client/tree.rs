@@ -15,6 +15,7 @@ use crate::client::credits;
 use crate::client::directory::{DirectoryReader, ListOptions};
 use crate::client::durable::FileIdentity;
 use crate::client::stream::{FileDownload, Progress};
+use crate::client::streams::{self, StreamInfo};
 use crate::client::write_pipe::WritePipe;
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
@@ -838,6 +839,44 @@ impl Tree {
         wire_name: String,
         expected_size: u64,
     ) -> Result<(Vec<u8>, FileInfo)> {
+        let (data, info, _) = self
+            .read_compound(conn, path, wire_name, expected_size, false)
+            .await?;
+        Ok((data, info))
+    }
+
+    /// [`read_file_compound_sized_with_info`](Self::read_file_compound_sized_with_info),
+    /// plus the file's named streams, listed in the same frame: CREATE + READ +
+    /// QUERY_INFO (FileStreamInformation) + CLOSE. Still one round trip, so a
+    /// copy that keeps xattrs learns which ones a file has for no extra wait.
+    ///
+    /// The list is `None` when the server didn't answer it (a share with no
+    /// named streams, or a list too long for one credit's worth of buffer);
+    /// [`list_streams`](Self::list_streams) asks again. The bytes and the
+    /// metadata don't depend on it: the listing goes after the READ, so a
+    /// refusal can't take the read down with it. Ask only when you'll use the
+    /// answer: it costs the server a listing on every call.
+    pub async fn read_file_compound_sized_with_streams(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        expected_size: u64,
+    ) -> Result<(Vec<u8>, FileInfo, Option<Vec<StreamInfo>>)> {
+        let wire_name = self.format_path(path);
+        self.read_compound(conn, path, wire_name, expected_size, true)
+            .await
+    }
+
+    /// CREATE + READ (+ QUERY_INFO for the streams) + CLOSE on a name already
+    /// in wire form.
+    async fn read_compound(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        wire_name: String,
+        expected_size: u64,
+        with_streams: bool,
+    ) -> Result<(Vec<u8>, FileInfo, Option<Vec<StreamInfo>>)> {
         let conn = &mut self.pinned_conn(conn);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         // Ask for what the caller expects, capped by what one READ can carry
@@ -891,8 +930,13 @@ impl Tree {
             file_id: FileId::SENTINEL,
         };
 
+        // The stream listing goes AFTER the READ: a server may fail every
+        // related op after a refused one (MS-SMB2 § 3.3.5.2.7.2), and the
+        // listing is the one a server without streams refuses.
+        let streams_req = streams::stream_list_request(streams::STREAM_LIST_BUFFER);
+
         // Send as compound.
-        let ops = [
+        let mut ops = vec![
             CompoundOp {
                 command: Command::Create,
                 body: &create_req,
@@ -905,13 +949,21 @@ impl Tree {
                 tree_id: Some(self.tree_id),
                 credit_charge: CreditCharge(read_credit_charge),
             },
-            CompoundOp {
-                command: Command::Close,
-                body: &close_req,
+        ];
+        if with_streams {
+            ops.push(CompoundOp {
+                command: Command::QueryInfo,
+                body: &streams_req,
                 tree_id: Some(self.tree_id),
                 credit_charge: CreditCharge(1),
-            },
-        ];
+            });
+        }
+        ops.push(CompoundOp {
+            command: Command::Close,
+            body: &close_req,
+            tree_id: Some(self.tree_id),
+            credit_charge: CreditCharge(1),
+        });
 
         let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
 
@@ -919,7 +971,11 @@ impl Tree {
         let create_body = &responses[0].body;
         let read_header = &responses[1].header;
         let read_body = &responses[1].body;
-        let close_header = &responses[2].header;
+        let close_header = &responses[ops.len() - 1].header;
+        let streams = match with_streams {
+            true => streams::stream_list_answer(&responses[2], path),
+            false => None,
+        };
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
@@ -933,6 +989,11 @@ impl Tree {
         let mut cursor = ReadCursor::new(create_body);
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
+        // A refused listing takes the CLOSE after it down with it (pitfall 2),
+        // and then the handle is still open.
+        let listing_left_it_open = with_streams
+            && responses[2].header.status != NtStatus::SUCCESS
+            && close_header.status != NtStatus::SUCCESS;
 
         // The READ can return at most `requested` bytes, so anything bigger
         // comes back truncated, and a file that is exactly `requested` bytes
@@ -948,6 +1009,9 @@ impl Tree {
                 "tree: read_file_compound file is {} bytes > the {}-byte read issued for it path={:?}",
                 create_resp.end_of_file, requested, path
             );
+            if listing_left_it_open {
+                let _ = self.close_handle(conn, file_id).await;
+            }
             return Err(Error::FileTooLargeForSingleRead {
                 size: create_resp.end_of_file,
                 requested,
@@ -987,10 +1051,13 @@ impl Tree {
                 "tree: compound CLOSE returned {:?} (non-fatal, data already read)",
                 close_header.status,
             );
+            if listing_left_it_open {
+                let _ = self.close_handle(conn, file_id).await;
+            }
         }
 
         trace!("tree: read_file_compound done, read {} bytes", data.len());
-        Ok((data, file_info_from_create(&create_resp)))
+        Ok((data, file_info_from_create(&create_resp), streams))
     }
 
     /// Read a file's contents using a compound request (1 round-trip).
@@ -2225,6 +2292,25 @@ impl Tree {
         ))
     }
 
+    /// [`download`](Self::download), with the file's named streams listed in
+    /// the open's own frame (CREATE + QUERY_INFO), so
+    /// [`FileDownload::streams`] has them for no extra round trip. For a copy
+    /// that keeps xattrs: the list says which streams to read, and a file with
+    /// none needs nothing more. Ask only when you'll use the answer: it costs
+    /// the server a listing on every open.
+    pub async fn download_with_streams<'a>(
+        &'a self,
+        conn: &'a mut Connection,
+        path: &str,
+    ) -> Result<FileDownload<'a>> {
+        let mut conn = conn.pinned_to_session();
+        let (file_id, info, streams) = self.open_for_read_with_streams(&mut conn, path).await?;
+        Ok(
+            FileDownload::of_open_file(std::borrow::Cow::Borrowed(self), conn, file_id, info)
+                .with_streams(streams),
+        )
+    }
+
     /// Write a file using pipelined I/O.
     ///
     /// Opens/creates the file, then streams it in
@@ -2892,6 +2978,43 @@ impl Tree {
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
         Ok((resp.file_id, file_info_from_create(&resp)))
+    }
+
+    /// [`open_for_read`](Self::open_for_read) with a related QUERY_INFO for
+    /// the stream list in the same frame. The handle stays open either way;
+    /// a refused listing only leaves the list `None`.
+    async fn open_for_read_with_streams(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<(FileId, FileInfo, Option<Vec<StreamInfo>>)> {
+        let conn = &mut self.pinned_conn(conn);
+        let create = self.read_open_request(path);
+        let query = streams::stream_list_request(streams::STREAM_LIST_BUFFER);
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &query,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+        ];
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
+        if responses[0].header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: responses[0].header.status,
+                command: Command::Create,
+            });
+        }
+        let resp = CreateResponse::unpack(&mut ReadCursor::new(&responses[0].body))?;
+        let listed = streams::stream_list_answer(&responses[1], path);
+        Ok((resp.file_id, file_info_from_create(&resp), listed))
     }
 
     /// The CREATE [`open_file`](Self::open_file) and a

@@ -18,7 +18,7 @@ use log::trace;
 
 use crate::client::batch::{self, BatchOptions, BatchResults};
 use crate::client::connection::Connection;
-use crate::client::streams::is_missing_name;
+use crate::client::streams::{is_missing_name, no_streams_if_refused, StreamInfo};
 use crate::error::Result;
 use crate::types::Command;
 use crate::{Error, Tree};
@@ -368,6 +368,139 @@ impl Tree {
         })
         .collect_in_order()
         .await
+    }
+}
+
+/// One xattr a [`Tree::get_xattrs`] read: its name, as the other calls take
+/// it, and its value or why it couldn't be read.
+pub type XattrRead = (String, Result<Vec<u8>>);
+
+impl Tree {
+    /// Read every xattr a file's stream listing names, overlapped: one round
+    /// trip for the lot when they're small, which tags, comments, and
+    /// FinderInfo always are. The listing is what
+    /// [`FileDownload::streams`](crate::FileDownload::streams) or
+    /// [`read_file_compound_sized_with_streams`](Self::read_file_compound_sized_with_streams)
+    /// got with the open, so a copy learns a file's xattrs for one round trip
+    /// in all, and a file listing none for nothing.
+    ///
+    /// The results keep the listing's order, each independent. A stream removed
+    /// since the listing is left out, since the file no longer has it; any
+    /// other failure is that item's `Err`. A resource fork too big for one READ
+    /// costs its own extra round trips.
+    pub async fn get_xattrs(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        listed: &[StreamInfo],
+    ) -> Vec<XattrRead> {
+        trace!("xattr: get all path={path:?}, streams={}", listed.len());
+        let window = batch::window_for(conn, BATCH_ITEM_CHARGE, None);
+        let streams: Vec<StreamInfo> = listed.to_vec();
+        let path_owned = path.to_string();
+        let (tree, conn_clone) = (self.clone(), conn.clone());
+        let reads = batch::run(streams.len(), window, move |index| {
+            let (tree, mut conn) = (tree.clone(), conn_clone.clone());
+            let (path, stream) = (path_owned.clone(), streams[index].clone());
+            async move {
+                // The item's own outcome rides inside, so the batch never
+                // fails the others.
+                let read = tree
+                    .read_stream_sized(&mut conn, &path, &stream.name, stream.size.max(1))
+                    .await;
+                Ok(read)
+            }
+        })
+        .collect_in_order()
+        .await;
+        listed
+            .iter()
+            .zip(reads)
+            .filter_map(|(stream, read)| {
+                let name = stream_xattr_name(&stream.name).to_string();
+                let value = match read.and_then(|inner| inner) {
+                    Ok(data) if name == XATTR_FINDER_INFO => finder_info_from_afp_info(&data),
+                    Ok(data) => Ok(data),
+                    Err(Error::Protocol {
+                        status,
+                        command: Command::Create,
+                    }) if is_missing_name(status) => return None,
+                    Err(e) => Err(e),
+                };
+                Some((name, value))
+            })
+            .collect()
+    }
+
+    /// Write xattrs on a file or folder the caller has just created, overlapped:
+    /// one round trip for the lot when they're small. For a copy, onto its
+    /// fresh destination before anyone else can see it.
+    ///
+    /// Cheaper than [`set_xattr`](Self::set_xattr) on purpose, for that one
+    /// case: ❗ it doesn't check the file is there, and a stream write to a
+    /// missing file CREATES it (empty), so call it only on a path you just made.
+    /// And it writes `com.apple.FinderInfo` into a new `AFP_AfpInfo` without
+    /// reading the old one, so anything else an existing one held is replaced.
+    ///
+    /// The results are in input order, each independent of the others. A share
+    /// with no named streams answers each with
+    /// [`Error::NamedStreamsUnsupported`]; a value the server won't take (past
+    /// `streams_xattr`'s 64 KiB, say) leaves no stream behind.
+    pub async fn set_xattrs_on_new_file(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        xattrs: &[(&str, &[u8])],
+    ) -> Vec<Result<()>> {
+        trace!(
+            "xattr: set on a new file path={path:?}, count={}",
+            xattrs.len()
+        );
+        let window = batch::window_for(conn, BATCH_ITEM_CHARGE, None);
+        let items: Vec<(String, Vec<u8>)> = xattrs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.to_vec()))
+            .collect();
+        let path_owned = path.to_string();
+        let (tree, conn_clone) = (self.clone(), conn.clone());
+        batch::run(items.len(), window, move |index| {
+            let (tree, mut conn) = (tree.clone(), conn_clone.clone());
+            let path = path_owned.clone();
+            let (name, value) = items[index].clone();
+            async move {
+                tree.set_xattr_on_new_file(&mut conn, &path, &name, &value)
+                    .await
+            }
+        })
+        .collect_in_order()
+        .await
+    }
+
+    async fn set_xattr_on_new_file(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        check_xattr_name(name)?;
+        let stream = xattr_stream_name(name);
+        let data = match name {
+            XATTR_FINDER_INFO => afp_info_with_finder_info(None, value)?,
+            _ => value.to_vec(),
+        };
+        let wire_name = self.stream_wire_name(path, stream)?;
+        let written = self.write_stream_named(conn, wire_name, &data).await;
+        if let Err(Error::Protocol {
+            command: Command::Write,
+            ..
+        }) = &written
+        {
+            // As in `write_stream`: the CREATE made the stream, and an empty
+            // or partial one reads as real.
+            let _ = self.delete_stream(conn, path, stream).await;
+        }
+        no_streams_if_refused(written, path)
     }
 }
 
