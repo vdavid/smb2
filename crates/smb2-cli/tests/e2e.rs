@@ -1223,6 +1223,21 @@ fn a_wrong_password_fails() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+/// `--require-encryption` connects to a server that only allows encryption
+/// and encrypts anyway; a guest session, which can't, is refused rather than
+/// served in the clear.
+#[test]
+#[ignore = "needs the smb-auth and smb-fruit containers"]
+fn require_encryption_encrypts_or_refuses() {
+    let share = Fixture::new("require-encryption");
+    ok(&["--require-encryption", "ls", &share.target("")]);
+
+    let output = fruit_run(&["--require-encryption", "ls", FRUIT]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires encryption"), "{stderr}");
+}
+
 // ── xattr and streams (smb-fruit) ────────────────────────────────────
 //
 // The only tests here that need a server with named streams, so they talk to

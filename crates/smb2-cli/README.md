@@ -60,6 +60,8 @@ There's also `--password`, but your shell will remember it and so will the proce
 
 `--user` (or `SMB2_USER`) sets the username; `--guest` connects with no credentials.
 
+`--require-encryption` encrypts the whole session even when the server only allows it, and refuses to connect when it can't encrypt (the server agreed on no cipher, or answered with a guest session) rather than sending your files in the clear.
+
 ## Commands
 
 ```sh

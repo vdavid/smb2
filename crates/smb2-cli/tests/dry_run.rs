@@ -120,6 +120,32 @@ fn rm_plans_the_deletion_without_connecting() {
     assert!(stdout.contains("rm //127.0.0.1:1/share/junk"), "{stdout:?}");
 }
 
+/// `--require-encryption` is a global flag, accepted anywhere, and changes
+/// nothing about a dry run.
+#[test]
+fn require_encryption_is_accepted_and_a_dry_run_stays_dry() {
+    let target = format!("{DEAD_SHARE}/junk");
+    for args in [
+        [
+            "--require-encryption",
+            "--guest",
+            "--dry-run",
+            "rm",
+            &target,
+        ],
+        [
+            "--guest",
+            "--dry-run",
+            "rm",
+            "--require-encryption",
+            &target,
+        ],
+    ] {
+        let stdout = expect_dry(&args);
+        assert!(stdout.contains("rm //127.0.0.1:1/share/junk"), "{stdout:?}");
+    }
+}
+
 #[test]
 fn rmdir_plans_the_removal_without_connecting() {
     let stdout = expect_dry(&[

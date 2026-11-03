@@ -19,6 +19,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Connections below SMB 3.1.1 validate their negotiation** with a signed `FSCTL_VALIDATE_NEGOTIATE_INFO` after the first tree connect of a session that signs (MS-SMB2 § 3.2.5.5), on `SmbClient::connect_share`, the low-level `Tree::connect`, and the IPC$ connects alike. A server that doesn't confirm the dialect, capabilities, and security mode it negotiated fails the tree connect with the new `Error::NegotiateValidationFailed` (`ErrorKind::NegotiateValidationFailed`, not retryable) and the connection is closed. A server that answers with a signed "not supported" is accepted, as the spec allows. SMB 3.1.1 needs no extra round trip, since its preauth hash already covers the negotiation.
 - **A client can require encryption**: `ClientConfig::require_encryption` (and `Connection::set_require_encryption`) makes every session encrypt with the negotiated cipher even when the server only allows it, and fails the login with the new `Error::EncryptionRequired` (`ErrorKind::Unsupported`) when the connection can't encrypt: no cipher, a dialect below 3.0, or a guest session. It covers DFS target connections and reconnects too. Default `false`.
+- **smb2-cli: `--require-encryption`**, a global flag that sets `ClientConfig::require_encryption` on every connection a command opens.
 - New Docker containers: `smb-encryption-desired` (default dialects, encryption preferred) and `smb-auth-smb302` / `smb-auth-smb21` (the auth fixture capped at an older dialect).
 
 ### Fixed

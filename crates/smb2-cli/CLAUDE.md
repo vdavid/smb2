@@ -22,7 +22,7 @@ against.
 
 - `src/main.rs`: clap definitions and dispatch. Global flags (`--json`, `--dry-run`, and everything in `AuthArgs`) live on the top-level `Cli`. `-j/--concurrency` deliberately isn't global: it's a flattened `pool::Concurrency` on the six commands that reach `pool::run`, since every other command opens exactly one connection and would be advertising something it can't do.
 - `src/target.rs`: parses `//host/share/path`, `smb://…`, and `\\host\share\path` into a `Target`. `Target::resolve` joins a relative path onto a base, which is how batch inputs stay short.
-- `src/auth.rs`: `AuthArgs` and credential resolution, in order: `--guest`, `--password-command`, `--password`/`SMB2_PASS`, terminal prompt.
+- `src/auth.rs`: `AuthArgs` and credential resolution, in order: `--guest`, `--password-command`, `--password`/`SMB2_PASS`, terminal prompt. `--require-encryption` rides along on `Credentials`, and `Credentials::connect` is the one place a connection is opened, so every command honours it.
 - `src/batch.rs`: turns command-line targets or a `--from-file` list into one share plus a list of paths. Everything in a batch must be on the same host and share.
 - `src/pool.rs`: the concurrency engine. `Job` is the unit of work, `Outcome` the result, and `Concurrency` is the `-j` flag the pooling commands flatten in.
 - `src/remote.rs`: what the server has at a path (`RemoteKind`, and the stat behind it). `put` and `mkdir` both have to tell a file from a directory before they act, and only a clean "it isn't there" counts as missing: an `ACCESS_DENIED` read as "nothing there" is how an upload clobbers a directory.
@@ -87,7 +87,7 @@ server's `MaxReadSize` (8 MB on a stock Samba) is a hard ceiling on what one REA
 
 `cargo test -p smb2-cli` covers parsing, formatting, the transfer destination rules, the `mkdir` collision rules, and which commands accept `-j`, all with no network. `tests/dry_run.rs` runs the built binary against `//127.0.0.1:1/…`, where connecting is refused instantly, which is what makes "`--dry-run` doesn't connect" testable.
 
-`tests/e2e.rs` is the other half: 35 tests that run the built binary against a live Samba fixture and check what
+`tests/e2e.rs` is the other half: 41 tests that run the built binary against a live Samba fixture and check what
 it left on the share, because a command that writes the wrong thing passes every test that never connects. Both
 data-safety bugs this CLI has shipped were caught by hand for exactly that reason. Run it with `just test-cli-e2e`,
 or by hand:

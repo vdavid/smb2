@@ -105,7 +105,8 @@ pub async fn connect_all(
 }
 
 async fn connect_one(target: &Target, credentials: &Credentials) -> Result<(SmbClient, Tree)> {
-    let mut client = smb2::connect(&target.addr(), &credentials.username, &credentials.password)
+    let mut client = credentials
+        .connect(&target.addr())
         .await
         .with_context(|| format!("connecting to {}", target.addr()))?;
     let tree = client

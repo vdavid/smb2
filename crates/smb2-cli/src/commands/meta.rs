@@ -366,7 +366,8 @@ pub async fn df(target: &Target, credentials: &Credentials, as_json: bool) -> Re
 
 pub async fn shares(host: &str, port: u16, credentials: &Credentials, as_json: bool) -> Result<()> {
     let addr = format!("{host}:{port}");
-    let mut client = smb2::connect(&addr, &credentials.username, &credentials.password)
+    let mut client = credentials
+        .connect(&addr)
         .await
         .with_context(|| format!("connecting to {addr}"))?;
     let shares = client
