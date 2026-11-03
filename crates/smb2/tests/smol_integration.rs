@@ -149,6 +149,12 @@ fn smol_mandatory_encryption_round_trips_a_file() {
         let mut client = SmbClient::connect(config(ENCRYPTION_ADDR, "testuser", "testpass"))
             .await
             .expect("SmbClient::connect to smb-encryption failed");
+        // A round trip alone passes in plaintext too, which these fixtures
+        // served for months (issue #32).
+        assert!(
+            client.connection().should_encrypt(),
+            "session must be encrypted"
+        );
         write_read_delete(&mut client, "private", "smol_encryption_round_trip.tmp").await;
     });
 }

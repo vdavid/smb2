@@ -353,6 +353,8 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 40. **A stream name travels apart from its path, and a stream CREATE can create the file** ✅ -- `encode_path` maps every `:` to U+F022 because a `:` in a file name is legitimate (pitfall 23), so `f.txt:stream` in a path is one ordinary name. ❌ Never let `:` through it: `Tree::stream_wire_name` joins `format_path(path)` and `encode_name(stream)`, which also gets DFS right and is exactly what macOS `smbfs` sends for `com.apple.metadata:_kMDItemUserTags`. Mapping the stream's own `:` also means no stream name can reach `::$DATA`, so `delete_stream` can't delete a file; an empty name is refused because `f.txt:` would name the file. And `FILE_OVERWRITE_IF` on a stream of a missing file creates the file, so `write_stream` probes first; only `set_xattrs_on_new_file` skips the probe, and it's documented as for a path the caller just made. Spans `name.rs` + `client/streams.rs` + `client/xattr.rs` + `client/batch.rs`; see `client/CLAUDE.md` § Named streams and xattrs and `docs/notes/named-streams-and-xattrs.md`.
 
+41. **Encryption takes a capability bit, a cipher the server picked, and keys of two different lengths from two different keys** ✅ -- Each one failed silently or loudly for months (#32). NEGOTIATE must send `SMB2_GLOBAL_CAP_ENCRYPTION` on every dialect: Samba reads the 3.1.1 cipher context only when it's set, so without it no cipher was picked, `required` refused the session, and `desired` served every encryption fixture in plaintext while its tests passed. The connection's cipher (`negotiated_cipher`) is AES-128-CCM on 3.0 / 3.0.2 when the server granted the bit, and the server's pick on 3.1.1; ❌ never a cipher we chose (the old AES-128-CCM fallback is what hid the missing bit), so a session or share demanding encryption without one fails with `Error::EncryptionUnavailable`. Then the keys: ❌ the signing key is ALWAYS 128 bits, from the first 16 bytes of the authentication's key (`Session.SessionKey`), whatever the cipher; deriving it at 256 bits failed every login to a server that picked AES-256, encrypting or not. And AES-256 encryption keys come from the FULL key (`Session.FullSessionKey`, MS-SMB2 § 3.2.5.3.1), which only differs from the first 16 bytes under Kerberos, so NTLM tests can't catch that one. Every encryption test asserts the connection actually encrypts. Spans `client/connection.rs` + `client/session.rs` + `client/mod.rs` + `crypto/kdf.rs`; see `crypto/CLAUDE.md` § Key derivation and `client/CLAUDE.md` § Encryption.
+
 ## Testing
 
 See `tests/CLAUDE.md` for the full testing guide. Quick reference:
@@ -369,7 +371,7 @@ starts one container rather than 16.
 
 ### Docker test containers
 
-19 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+23 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
@@ -386,6 +388,8 @@ starts one container rather than 16.
 | smb-maxreadsize       | 10454 | 64 KB max read/write, chunking edge cases     |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
 | smb-encryption-required | 10465 | Global `server smb encrypt = required`: a session without the ENCRYPTION capability is refused |
+| smb-encryption-aes256 | 10466 | AES-256-GCM only, not required: an AES-256 session signs (128-bit key), and an encrypting share round-trips |
+| smb-encryption-aes256-ccm | 10467 | AES-256-CCM only, required for the session |
 | smb-weirdnames        | 10459 | Names carrying SMB2-illegal characters, seeded as the exact private-use bytes macOS writes |
 | smb-dfs-root          | 10456 | DFS *link* inside a real, tree-connectable share (the `STATUS_PATH_NOT_COVERED` path) |
 | smb-dfs-target        | 10457 | DFS target server with actual files            |

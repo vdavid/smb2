@@ -7,6 +7,7 @@
 //! computed over the raw wire bytes of NEGOTIATE and SESSION_SETUP exchanges,
 //! which feeds into the KDF as the "context" parameter.
 
+use crate::crypto::encryption::Cipher;
 use crate::types::Dialect;
 use digest::{Digest, KeyInit};
 use hmac::{Hmac, Mac};
@@ -76,21 +77,49 @@ impl std::fmt::Debug for DerivedKeys {
     }
 }
 
-/// Derive session keys for the given dialect.
+/// `Session.SessionKey` from the key the authentication protocol produced
+/// (MS-SMB2 § 3.2.5.3.1): its first 16 bytes, right-padded with zeros if it
+/// is shorter.
 ///
-/// For SMB 3.0 and 3.0.2, the context is a fixed ASCII string.
-/// For SMB 3.1.1, the context is the preauthentication integrity hash value
-/// (64 bytes from SHA-512).
+/// NTLM's key is exactly 16 bytes, so this is that key. Kerberos hands over
+/// the whole subkey (32 bytes for an AES-256 enctype), and everything except
+/// AES-256 encryption uses only these first 16 bytes of it.
+pub fn session_key(gss_key: &[u8]) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    let n = gss_key.len().min(16);
+    key[..n].copy_from_slice(&gss_key[..n]);
+    key
+}
+
+/// Derive session keys for the given dialect (MS-SMB2 § 3.2.5.3.1).
+///
+/// `gss_key` is the key the authentication protocol produced, in full: the
+/// NTLM `ExportedSessionKey` or the Kerberos subkey. `cipher` is the
+/// connection's negotiated cipher (`Connection.CipherId`).
+///
+/// Two rules here are easy to get wrong, and both broke AES-256 once:
+///
+/// - **The signing key is always 128 bits**, derived from [`session_key`]
+///   (`Session.SigningKey` is "a 128-bit key"). Only the encryption and
+///   decryption keys follow the cipher.
+/// - **AES-256 keys on 3.1.1 come from the FULL key**
+///   (`Session.FullSessionKey`), not its first 16 bytes. With NTLM the two
+///   are the same 16 bytes; with Kerberos and an AES-256 enctype they aren't,
+///   and deriving from the truncated key gives keys the server doesn't have.
+///
+/// For SMB 3.0 and 3.0.2, the context is a fixed ASCII string and the cipher
+/// is always AES-128-CCM, whatever `cipher` says. For SMB 3.1.1, the context
+/// is the preauthentication integrity hash value (64 bytes from SHA-512).
 ///
 /// # Panics
 ///
 /// Panics if `dialect` is SMB 3.1.1 and `preauth_hash` is `None`.
 /// Panics if `dialect` is not in the SMB 3.x family.
 pub fn derive_session_keys(
-    session_key: &[u8],
+    gss_key: &[u8],
     dialect: Dialect,
     preauth_hash: Option<&[u8; 64]>,
-    key_length_bits: u32,
+    cipher: Option<Cipher>,
 ) -> DerivedKeys {
     assert!(
         matches!(
@@ -125,10 +154,19 @@ pub fn derive_session_keys(
         dec_context = b"ServerOut\0";
     }
 
+    let session_key = session_key(gss_key);
+    let aes_256 = dialect == Dialect::Smb3_1_1
+        && matches!(cipher, Some(Cipher::Aes256Ccm | Cipher::Aes256Gcm));
+    let (cipher_key, cipher_bits): (&[u8], u32) = if aes_256 {
+        (gss_key, 256)
+    } else {
+        (&session_key, 128)
+    };
+
     DerivedKeys {
-        signing_key: sp800_108_kdf(session_key, signing_label, signing_context, key_length_bits),
-        encryption_key: sp800_108_kdf(session_key, enc_label, enc_context, key_length_bits),
-        decryption_key: sp800_108_kdf(session_key, dec_label, dec_context, key_length_bits),
+        signing_key: sp800_108_kdf(&session_key, signing_label, signing_context, 128),
+        encryption_key: sp800_108_kdf(cipher_key, enc_label, enc_context, cipher_bits),
+        decryption_key: sp800_108_kdf(cipher_key, dec_label, dec_context, cipher_bits),
     }
 }
 
@@ -300,7 +338,7 @@ mod tests {
     #[test]
     fn derive_keys_smb3_0_uses_legacy_labels() {
         let session_key = [0x42; 16];
-        let keys = derive_session_keys(&session_key, Dialect::Smb3_0, None, 128);
+        let keys = derive_session_keys(&session_key, Dialect::Smb3_0, None, None);
 
         // Verify each key matches what we'd get calling KDF directly with the
         // SMB 3.0 label/context pairs.
@@ -321,7 +359,7 @@ mod tests {
     #[test]
     fn derive_keys_smb3_0_2_uses_legacy_labels() {
         let session_key = [0x42; 16];
-        let keys = derive_session_keys(&session_key, Dialect::Smb3_0_2, None, 128);
+        let keys = derive_session_keys(&session_key, Dialect::Smb3_0_2, None, None);
 
         assert_eq!(
             keys.signing_key,
@@ -341,7 +379,7 @@ mod tests {
     fn derive_keys_smb3_1_1_uses_new_labels_with_preauth_hash() {
         let session_key = [0x42; 16];
         let preauth_hash = [0xAB; 64];
-        let keys = derive_session_keys(&session_key, Dialect::Smb3_1_1, Some(&preauth_hash), 128);
+        let keys = derive_session_keys(&session_key, Dialect::Smb3_1_1, Some(&preauth_hash), None);
 
         assert_eq!(
             keys.signing_key,
@@ -357,21 +395,102 @@ mod tests {
         );
     }
 
+    /// `Session.SigningKey` is 128 bits whatever the cipher (MS-SMB2
+    /// § 3.2.1.3): a 32-byte one failed every AES-256 session with "AES-128-GMAC
+    /// requires a 16-byte key" (reported in #32).
     #[test]
     fn derive_keys_smb3_1_1_256_bit() {
         let session_key = [0x42; 16];
         let preauth_hash = [0xCD; 64];
-        let keys = derive_session_keys(&session_key, Dialect::Smb3_1_1, Some(&preauth_hash), 256);
+        for cipher in [Cipher::Aes256Gcm, Cipher::Aes256Ccm] {
+            let keys = derive_session_keys(
+                &session_key,
+                Dialect::Smb3_1_1,
+                Some(&preauth_hash),
+                Some(cipher),
+            );
 
-        assert_eq!(keys.signing_key.len(), 32);
-        assert_eq!(keys.encryption_key.len(), 32);
-        assert_eq!(keys.decryption_key.len(), 32);
+            assert_eq!(
+                keys.signing_key,
+                sp800_108_kdf(&session_key, b"SMBSigningKey\0", &preauth_hash, 128)
+            );
+            assert_eq!(
+                keys.encryption_key,
+                sp800_108_kdf(&session_key, b"SMBC2SCipherKey\0", &preauth_hash, 256)
+            );
+            assert_eq!(
+                keys.decryption_key,
+                sp800_108_kdf(&session_key, b"SMBS2CCipherKey\0", &preauth_hash, 256)
+            );
+        }
+    }
+
+    /// Kerberos with an AES-256 enctype hands over a 32-byte subkey. AES-256
+    /// encryption keys come from all of it (`Session.FullSessionKey`); the
+    /// signing key comes from its first 16 bytes (`Session.SessionKey`).
+    #[test]
+    fn aes_256_cipher_keys_come_from_the_full_session_key() {
+        let full_key: Vec<u8> = (0u8..32).collect();
+        let preauth_hash = [0xCD; 64];
+        let keys = derive_session_keys(
+            &full_key,
+            Dialect::Smb3_1_1,
+            Some(&preauth_hash),
+            Some(Cipher::Aes256Gcm),
+        );
+
+        assert_eq!(
+            keys.signing_key,
+            sp800_108_kdf(&full_key[..16], b"SMBSigningKey\0", &preauth_hash, 128)
+        );
+        assert_eq!(
+            keys.encryption_key,
+            sp800_108_kdf(&full_key, b"SMBC2SCipherKey\0", &preauth_hash, 256)
+        );
+        assert_eq!(
+            keys.decryption_key,
+            sp800_108_kdf(&full_key, b"SMBS2CCipherKey\0", &preauth_hash, 256)
+        );
+    }
+
+    /// Below AES-256 (and on every dialect before 3.1.1) only the first 16
+    /// bytes of a long Kerberos key take part.
+    #[test]
+    fn a_long_key_is_cut_to_16_bytes_below_aes_256() {
+        let full_key: Vec<u8> = (0u8..32).collect();
+        let preauth_hash = [0xCD; 64];
+        let cases = [
+            (
+                Dialect::Smb3_1_1,
+                Some(&preauth_hash),
+                Some(Cipher::Aes128Gcm),
+            ),
+            (Dialect::Smb3_1_1, Some(&preauth_hash), None),
+            // A 3.0.2 connection is AES-128-CCM whatever the caller passes.
+            (Dialect::Smb3_0_2, None, Some(Cipher::Aes256Gcm)),
+        ];
+        let all = |k: DerivedKeys| (k.signing_key, k.encryption_key, k.decryption_key);
+        for (dialect, hash, cipher) in cases {
+            let keys = all(derive_session_keys(&full_key, dialect, hash, cipher));
+            let cut = all(derive_session_keys(&full_key[..16], dialect, hash, cipher));
+            assert_eq!(keys, cut, "{dialect:?} {cipher:?}");
+            assert_eq!(keys.1.len(), 16, "{dialect:?} {cipher:?}");
+        }
+    }
+
+    #[test]
+    fn session_key_is_the_first_16_bytes_right_padded_with_zeros() {
+        let long: Vec<u8> = (1u8..=32).collect();
+        assert_eq!(session_key(&long).as_slice(), &long[..16]);
+        let mut padded = [0u8; 16];
+        padded[..8].copy_from_slice(&[7; 8]);
+        assert_eq!(session_key(&[7; 8]), padded);
     }
 
     #[test]
     fn derive_keys_all_three_are_different() {
         let session_key = [0x42; 16];
-        let keys = derive_session_keys(&session_key, Dialect::Smb3_0, None, 128);
+        let keys = derive_session_keys(&session_key, Dialect::Smb3_0, None, None);
 
         assert_ne!(keys.signing_key, keys.encryption_key);
         assert_ne!(keys.signing_key, keys.decryption_key);
@@ -382,14 +501,14 @@ mod tests {
     #[should_panic(expected = "preauthentication integrity hash")]
     fn derive_keys_smb3_1_1_panics_without_preauth_hash() {
         let session_key = [0x42; 16];
-        derive_session_keys(&session_key, Dialect::Smb3_1_1, None, 128);
+        derive_session_keys(&session_key, Dialect::Smb3_1_1, None, None);
     }
 
     #[test]
     #[should_panic(expected = "SMB 3.x dialect family")]
     fn derive_keys_panics_for_smb2() {
         let session_key = [0x42; 16];
-        derive_session_keys(&session_key, Dialect::Smb2_0_2, None, 128);
+        derive_session_keys(&session_key, Dialect::Smb2_0_2, None, None);
     }
 
     // ========================================================================
@@ -524,7 +643,7 @@ mod tests {
             &session_key,
             Dialect::Smb3_1_1,
             Some(session_hasher.value()),
-            128,
+            Some(Cipher::Aes128Gcm),
         );
 
         // Keys should all be 16 bytes and different from each other

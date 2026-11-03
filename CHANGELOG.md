@@ -7,9 +7,19 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- **`crypto::kdf::derive_session_keys` takes the negotiated cipher instead of a key length**, and the whole key the authentication produced instead of its first 16 bytes: `derive_session_keys(gss_key, dialect, preauth_hash, cipher: Option<Cipher>)`. That's what it needs to get AES-256 right (below). `crypto::kdf::session_key` gives the 16-byte `Session.SessionKey` from the same key.
+- **A session or share that requires encryption fails with the new `Error::EncryptionUnavailable` when the server negotiated no cipher** (`ErrorKind::Unsupported`, not retryable), where it used to guess AES-128-CCM, which no server agreed to. A share refused this way is disconnected again.
+- **`NegotiatedParams::cipher` is `Some(Cipher::Aes128Ccm)` on SMB 3.0 and 3.0.2** when the server granted the `ENCRYPTION` capability, so it now always says what the connection encrypts with. It was `None` on those dialects.
+
 ### Fixed
 
-- **Servers that require encryption accept the session**: NEGOTIATE now sets the `ENCRYPTION` capability. Without it, Samba with `server smb encrypt = required` refused the session at setup, and with `desired` the session ran in plaintext. A new `smb-encryption-required` container covers it.
+- **Servers that require encryption accept the session**: NEGOTIATE now sets the `ENCRYPTION` capability. Without it, Samba with `server smb encrypt = required` refused the session at setup, and with `desired` the session ran in plaintext. A new `smb-encryption-required` container covers it. Reported in [#32](https://github.com/vdavid/smb2/issues/32) by InstaZDLL.
+- **AES-256 sessions sign**: the signing key is always 128 bits (MS-SMB2 § 3.2.1.3). It was derived at the cipher's length, so every session with a server that picked AES-256 failed with "AES-128-GMAC requires a 16-byte key", whether or not it encrypted. Reported in [#32](https://github.com/vdavid/smb2/issues/32).
+- **Kerberos with AES-256 encryption derives the keys the server has**: the encryption keys come from the full Kerberos session key (`Session.FullSessionKey`, MS-SMB2 § 3.2.5.3.1), the signing key from its first 16 bytes. Every key used to come from the first 16 bytes.
+- **A NEGOTIATE response with a malformed encryption context fails the connect**, as MS-SMB2 § 3.2.5.2 asks: two encryption contexts, a cipher count other than one, or a cipher this client didn't offer.
+- **The encryption tests prove encryption**: every `encryption_*` Docker test asserts the connection encrypts with the expected cipher. They passed in plaintext for months. New `smb-encryption-aes256` (AES-256-GCM, a plain and an encrypting share) and `smb-encryption-aes256-ccm` (AES-256-CCM, required) containers cover both AES-256 ciphers.
 
 ## [0.40.0] - 2026-11-03
 

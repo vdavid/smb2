@@ -627,7 +627,11 @@ Encryption is activated when the session flags include `ENCRYPT_DATA` or a share
 - Signing is skipped (AEAD provides authentication)
 - Compound chains are encrypted as one unit (pitfall #9)
 
-Tree-level encryption: `connect_share()` checks the share's encrypt flag and activates encryption on the connection if needed, even if the session didn't require it.
+Tree-level encryption: `connect_share()` (and every DFS target's `ensure_tree`) goes through `activate_share_encryption`, which turns encryption on for a share flagged `SMB2_SHAREFLAG_ENCRYPT_DATA` even if the session didn't require it. The low-level `Tree::connect` doesn't: it only reports `encrypt_data`.
+
+- **Only a negotiated cipher encrypts** (`NegotiatedParams::cipher`, `Connection.CipherId`): AES-128-CCM on 3.0 / 3.0.2 when the server granted `SMB2_GLOBAL_CAP_ENCRYPTION`, the server's pick on 3.1.1. NEGOTIATE has to send that capability for Samba to pick anything (#32). Without a cipher, `session_keys` derives no encryption keys.
+- **Demanded but not negotiated is an error, never a guess**: a session with `ENCRYPT_DATA` (`session_cipher`) or a share with the encrypt flag on a connection with no cipher fails with `Error::EncryptionUnavailable` (the share is disconnected again). ❌ Don't bring back the AES-128-CCM fallback: the server decrypts nothing with a cipher it never agreed to, and the fallback is what kept the missing capability bit hidden. Below 3.0 both flags mean nothing and are ignored. MS-SMB2 § 3.2.5.5 would have the client ignore a share's flag without a cipher; refusing is the deliberate, safer reading.
+- **Keys** follow `crypto/CLAUDE.md` § Key derivation: the signing key is always 128 bits, and AES-256 keys come from the full Kerberos key. `Session::setup` and `setup_kerberos` both go through `session_keys` with the whole key the authentication produced, so the two can't drift.
 
 ## Reconnection
 

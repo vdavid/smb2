@@ -74,9 +74,11 @@ number held in a variable named like a path) is fixed by renaming the variable, 
 
 ## Docker integration tests (`tests/docker_integration.rs`)
 
-Tests against 18 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.
+Tests against 23 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.
 
 Containers live in `tests/docker/internal/`.
+
+❌ **An encryption test asserts the connection encrypts** (`assert_encrypts`, with the cipher), not only that data reads back. Every `encryption_*` test passed in plaintext for months because the client never advertised `SMB2_GLOBAL_CAP_ENCRYPTION`, so Samba agreed on no cipher and served the fixtures in the clear (#32). A new one calls it too.
 
 **Running Docker tests:**
 
@@ -125,7 +127,9 @@ Two traps when several sessions share the machine:
 | smb-fruit | 10464 | `catia fruit streams_xattr`, what a Mac-friendly NAS runs: named streams, FinderInfo in `AFP_AfpInfo`. A stream past 64 KiB is refused (`STATUS_FILE_SYSTEM_LIMITATION`), which real-hardware `streams_depot` doesn't do. The macOS side is proved on a real mount in `tests/integration.rs` |
 | smb-samba415 | 10463 | Samba 4.15.13 on Alpine 3.15, kept old on purpose: it refuses a FLUSH anywhere but last in a compound, and the refusal panics smbd (AGENTS.md pitfall 33). Twenty small `write_file`s on one connection, read back intact. ❌ Don't bump its base image |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2): different cipher family |
-| smb-encryption-required | 10465 | Global `server smb encrypt = required` (SMB 3.0–3.1.1): refused at session setup unless NEGOTIATE carries the ENCRYPTION capability; asserts `should_encrypt()` |
+| smb-encryption-required | 10465 | Global `server smb encrypt = required` (SMB 3.0–3.1.1): refused at session setup unless NEGOTIATE carries the ENCRYPTION capability |
+| smb-encryption-aes256 | 10466 | AES-256-GCM only, encryption not required: `private` proves an AES-256 session signs with a 128-bit key (#32), `encrypted` (`smb encrypt = required`) round-trips under AES-256-GCM |
+| smb-encryption-aes256-ccm | 10467 | AES-256-CCM only, required for the session: 256-bit keys with CCM's 11-byte nonce |
 | smb-weirdnames | 10459 | Names with SMB2-illegal characters. `populate.sh` writes them with octal escapes, so the on-disk bytes are exactly what macOS smbfs produces; a listing that decodes them proves Finder parity, which is the strongest assertion CI can make without a Mac. ❌ Don't replace those escapes with the literal characters. |
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target, plus a seeded `Root-File.txt` in the root share itself (guest can't write there) for `resolve` on a DFS share |
 | smb-dfs-target | 10457 | DFS target server with test files (hello.txt, subdir/nested.txt) |

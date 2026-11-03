@@ -23,11 +23,13 @@ GMAC is AES-128-GCM with empty plaintext. The auth tag IS the signature. The 12-
 
 ## Encryption
 
-Four ciphers, negotiated during NEGOTIATE:
-- AES-128-CCM (11-byte nonce) -- SMB 3.0+
-- AES-128-GCM (12-byte nonce) -- SMB 3.0+
+Four ciphers, negotiated during NEGOTIATE (`client/connection.rs` `negotiated_cipher`):
+- AES-128-CCM (11-byte nonce) -- the only cipher on SMB 3.0 / 3.0.2, granted by the server's `SMB2_GLOBAL_CAP_ENCRYPTION`
+- AES-128-GCM (12-byte nonce) -- SMB 3.1.1
 - AES-256-CCM (11-byte nonce) -- SMB 3.1.1
 - AES-256-GCM (12-byte nonce) -- SMB 3.1.1
+
+On 3.1.1 the server picks one from our `SMB2_ENCRYPTION_CAPABILITIES`, and only if NEGOTIATE carried `SMB2_GLOBAL_CAP_ENCRYPTION`: Samba reads the context only then, so without the bit it picks none (#32). No cipher means no encryption keys and no encryption; a session or share that demands it fails with `Error::EncryptionUnavailable`. ❌ Never fall back to a cipher of our own: the server decrypts nothing with it, and that fallback is what let the encryption fixtures pass in plaintext for months.
 
 Nonces come from a `NonceGenerator` with a monotonic u64 counter. Nonce reuse breaks GCM catastrophically -- the counter must never reset within a session.
 
@@ -35,10 +37,12 @@ AAD is the TRANSFORM_HEADER bytes 20..52 (Nonce + OriginalMessageSize + Reserved
 
 ## Key derivation (SP800-108)
 
-`derive_session_keys` produces three keys (signing, encryption, decryption) from the NTLM session key using HMAC-SHA256 in counter mode.
+`derive_session_keys(gss_key, dialect, preauth_hash, cipher)` produces three keys (signing, encryption, decryption) using HMAC-SHA256 in counter mode. `gss_key` is the whole key the authentication produced: NTLM's 16-byte `ExportedSessionKey`, or the Kerberos subkey (32 bytes for an AES-256 enctype).
 
 - **SMB 3.0/3.0.2**: Fixed ASCII label/context pairs (for example, `"SMB2AESCMAC\0"` / `"SmbSign\0"`)
 - **SMB 3.1.1**: New labels (`"SMBSigningKey\0"`) with preauth hash (64-byte SHA-512) as context
+- **The signing key is always 128 bits, from `Session.SessionKey`** (`session_key`: the first 16 bytes, zero-padded). ❌ Never derive it at the cipher's length: a 32-byte signing key failed every session with a server that picked AES-256, encrypting or not (#32).
+- **AES-256 encryption keys on 3.1.1 come from the FULL key** (`Session.FullSessionKey`, MS-SMB2 § 3.2.5.3.1), at 256 bits; everything else uses the first 16 bytes. With NTLM the two are the same bytes, so only Kerberos can catch a regression here; `aes_256_cipher_keys_come_from_the_full_session_key` pins it on the mock.
 
 `PreauthHasher` computes `SHA-512(prev_hash || message_bytes)` incrementally over negotiate and session-setup wire bytes. Cloned per session (spec requires per-session hash).
 

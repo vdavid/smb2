@@ -2740,6 +2740,24 @@ async fn encryption_client() -> SmbClient {
     .expect("SmbClient::connect to smb-encryption failed")
 }
 
+/// Fail unless the connection `tree` lives on encrypts, with `cipher`.
+///
+/// ❌ Every `encryption_*` test calls this. Without it, they passed in
+/// plaintext for months: the client never advertised
+/// `SMB2_GLOBAL_CAP_ENCRYPTION`, so Samba agreed on no cipher and served
+/// these fixtures in the clear, and a test that only reads its data back
+/// can't tell (issue #32).
+#[track_caller]
+fn assert_encrypts(client: &SmbClient, tree: &Tree, cipher: smb2::client::Cipher) {
+    let conn = client.connection_for(tree).expect("the tree's connection");
+    assert!(
+        conn.should_encrypt(),
+        "share {:?} must be encrypted",
+        tree.share_name
+    );
+    assert_eq!(conn.params().and_then(|p| p.cipher), Some(cipher));
+}
+
 #[tokio::test]
 #[ignore]
 async fn encryption_required_connect_and_operate() {
@@ -2750,6 +2768,7 @@ async fn encryption_required_connect_and_operate() {
         .connect_share("private")
         .await
         .expect("connect_share failed");
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes128Gcm);
 
     let test_path = "docker_test_encrypted.tmp";
     let test_data = b"encrypted write test data 1234567890";
@@ -2785,6 +2804,7 @@ async fn encryption_required_pipelined_large_file() {
         .connect_share("private")
         .await
         .expect("connect_share failed");
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes128Gcm);
 
     let test_path = "docker_test_encrypted_pipelined.tmp";
     let test_data: Vec<u8> = (0..524_288).map(|i| (i % 199) as u8).collect();
@@ -2816,6 +2836,11 @@ async fn encryption_required_list_shares() {
     let _ = env_logger::try_init();
 
     let mut client = encryption_client().await;
+    // `smb encrypt = desired` encrypts the whole session, IPC$ included.
+    assert!(
+        client.connection().should_encrypt(),
+        "session must be encrypted"
+    );
     let shares = client.list_shares().await.expect("list_shares failed");
     assert!(
         shares.iter().any(|s| s.name == "private"),
@@ -2855,10 +2880,7 @@ async fn encryption_global_required_connect_and_operate() {
         .connect_share("private")
         .await
         .expect("connect_share failed");
-    assert!(
-        client.connection_for(&tree).unwrap().should_encrypt(),
-        "session must be encrypted"
-    );
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes128Gcm);
 
     let test_path = "docker_test_required.tmp";
     let test_data = b"required encryption round trip";
@@ -2915,6 +2937,8 @@ async fn encryption_aes128_ccm_connect_and_operate() {
         .connect_share("private")
         .await
         .expect("connect_share failed");
+    // 3.0.x has one cipher, granted by the capability bit alone.
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes128Ccm);
 
     let test_path = "docker_test_aes128.tmp";
     let test_data = b"AES-128-CCM encrypted write test";
@@ -2938,6 +2962,103 @@ async fn encryption_aes128_ccm_connect_and_operate() {
         .disconnect_share(&tree)
         .await
         .expect("disconnect failed");
+}
+
+// ── AES-256 (smb-encryption-aes256 and -aes256-ccm, SMB 3.1.1) ──────
+
+const ENCRYPTION_AES256_ADDR: &str = "127.0.0.1:10466";
+const ENCRYPTION_AES256_CCM_ADDR: &str = "127.0.0.1:10467";
+
+async fn testuser_client(addr: &str) -> SmbClient {
+    SmbClient::connect(ClientConfig {
+        addr: addr.to_string(),
+        timeout: TIMEOUT,
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        ..Default::default()
+    })
+    .await
+    .unwrap_or_else(|e| panic!("connect to {addr} failed: {e}"))
+}
+
+/// Write, read back, and delete one file on `tree`.
+async fn round_trip(client: &mut SmbClient, tree: &mut Tree, path: &str) {
+    let test_data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    client
+        .write_file(tree, path, &test_data)
+        .await
+        .expect("write_file failed");
+    let data = client
+        .read_file(tree, path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(data, test_data);
+    client
+        .delete_file(tree, path)
+        .await
+        .expect("delete_file failed");
+}
+
+/// A server whose only cipher is AES-256, not requiring encryption: the
+/// session still negotiates AES-256-GCM, and has to sign with a 128-bit key.
+/// It used to derive a 32-byte one, which failed every login here with
+/// "AES-128-GMAC requires a 16-byte key" once the capability bit let Samba
+/// pick a cipher at all (issue #32).
+#[tokio::test]
+#[ignore]
+async fn encryption_aes256_only_server_signs_an_unencrypted_session() {
+    let _ = env_logger::try_init();
+
+    let mut client = testuser_client(ENCRYPTION_AES256_ADDR).await;
+    assert_eq!(
+        client.params().and_then(|p| p.cipher),
+        Some(smb2::client::Cipher::Aes256Gcm)
+    );
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share failed");
+    assert!(
+        !client.connection_for(&tree).unwrap().should_encrypt(),
+        "the plain share asked for no encryption"
+    );
+    round_trip(&mut client, &mut tree, "docker_test_aes256_plain.tmp").await;
+}
+
+/// The same server's share that requires encryption: everything after its
+/// TREE_CONNECT is AES-256-GCM, with keys from the full session key.
+#[tokio::test]
+#[ignore]
+async fn encryption_aes256_gcm_share_round_trips_encrypted() {
+    let _ = env_logger::try_init();
+
+    let mut client = testuser_client(ENCRYPTION_AES256_ADDR).await;
+    let mut tree = client
+        .connect_share("encrypted")
+        .await
+        .expect("connect_share failed");
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes256Gcm);
+    round_trip(&mut client, &mut tree, "docker_test_aes256_gcm.tmp").await;
+}
+
+/// AES-256-CCM, required for the whole session: 256-bit keys with CCM's
+/// 11-byte nonce, the one combination no other fixture negotiates.
+#[tokio::test]
+#[ignore]
+async fn encryption_aes256_ccm_session_round_trips_encrypted() {
+    let _ = env_logger::try_init();
+
+    let mut client = testuser_client(ENCRYPTION_AES256_CCM_ADDR).await;
+    assert!(
+        client.connection().should_encrypt(),
+        "session must be encrypted"
+    );
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share failed");
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes256Ccm);
+    round_trip(&mut client, &mut tree, "docker_test_aes256_ccm.tmp").await;
 }
 
 // ── Flaky server (smb-flaky, 5s up / 5s down) ───────────────────────
@@ -4353,6 +4474,7 @@ async fn encryption_streamed_write() {
         .connect_share("private")
         .await
         .expect("connect_share failed");
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes128Gcm);
 
     let test_path = "smb2_test_streamed_encryption.tmp";
     let total_size = 512 * 1024usize;
@@ -5658,6 +5780,7 @@ async fn encryption_file_writer() {
         .connect_share("private")
         .await
         .expect("connect_share failed");
+    assert_encrypts(&client, &tree, smb2::client::Cipher::Aes128Gcm);
 
     let test_path = "smb2_test_file_writer_encryption.bin";
     let test_data: Vec<u8> = (0..128 * 1024).map(|i| (i % 199) as u8).collect();
@@ -6438,20 +6561,13 @@ async fn a_reconnect_to_a_signing_required_server_re_derives_working_keys() {
     client.delete_file(&tree, path).await.ok();
 }
 
-/// The same round trip against the SMB 3.1.1 encryption-capable server.
+/// The same round trip against the SMB 3.1.1 encryption server: an encrypted
+/// session survives a revival, and comes back encrypted.
 ///
-/// ⚠️ **This does NOT prove an encrypted session survives a revival**, and it
-/// is documented here so nobody reads it as though it does. Both encryption
-/// fixtures run `smb encrypt = desired` rather than `required`, and Samba 4.20
-/// only sets `SMB2_SHAREFLAG_ENCRYPT_DATA` for `required` — so this client
-/// never activates encryption against them and the traffic is plaintext
-/// (verified 2026-08-02: `should_encrypt` and `tree.encrypt_data` are both
-/// false before any reconnect). What it does cover is the crypto posture being
-/// *preserved* across a revival on an SMB 3.1.1 session, and it will start
-/// covering the real thing the day a fixture demands encryption.
-///
-/// The encrypted-session revival itself rests on the unit tests, which assert
-/// the crypto state is wiped and re-derived.
+/// It ran in plaintext until the client advertised
+/// `SMB2_GLOBAL_CAP_ENCRYPTION` (issue #32): Samba agreed on no cipher, so
+/// `smb encrypt = desired` encrypted nothing. The assert on `posture_before`
+/// keeps it from passing that way again.
 #[tokio::test]
 #[ignore]
 async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
@@ -6478,6 +6594,10 @@ async fn a_reconnect_preserves_the_crypto_posture_on_an_smb311_session() {
         .await
         .expect("connect_share");
     let posture_before = client.diagnostics().primary.encryption.active;
+    assert!(
+        posture_before,
+        "the session must be encrypted before the blip"
+    );
     let path = "reconnect_encrypted.tmp";
     let payload = b"the same posture on both sides of the blip";
     client

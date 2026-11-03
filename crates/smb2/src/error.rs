@@ -243,6 +243,31 @@ pub enum Error {
         anonymous: bool,
     },
 
+    /// The server requires encryption, for the whole session or for one
+    /// share, but agreed on no cipher when the connection was negotiated, so
+    /// nothing can be encrypted.
+    ///
+    /// On SMB 3.1.1 the server picks a cipher from the ones this client
+    /// offers; picking none (or a dialect below 3.0, where SMB has no
+    /// encryption) and then demanding encryption is a server
+    /// misconfiguration, typically a cipher list with nothing in common with
+    /// this client's (`server smb3 encryption algorithms` on Samba). The
+    /// client refuses rather than guessing a cipher the server never agreed
+    /// to, or carrying on in the clear. `share` is `None` when the session
+    /// itself demanded it (no session was set up), and names the share
+    /// otherwise.
+    ///
+    /// Classifies as [`ErrorKind::Unsupported`] and is not retryable.
+    #[error(
+        "the server requires encryption{} but agreed on no cipher, so nothing can be encrypted. \
+         Check the server's encryption settings",
+        share.as_ref().map(|s| format!(" for share {s:?}")).unwrap_or_default()
+    )]
+    EncryptionUnavailable {
+        /// The share that asked for encryption, or `None` for the session.
+        share: Option<String>,
+    },
+
     /// An I/O or transport error occurred.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -841,8 +866,8 @@ pub enum ErrorKind {
     /// copy. Consumers branch on this to fall back to a client-side path (for
     /// server-side copy, a plain read-then-write). Maps from
     /// `STATUS_NOT_SUPPORTED`, `STATUS_INVALID_DEVICE_REQUEST`, and
-    /// `STATUS_NOT_IMPLEMENTED`, and from [`Error::NamedStreamsUnsupported`] and
-    /// [`Error::StreamDeleteIgnored`].
+    /// `STATUS_NOT_IMPLEMENTED`, and from [`Error::NamedStreamsUnsupported`],
+    /// [`Error::StreamDeleteIgnored`], and [`Error::EncryptionUnavailable`].
     Unsupported,
     /// An interrupted upload can't resume from its checkpoint: write the
     /// file again from the start. Only [`Error::ResumeRefused`] has it, and
@@ -884,6 +909,7 @@ impl Error {
             Error::Auth { .. } => ErrorKind::AuthRequired,
             Error::SignatureInvalid { .. } => ErrorKind::SignatureInvalid,
             Error::GuestSessionRefused { .. } => ErrorKind::GuestSessionRefused,
+            Error::EncryptionUnavailable { .. } => ErrorKind::Unsupported,
             Error::Io(_) => ErrorKind::Io,
             Error::Disconnected => ErrorKind::ConnectionLost,
             Error::Timeout => ErrorKind::TimedOut,

@@ -68,6 +68,18 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10455:445"
 
+  smb-encryption-aes256:
+    build:
+      context: smb-encryption-aes256
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10466:445"
+
+  smb-encryption-aes256-ccm:
+    build:
+      context: smb-encryption-aes256-ccm
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10467:445"
+
   smb-50shares:
     build:
       context: smb-50shares

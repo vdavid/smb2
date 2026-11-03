@@ -3,11 +3,12 @@
 //! The [`Session`] type manages the multi-round-trip SESSION_SETUP exchange
 //! (NTLM authentication), key derivation, and signing activation.
 
-use log::{debug, info, trace, warn};
+use log::{debug, info, trace};
 
 use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
-use crate::client::connection::Connection;
-use crate::crypto::kdf::derive_session_keys;
+use crate::client::connection::{Connection, NegotiatedParams};
+use crate::crypto::encryption::Cipher;
+use crate::crypto::kdf::{self, derive_session_keys};
 use crate::crypto::signing::{self, algorithm_for_dialect, SigningAlgorithm};
 use crate::error::{Result, SignatureFailure};
 use crate::msg::header::Header;
@@ -251,45 +252,12 @@ impl Session {
             signing_algorithm, params.dialect
         );
 
-        // Derive keys for SMB 3.x, or use session key directly for SMB 2.x.
         trace!(
             "session: deriving keys, session_key_len={}",
             session_key.len()
         );
-        let (signing_key, encryption_key, decryption_key) = match params.dialect {
-            Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
-                let keys = derive_session_keys(&session_key, params.dialect, None, 128);
-                (
-                    keys.signing_key,
-                    Some(keys.encryption_key),
-                    Some(keys.decryption_key),
-                )
-            }
-            Dialect::Smb3_1_1 => {
-                // Key length: 256 bits only for AES-256 ciphers. GMAC signing
-                // uses AES-128-GCM internally, so it needs 128-bit (16-byte) keys.
-                let key_len_bits = match params.cipher {
-                    Some(crate::crypto::encryption::Cipher::Aes256Ccm)
-                    | Some(crate::crypto::encryption::Cipher::Aes256Gcm) => 256,
-                    _ => 128,
-                };
-                let keys = derive_session_keys(
-                    &session_key,
-                    Dialect::Smb3_1_1,
-                    Some(session_hasher.value()),
-                    key_len_bits,
-                );
-                (
-                    keys.signing_key,
-                    Some(keys.encryption_key),
-                    Some(keys.decryption_key),
-                )
-            }
-            _ => {
-                // SMB 2.x: use session key directly for signing.
-                (session_key.clone(), None, None)
-            }
-        };
+        let (signing_key, encryption_key, decryption_key) =
+            session_keys(&session_key, &params, session_hasher.value());
 
         // Nothing below may read `session_flags` before this: they decide
         // whether signing and encryption turn on at all.
@@ -308,32 +276,18 @@ impl Session {
         let should_sign = params.signing_required
             || !setup_resp2.session_flags.is_guest() && !setup_resp2.session_flags.is_null();
 
-        let should_encrypt = setup_resp2.session_flags.encrypt_data();
+        let encrypt_with = session_cipher(&params, setup_resp2.session_flags)?;
+        let should_encrypt = encrypt_with.is_some();
 
         // Activate signing on the connection.
         if should_sign {
             conn.activate_signing(signing_key.clone(), signing_algorithm);
         }
-
-        // Activate encryption on the connection if the session requires it.
-        // The cipher comes from negotiate contexts (SMB 3.1.1). If the server
-        // didn't send one (for example, Samba with `smb encrypt = required` sometimes
-        // omits the encryption context), fall back to AES-128-CCM which is
-        // universally supported by all SMB 3.x servers.
-        if should_encrypt {
-            let cipher = params
-                .cipher
-                .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
-            if let (Some(ref enc_key), Some(ref dec_key)) = (&encryption_key, &decryption_key) {
-                conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
-            } else {
-                warn!(
-                    "session: encryption requested but missing keys, \
-                     enc_key={}, dec_key={}",
-                    encryption_key.is_some(),
-                    decryption_key.is_some(),
-                );
-            }
+        // `session_keys` derives both keys whenever the connection has a cipher.
+        if let (Some(cipher), Some(enc_key), Some(dec_key)) =
+            (encrypt_with, &encryption_key, &decryption_key)
+        {
+            conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
         }
 
         info!(
@@ -505,25 +459,18 @@ impl Session {
             }
         }
 
-        // Get the session key AFTER processing the AP-REP (the server's
-        // subkey may have overridden ours).
-        //
-        // Per MS-SMB2 3.2.5.3: "Session.SessionKey MUST be set to the first
-        // 16 bytes of the cryptographic key queried from the GSS protocol."
-        let full_key = auth.session_key().ok_or_else(|| Error::Auth {
-            message: "Kerberos authentication produced no session key".to_string(),
-        })?;
-        let session_key = if full_key.len() > 16 {
-            full_key[..16].to_vec()
-        } else {
-            full_key.to_vec()
-        };
+        // Get the key AFTER processing the AP-REP (the server's subkey may
+        // have overridden ours). It goes to `session_keys` whole: AES-256
+        // encryption derives from all of it (`Session.FullSessionKey`),
+        // everything else from its first 16 bytes (`Session.SessionKey`).
+        let full_key = auth
+            .session_key()
+            .ok_or_else(|| Error::Auth {
+                message: "Kerberos authentication produced no session key".to_string(),
+            })?
+            .to_vec();
 
-        debug!(
-            "session: Kerberos session_key_len={} (truncated from {})",
-            session_key.len(),
-            full_key.len()
-        );
+        debug!("session: Kerberos key_len={}", full_key.len());
 
         // Determine signing algorithm.
         let signing_algorithm = algorithm_for_dialect(params.dialect, params.gmac_negotiated);
@@ -532,36 +479,8 @@ impl Session {
             signing_algorithm, params.dialect
         );
 
-        // Derive keys for SMB 3.x using the Kerberos session key.
-        let (signing_key, encryption_key, decryption_key) = match params.dialect {
-            Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
-                let keys = derive_session_keys(&session_key, params.dialect, None, 128);
-                (
-                    keys.signing_key,
-                    Some(keys.encryption_key),
-                    Some(keys.decryption_key),
-                )
-            }
-            Dialect::Smb3_1_1 => {
-                let key_len_bits = match params.cipher {
-                    Some(crate::crypto::encryption::Cipher::Aes256Ccm)
-                    | Some(crate::crypto::encryption::Cipher::Aes256Gcm) => 256,
-                    _ => 128,
-                };
-                let keys = derive_session_keys(
-                    &session_key,
-                    Dialect::Smb3_1_1,
-                    Some(session_hasher.value()),
-                    key_len_bits,
-                );
-                (
-                    keys.signing_key,
-                    Some(keys.encryption_key),
-                    Some(keys.decryption_key),
-                )
-            }
-            _ => (session_key.clone(), None, None),
-        };
+        let (signing_key, encryption_key, decryption_key) =
+            session_keys(&full_key, &params, session_hasher.value());
 
         // A Kerberos login always names an account, so the final response
         // has to prove itself before its flags are believed.
@@ -578,19 +497,16 @@ impl Session {
         let should_sign = params.signing_required
             || !setup_resp.session_flags.is_guest() && !setup_resp.session_flags.is_null();
 
-        let should_encrypt = setup_resp.session_flags.encrypt_data();
+        let encrypt_with = session_cipher(&params, setup_resp.session_flags)?;
+        let should_encrypt = encrypt_with.is_some();
 
         if should_sign {
             conn.activate_signing(signing_key.clone(), signing_algorithm);
         }
-
-        if should_encrypt {
-            let cipher = params
-                .cipher
-                .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
-            if let (Some(ref enc_key), Some(ref dec_key)) = (&encryption_key, &decryption_key) {
-                conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
-            }
+        if let (Some(cipher), Some(enc_key), Some(dec_key)) =
+            (encrypt_with, &encryption_key, &decryption_key)
+        {
+            conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
         }
 
         info!(
@@ -612,6 +528,65 @@ impl Session {
         // instance) can pick up the new keys instead of using a dead session's.
         conn.adopt_session(&session);
         Ok(session)
+    }
+}
+
+/// The signing key and the encryption and decryption keys a session uses
+/// (MS-SMB2 § 3.2.5.3.1), from the whole key the authentication protocol
+/// produced (`gss_key`: NTLM's 16 bytes, or the full Kerberos subkey).
+///
+/// SMB 2.x signs with `Session.SessionKey` itself and has no encryption. On
+/// 3.x the encryption keys exist only when the connection negotiated a
+/// cipher (`Connection.SupportsEncryption`), so a session can't end up
+/// holding keys for a cipher nobody agreed on.
+fn session_keys(
+    gss_key: &[u8],
+    params: &NegotiatedParams,
+    preauth_hash: &[u8; 64],
+) -> (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    match params.dialect {
+        Dialect::Smb3_0 | Dialect::Smb3_0_2 | Dialect::Smb3_1_1 => {
+            let hash = (params.dialect == Dialect::Smb3_1_1).then_some(preauth_hash);
+            let keys = derive_session_keys(gss_key, params.dialect, hash, params.cipher);
+            match params.cipher {
+                Some(_) => (
+                    keys.signing_key,
+                    Some(keys.encryption_key),
+                    Some(keys.decryption_key),
+                ),
+                None => (keys.signing_key, None, None),
+            }
+        }
+        _ => (kdf::session_key(gss_key).to_vec(), None, None),
+    }
+}
+
+/// The cipher this session encrypts with, or `None` when it doesn't encrypt.
+///
+/// `ENCRYPT_DATA` means something only on SMB 3.x (MS-SMB2 § 3.2.5.3.1). A
+/// session that demands encryption on a connection with no cipher fails with
+/// [`Error::EncryptionUnavailable`]: ❌ never pick one ourselves. The server
+/// agreed to none, so it would decrypt nothing, and that "fallback" is what
+/// hid the missing `SMB2_GLOBAL_CAP_ENCRYPTION` bit for months (#32).
+///
+/// Reads the session flags, so only after [`authenticate_final_response`].
+fn session_cipher(params: &NegotiatedParams, flags: SessionFlags) -> Result<Option<Cipher>> {
+    let smb3 = matches!(
+        params.dialect,
+        Dialect::Smb3_0 | Dialect::Smb3_0_2 | Dialect::Smb3_1_1
+    );
+    if !(smb3 && flags.encrypt_data()) {
+        return Ok(None);
+    }
+    match params.cipher {
+        Some(cipher) => Ok(Some(cipher)),
+        None => {
+            debug!(
+                "session: the server requires encryption but negotiated no cipher, refusing, dialect={}",
+                params.dialect
+            );
+            Err(Error::EncryptionUnavailable { share: None })
+        }
     }
 }
 
@@ -1068,7 +1043,8 @@ mod tests {
     const PASS: &str = "pass";
 
     /// Run `Session::setup` against a mock that answers the final round with
-    /// `flags`, signed (or not) with the key a real server would derive.
+    /// `flags`, signed (or not) with the key a real server would derive. The
+    /// connection negotiated encryption ([`granted_cipher`]).
     async fn setup_against_server(
         dialect: Dialect,
         gmac: bool,
@@ -1077,6 +1053,23 @@ mod tests {
         flags: SessionFlags,
         finish: Final,
     ) -> Result<Session> {
+        let cipher = granted_cipher(dialect);
+        setup_with_cipher(dialect, gmac, cipher, username, password, flags, finish)
+            .await
+            .0
+    }
+
+    /// [`setup_against_server`] on a connection that negotiated `cipher`,
+    /// handing back the connection too.
+    async fn setup_with_cipher(
+        dialect: Dialect,
+        gmac: bool,
+        cipher: Option<Cipher>,
+        username: &str,
+        password: &str,
+        flags: SessionFlags,
+        finish: Final,
+    ) -> (Result<Session>, Connection) {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
         let session_id = SessionId(0x4242);
@@ -1095,10 +1088,16 @@ mod tests {
             "test-server",
         );
         set_test_params_with(&mut conn, dialect, gmac);
+        let mut params = conn.params().unwrap();
+        params.cipher = cipher;
+        conn.set_test_params(params);
         let mut hasher = conn.preauth_hasher();
 
         let (user, pass) = (username.to_string(), password.to_string());
-        let task = tokio::spawn(async move { Session::setup(&mut conn, &user, &pass, "").await });
+        let task = tokio::spawn(async move {
+            let result = Session::setup(&mut conn, &user, &pass, "").await;
+            (result, conn)
+        });
 
         // Wait for the AUTHENTICATE request: the key the final response is
         // signed with depends on what the client put in it.
@@ -1131,10 +1130,10 @@ mod tests {
         );
         let signing_key = match dialect {
             Dialect::Smb3_0 | Dialect::Smb3_0_2 => {
-                derive_session_keys(&session_key, dialect, None, 128).signing_key
+                derive_session_keys(&session_key, dialect, None, cipher).signing_key
             }
             Dialect::Smb3_1_1 => {
-                derive_session_keys(&session_key, dialect, Some(hasher.value()), 128).signing_key
+                derive_session_keys(&session_key, dialect, Some(hasher.value()), cipher).signing_key
             }
             _ => session_key,
         };
@@ -1167,6 +1166,15 @@ mod tests {
         mock.queue_response(response);
 
         task.await.unwrap()
+    }
+
+    /// The cipher a server that grants encryption leaves each dialect with.
+    fn granted_cipher(dialect: Dialect) -> Option<Cipher> {
+        match dialect {
+            Dialect::Smb3_0 | Dialect::Smb3_0_2 => Some(Cipher::Aes128Ccm),
+            Dialect::Smb3_1_1 => Some(Cipher::Aes128Gcm),
+            _ => None,
+        }
     }
 
     /// Offset of `SessionFlags` in a SESSION_SETUP response: the 64-byte
@@ -1238,6 +1246,100 @@ mod tests {
         .await
         .unwrap();
         assert!(session.should_encrypt);
+    }
+
+    /// An AES-256 connection signs with a 128-bit key and encrypts with a
+    /// 256-bit one. A 32-byte signing key failed every such session with
+    /// "AES-128-GMAC requires a 16-byte key", required encryption or not
+    /// (reported in #32).
+    #[tokio::test]
+    async fn an_aes_256_session_signs_with_a_128_bit_key() {
+        for (flags, encrypts) in [
+            (SessionFlags(SessionFlags::ENCRYPT_DATA), true),
+            (SessionFlags(0), false),
+        ] {
+            for cipher in [Cipher::Aes256Gcm, Cipher::Aes256Ccm] {
+                let (session, conn) = setup_with_cipher(
+                    Dialect::Smb3_1_1,
+                    true,
+                    Some(cipher),
+                    USER,
+                    PASS,
+                    flags,
+                    Final::Signed,
+                )
+                .await;
+                let session = session.unwrap_or_else(|e| panic!("{cipher:?}: {e}"));
+                assert_eq!(session.signing_key.len(), 16, "{cipher:?}");
+                assert_eq!(session.encryption_key.as_ref().map(Vec::len), Some(32));
+                assert_eq!(session.decryption_key.as_ref().map(Vec::len), Some(32));
+                assert_eq!(session.should_encrypt, encrypts, "{cipher:?}");
+                assert_eq!(conn.should_encrypt(), encrypts, "{cipher:?}");
+            }
+        }
+    }
+
+    /// A server that demands encryption but negotiated no cipher would
+    /// decrypt nothing, so the session fails rather than guessing one. The
+    /// old AES-128-CCM guess is what hid #32's missing capability bit.
+    #[tokio::test]
+    async fn a_session_demanding_encryption_without_a_cipher_is_refused() {
+        for dialect in [Dialect::Smb3_0, Dialect::Smb3_0_2, Dialect::Smb3_1_1] {
+            let (result, conn) = setup_with_cipher(
+                dialect,
+                false,
+                None,
+                USER,
+                PASS,
+                SessionFlags(SessionFlags::ENCRYPT_DATA),
+                Final::Signed,
+            )
+            .await;
+            match result {
+                Err(Error::EncryptionUnavailable { share: None }) => {}
+                other => panic!("{dialect:?}: expected EncryptionUnavailable, got {other:?}"),
+            }
+            assert!(!conn.should_encrypt(), "{dialect:?}");
+        }
+    }
+
+    /// Without a cipher there's nothing to encrypt with, so the session holds
+    /// no encryption keys at all, and a session that doesn't demand
+    /// encryption works as before.
+    #[tokio::test]
+    async fn a_connection_without_a_cipher_derives_no_encryption_keys() {
+        let (session, _conn) = setup_with_cipher(
+            Dialect::Smb3_1_1,
+            true,
+            None,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Signed,
+        )
+        .await;
+        let session = session.unwrap();
+        assert!(session.encryption_key.is_none());
+        assert!(session.decryption_key.is_none());
+        assert!(!session.should_encrypt);
+    }
+
+    /// `ENCRYPT_DATA` means something only on SMB 3.x; a 2.x session has no
+    /// encryption, so the flag changes nothing there.
+    #[tokio::test]
+    async fn encrypt_data_on_smb_2_is_ignored() {
+        let session = setup_against_server(
+            Dialect::Smb2_1,
+            false,
+            USER,
+            PASS,
+            SessionFlags(SessionFlags::ENCRYPT_DATA),
+            Final::Signed,
+        )
+        .await
+        .unwrap();
+        assert!(!session.should_encrypt);
+        assert!(session.should_sign);
     }
 
     #[tokio::test]

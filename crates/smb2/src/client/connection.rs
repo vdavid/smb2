@@ -1594,10 +1594,83 @@ pub struct NegotiatedParams {
     pub capabilities: Capabilities,
     /// Whether AES-GMAC signing was negotiated (SMB 3.1.1).
     pub gmac_negotiated: bool,
-    /// The cipher negotiated for encryption (SMB 3.x).
+    /// The cipher this connection encrypts with (MS-SMB2 `Connection.CipherId`),
+    /// or `None` when the server didn't agree to encrypt.
+    ///
+    /// On 3.1.1 it's the cipher the server picked from our
+    /// `SMB2_ENCRYPTION_CAPABILITIES`; on 3.0 and 3.0.2 it's AES-128-CCM when
+    /// the server granted `SMB2_GLOBAL_CAP_ENCRYPTION`. Always `None` below 3.0.
     pub cipher: Option<Cipher>,
     /// Whether compression was negotiated with the server.
     pub compression_supported: bool,
+}
+
+/// The ciphers NEGOTIATE offers on 3.1.1, in our order of preference: GCM
+/// before CCM (faster, and what Windows prefers), 128 before 256 (the order
+/// Windows offers them in). The server picks.
+const OFFERED_CIPHERS: [(u16, Cipher); 4] = [
+    (CIPHER_AES_128_GCM, Cipher::Aes128Gcm),
+    (CIPHER_AES_128_CCM, Cipher::Aes128Ccm),
+    (CIPHER_AES_256_GCM, Cipher::Aes256Gcm),
+    (CIPHER_AES_256_CCM, Cipher::Aes256Ccm),
+];
+
+/// The cipher a NEGOTIATE response leaves the connection with
+/// (`Connection.CipherId`, MS-SMB2 § 3.2.5.2), or `None` when it can't encrypt.
+///
+/// - **3.0 / 3.0.2**: AES-128-CCM, the only cipher those dialects have, if
+///   the server granted `SMB2_GLOBAL_CAP_ENCRYPTION`; otherwise none.
+/// - **3.1.1**: whatever the one `SMB2_ENCRYPTION_CAPABILITIES` context
+///   names. Absent, or cipher 0, means the server didn't agree to encrypt.
+///   ❌ Never fall back to a cipher of our choosing here: a server that picked
+///   none won't decrypt anything, and a session that needs encryption must
+///   fail instead ([`Error::EncryptionUnavailable`]).
+///
+/// A context the spec says to reject (two of them, a count other than one,
+/// a cipher we didn't offer) is an error rather than a quiet "no cipher".
+fn negotiated_cipher(
+    dialect: Dialect,
+    capabilities: Capabilities,
+    contexts: &[NegotiateContext],
+) -> Result<Option<Cipher>> {
+    match dialect {
+        Dialect::Smb3_0 | Dialect::Smb3_0_2 => Ok(capabilities
+            .contains(Capabilities::ENCRYPTION)
+            .then_some(Cipher::Aes128Ccm)),
+        Dialect::Smb3_1_1 => {
+            let mut found = contexts.iter().filter_map(|ctx| match ctx {
+                NegotiateContext::Encryption { ciphers } => Some(ciphers),
+                _ => None,
+            });
+            let Some(ciphers) = found.next() else {
+                return Ok(None);
+            };
+            if found.next().is_some() {
+                return Err(Error::invalid_data(
+                    "NEGOTIATE response carries more than one encryption context",
+                ));
+            }
+            let &[id] = ciphers.as_slice() else {
+                return Err(Error::invalid_data(format!(
+                    "NEGOTIATE response's encryption context names {} ciphers, not one",
+                    ciphers.len()
+                )));
+            };
+            if id == 0 {
+                return Ok(None);
+            }
+            OFFERED_CIPHERS
+                .iter()
+                .find(|&&(offered, _)| offered == id)
+                .map(|&(_, cipher)| Some(cipher))
+                .ok_or_else(|| {
+                    Error::invalid_data(format!(
+                        "server selected cipher 0x{id:04X} which we did not offer"
+                    ))
+                })
+        }
+        _ => Ok(None),
+    }
 }
 
 /// A received SMB2 sub-response, post-decrypt / post-decompress / post-header-parse.
@@ -2989,12 +3062,7 @@ impl Connection {
                 salt: generate_salt(),
             },
             NegotiateContext::Encryption {
-                ciphers: vec![
-                    CIPHER_AES_128_GCM,
-                    CIPHER_AES_128_CCM,
-                    CIPHER_AES_256_GCM,
-                    CIPHER_AES_256_CCM,
-                ],
+                ciphers: OFFERED_CIPHERS.iter().map(|&(id, _)| id).collect(),
             },
             NegotiateContext::Signing {
                 algorithms: vec![SIGNING_AES_GMAC, SIGNING_AES_CMAC, SIGNING_HMAC_SHA256],
@@ -3095,8 +3163,12 @@ impl Connection {
             )));
         }
 
+        let cipher = negotiated_cipher(
+            resp.dialect_revision,
+            resp.capabilities,
+            &resp.negotiate_contexts,
+        )?;
         let mut gmac_negotiated = false;
-        let mut cipher = None;
         let mut compression_supported = false;
 
         for ctx in &resp.negotiate_contexts {
@@ -3105,17 +3177,6 @@ impl Connection {
                     if algorithms.contains(&SIGNING_AES_GMAC) =>
                 {
                     gmac_negotiated = true;
-                }
-                NegotiateContext::Encryption { ciphers } => {
-                    if let Some(&c) = ciphers.first() {
-                        cipher = match c {
-                            CIPHER_AES_128_CCM => Some(Cipher::Aes128Ccm),
-                            CIPHER_AES_128_GCM => Some(Cipher::Aes128Gcm),
-                            CIPHER_AES_256_CCM => Some(Cipher::Aes256Ccm),
-                            CIPHER_AES_256_GCM => Some(Cipher::Aes256Gcm),
-                            _ => None,
-                        };
-                    }
                 }
                 NegotiateContext::Compression { algorithms, .. }
                     if algorithms.contains(&COMPRESSION_LZ4) =>
@@ -7729,6 +7790,82 @@ mod tests {
         assert_eq!(params.dialect, Dialect::Smb2_0_2);
         assert!(!params.gmac_negotiated);
         assert!(params.cipher.is_none());
+    }
+
+    // ── Which cipher a NEGOTIATE leaves the connection with ──
+
+    fn encryption(ciphers: &[u16]) -> NegotiateContext {
+        NegotiateContext::Encryption {
+            ciphers: ciphers.to_vec(),
+        }
+    }
+
+    /// 3.0 and 3.0.2 have one cipher, and the server's capability bit is the
+    /// only thing that says it encrypts at all (MS-SMB2 § 3.2.5.2).
+    #[test]
+    fn smb_3_0_encrypts_with_aes_128_ccm_only_when_the_server_grants_it() {
+        let granted = Capabilities::new(Capabilities::ENCRYPTION);
+        for dialect in [Dialect::Smb3_0, Dialect::Smb3_0_2] {
+            assert_eq!(
+                negotiated_cipher(dialect, granted, &[]).unwrap(),
+                Some(Cipher::Aes128Ccm)
+            );
+            assert_eq!(
+                negotiated_cipher(dialect, Capabilities::default(), &[]).unwrap(),
+                None
+            );
+        }
+        for dialect in [Dialect::Smb2_0_2, Dialect::Smb2_1] {
+            assert_eq!(negotiated_cipher(dialect, granted, &[]).unwrap(), None);
+        }
+    }
+
+    /// On 3.1.1 the context is the answer; the capability bit isn't consulted.
+    #[test]
+    fn smb_3_1_1_takes_the_cipher_the_server_picked() {
+        let none = Capabilities::default();
+        for (id, cipher) in OFFERED_CIPHERS {
+            assert_eq!(
+                negotiated_cipher(Dialect::Smb3_1_1, none, &[encryption(&[id])]).unwrap(),
+                Some(cipher)
+            );
+        }
+    }
+
+    /// No context, or cipher 0, is the server declining to encrypt. ❌ Never
+    /// a cipher we pick ourselves: that's what hid #32 for months.
+    #[test]
+    fn smb_3_1_1_with_no_cipher_picked_does_not_encrypt() {
+        let granted = Capabilities::new(Capabilities::ENCRYPTION);
+        assert_eq!(
+            negotiated_cipher(Dialect::Smb3_1_1, granted, &[]).unwrap(),
+            None
+        );
+        assert_eq!(
+            negotiated_cipher(Dialect::Smb3_1_1, granted, &[encryption(&[0])]).unwrap(),
+            None
+        );
+    }
+
+    /// The three shapes MS-SMB2 § 3.2.5.2 tells a client to reject.
+    #[test]
+    fn a_malformed_encryption_context_fails_the_negotiate() {
+        let caps = Capabilities::default();
+        let cases: [&[NegotiateContext]; 4] = [
+            &[
+                encryption(&[CIPHER_AES_128_GCM]),
+                encryption(&[CIPHER_AES_128_GCM]),
+            ],
+            &[encryption(&[])],
+            &[encryption(&[CIPHER_AES_128_GCM, CIPHER_AES_256_GCM])],
+            &[encryption(&[0x0009])],
+        ];
+        for contexts in cases {
+            assert!(
+                negotiated_cipher(Dialect::Smb3_1_1, caps, contexts).is_err(),
+                "{contexts:?}"
+            );
+        }
     }
 
     #[tokio::test]

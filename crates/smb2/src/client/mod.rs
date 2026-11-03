@@ -89,7 +89,7 @@ use crate::error::Result;
 use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
 use crate::types::status::NtStatus;
-use crate::types::{FileId, SessionId};
+use crate::types::{Dialect, FileId, SessionId};
 use crate::Error;
 use connections::{ConnectionEntry, Connections};
 
@@ -425,20 +425,52 @@ fn dfs_target_not_allowed(path: &str, sign_in: DfsSignIn) -> Error {
 /// ❌ **Every tree connect goes through here.** A share that asked to be
 /// encrypted and is not is a data-confidentiality bug, not a convenience gap,
 /// and a DFS target share is exactly as entitled to it as the one the caller
-/// named. Falls back to AES-128-CCM when the server sent no encryption
-/// negotiate context, the same fallback session-level encryption makes.
-fn activate_share_encryption(conn: &mut Connection, session: &Session, tree: &Tree) {
-    if !tree.encrypt_data || conn.should_encrypt() {
-        return;
-    }
-    let (Some(enc_key), Some(dec_key)) = (&session.encryption_key, &session.decryption_key) else {
-        return;
+/// named.
+///
+/// A share asking for it on a connection that negotiated no cipher fails with
+/// [`Error::EncryptionUnavailable`] and the tree is disconnected again. ❌
+/// Never pick a cipher here: the server agreed to none, so it would decrypt
+/// nothing, and carrying on in the clear is what the share asked not to
+/// happen. MS-SMB2 § 3.2.5.5 would have the client ignore the flag there; we
+/// refuse instead, since a share that wants encryption and a client that
+/// quietly doesn't is the outcome #32 was about. The flag means nothing below
+/// SMB 3.0 (§ 2.2.10), so it's ignored there.
+async fn activate_share_encryption(
+    conn: &mut Connection,
+    session: &Session,
+    tree: &Tree,
+) -> Result<()> {
+    let Some(params) = conn.params() else {
+        return Ok(());
     };
-    let cipher = conn
-        .params()
-        .and_then(|p| p.cipher)
-        .unwrap_or(crate::crypto::encryption::Cipher::Aes128Ccm);
-    conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
+    let smb3 = matches!(
+        params.dialect,
+        Dialect::Smb3_0 | Dialect::Smb3_0_2 | Dialect::Smb3_1_1
+    );
+    if !tree.encrypt_data || !smb3 || conn.should_encrypt() {
+        return Ok(());
+    }
+    if let (Some(cipher), Some(enc_key), Some(dec_key)) = (
+        params.cipher,
+        &session.encryption_key,
+        &session.decryption_key,
+    ) {
+        conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
+        return Ok(());
+    }
+    debug!(
+        "tree: share requires encryption but the connection has no cipher, refusing share={:?}",
+        tree.share_name
+    );
+    if let Err(e) = tree.disconnect(conn).await {
+        debug!(
+            "tree: disconnecting the refused share failed: {e} share={:?}",
+            tree.share_name
+        );
+    }
+    Err(Error::EncryptionUnavailable {
+        share: Some(tree.share_name.clone()),
+    })
 }
 
 /// How many referrals one connect may follow before we call it a loop.
@@ -743,7 +775,8 @@ impl SmbClient {
         let refusal = match Tree::connect(self.connections.primary_mut(), share_name).await {
             Ok(mut tree) => {
                 tree.server = self.connections.primary_server().to_string();
-                activate_share_encryption(self.connections.primary_mut(), &self.session, &tree);
+                activate_share_encryption(self.connections.primary_mut(), &self.session, &tree)
+                    .await?;
                 return Ok(tree);
             }
             Err(err) => err,
@@ -1665,7 +1698,7 @@ impl SmbClient {
             self.refresh_session();
             let mut tree = Tree::connect(self.connections.primary_mut(), share).await?;
             tree.server = target_addr.to_string();
-            activate_share_encryption(self.connections.primary_mut(), &self.session, &tree);
+            activate_share_encryption(self.connections.primary_mut(), &self.session, &tree).await?;
             return Ok(tree);
         }
 
@@ -1675,7 +1708,7 @@ impl SmbClient {
             .ok_or_else(|| Error::invalid_data("DFS: no connection for target"))?;
         let mut tree = Tree::connect(&mut entry.conn, share).await?;
         tree.server = target_addr.to_string();
-        activate_share_encryption(&mut entry.conn, &entry.session, &tree);
+        activate_share_encryption(&mut entry.conn, &entry.session, &tree).await?;
         Ok(tree)
     }
 
@@ -3200,6 +3233,13 @@ mod tests {
             maximal_access: 0x001F_01FF,
         };
         pack_message(&h, &body)
+    }
+
+    fn build_tree_disconnect_response() -> Vec<u8> {
+        let mut h = Header::new_request(Command::TreeDisconnect);
+        h.flags.set_response();
+        h.credits = 32;
+        pack_message(&h, &crate::msg::tree_disconnect::TreeDisconnectResponse)
     }
 
     /// A session with SMB 3.x encryption keys, which is what session setup
@@ -4730,6 +4770,10 @@ mod tests {
 
         let target_mock = Arc::new(MockTransport::new());
         pool_extra_connection(&mut client, "dfs-target:445", &target_mock);
+        negotiate_encryption(
+            &mut client.connections.extra_mut("dfs-target:445").unwrap().conn,
+            Some(Cipher::Aes128Gcm),
+        );
 
         target_mock.queue_response(build_encrypting_tree_connect_response(TreeId(5)));
         let tree = client
@@ -4770,19 +4814,16 @@ mod tests {
             .should_encrypt());
     }
 
-    /// Without keys there is nothing to encrypt with, and silently pretending
-    /// otherwise would be worse than leaving it off.
-    #[tokio::test]
-    async fn an_encrypting_share_without_session_keys_is_left_alone() {
-        let mock = Arc::new(MockTransport::new());
-        let mut client = make_mock_client(&mock, SessionId(0x78)).await;
+    /// Give a mock connection the cipher a NEGOTIATE on 3.1.1 would.
+    fn negotiate_encryption(conn: &mut Connection, cipher: Option<Cipher>) {
+        let mut params = conn.params().expect("the mock negotiated");
+        params.dialect = Dialect::Smb3_1_1;
+        params.cipher = cipher;
+        conn.set_test_params(params);
+    }
 
-        let keyless = Session {
-            encryption_key: None,
-            decryption_key: None,
-            ..session_with_keys(SessionId(0x78))
-        };
-        let tree = Tree {
+    fn an_encrypting_tree() -> Tree {
+        Tree {
             pin: None,
             tree_id: TreeId(1),
             share_name: "secret".to_string(),
@@ -4790,9 +4831,68 @@ mod tests {
             is_dfs: false,
             encrypt_data: true,
             dfs_origin: None,
-        };
+        }
+    }
 
-        activate_share_encryption(client.connection_mut(), &keyless, &tree);
+    /// A share that asks for encryption on a connection that negotiated no
+    /// cipher (or holds no keys) is refused: the server agreed to no cipher,
+    /// so guessing one encrypts nothing it can read, and carrying on in the
+    /// clear is what the share asked not to happen. The refused tree is
+    /// disconnected again.
+    #[tokio::test]
+    async fn an_encrypting_share_without_a_cipher_is_refused() {
+        let keyless = Session {
+            encryption_key: None,
+            decryption_key: None,
+            ..session_with_keys(SessionId(0x78))
+        };
+        for (cipher, session) in [
+            (None, session_with_keys(SessionId(0x78))),
+            (Some(Cipher::Aes128Gcm), keyless),
+        ] {
+            let mock = Arc::new(MockTransport::new());
+            let mut client = make_mock_client(&mock, SessionId(0x78)).await;
+            negotiate_encryption(client.connection_mut(), cipher);
+            let sent_before = mock.sent_count();
+            mock.queue_response(build_tree_disconnect_response());
+
+            let err =
+                activate_share_encryption(client.connection_mut(), &session, &an_encrypting_tree())
+                    .await
+                    .unwrap_err();
+
+            assert!(
+                matches!(&err, Error::EncryptionUnavailable { share: Some(s) } if s == "secret"),
+                "{cipher:?}: {err:?}"
+            );
+            assert_eq!(err.kind(), crate::ErrorKind::Unsupported);
+            assert!(!client.connection_mut().should_encrypt());
+            let disconnect = mock
+                .sent_message(sent_before)
+                .expect("a TREE_DISCONNECT went out");
+            let header = Header::unpack(&mut crate::pack::ReadCursor::new(&disconnect)).unwrap();
+            assert_eq!(header.command, Command::TreeDisconnect, "{cipher:?}");
+        }
+    }
+
+    /// `SMB2_SHAREFLAG_ENCRYPT_DATA` means something only on SMB 3.x
+    /// (MS-SMB2 § 2.2.10), so a 2.x share carrying it connects as before.
+    #[tokio::test]
+    async fn an_encrypting_share_flag_on_smb_2_is_ignored() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x78)).await;
+        let mut params = client.connection_mut().params().unwrap();
+        params.dialect = Dialect::Smb2_1;
+        params.cipher = None;
+        client.connection_mut().set_test_params(params);
+
+        activate_share_encryption(
+            client.connection_mut(),
+            &session_with_keys(SessionId(0x78)),
+            &an_encrypting_tree(),
+        )
+        .await
+        .unwrap();
         assert!(!client.connection_mut().should_encrypt());
     }
 
