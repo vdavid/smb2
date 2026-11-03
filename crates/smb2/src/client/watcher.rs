@@ -912,7 +912,7 @@ mod loss_window_tests {
             server_guid: Guid::ZERO,
             signing_required: false,
             capabilities: Capabilities::default(),
-            gmac_negotiated: false,
+            signing_algorithm: crate::crypto::signing::SigningAlgorithm::HmacSha256,
             cipher: None,
             compression_supported: false,
         });

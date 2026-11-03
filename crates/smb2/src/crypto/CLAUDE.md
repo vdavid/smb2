@@ -15,9 +15,11 @@ Handles all cryptographic operations. Most users don't touch this directly -- `S
 
 | Algorithm | Dialect | Key size |
 |---|---|---|
-| HMAC-SHA256 (truncated to 16 bytes) | SMB 2.0.2, 2.1 | any |
-| AES-128-CMAC | SMB 3.0, 3.0.2, 3.1.1 (fallback) | 16 bytes |
-| AES-128-GMAC | SMB 3.1.1 (with `SMB2_SIGNING_CAPABILITIES`) | 16 bytes |
+| HMAC-SHA256 (truncated to 16 bytes) | SMB 2.0.2, 2.1; 3.1.1 if the server selects it | any |
+| AES-128-CMAC | SMB 3.0, 3.0.2; 3.1.1 if selected, or with no signing context | 16 bytes |
+| AES-128-GMAC | SMB 3.1.1 if selected | 16 bytes |
+
+On 3.1.1 the algorithm is whatever the server put in its `SMB2_SIGNING_CAPABILITIES` response, which NEGOTIATE resolves once into `NegotiatedParams::signing_algorithm` (`algorithm_for_dialect`); the session reads it from there. ❌ Don't infer it from what the client offered or from the dialect alone: a server restricted to HMAC-SHA256 picks it on 3.1.1, and verifying with CMAC failed the login as a signature mismatch (issue #33). A pick the client didn't offer, a count other than one, or a second context fails NEGOTIATE (MS-SMB2 § 3.2.5.2), because a guess only moves the failure to the first signed response.
 
 GMAC is AES-128-GCM with empty plaintext. The auth tag IS the signature. The 12-byte nonce encodes `MessageId` (bytes 0-7), a role bit (byte 8 bit 0: 0=client, 1=server), and a cancel flag (byte 8 bit 1).
 

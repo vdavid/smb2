@@ -293,8 +293,12 @@ pub struct NegotiatedSummary {
     /// With the `serde` feature on, this serializes as the underlying
     /// `u32` bits (not a JSON object of named flags).
     pub capabilities: Capabilities,
-    /// Whether AES-GMAC signing was negotiated (SMB 3.1.1).
+    /// Whether AES-GMAC signing was negotiated (SMB 3.1.1). The same as
+    /// `signing_algorithm == SigningAlgorithm::AesGmac`.
     pub gmac_negotiated: bool,
+    /// The algorithm the connection's sessions sign with, which on SMB 3.1.1
+    /// is the server's pick from `SMB2_SIGNING_CAPABILITIES`.
+    pub signing_algorithm: SigningAlgorithm,
     /// The negotiated encryption cipher (SMB 3.x).
     pub cipher: Option<Cipher>,
     /// Whether compression was negotiated with the server.

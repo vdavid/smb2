@@ -74,7 +74,7 @@ number held in a variable named like a path) is fixed by renaming the variable, 
 
 ## Docker integration tests (`tests/docker_integration.rs`)
 
-Tests against 23 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.
+Tests against 24 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.
 
 Containers live in `tests/docker/internal/`.
 
@@ -115,6 +115,7 @@ Two traps when several sessions share the machine:
 | smb-guest | 10445 | Guest auth, a named login mapped to guest is refused, CRUD, compound, pipelined, streamed write, streaming, progress, cancel, fs_info, reconnect, file watching |
 | smb-auth | 10446 | NTLM auth, wrong-password rejection |
 | smb-signing | 10447 | Mandatory signing: write/read, compound, pipelined 512 KB, streamed write |
+| smb-signing-hmac | 10468 | SMB 3.1.1 only, mandatory signing, `server smb3 signing algorithms = HMAC-SHA256`: the server picks HMAC-SHA256 from the signing context and the session signs with it (issue #33). Connect, write, read |
 | smb-readonly | 10448 | Read-only share: list/read/stat succeed, write/delete/mkdir/streamed-write fail cleanly |
 | smb-ancient | 10449 | SMB1-only server: negotiate fails cleanly (not hang) |
 | smb-flaky | 10450 | 5s up / 5s down: connect during up, get clean error when down |

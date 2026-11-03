@@ -9,7 +9,7 @@ use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
 use crate::client::connection::{Connection, NegotiatedParams};
 use crate::crypto::encryption::Cipher;
 use crate::crypto::kdf::{self, derive_session_keys};
-use crate::crypto::signing::{self, algorithm_for_dialect, SigningAlgorithm};
+use crate::crypto::signing::{self, SigningAlgorithm};
 use crate::error::{Result, SignatureFailure};
 use crate::msg::header::Header;
 use crate::msg::session_setup::{SessionFlags, SessionSetupRequest, SessionSetupResponse};
@@ -244,9 +244,7 @@ impl Session {
             })?
             .to_vec();
 
-        // Determine signing algorithm.
-        let gmac_negotiated = params.gmac_negotiated;
-        let signing_algorithm = algorithm_for_dialect(params.dialect, gmac_negotiated);
+        let signing_algorithm = params.signing_algorithm;
         debug!(
             "session: signing_algo={:?}, dialect={}",
             signing_algorithm, params.dialect
@@ -472,8 +470,7 @@ impl Session {
 
         debug!("session: Kerberos key_len={}", full_key.len());
 
-        // Determine signing algorithm.
-        let signing_algorithm = algorithm_for_dialect(params.dialect, params.gmac_negotiated);
+        let signing_algorithm = params.signing_algorithm;
         debug!(
             "session: Kerberos signing_algo={:?}, dialect={}",
             signing_algorithm, params.dialect
@@ -690,6 +687,7 @@ fn authenticate_final_response(
 mod tests {
     use super::*;
     use crate::client::connection::{pack_message, Connection, NegotiatedParams};
+    use crate::crypto::signing::algorithm_for_dialect;
     use crate::error::SignatureFailure;
     use crate::msg::header::Header;
     use crate::msg::session_setup::{SessionFlags, SessionSetupResponse};
@@ -1003,10 +1001,15 @@ mod tests {
     /// That includes a credit window: the NEGOTIATE response is what opens
     /// one, and SESSION_SETUP spends from it like any other request.
     fn set_test_params(conn: &mut Connection, dialect: Dialect) {
-        set_test_params_with(conn, dialect, false);
+        set_test_params_with(conn, dialect, None);
     }
 
-    fn set_test_params_with(conn: &mut Connection, dialect: Dialect, gmac_negotiated: bool) {
+    /// `selected` is the server's pick from the signing-capabilities context.
+    fn set_test_params_with(
+        conn: &mut Connection,
+        dialect: Dialect,
+        selected: Option<SigningAlgorithm>,
+    ) {
         conn.set_credits(512);
         conn.set_test_params(NegotiatedParams {
             dialect,
@@ -1016,7 +1019,7 @@ mod tests {
             server_guid: Guid::ZERO,
             signing_required: false,
             capabilities: Capabilities::default(),
-            gmac_negotiated,
+            signing_algorithm: algorithm_for_dialect(dialect, selected),
             cipher: None,
             compression_supported: false,
         });
@@ -1047,14 +1050,14 @@ mod tests {
     /// connection negotiated encryption ([`granted_cipher`]).
     async fn setup_against_server(
         dialect: Dialect,
-        gmac: bool,
+        selected: Option<SigningAlgorithm>,
         username: &str,
         password: &str,
         flags: SessionFlags,
         finish: Final,
     ) -> Result<Session> {
         let cipher = granted_cipher(dialect);
-        setup_with_cipher(dialect, gmac, cipher, username, password, flags, finish)
+        setup_with_cipher(dialect, selected, cipher, username, password, flags, finish)
             .await
             .0
     }
@@ -1063,7 +1066,7 @@ mod tests {
     /// handing back the connection too.
     async fn setup_with_cipher(
         dialect: Dialect,
-        gmac: bool,
+        selected: Option<SigningAlgorithm>,
         cipher: Option<Cipher>,
         username: &str,
         password: &str,
@@ -1087,7 +1090,7 @@ mod tests {
             Box::new(mock.clone()),
             "test-server",
         );
-        set_test_params_with(&mut conn, dialect, gmac);
+        set_test_params_with(&mut conn, dialect, selected);
         let mut params = conn.params().unwrap();
         params.cipher = cipher;
         conn.set_test_params(params);
@@ -1137,7 +1140,7 @@ mod tests {
             }
             _ => session_key,
         };
-        let algorithm = algorithm_for_dialect(dialect, gmac);
+        let algorithm = algorithm_for_dialect(dialect, selected);
 
         let mut response =
             build_session_setup_response(NtStatus::SUCCESS, session_id, vec![], flags);
@@ -1221,7 +1224,7 @@ mod tests {
     async fn signed_final_response_is_accepted_on_3_1_1_gmac() {
         let session = setup_against_server(
             Dialect::Smb3_1_1,
-            true,
+            Some(SigningAlgorithm::AesGmac),
             USER,
             PASS,
             SessionFlags(0),
@@ -1233,11 +1236,30 @@ mod tests {
         assert_eq!(session.signing_algorithm, SigningAlgorithm::AesGmac);
     }
 
+    /// Issue #33: a 3.1.1 server restricted to HMAC-SHA256 picks it from the
+    /// signing-capabilities context, and its final response (signed with
+    /// HMAC-SHA256) has to verify, which it didn't while 3.1.1 meant CMAC.
+    #[tokio::test]
+    async fn signed_final_response_is_accepted_on_3_1_1_hmac_sha256() {
+        let session = setup_against_server(
+            Dialect::Smb3_1_1,
+            Some(SigningAlgorithm::HmacSha256),
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Signed,
+        )
+        .await
+        .unwrap();
+        assert!(session.should_sign);
+        assert_eq!(session.signing_algorithm, SigningAlgorithm::HmacSha256);
+    }
+
     #[tokio::test]
     async fn signed_final_response_is_accepted_on_3_0_2() {
         let session = setup_against_server(
             Dialect::Smb3_0_2,
-            false,
+            None,
             USER,
             PASS,
             SessionFlags(SessionFlags::ENCRYPT_DATA),
@@ -1261,7 +1283,7 @@ mod tests {
             for cipher in [Cipher::Aes256Gcm, Cipher::Aes256Ccm] {
                 let (session, conn) = setup_with_cipher(
                     Dialect::Smb3_1_1,
-                    true,
+                    Some(SigningAlgorithm::AesGmac),
                     Some(cipher),
                     USER,
                     PASS,
@@ -1287,7 +1309,7 @@ mod tests {
         for dialect in [Dialect::Smb3_0, Dialect::Smb3_0_2, Dialect::Smb3_1_1] {
             let (result, conn) = setup_with_cipher(
                 dialect,
-                false,
+                None,
                 None,
                 USER,
                 PASS,
@@ -1310,7 +1332,7 @@ mod tests {
     async fn a_connection_without_a_cipher_derives_no_encryption_keys() {
         let (session, _conn) = setup_with_cipher(
             Dialect::Smb3_1_1,
-            true,
+            Some(SigningAlgorithm::AesGmac),
             None,
             USER,
             PASS,
@@ -1330,7 +1352,7 @@ mod tests {
     async fn encrypt_data_on_smb_2_is_ignored() {
         let session = setup_against_server(
             Dialect::Smb2_1,
-            false,
+            None,
             USER,
             PASS,
             SessionFlags(SessionFlags::ENCRYPT_DATA),
@@ -1346,7 +1368,7 @@ mod tests {
     async fn signed_final_response_is_accepted_on_2_0_2() {
         let session = setup_against_server(
             Dialect::Smb2_0_2,
-            false,
+            None,
             USER,
             PASS,
             SessionFlags(0),
@@ -1364,7 +1386,7 @@ mod tests {
     async fn unsigned_final_response_is_refused_on_3_1_1() {
         let result = setup_against_server(
             Dialect::Smb3_1_1,
-            false,
+            None,
             USER,
             PASS,
             SessionFlags(0),
@@ -1381,7 +1403,7 @@ mod tests {
     async fn unsigned_final_response_is_refused_on_3_0_2() {
         let result = setup_against_server(
             Dialect::Smb3_0_2,
-            false,
+            None,
             USER,
             PASS,
             SessionFlags(0),
@@ -1398,7 +1420,7 @@ mod tests {
     async fn cleared_encrypt_data_flag_is_refused() {
         let result = setup_against_server(
             Dialect::Smb3_1_1,
-            true,
+            Some(SigningAlgorithm::AesGmac),
             USER,
             PASS,
             SessionFlags(SessionFlags::ENCRYPT_DATA),
@@ -1416,7 +1438,7 @@ mod tests {
     async fn tampered_guest_flag_is_refused() {
         let result = setup_against_server(
             Dialect::Smb3_1_1,
-            true,
+            Some(SigningAlgorithm::AesGmac),
             USER,
             PASS,
             SessionFlags(0),
@@ -1433,7 +1455,7 @@ mod tests {
         for dialect in [Dialect::Smb2_0_2, Dialect::Smb3_1_1] {
             let result = setup_against_server(
                 dialect,
-                false,
+                None,
                 USER,
                 PASS,
                 SessionFlags(SessionFlags::IS_GUEST),
@@ -1448,7 +1470,7 @@ mod tests {
     async fn null_session_for_a_credentialed_login_is_refused() {
         let result = setup_against_server(
             Dialect::Smb3_1_1,
-            false,
+            None,
             USER,
             PASS,
             SessionFlags(SessionFlags::IS_NULL),
@@ -1464,7 +1486,7 @@ mod tests {
     async fn bad_signature_is_refused_on_2_0_2() {
         let result = setup_against_server(
             Dialect::Smb2_0_2,
-            false,
+            None,
             USER,
             PASS,
             SessionFlags(0),
@@ -1481,7 +1503,7 @@ mod tests {
         for dialect in [Dialect::Smb2_0_2, Dialect::Smb3_1_1] {
             let session = setup_against_server(
                 dialect,
-                false,
+                None,
                 "",
                 "",
                 SessionFlags(SessionFlags::IS_GUEST),
@@ -1505,7 +1527,7 @@ mod tests {
                 for flags in [SessionFlags::IS_GUEST, SessionFlags::IS_NULL] {
                     let session = setup_against_server(
                         dialect,
-                        false,
+                        None,
                         name,
                         "",
                         SessionFlags(flags),
@@ -1527,7 +1549,7 @@ mod tests {
         for name in ["guest1", "Guests", " Guest", "DOMAIN\\Guest"] {
             let result = setup_against_server(
                 Dialect::Smb3_1_1,
-                false,
+                None,
                 name,
                 "",
                 SessionFlags(SessionFlags::IS_GUEST),
@@ -1545,7 +1567,7 @@ mod tests {
     async fn a_login_named_guest_answered_with_a_full_session_is_still_verified() {
         let result = setup_against_server(
             Dialect::Smb3_1_1,
-            false,
+            None,
             "Guest",
             "",
             SessionFlags(0),
@@ -1556,7 +1578,7 @@ mod tests {
 
         let session = setup_against_server(
             Dialect::Smb3_1_1,
-            false,
+            None,
             "Guest",
             "",
             SessionFlags(0),

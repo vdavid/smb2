@@ -1592,8 +1592,10 @@ pub struct NegotiatedParams {
     pub signing_required: bool,
     /// Server capabilities.
     pub capabilities: Capabilities,
-    /// Whether AES-GMAC signing was negotiated (SMB 3.1.1).
-    pub gmac_negotiated: bool,
+    /// The algorithm this connection's sessions sign with: the dialect's,
+    /// or on SMB 3.1.1 the one the server picked from
+    /// `SMB2_SIGNING_CAPABILITIES` (AES-128-CMAC when it sent none).
+    pub signing_algorithm: SigningAlgorithm,
     /// The cipher this connection encrypts with (MS-SMB2 `Connection.CipherId`),
     /// or `None` when the server didn't agree to encrypt.
     ///
@@ -3065,7 +3067,7 @@ impl Connection {
                 ciphers: OFFERED_CIPHERS.iter().map(|&(id, _)| id).collect(),
             },
             NegotiateContext::Signing {
-                algorithms: vec![SIGNING_AES_GMAC, SIGNING_AES_CMAC, SIGNING_HMAC_SHA256],
+                algorithms: OFFERED_SIGNING_ALGORITHMS.to_vec(),
             },
         ];
 
@@ -3168,15 +3170,18 @@ impl Connection {
             resp.capabilities,
             &resp.negotiate_contexts,
         )?;
-        let mut gmac_negotiated = false;
+        let mut signing_selected = None;
         let mut compression_supported = false;
 
         for ctx in &resp.negotiate_contexts {
             match ctx {
-                NegotiateContext::Signing { algorithms }
-                    if algorithms.contains(&SIGNING_AES_GMAC) =>
-                {
-                    gmac_negotiated = true;
+                NegotiateContext::Signing { algorithms } => {
+                    if signing_selected.is_some() {
+                        return Err(Error::invalid_data(
+                            "server sent more than one signing-capabilities context",
+                        ));
+                    }
+                    signing_selected = Some(selected_signing_algorithm(algorithms)?);
                 }
                 NegotiateContext::Compression { algorithms, .. }
                     if algorithms.contains(&COMPRESSION_LZ4) =>
@@ -3187,6 +3192,8 @@ impl Connection {
             }
         }
 
+        let signing_algorithm =
+            signing::algorithm_for_dialect(resp.dialect_revision, signing_selected);
         let signing_required = resp.security_mode.signing_required();
         let compression_enabled =
             self.inner.compression_requested.load(Ordering::Acquire) && compression_supported;
@@ -3205,7 +3212,7 @@ impl Connection {
             server_guid: resp.server_guid,
             signing_required,
             capabilities: resp.capabilities,
-            gmac_negotiated,
+            signing_algorithm,
             cipher,
             compression_supported,
         });
@@ -3215,9 +3222,9 @@ impl Connection {
             resp.dialect_revision, signing_required, resp.capabilities
         );
         debug!(
-            "negotiate: max_read={}, max_write={}, max_transact={}, server_guid={:?}, cipher={:?}, gmac={}, compression={}",
+            "negotiate: max_read={}, max_write={}, max_transact={}, server_guid={:?}, cipher={:?}, signing={:?}, compression={}",
             resp.max_read_size, resp.max_write_size, resp.max_transact_size,
-            resp.server_guid, cipher, gmac_negotiated, compression_enabled
+            resp.server_guid, cipher, signing_algorithm, compression_enabled
         );
 
         Ok(())
@@ -5903,7 +5910,8 @@ impl Connection {
             server_guid: p.server_guid,
             signing_required: p.signing_required,
             capabilities: p.capabilities,
-            gmac_negotiated: p.gmac_negotiated,
+            gmac_negotiated: p.signing_algorithm == SigningAlgorithm::AesGmac,
+            signing_algorithm: p.signing_algorithm,
             cipher: p.cipher,
             compression_supported: p.compression_supported,
         });
@@ -6560,6 +6568,35 @@ pub(crate) fn random_guid() -> Guid {
     }
 }
 
+/// What NEGOTIATE offers in `SMB2_SIGNING_CAPABILITIES`, most preferred first.
+const OFFERED_SIGNING_ALGORITHMS: [u16; 3] =
+    [SIGNING_AES_GMAC, SIGNING_AES_CMAC, SIGNING_HMAC_SHA256];
+
+/// The server's pick from the signing-capabilities context.
+///
+/// A response carries exactly one algorithm, and one the client offered
+/// (MS-SMB2 § 2.2.4.1.7, § 3.2.5.2). Anything else is a protocol violation
+/// the client MUST refuse: guessing an algorithm here only moves the failure
+/// to the first signed response, as a signature mismatch that reads like
+/// tampering.
+fn selected_signing_algorithm(algorithms: &[u16]) -> Result<SigningAlgorithm> {
+    let &[id] = algorithms else {
+        return Err(Error::invalid_data(format!(
+            "server's signing-capabilities context names {} algorithms, not one",
+            algorithms.len()
+        )));
+    };
+    OFFERED_SIGNING_ALGORITHMS
+        .contains(&id)
+        .then(|| SigningAlgorithm::from_id(id))
+        .flatten()
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "server selected signing algorithm 0x{id:04X} which we did not offer"
+            ))
+        })
+}
+
 fn generate_salt() -> Vec<u8> {
     let mut salt = vec![0u8; 32];
     getrandom::fill(&mut salt).expect("failed to generate random salt");
@@ -6657,6 +6694,12 @@ mod tests {
 
     /// Build a canned negotiate response with the given dialect.
     fn build_negotiate_response(dialect: Dialect) -> Vec<u8> {
+        build_negotiate_response_with(dialect, vec![])
+    }
+
+    /// [`build_negotiate_response`] with `extra` contexts after the preauth
+    /// one (3.1.1 only).
+    fn build_negotiate_response_with(dialect: Dialect, extra: Vec<NegotiateContext>) -> Vec<u8> {
         let resp_header = {
             let mut h = Header::new_request(Command::Negotiate);
             h.flags.set_response();
@@ -6675,15 +6718,86 @@ mod tests {
             server_start_time: 131_000_000_000_000_000,
             security_buffer: vec![0x60, 0x00],
             negotiate_contexts: if dialect == Dialect::Smb3_1_1 {
-                vec![NegotiateContext::PreauthIntegrity {
+                let mut contexts = vec![NegotiateContext::PreauthIntegrity {
                     hash_algorithms: vec![HASH_ALGORITHM_SHA512],
                     salt: vec![0xBB; 32],
-                }]
+                }];
+                contexts.extend(extra);
+                contexts
             } else {
                 vec![]
             },
         };
         pack_message(&resp_header, &resp_body)
+    }
+
+    /// NEGOTIATE against a 3.1.1 server answering with `contexts`.
+    async fn negotiate_3_1_1_with(contexts: Vec<NegotiateContext>) -> Result<NegotiatedParams> {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        mock.queue_response(build_negotiate_response_with(Dialect::Smb3_1_1, contexts));
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.negotiate().await?;
+        Ok(conn.params().unwrap().clone())
+    }
+
+    fn signing_context(algorithms: &[u16]) -> NegotiateContext {
+        NegotiateContext::Signing {
+            algorithms: algorithms.to_vec(),
+        }
+    }
+
+    /// Issue #33: the client offers HMAC-SHA256, so a server restricted to
+    /// it picks it, and that's what the session has to sign with.
+    #[tokio::test]
+    async fn negotiate_signs_with_the_algorithm_the_server_selected() {
+        for (id, expected) in [
+            (SIGNING_HMAC_SHA256, SigningAlgorithm::HmacSha256),
+            (SIGNING_AES_CMAC, SigningAlgorithm::AesCmac),
+            (SIGNING_AES_GMAC, SigningAlgorithm::AesGmac),
+        ] {
+            let params = negotiate_3_1_1_with(vec![signing_context(&[id])])
+                .await
+                .unwrap();
+            assert_eq!(params.signing_algorithm, expected, "selected 0x{id:04X}");
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiate_without_a_signing_context_signs_3_1_1_with_aes_cmac() {
+        let params = negotiate_3_1_1_with(vec![]).await.unwrap();
+        assert_eq!(params.signing_algorithm, SigningAlgorithm::AesCmac);
+    }
+
+    /// MS-SMB2 § 3.2.5.2: exactly one algorithm, one we offered, in at most
+    /// one context, or the client MUST fail the negotiate.
+    #[tokio::test]
+    async fn negotiate_refuses_a_signing_selection_it_cant_trust() {
+        let cases = [
+            ("an unknown id", vec![signing_context(&[0x0007])]),
+            ("no algorithm", vec![signing_context(&[])]),
+            (
+                "two algorithms",
+                vec![signing_context(&[SIGNING_AES_GMAC, SIGNING_AES_CMAC])],
+            ),
+            (
+                "two contexts",
+                vec![
+                    signing_context(&[SIGNING_AES_CMAC]),
+                    signing_context(&[SIGNING_AES_CMAC]),
+                ],
+            ),
+        ];
+        for (what, contexts) in cases {
+            match negotiate_3_1_1_with(contexts).await {
+                Err(Error::InvalidData { .. }) => {}
+                other => panic!("{what}: expected InvalidData, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -7788,7 +7902,7 @@ mod tests {
 
         let params = conn.params().unwrap();
         assert_eq!(params.dialect, Dialect::Smb2_0_2);
-        assert!(!params.gmac_negotiated);
+        assert_eq!(params.signing_algorithm, SigningAlgorithm::HmacSha256);
         assert!(params.cipher.is_none());
     }
 
@@ -9145,7 +9259,7 @@ mod tests {
             server_guid: Guid::ZERO,
             signing_required: false,
             capabilities: Capabilities::default(),
-            gmac_negotiated: false,
+            signing_algorithm: crate::crypto::signing::SigningAlgorithm::AesCmac,
             cipher: Some(Cipher::Aes128Gcm),
             compression_supported: false,
         });

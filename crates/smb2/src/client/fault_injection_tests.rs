@@ -2206,7 +2206,7 @@ impl SessionReviver for Nas {
             server_guid: Guid::ZERO,
             signing_required: false,
             capabilities: Capabilities::default(),
-            gmac_negotiated: false,
+            signing_algorithm: crate::crypto::signing::SigningAlgorithm::AesCmac,
             cipher: None,
             compression_supported: false,
         });

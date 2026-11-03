@@ -8750,7 +8750,7 @@ mod tests {
             server_guid: crate::pack::Guid::ZERO,
             signing_required: false,
             capabilities: crate::types::flags::Capabilities::default(),
-            gmac_negotiated: false,
+            signing_algorithm: crate::crypto::signing::SigningAlgorithm::HmacSha256,
             cipher: None,
             compression_supported: false,
         };

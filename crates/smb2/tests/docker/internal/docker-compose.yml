@@ -24,6 +24,12 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10447:445"
 
+  smb-signing-hmac:
+    build:
+      context: smb-signing-hmac
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10468:445"
+
   smb-readonly:
     build:
       context: smb-readonly

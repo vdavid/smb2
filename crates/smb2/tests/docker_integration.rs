@@ -16,6 +16,7 @@ use smb2::client::{list_shares, ClientConfig, Connection, Session, SmbClient, Tr
 const GUEST_ADDR: &str = "127.0.0.1:10445";
 const AUTH_ADDR: &str = "127.0.0.1:10446";
 const SIGNING_ADDR: &str = "127.0.0.1:10447";
+const SIGNING_HMAC_ADDR: &str = "127.0.0.1:10468";
 const READONLY_ADDR: &str = "127.0.0.1:10448";
 const ANCIENT_ADDR: &str = "127.0.0.1:10449";
 const FLAKY_ADDR: &str = "127.0.0.1:10450";
@@ -2457,6 +2458,60 @@ async fn watcher_does_not_lose_events_during_consumer_processing_delay() {
             );
         })
         .await;
+}
+
+// ── HMAC-SHA256 signing on SMB 3.1.1 (smb-signing-hmac) ──────────────
+
+/// Issue #33: a 3.1.1 server restricted to HMAC-SHA256 picks it from the
+/// signing-capabilities context, and the session has to sign and verify
+/// with it. Verifying with AES-CMAC (what 3.1.1 used to mean here) failed
+/// the very first signed response, the final SESSION_SETUP.
+#[tokio::test]
+#[ignore]
+async fn signing_hmac_sha256_on_3_1_1_round_trips() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: SIGNING_HMAC_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        ..Default::default()
+    })
+    .await
+    .expect("SmbClient::connect to smb-signing-hmac failed");
+
+    let params = client.params().expect("negotiated");
+    assert_eq!(params.dialect, smb2::types::Dialect::Smb3_1_1);
+    assert_eq!(
+        params.signing_algorithm,
+        smb2::crypto::signing::SigningAlgorithm::HmacSha256
+    );
+
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share failed");
+    let test_path = "docker_test_signing_hmac.tmp";
+    let test_data = b"HMAC-SHA256 signed on SMB 3.1.1";
+    client
+        .write_file(&tree, test_path, test_data)
+        .await
+        .expect("write_file failed (HMAC-SHA256)");
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed (HMAC-SHA256)");
+    assert_eq!(data, test_data);
+
+    client
+        .delete_file(&tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
 }
 
 // ── Mandatory signing (smb-signing) ──────────────────────────────────

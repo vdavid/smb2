@@ -597,7 +597,7 @@ Pinned by the `stream.rs` close-on-drop tests (`file_writer_dropped_mid_upload_c
 4. Receive STATUS_SUCCESS (do NOT include in preauth hash)
 5. Derive signing/encryption keys via SP800-108 KDF
 6. `authenticate_final_response`: prove the STATUS_SUCCESS response before reading its `SessionFlags`
-7. Activate signing on the connection
+7. Activate signing on the connection, with `NegotiatedParams::signing_algorithm` (on 3.1.1, the server's pick from the signing context; see `src/crypto/CLAUDE.md`)
 8. If session or share requires encryption, activate encryption (TRANSFORM_HEADER wrapping with AEAD)
 
 Step 6 exists because the final response's flags decide whether signing and encryption turn on at all, and nothing

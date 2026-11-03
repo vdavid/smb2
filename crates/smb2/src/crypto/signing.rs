@@ -1,10 +1,12 @@
 //! SMB2 message signing and signature verification.
 //!
-//! Supports three signing algorithms, selected by negotiated dialect:
-//! - **HMAC-SHA256** (SMB 2.0.2, 2.1): 32-byte hash truncated to 16 bytes.
-//! - **AES-128-CMAC** (SMB 3.0, 3.0.2): 16-byte MAC.
-//! - **AES-256-GMAC** (SMB 3.1.1 with `SMB2_SIGNING_CAPABILITIES`): AES-256-GCM
-//!   with empty plaintext; the 16-byte auth tag is the signature.
+//! Supports three signing algorithms, selected by the negotiated dialect and,
+//! on SMB 3.1.1, by the server's pick from `SMB2_SIGNING_CAPABILITIES`:
+//! - **HMAC-SHA256** (SMB 2.0.2, 2.1; 3.1.1 if selected): 32-byte hash
+//!   truncated to 16 bytes.
+//! - **AES-128-CMAC** (SMB 3.0, 3.0.2; 3.1.1 by default): 16-byte MAC.
+//! - **AES-GMAC** (SMB 3.1.1 if selected): AES-128-GCM with empty plaintext;
+//!   the 16-byte auth tag is the signature.
 //!
 //! Reference: MS-SMB2 sections 3.1.4.1 (signing) and 3.1.5.1 (verification).
 
@@ -12,6 +14,7 @@ use ctutils::CtEq;
 use log::{error, trace};
 
 use crate::error::SignatureFailure;
+use crate::msg::negotiate::{SIGNING_AES_CMAC, SIGNING_AES_GMAC, SIGNING_HMAC_SHA256};
 use crate::types::{Command, Dialect, MessageId};
 use crate::Error;
 
@@ -26,30 +29,42 @@ const MIN_MESSAGE_LEN: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum SigningAlgorithm {
-    /// HMAC-SHA256 truncated to 16 bytes (SMB 2.0.2, 2.1).
+    /// HMAC-SHA256 truncated to 16 bytes (SMB 2.0.2, 2.1, and SMB 3.1.1
+    /// when the server selects it).
     HmacSha256,
-    /// AES-128-CMAC (SMB 3.0, 3.0.2).
+    /// AES-128-CMAC (SMB 3.0, 3.0.2, and SMB 3.1.1 by default).
     AesCmac,
-    /// AES-256-GMAC with MessageId-based nonce (SMB 3.1.1).
+    /// AES-GMAC with MessageId-based nonce (SMB 3.1.1, when selected).
     AesGmac,
 }
 
-/// Select the appropriate signing algorithm for a dialect.
+impl SigningAlgorithm {
+    /// The algorithm an `SMB2_SIGNING_CAPABILITIES` id names (MS-SMB2
+    /// § 2.2.3.1.7), or `None` for an id this crate doesn't know.
+    pub fn from_id(id: u16) -> Option<Self> {
+        match id {
+            SIGNING_HMAC_SHA256 => Some(Self::HmacSha256),
+            SIGNING_AES_CMAC => Some(Self::AesCmac),
+            SIGNING_AES_GMAC => Some(Self::AesGmac),
+            _ => None,
+        }
+    }
+}
+
+/// Select the signing algorithm a session on `dialect` uses.
 ///
-/// For SMB 3.1.1, `gmac_negotiated` indicates whether the peer negotiated
-/// `AES-256-GMAC` via `SMB2_SIGNING_CAPABILITIES`. When `false`, SMB 3.1.1
-/// falls back to AES-128-CMAC.
-pub fn algorithm_for_dialect(dialect: Dialect, gmac_negotiated: bool) -> SigningAlgorithm {
+/// `selected` is the server's pick from `SMB2_SIGNING_CAPABILITIES`, which
+/// only SMB 3.1.1 has. On 3.1.1 without one, the algorithm is AES-128-CMAC
+/// (MS-SMB2 § 3.1.4.1); on every other dialect, it follows the dialect and
+/// `selected` is ignored.
+pub fn algorithm_for_dialect(
+    dialect: Dialect,
+    selected: Option<SigningAlgorithm>,
+) -> SigningAlgorithm {
     match dialect {
         Dialect::Smb2_0_2 | Dialect::Smb2_1 => SigningAlgorithm::HmacSha256,
         Dialect::Smb3_0 | Dialect::Smb3_0_2 => SigningAlgorithm::AesCmac,
-        Dialect::Smb3_1_1 => {
-            if gmac_negotiated {
-                SigningAlgorithm::AesGmac
-            } else {
-                SigningAlgorithm::AesCmac
-            }
-        }
+        Dialect::Smb3_1_1 => selected.unwrap_or(SigningAlgorithm::AesCmac),
     }
 }
 
@@ -359,64 +374,43 @@ mod tests {
     // ── algorithm_for_dialect ─────────────────────────────────────────
 
     #[test]
-    fn algorithm_for_smb2_0_2_is_hmac_sha256() {
-        assert_eq!(
-            algorithm_for_dialect(Dialect::Smb2_0_2, false),
-            SigningAlgorithm::HmacSha256
-        );
+    fn pre_3_1_1_dialects_sign_by_dialect_whatever_was_selected() {
+        use SigningAlgorithm::*;
+        for selected in [None, Some(AesGmac), Some(HmacSha256), Some(AesCmac)] {
+            assert_eq!(
+                algorithm_for_dialect(Dialect::Smb2_0_2, selected),
+                HmacSha256
+            );
+            assert_eq!(algorithm_for_dialect(Dialect::Smb2_1, selected), HmacSha256);
+            assert_eq!(algorithm_for_dialect(Dialect::Smb3_0, selected), AesCmac);
+            assert_eq!(algorithm_for_dialect(Dialect::Smb3_0_2, selected), AesCmac);
+        }
     }
 
     #[test]
-    fn algorithm_for_smb2_1_is_hmac_sha256() {
-        assert_eq!(
-            algorithm_for_dialect(Dialect::Smb2_1, false),
-            SigningAlgorithm::HmacSha256
-        );
+    fn smb3_1_1_signs_with_the_servers_pick_and_aes_cmac_without_one() {
+        use SigningAlgorithm::*;
+        assert_eq!(algorithm_for_dialect(Dialect::Smb3_1_1, None), AesCmac);
+        for pick in [HmacSha256, AesCmac, AesGmac] {
+            assert_eq!(algorithm_for_dialect(Dialect::Smb3_1_1, Some(pick)), pick);
+        }
     }
 
     #[test]
-    fn algorithm_for_smb3_0_is_aes_cmac() {
+    fn signing_ids_map_to_algorithms_and_unknown_ids_to_none() {
         assert_eq!(
-            algorithm_for_dialect(Dialect::Smb3_0, false),
-            SigningAlgorithm::AesCmac
-        );
-    }
-
-    #[test]
-    fn algorithm_for_smb3_0_2_is_aes_cmac() {
-        assert_eq!(
-            algorithm_for_dialect(Dialect::Smb3_0_2, false),
-            SigningAlgorithm::AesCmac
-        );
-    }
-
-    #[test]
-    fn algorithm_for_smb3_1_1_without_gmac_is_aes_cmac() {
-        assert_eq!(
-            algorithm_for_dialect(Dialect::Smb3_1_1, false),
-            SigningAlgorithm::AesCmac
-        );
-    }
-
-    #[test]
-    fn algorithm_for_smb3_1_1_with_gmac_is_aes_gmac() {
-        assert_eq!(
-            algorithm_for_dialect(Dialect::Smb3_1_1, true),
-            SigningAlgorithm::AesGmac
-        );
-    }
-
-    #[test]
-    fn gmac_flag_ignored_for_older_dialects() {
-        // Even if gmac_negotiated is true, older dialects don't use GMAC.
-        assert_eq!(
-            algorithm_for_dialect(Dialect::Smb2_0_2, true),
-            SigningAlgorithm::HmacSha256
+            SigningAlgorithm::from_id(0x0000),
+            Some(SigningAlgorithm::HmacSha256)
         );
         assert_eq!(
-            algorithm_for_dialect(Dialect::Smb3_0, true),
-            SigningAlgorithm::AesCmac
+            SigningAlgorithm::from_id(0x0001),
+            Some(SigningAlgorithm::AesCmac)
         );
+        assert_eq!(
+            SigningAlgorithm::from_id(0x0002),
+            Some(SigningAlgorithm::AesGmac)
+        );
+        assert_eq!(SigningAlgorithm::from_id(0x0003), None);
     }
 
     // ── Message too short ─────────────────────────────────────────────

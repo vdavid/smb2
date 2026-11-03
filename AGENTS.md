@@ -371,13 +371,14 @@ starts one container rather than 16.
 
 ### Docker test containers
 
-23 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+24 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
 | smb-guest             | 10445 | Guest access, basic operations                |
 | smb-auth              | 10446 | NTLM authentication                           |
 | smb-signing           | 10447 | Mandatory signing (server rejects unsigned)   |
+| smb-signing-hmac      | 10468 | SMB 3.1.1 signed with HMAC-SHA256 only: the client signs with the server's pick from `SMB2_SIGNING_CAPABILITIES` |
 | smb-readonly          | 10448 | Write/delete return clean NTSTATUS errors     |
 | smb-ancient           | 10449 | SMB1 only, clean protocol rejection           |
 | smb-flaky             | 10450 | 5s up / 5s down, reconnect behavior           |
@@ -387,7 +388,7 @@ starts one container rather than 16.
 | smb-manyshares        | 10458 | 200 long-comment shares, multi-fragment srvsvc reassembly |
 | smb-maxreadsize       | 10454 | 64 KB max read/write, chunking edge cases     |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2) |
-| smb-encryption-required | 10465 | Global `server smb encrypt = required`: a session without the ENCRYPTION capability is refused |
+| smb-encryption-required | 10465 | Global `server smb encrypt = required`: refused at setup unless NEGOTIATE carries the ENCRYPTION capability |
 | smb-encryption-aes256 | 10466 | AES-256-GCM only, not required: an AES-256 session signs (128-bit key), and an encrypting share round-trips |
 | smb-encryption-aes256-ccm | 10467 | AES-256-CCM only, required for the session |
 | smb-weirdnames        | 10459 | Names carrying SMB2-illegal characters, seeded as the exact private-use bytes macOS writes |
