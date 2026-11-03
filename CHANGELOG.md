@@ -7,6 +7,8 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-11-04
+
 ### Breaking
 
 - **`crypto::kdf::derive_session_keys` takes the negotiated cipher instead of a key length**, and the whole key the authentication produced instead of its first 16 bytes: `derive_session_keys(gss_key, dialect, preauth_hash, cipher: Option<Cipher>)`. That's what it needs to get AES-256 right (below). `crypto::kdf::session_key` gives the 16-byte `Session.SessionKey` from the same key.
