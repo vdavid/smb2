@@ -115,6 +115,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_validate_negotiate_response_parse"
+path = "fuzz_targets/fuzz_validate_negotiate_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_query_info_response_parse"
 path = "fuzz_targets/fuzz_query_info_response_parse.rs"
 test = false

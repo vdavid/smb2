@@ -515,6 +515,42 @@ fn generate_fuzz_seeds() {
         write_seed("fuzz_afp_info_parse", "short", &afp[..20]);
     }
 
+    // ── fuzz_validate_negotiate_response_parse ──────────────────────
+    {
+        use smb2::msg::ioctl::{
+            IoctlResponse, ValidateNegotiateInfoResponse, FSCTL_VALIDATE_NEGOTIATE_INFO,
+        };
+        let mut info = WriteCursor::new();
+        ValidateNegotiateInfoResponse {
+            capabilities: Capabilities::new(Capabilities::DFS | Capabilities::LARGE_MTU),
+            guid: Guid {
+                data1: 0x1122_3344,
+                data2: 0x5566,
+                data3: 0x7788,
+                data4: [1, 2, 3, 4, 5, 6, 7, 8],
+            },
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
+            dialect: 0x0302,
+        }
+        .pack(&mut info);
+        let info = info.into_inner();
+        for (name, output) in [("valid", &info[..]), ("short_output", &info[..20])] {
+            let mut w = WriteCursor::new();
+            IoctlResponse {
+                ctl_code: FSCTL_VALIDATE_NEGOTIATE_INFO,
+                file_id: smb2::types::FileId::SENTINEL,
+                flags: 0,
+                output_data: output.to_vec(),
+            }
+            .pack(&mut w);
+            write_seed(
+                "fuzz_validate_negotiate_response_parse",
+                name,
+                &w.into_inner(),
+            );
+        }
+    }
+
     // ── fuzz_query_info_response_parse ──────────────────────────────
     write_seed(
         "fuzz_query_info_response_parse",

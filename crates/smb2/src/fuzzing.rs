@@ -201,6 +201,16 @@ pub fn fuzz_afp_info_parse(data: &[u8]) {
     let _ = crate::client::xattr::finder_info_from_afp_info(data);
 }
 
+/// Fuzz the `FSCTL_VALIDATE_NEGOTIATE_INFO` answer the way the client reads
+/// it: the IOCTL response body, then the `VALIDATE_NEGOTIATE_INFO` structure in
+/// its server-sized output buffer.
+pub fn fuzz_validate_negotiate_response_parse(data: &[u8]) {
+    use crate::msg::ioctl::{IoctlResponse, ValidateNegotiateInfoResponse};
+    if let Ok(resp) = IoctlResponse::unpack(&mut ReadCursor::new(data)) {
+        let _ = ValidateNegotiateInfoResponse::unpack(&mut ReadCursor::new(&resp.output_data));
+    }
+}
+
 /// Fuzz the directory-listing entry parser, as both classes a listing asks
 /// for, through the name decode a listing applies. The chain is walked by
 /// server-supplied `NextEntryOffset` and `FileNameLength` values.
