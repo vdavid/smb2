@@ -74,7 +74,7 @@ number held in a variable named like a path) is fixed by renaming the variable, 
 
 ## Docker integration tests (`tests/docker_integration.rs`)
 
-Tests against 24 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.
+Tests against 27 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.
 
 Containers live in `tests/docker/internal/`.
 
@@ -131,6 +131,8 @@ Two traps when several sessions share the machine:
 | smb-encryption-required | 10465 | Global `server smb encrypt = required` (SMB 3.0–3.1.1): refused at session setup unless NEGOTIATE carries the ENCRYPTION capability |
 | smb-encryption-aes256 | 10466 | AES-256-GCM only, encryption not required: `private` proves an AES-256 session signs with a 128-bit key (#32), `encrypted` (`smb encrypt = required`) round-trips under AES-256-GCM |
 | smb-encryption-aes256-ccm | 10467 | AES-256-CCM only, required for the session: 256-bit keys with CCM's 11-byte nonce |
+| smb-encryption-desired | 10469 | Samba's default dialects with `server smb encrypt = desired`. `negotiate_proxy` (in the test file) rewrites the NEGOTIATE as an on-path attacker would (3.1.1 and/or the ENCRYPTION capability taken out): every rewrite fails the negotiation check at the first tree connect (Samba hangs up on a mismatch), and `require_encryption` refuses the clear session at login |
+| smb-auth-smb302 / smb-auth-smb21 | 10470 / 10471 | smb-auth's image capped at SMB 3.0.2 / 2.1 with `--option=server max protocol=...` in the compose file: honest negotiations below 3.1.1, which validate (Samba 4.20 answers both with a matching signed answer) |
 | smb-weirdnames | 10459 | Names with SMB2-illegal characters. `populate.sh` writes them with octal escapes, so the on-disk bytes are exactly what macOS smbfs produces; a listing that decodes them proves Finder parity, which is the strongest assertion CI can make without a Mac. ❌ Don't replace those escapes with the literal characters. |
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target, plus a seeded `Root-File.txt` in the root share itself (guest can't write there) for `resolve` on a DFS share |
 | smb-dfs-target | 10457 | DFS target server with test files (hello.txt, subdir/nested.txt) |

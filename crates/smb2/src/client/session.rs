@@ -274,7 +274,11 @@ impl Session {
         let should_sign = params.signing_required
             || !setup_resp2.session_flags.is_guest() && !setup_resp2.session_flags.is_null();
 
-        let encrypt_with = session_cipher(&params, setup_resp2.session_flags)?;
+        let encrypt_with = session_cipher(
+            &params,
+            setup_resp2.session_flags,
+            conn.require_encryption(),
+        )?;
         let should_encrypt = encrypt_with.is_some();
 
         // Activate signing on the connection.
@@ -494,7 +498,8 @@ impl Session {
         let should_sign = params.signing_required
             || !setup_resp.session_flags.is_guest() && !setup_resp.session_flags.is_null();
 
-        let encrypt_with = session_cipher(&params, setup_resp.session_flags)?;
+        let encrypt_with =
+            session_cipher(&params, setup_resp.session_flags, conn.require_encryption())?;
         let should_encrypt = encrypt_with.is_some();
 
         if should_sign {
@@ -566,12 +571,35 @@ fn session_keys(
 /// agreed to none, so it would decrypt nothing, and that "fallback" is what
 /// hid the missing `SMB2_GLOBAL_CAP_ENCRYPTION` bit for months (#32).
 ///
+/// With `required` (`Connection::require_encryption`) the session encrypts
+/// whether the server asked or not, which servers accept on any session with
+/// keys (they answer an encrypted request encrypted). A connection that can't
+/// (no cipher, or a guest or anonymous session, which has no keys) fails with
+/// [`Error::EncryptionRequired`].
+///
 /// Reads the session flags, so only after [`authenticate_final_response`].
-fn session_cipher(params: &NegotiatedParams, flags: SessionFlags) -> Result<Option<Cipher>> {
+fn session_cipher(
+    params: &NegotiatedParams,
+    flags: SessionFlags,
+    required: bool,
+) -> Result<Option<Cipher>> {
     let smb3 = matches!(
         params.dialect,
         Dialect::Smb3_0 | Dialect::Smb3_0_2 | Dialect::Smb3_1_1
     );
+    if required {
+        return match params.cipher {
+            Some(cipher) if smb3 && !flags.is_guest() && !flags.is_null() => Ok(Some(cipher)),
+            _ => {
+                debug!(
+                    "session: encryption is required but this session can't encrypt, refusing, \
+                     dialect={}, cipher={:?}, flags={:?}",
+                    params.dialect, params.cipher, flags
+                );
+                Err(Error::EncryptionRequired)
+            }
+        };
+    }
     if !(smb3 && flags.encrypt_data()) {
         return Ok(None);
     }
@@ -1018,6 +1046,7 @@ mod tests {
             max_transact_size: 65536,
             server_guid: Guid::ZERO,
             signing_required: false,
+            security_mode: Default::default(),
             capabilities: Capabilities::default(),
             signing_algorithm: algorithm_for_dialect(dialect, selected),
             cipher: None,
@@ -1322,6 +1351,59 @@ mod tests {
                 other => panic!("{dialect:?}: expected EncryptionUnavailable, got {other:?}"),
             }
             assert!(!conn.should_encrypt(), "{dialect:?}");
+        }
+    }
+
+    /// With `require_encryption` a session encrypts with the negotiated
+    /// cipher whether the server asked or not, and one that can't (no cipher,
+    /// a dialect without encryption, a guest or anonymous session) is refused.
+    #[tokio::test]
+    async fn required_encryption_encrypts_unasked_or_refuses() {
+        let params = |dialect, cipher| {
+            let mut conn = Connection::from_transport(
+                Box::new(MockTransport::new()),
+                Box::new(MockTransport::new()),
+                "test-server",
+            );
+            set_test_params_with(&mut conn, dialect, None);
+            let mut params = conn.params().unwrap();
+            params.cipher = cipher;
+            params
+        };
+        let plain = SessionFlags(0);
+        let ccm = Some(Cipher::Aes128Ccm);
+
+        for dialect in [Dialect::Smb3_0, Dialect::Smb3_0_2, Dialect::Smb3_1_1] {
+            assert_eq!(
+                session_cipher(&params(dialect, ccm), plain, true).unwrap(),
+                Some(Cipher::Aes128Ccm),
+                "{dialect:?}: the server didn't ask, the session encrypts anyway"
+            );
+            assert_eq!(
+                session_cipher(&params(dialect, ccm), plain, false).unwrap(),
+                None
+            );
+        }
+        for (what, params, flags) in [
+            ("no cipher", params(Dialect::Smb3_0_2, None), plain),
+            ("SMB 2.1", params(Dialect::Smb2_1, ccm), plain),
+            (
+                "guest",
+                params(Dialect::Smb3_0_2, ccm),
+                SessionFlags(SessionFlags::IS_GUEST),
+            ),
+            (
+                "anonymous",
+                params(Dialect::Smb3_1_1, ccm),
+                SessionFlags(SessionFlags::IS_NULL),
+            ),
+        ] {
+            match session_cipher(&params, flags, true) {
+                Err(e @ Error::EncryptionRequired) => {
+                    assert_eq!(e.kind(), crate::ErrorKind::Unsupported, "{what}");
+                }
+                other => panic!("{what}: expected EncryptionRequired, got {other:?}"),
+            }
         }
     }
 

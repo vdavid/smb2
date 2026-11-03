@@ -147,6 +147,7 @@ async fn tree_connect_ipc(conn: &mut Connection) -> Result<TreeId> {
         .header
         .tree_id
         .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
+    conn.validate_negotiate(tree_id).await?;
 
     debug!("dfs: connected to IPC$, tree_id={}", tree_id);
     Ok(tree_id)

@@ -41,6 +41,8 @@ pub mod tree;
 pub(crate) mod tuning;
 #[cfg(test)]
 mod upload_tests;
+#[cfg(test)]
+mod validate_negotiate_tests;
 pub mod watcher;
 pub mod write_behind;
 pub(crate) mod write_pipe;
@@ -225,6 +227,25 @@ pub struct ClientConfig {
     ///
     /// Default: `None`.
     pub previous_session_id: Option<SessionId>,
+    /// Encrypt everything, or fail: the session encrypts even when the server
+    /// only allows it, and a connection that can't encrypt fails the connect
+    /// with [`Error::EncryptionRequired`].
+    ///
+    /// **Security:** without it, a session encrypts only when the server or
+    /// the share asks, and a server that merely prefers encryption (Samba's
+    /// `server smb encrypt = desired`) can be talked out of it by an on-path
+    /// attacker rewriting the negotiation. The negotiation check below SMB
+    /// 3.1.1 catches that rewrite at the first tree connect; this setting
+    /// makes the login itself refuse to go on in the clear, whatever the
+    /// server asked for.
+    ///
+    /// "Can't encrypt" means no cipher was negotiated (a dialect below SMB
+    /// 3.0, or a server with encryption off), or the login was answered with
+    /// a guest or anonymous session. Applies to DFS target connections and
+    /// to every revival too.
+    ///
+    /// Default: `false`.
+    pub require_encryption: bool,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -244,6 +265,7 @@ impl std::fmt::Debug for ClientConfig {
             connect_options,
             response_timeout,
             previous_session_id,
+            require_encryption,
         } = self;
         f.debug_struct("ClientConfig")
             .field("addr", addr)
@@ -259,6 +281,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("connect_options", connect_options)
             .field("response_timeout", response_timeout)
             .field("previous_session_id", previous_session_id)
+            .field("require_encryption", require_encryption)
             .finish()
     }
 }
@@ -305,6 +328,7 @@ impl Default for ClientConfig {
             connect_options: None,
             response_timeout: Some(connection::RESPONSE_TIMEOUT),
             previous_session_id: None,
+            require_encryption: false,
         }
     }
 }
@@ -649,6 +673,7 @@ impl SmbClient {
 
         let mut conn = Connection::connect_with(&config.addr, config.connect_options()).await?;
         conn.set_compression_requested(config.compression);
+        conn.set_require_encryption(config.require_encryption);
         // Before NEGOTIATE, so the handshake itself is bounded by it.
         conn.set_response_timeout(config.response_timeout);
         conn.negotiate().await?;
@@ -1644,6 +1669,7 @@ impl SmbClient {
         // Create new connection to target.
         let mut conn = Connection::connect_with(target_addr, self.config.connect_options()).await?;
         conn.set_compression_requested(self.config.compression);
+        conn.set_require_encryption(self.config.require_encryption);
         // The primary's deadline as it stands now, not the config's: the
         // consumer may have tuned it since `connect`. Before NEGOTIATE, so a
         // target that accepts and never answers can't hang the call.
@@ -4594,6 +4620,7 @@ mod tests {
                 max_transact_size: 65536,
                 server_guid: Guid::ZERO,
                 signing_required: false,
+                security_mode: Default::default(),
                 capabilities: Capabilities::default(), // no DFS
                 signing_algorithm: crate::crypto::signing::SigningAlgorithm::AesCmac,
                 cipher: None,

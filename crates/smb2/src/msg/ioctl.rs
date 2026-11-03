@@ -4,8 +4,9 @@
 //! data. The response returns output data from the control operation.
 
 use crate::error::Result;
-use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
-use crate::types::FileId;
+use crate::pack::{Guid, Pack, ReadCursor, Unpack, WriteCursor};
+use crate::types::flags::{Capabilities, SecurityMode};
+use crate::types::{Dialect, FileId};
 use crate::Error;
 
 // ── IOCTL flags ────────────────────────────────────────────────────────
@@ -282,9 +283,127 @@ impl Unpack for IoctlResponse {
     }
 }
 
+// ── VALIDATE_NEGOTIATE_INFO ────────────────────────────────────────────
+
+/// VALIDATE_NEGOTIATE_INFO request (MS-SMB2 section 2.2.31.4): what the
+/// client says it sent in NEGOTIATE, carried in an
+/// `FSCTL_VALIDATE_NEGOTIATE_INFO` IOCTL's input buffer.
+///
+/// Layout: Capabilities (4), Guid (16), SecurityMode (2), DialectCount (2),
+/// Dialects (2 each).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidateNegotiateInfoRequest {
+    pub capabilities: Capabilities,
+    pub guid: Guid,
+    pub security_mode: SecurityMode,
+    pub dialects: Vec<Dialect>,
+}
+
+impl Pack for ValidateNegotiateInfoRequest {
+    fn pack(&self, cursor: &mut WriteCursor) {
+        cursor.write_u32_le(self.capabilities.bits());
+        self.guid.pack(cursor);
+        cursor.write_u16_le(self.security_mode.bits());
+        cursor.write_u16_le(self.dialects.len() as u16);
+        for &dialect in &self.dialects {
+            cursor.write_u16_le(dialect.into());
+        }
+    }
+}
+
+/// VALIDATE_NEGOTIATE_INFO response (MS-SMB2 section 2.2.32.6): what the
+/// server says it answered NEGOTIATE with, in the IOCTL's output buffer.
+///
+/// Layout: Capabilities (4), Guid (16), SecurityMode (2), Dialect (2).
+/// `dialect` stays raw, since a value the client doesn't know is a mismatch to
+/// report, not a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidateNegotiateInfoResponse {
+    pub capabilities: Capabilities,
+    pub guid: Guid,
+    pub security_mode: SecurityMode,
+    pub dialect: u16,
+}
+
+impl ValidateNegotiateInfoResponse {
+    /// The structure's size on the wire, which is also the request's
+    /// `MaxOutputResponse` (MS-SMB2 § 3.2.5.5).
+    pub const SIZE: u32 = 24;
+}
+
+impl Pack for ValidateNegotiateInfoResponse {
+    fn pack(&self, cursor: &mut WriteCursor) {
+        cursor.write_u32_le(self.capabilities.bits());
+        self.guid.pack(cursor);
+        cursor.write_u16_le(self.security_mode.bits());
+        cursor.write_u16_le(self.dialect);
+    }
+}
+
+impl Unpack for ValidateNegotiateInfoResponse {
+    fn unpack(cursor: &mut ReadCursor<'_>) -> Result<Self> {
+        Ok(Self {
+            capabilities: Capabilities::new(cursor.read_u32_le()?),
+            guid: Guid::unpack(cursor)?,
+            security_mode: SecurityMode::new(cursor.read_u16_le()?),
+            dialect: cursor.read_u16_le()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── VALIDATE_NEGOTIATE_INFO tests ─────────────────────────────────
+
+    #[test]
+    fn validate_negotiate_info_request_layout() {
+        let guid = Guid {
+            data1: 0x0403_0201,
+            data2: 0x0605,
+            data3: 0x0807,
+            data4: [9, 10, 11, 12, 13, 14, 15, 16],
+        };
+        let request = ValidateNegotiateInfoRequest {
+            capabilities: Capabilities::new(0x45),
+            guid,
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
+            dialects: vec![Dialect::Smb2_0_2, Dialect::Smb3_1_1],
+        };
+        let mut w = WriteCursor::new();
+        request.pack(&mut w);
+        let bytes = w.into_inner();
+
+        let mut expected = vec![0x45, 0, 0, 0];
+        expected.extend(1..=16u8);
+        expected.extend([0x01, 0x00, 0x02, 0x00, 0x02, 0x02, 0x11, 0x03]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn validate_negotiate_info_response_roundtrip_and_short_buffer() {
+        let original = ValidateNegotiateInfoResponse {
+            capabilities: Capabilities::new(0x7F),
+            guid: Guid {
+                data1: 0xDEAD_BEEF,
+                data2: 1,
+                data3: 2,
+                data4: [3; 8],
+            },
+            security_mode: SecurityMode::new(SecurityMode::SIGNING_REQUIRED),
+            dialect: 0x0302,
+        };
+        let mut w = WriteCursor::new();
+        original.pack(&mut w);
+        let bytes = w.into_inner();
+        assert_eq!(bytes.len(), ValidateNegotiateInfoResponse::SIZE as usize);
+
+        let decoded = ValidateNegotiateInfoResponse::unpack(&mut ReadCursor::new(&bytes)).unwrap();
+        assert_eq!(decoded, original);
+
+        assert!(ValidateNegotiateInfoResponse::unpack(&mut ReadCursor::new(&bytes[..23])).is_err());
+    }
 
     // ── IoctlRequest tests ────────────────────────────────────────────
 

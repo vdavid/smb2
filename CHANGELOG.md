@@ -13,6 +13,13 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 - **`NegotiatedParams::gmac_negotiated` is now `signing_algorithm`**: the algorithm itself, which on SMB 3.1.1 can be any of the three. `crypto::signing::algorithm_for_dialect` takes the server's pick as an `Option<SigningAlgorithm>` in place of the `bool`. Diagnostics keep `NegotiatedSummary::gmac_negotiated` and gain `signing_algorithm` beside it.
 - **A session or share that requires encryption fails with the new `Error::EncryptionUnavailable` when the server negotiated no cipher** (`ErrorKind::Unsupported`, not retryable), where it used to guess AES-128-CCM, which no server agreed to. A share refused this way is disconnected again.
 - **`NegotiatedParams::cipher` is `Some(Cipher::Aes128Ccm)` on SMB 3.0 and 3.0.2** when the server granted the `ENCRYPTION` capability, so it now always says what the connection encrypts with. It was `None` on those dialects.
+- **`NegotiatedParams` gains `security_mode`**, the server's `SecurityMode` from NEGOTIATE, so a struct literal of it needs the new field.
+
+### Added
+
+- **Connections below SMB 3.1.1 validate their negotiation** with a signed `FSCTL_VALIDATE_NEGOTIATE_INFO` after the first tree connect of a session that signs (MS-SMB2 § 3.2.5.5), on `SmbClient::connect_share`, the low-level `Tree::connect`, and the IPC$ connects alike. A server that doesn't confirm the dialect, capabilities, and security mode it negotiated fails the tree connect with the new `Error::NegotiateValidationFailed` (`ErrorKind::NegotiateValidationFailed`, not retryable) and the connection is closed. A server that answers with a signed "not supported" is accepted, as the spec allows. SMB 3.1.1 needs no extra round trip, since its preauth hash already covers the negotiation.
+- **A client can require encryption**: `ClientConfig::require_encryption` (and `Connection::set_require_encryption`) makes every session encrypt with the negotiated cipher even when the server only allows it, and fails the login with the new `Error::EncryptionRequired` (`ErrorKind::Unsupported`) when the connection can't encrypt: no cipher, a dialect below 3.0, or a guest session. It covers DFS target connections and reconnects too. Default `false`.
+- New Docker containers: `smb-encryption-desired` (default dialects, encryption preferred) and `smb-auth-smb302` / `smb-auth-smb21` (the auth fixture capped at an older dialect).
 
 ### Fixed
 

@@ -1425,6 +1425,10 @@ use crate::crypto::signing::{self, SigningAlgorithm};
 use crate::error::{Error, Result};
 use crate::msg::echo::EchoRequest;
 use crate::msg::header::Header;
+use crate::msg::ioctl::{
+    IoctlRequest, IoctlResponse, ValidateNegotiateInfoRequest, ValidateNegotiateInfoResponse,
+    FSCTL_VALIDATE_NEGOTIATE_INFO, SMB2_0_IOCTL_IS_FSCTL,
+};
 use crate::msg::negotiate::{
     NegotiateContext, NegotiateRequest, NegotiateResponse, CIPHER_AES_128_CCM, CIPHER_AES_128_GCM,
     CIPHER_AES_256_CCM, CIPHER_AES_256_GCM, COMPRESSION_LZ4, HASH_ALGORITHM_SHA512,
@@ -1590,6 +1594,8 @@ pub struct NegotiatedParams {
     pub server_guid: Guid,
     /// Whether the server requires signing.
     pub signing_required: bool,
+    /// The server's `SecurityMode`, as NEGOTIATE answered it.
+    pub security_mode: SecurityMode,
     /// Server capabilities.
     pub capabilities: Capabilities,
     /// The algorithm this connection's sessions sign with: the dialect's,
@@ -1605,6 +1611,70 @@ pub struct NegotiatedParams {
     pub cipher: Option<Cipher>,
     /// Whether compression was negotiated with the server.
     pub compression_supported: bool,
+}
+
+/// The `SecurityMode` NEGOTIATE sends, and `FSCTL_VALIDATE_NEGOTIATE_INFO`
+/// repeats (MS-SMB2 `Connection.ClientSecurityMode`).
+const CLIENT_SECURITY_MODE: SecurityMode = SecurityMode::new(SecurityMode::SIGNING_ENABLED);
+
+/// The capabilities NEGOTIATE sends, and `FSCTL_VALIDATE_NEGOTIATE_INFO`
+/// repeats (MS-SMB2 `Connection.ClientCapabilities`).
+const CLIENT_CAPABILITIES: Capabilities = Capabilities::new(
+    Capabilities::DFS | Capabilities::LEASING | Capabilities::LARGE_MTU | Capabilities::ENCRYPTION,
+);
+
+/// The statuses a server that doesn't implement `FSCTL_VALIDATE_NEGOTIATE_INFO`
+/// answers it with. MS-SMB2 § 3.2.5.14.12 terminates only on
+/// `STATUS_ACCESS_DENIED` and on a mismatch, and older servers (Windows before
+/// 8, some NAS firmware) refuse the FSCTL itself, signed, in these ways; the
+/// Linux client and Windows accept them. Any other status fails closed.
+const VALIDATE_NEGOTIATE_UNSUPPORTED: [NtStatus; 3] = [
+    NtStatus::NOT_SUPPORTED,
+    NtStatus::INVALID_DEVICE_REQUEST,
+    NtStatus::FILE_CLOSED,
+];
+
+/// Judge a (signature-verified) `FSCTL_VALIDATE_NEGOTIATE_INFO` answer
+/// against what NEGOTIATE left the connection with (MS-SMB2 § 3.2.5.14.12).
+/// `Err` carries why it fails.
+fn validate_negotiate_answer(
+    frame: &Frame,
+    params: &NegotiatedParams,
+) -> std::result::Result<(), String> {
+    let status = frame.header.status;
+    if VALIDATE_NEGOTIATE_UNSUPPORTED.contains(&status) {
+        debug!("negotiate: the server doesn't implement validation, status={status:?}");
+        return Ok(());
+    }
+    if status != NtStatus::SUCCESS {
+        return Err(format!("the server refused to confirm it ({status:?})"));
+    }
+    let answer = IoctlResponse::unpack(&mut ReadCursor::new(&frame.body))
+        .and_then(|resp| {
+            ValidateNegotiateInfoResponse::unpack(&mut ReadCursor::new(&resp.output_data))
+        })
+        .map_err(|e| format!("the server's answer didn't parse: {e}"))?;
+
+    let mismatch = if answer.dialect != u16::from(params.dialect) {
+        Some("dialect")
+    } else if answer.guid != params.server_guid {
+        Some("server GUID")
+    } else if answer.security_mode != params.security_mode {
+        Some("security mode")
+    } else if answer.capabilities != params.capabilities {
+        Some("capabilities")
+    } else {
+        None
+    };
+    match mismatch {
+        Some(field) => Err(format!(
+            "the server's {field} differs from what NEGOTIATE answered"
+        )),
+        None => {
+            debug!("negotiate: validated, dialect={}", params.dialect);
+            Ok(())
+        }
+    }
 }
 
 /// The ciphers NEGOTIATE offers on 3.1.1, in our order of preference: GCM
@@ -2041,6 +2111,14 @@ struct Inner {
     compression_enabled: AtomicBool,
     /// Whether the client wants compression (from config).
     compression_requested: AtomicBool,
+    /// Whether every session on this connection must encrypt, whatever the
+    /// server asks for (`ClientConfig::require_encryption`). Survives a
+    /// revival, like the rest of the caller's settings.
+    require_encryption: AtomicBool,
+    /// Whether this connection's NEGOTIATE has been proven with a signed
+    /// `FSCTL_VALIDATE_NEGOTIATE_INFO` (or needs no proof: SMB 3.1.1).
+    /// Cleared by every NEGOTIATE, so a revival validates its own.
+    negotiate_validated: AtomicBool,
     /// Preauth integrity hash (for SMB 3.1.1 key derivation). Mutated during
     /// negotiate and session setup; both happen on one task before any clone
     /// is expected to observe it.
@@ -2159,6 +2237,8 @@ impl Inner {
             write_lateness_hint: StdMutex::new(None),
             compression_enabled: AtomicBool::new(false),
             compression_requested: AtomicBool::new(true),
+            require_encryption: AtomicBool::new(false),
+            negotiate_validated: AtomicBool::new(false),
             preauth_hasher: StdMutex::new(PreauthHasher::new()),
             dfs_trees: StdMutex::new(HashSet::new()),
             ipc_tree: StdMutex::new(None),
@@ -3078,14 +3158,15 @@ impl Connection {
             });
         }
 
+        // Whatever an earlier NEGOTIATE on this connection proved, this one
+        // hasn't proven anything yet.
+        self.inner
+            .negotiate_validated
+            .store(false, Ordering::Release);
+
         let request = NegotiateRequest {
-            security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
-            capabilities: Capabilities::new(
-                Capabilities::DFS
-                    | Capabilities::LEASING
-                    | Capabilities::LARGE_MTU
-                    | Capabilities::ENCRYPTION,
-            ),
+            security_mode: CLIENT_SECURITY_MODE,
+            capabilities: CLIENT_CAPABILITIES,
             client_guid,
             dialects: Dialect::ALL.to_vec(),
             negotiate_contexts,
@@ -3211,6 +3292,7 @@ impl Connection {
             max_transact_size: resp.max_transact_size,
             server_guid: resp.server_guid,
             signing_required,
+            security_mode: resp.security_mode,
             capabilities: resp.capabilities,
             signing_algorithm,
             cipher,
@@ -3228,6 +3310,94 @@ impl Connection {
         );
 
         Ok(())
+    }
+
+    /// The `ClientGuid` this connection negotiates with.
+    #[cfg(test)]
+    pub(crate) fn client_guid(&self) -> Guid {
+        self.inner.client_guid
+    }
+
+    /// Prove this connection's NEGOTIATE wasn't rewritten on its way, with a
+    /// signed `FSCTL_VALIDATE_NEGOTIATE_INFO` on the tree just connected
+    /// (MS-SMB2 § 3.2.5.5, § 3.2.5.14.12). Every TREE_CONNECT calls it on
+    /// success; it sends something once per NEGOTIATE at most.
+    ///
+    /// Nothing else catches a downgrade below 3.1.1: an on-path attacker who
+    /// takes 3.1.1 (whose preauth hash would notice) and the ENCRYPTION
+    /// capability out of the request leaves a session that signs but sends
+    /// everything else in the clear. The request repeats what we sent, the
+    /// server compares it with what it received and the answer with what it
+    /// sent, and the response has to be signed by the session key, which the
+    /// attacker doesn't have (the receiver refuses an unsigned one, pitfall 29).
+    ///
+    /// It sends nothing when the negotiation needs no proof (3.1.1) or none can
+    /// be had: a guest or anonymous session doesn't sign, so validation waits
+    /// for a session that does. Every failure tears the connection down and
+    /// returns [`Error::NegotiateValidationFailed`].
+    pub(crate) async fn validate_negotiate(&self, tree_id: TreeId) -> Result<()> {
+        if self.inner.negotiate_validated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(params) = self.params() else {
+            return Ok(());
+        };
+        if params.dialect == Dialect::Smb3_1_1 {
+            self.inner
+                .negotiate_validated
+                .store(true, Ordering::Release);
+            return Ok(());
+        }
+        if !self.inner.crypto.lock().unwrap().should_sign {
+            trace!("negotiate: not validated yet, this session doesn't sign");
+            return Ok(());
+        }
+
+        let info = ValidateNegotiateInfoRequest {
+            capabilities: CLIENT_CAPABILITIES,
+            guid: self.inner.client_guid,
+            security_mode: CLIENT_SECURITY_MODE,
+            dialects: Dialect::ALL.to_vec(),
+        };
+        let mut input = WriteCursor::new();
+        info.pack(&mut input);
+        let request = IoctlRequest {
+            ctl_code: FSCTL_VALIDATE_NEGOTIATE_INFO,
+            file_id: FileId::SENTINEL,
+            max_input_response: 0,
+            max_output_response: ValidateNegotiateInfoResponse::SIZE,
+            flags: SMB2_0_IOCTL_IS_FSCTL,
+            input_data: input.into_inner(),
+        };
+
+        let verdict = match self.execute(Command::Ioctl, &request, Some(tree_id)).await {
+            Ok(frame) => validate_negotiate_answer(&frame, &params),
+            // An answer that fails its signature check is exactly what a
+            // forged one looks like (§ 3.2.5.14.12: terminate).
+            Err(e @ Error::SignatureInvalid { .. }) => Err(format!("the response {e}")),
+            // A server that finds a mismatch terminates the connection
+            // (§ 3.3.5.15.12), which is how Samba answers a rewritten NEGOTIATE.
+            Err(Error::Disconnected) => {
+                Err("the server closed the connection when asked to confirm it".to_string())
+            }
+            Err(e) => return Err(e),
+        };
+        match verdict {
+            Ok(()) => {
+                self.inner
+                    .negotiate_validated
+                    .store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(reason) => {
+                error!(
+                    "negotiate: validation failed, dropping the connection: {reason} server={:?}",
+                    self.inner.server_name
+                );
+                self.mark_dead();
+                Err(Error::NegotiateValidationFailed { reason })
+            }
+        }
     }
 
     /// Get the estimated round-trip time: NEGOTIATE's, lowered by the
@@ -3682,6 +3852,22 @@ impl Connection {
         self.inner
             .compression_requested
             .store(requested, Ordering::Release);
+    }
+
+    /// Require every session set up on this connection to encrypt, whatever
+    /// the server asks for. [`ClientConfig::require_encryption`](crate::ClientConfig::require_encryption)
+    /// documents it; set it before [`Session::setup`](crate::client::session::Session::setup).
+    /// A revival keeps it.
+    pub fn set_require_encryption(&self, required: bool) {
+        self.inner
+            .require_encryption
+            .store(required, Ordering::Release);
+    }
+
+    /// Whether sessions on this connection must encrypt
+    /// ([`set_require_encryption`](Self::set_require_encryption)).
+    pub fn require_encryption(&self) -> bool {
+        self.inner.require_encryption.load(Ordering::Acquire)
     }
 
     /// Whether compression is active on this connection.
@@ -9258,6 +9444,7 @@ mod tests {
             max_transact_size: 65536,
             server_guid: Guid::ZERO,
             signing_required: false,
+            security_mode: Default::default(),
             capabilities: Capabilities::default(),
             signing_algorithm: crate::crypto::signing::SigningAlgorithm::AesCmac,
             cipher: Some(Cipher::Aes128Gcm),

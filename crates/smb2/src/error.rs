@@ -268,6 +268,42 @@ pub enum Error {
         share: Option<String>,
     },
 
+    /// This client requires encryption
+    /// ([`ClientConfig::require_encryption`](crate::ClientConfig::require_encryption)),
+    /// and the session can't have it: the connection agreed on no cipher (or a
+    /// dialect below SMB 3.0, which has none), or the server answered the login
+    /// with a guest or anonymous session, which has no keys.
+    ///
+    /// A server that doesn't offer encryption looks like this, and so does an
+    /// on-path attacker removing it from the negotiation, which is the case the
+    /// setting exists for. Nothing was sent past the login.
+    ///
+    /// Classifies as [`ErrorKind::Unsupported`] and is not retryable.
+    #[error(
+        "this client requires encryption, but the server agreed on no cipher or offered a guest \
+         session, so the connection would be in the clear. Check the server's encryption settings"
+    )]
+    EncryptionRequired,
+
+    /// The server didn't confirm the dialect, capabilities, and security mode
+    /// this connection negotiated (`FSCTL_VALIDATE_NEGOTIATE_INFO`, MS-SMB2
+    /// § 3.2.5.14.12), so the negotiation may have been rewritten on its way
+    /// to move the session off SMB 3.1.1 or off encryption. The connection is
+    /// torn down.
+    ///
+    /// Only a connection below SMB 3.1.1 with a signing session checks this,
+    /// at its first tree connect. A server with a broken implementation looks
+    /// the same, which is why `reason` says what didn't match.
+    ///
+    /// Classifies as [`ErrorKind::NegotiateValidationFailed`] and is not
+    /// retryable: surface it as a security problem with the connection.
+    #[error("the server didn't confirm the connection's negotiation: {reason}")]
+    NegotiateValidationFailed {
+        /// What failed: the server's refusal, a field that differs, or an
+        /// answer that wasn't signed.
+        reason: String,
+    },
+
     /// An I/O or transport error occurred.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -867,7 +903,8 @@ pub enum ErrorKind {
     /// server-side copy, a plain read-then-write). Maps from
     /// `STATUS_NOT_SUPPORTED`, `STATUS_INVALID_DEVICE_REQUEST`, and
     /// `STATUS_NOT_IMPLEMENTED`, and from [`Error::NamedStreamsUnsupported`],
-    /// [`Error::StreamDeleteIgnored`], and [`Error::EncryptionUnavailable`].
+    /// [`Error::StreamDeleteIgnored`], [`Error::EncryptionUnavailable`], and
+    /// [`Error::EncryptionRequired`].
     Unsupported,
     /// An interrupted upload can't resume from its checkpoint: write the
     /// file again from the start. Only [`Error::ResumeRefused`] has it, and
@@ -883,6 +920,10 @@ pub enum ErrorKind {
     /// server that maps failed logins to guest; check the credentials. Only
     /// [`Error::GuestSessionRefused`] has it. Not retryable.
     GuestSessionRefused,
+    /// The server didn't confirm what the connection negotiated, so it may
+    /// have been tampered with; the connection is gone. Only
+    /// [`Error::NegotiateValidationFailed`] has it. Not retryable.
+    NegotiateValidationFailed,
     /// A protocol error not covered by other variants.
     ///
     /// Use [`Error::status()`] to get the raw NTSTATUS code. Some defined
@@ -909,7 +950,10 @@ impl Error {
             Error::Auth { .. } => ErrorKind::AuthRequired,
             Error::SignatureInvalid { .. } => ErrorKind::SignatureInvalid,
             Error::GuestSessionRefused { .. } => ErrorKind::GuestSessionRefused,
-            Error::EncryptionUnavailable { .. } => ErrorKind::Unsupported,
+            Error::EncryptionUnavailable { .. } | Error::EncryptionRequired => {
+                ErrorKind::Unsupported
+            }
+            Error::NegotiateValidationFailed { .. } => ErrorKind::NegotiateValidationFailed,
             Error::Io(_) => ErrorKind::Io,
             Error::Disconnected => ErrorKind::ConnectionLost,
             Error::Timeout => ErrorKind::TimedOut,

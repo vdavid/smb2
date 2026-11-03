@@ -525,6 +525,8 @@ impl Tree {
             .header
             .tree_id
             .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
+        // Nothing goes out on a tree until the negotiation is proven.
+        conn.validate_negotiate(tree_id).await?;
 
         let is_dfs = resp
             .capabilities
@@ -8749,6 +8751,7 @@ mod tests {
             max_transact_size: 65536,
             server_guid: crate::pack::Guid::ZERO,
             signing_required: false,
+            security_mode: Default::default(),
             capabilities: crate::types::flags::Capabilities::default(),
             signing_algorithm: crate::crypto::signing::SigningAlgorithm::HmacSha256,
             cipher: None,

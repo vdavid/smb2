@@ -8639,3 +8639,236 @@ async fn guest_a_share_without_streams_still_reads_and_refuses_new_file_xattrs()
     );
     let _ = tree.delete_file(&mut conn, file).await;
 }
+
+// ── A rewritten NEGOTIATE (smb-encryption-desired, smb-auth) ─────────
+
+/// Samba's default dialects, `server smb encrypt = desired`.
+const ENCRYPTION_DESIRED_ADDR: &str = "127.0.0.1:10469";
+
+/// How [`negotiate_proxy`] rewrites the first NEGOTIATE request, the way an
+/// on-path attacker could.
+#[derive(Clone, Copy, Debug)]
+enum Rewrite {
+    /// Change nothing (the control).
+    None,
+    /// Take 3.1.1 out of the dialects, keep the ENCRYPTION capability.
+    Drop311,
+    /// Take 3.1.1 out and clear the ENCRYPTION capability.
+    Drop311Strip,
+    /// Leave only 2.0.2 and 2.1, and clear the capability.
+    Only2x,
+}
+
+/// Rewrite a NEGOTIATE request in place. Expects the dialects in the order
+/// this crate sends them (2.0.2, 2.1, 3.0, 3.0.2, 3.1.1): a shorter count drops
+/// the tail, and without 3.1.1 the context offset and count are read as a
+/// `ClientStartTime` that has to be zero, so the frame keeps its size.
+fn rewrite_negotiate(frame: &mut [u8], mode: Rewrite) {
+    const BODY: usize = 64;
+    let dialects: u16 = match mode {
+        Rewrite::None => return,
+        Rewrite::Drop311 | Rewrite::Drop311Strip => 4,
+        Rewrite::Only2x => 2,
+    };
+    if !matches!(mode, Rewrite::Drop311) {
+        frame[BODY + 8] &= !0x40; // SMB2_GLOBAL_CAP_ENCRYPTION
+    }
+    frame[BODY + 2..BODY + 4].copy_from_slice(&dialects.to_le_bytes());
+    frame[BODY + 28..BODY + 36].fill(0);
+}
+
+/// A TCP proxy in front of `upstream` that rewrites each connection's first
+/// NEGOTIATE with `mode` and passes everything else through. Returns the
+/// address to connect to.
+async fn negotiate_proxy(upstream: &'static str, mode: Rewrite) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn pump(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+        mut rewrite: Option<Rewrite>,
+    ) {
+        let mut head = [0u8; 4];
+        while from.read_exact(&mut head).await.is_ok() {
+            let len = u32::from_be_bytes([0, head[1], head[2], head[3]]) as usize;
+            let mut frame = vec![0u8; len];
+            if from.read_exact(&mut frame).await.is_err() {
+                break;
+            }
+            // Command 0 is NEGOTIATE.
+            if frame.starts_with(b"\xFESMB") && frame[12] == 0 {
+                if let Some(mode) = rewrite.take() {
+                    rewrite_negotiate(&mut frame, mode);
+                }
+            }
+            if to.write_all(&head).await.is_err() || to.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let server = tokio::net::TcpStream::connect(upstream)
+                .await
+                .expect("the proxy reaches its upstream");
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            tokio::spawn(pump(client_read, server_write, Some(mode)));
+            tokio::spawn(pump(server_read, client_write, None));
+        }
+    });
+    addr
+}
+
+/// `testuser` on `addr`, optionally requiring encryption.
+fn proxied_config(addr: String, require_encryption: bool) -> ClientConfig {
+    ClientConfig {
+        addr,
+        timeout: TIMEOUT,
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        compression: false,
+        require_encryption,
+        ..Default::default()
+    }
+}
+
+/// smb-auth capped at SMB 3.0.2, and at SMB 2.1: negotiations below 3.1.1 that
+/// nobody rewrote.
+const AUTH_SMB302_ADDR: &str = "127.0.0.1:10470";
+const AUTH_SMB21_ADDR: &str = "127.0.0.1:10471";
+
+/// Every rewrite that moves a session off 3.1.1 now fails at the first tree
+/// connect, on a server preferring encryption and on one with no opinion: the
+/// server won't confirm a negotiation it didn't see. `Drop311` alone keeps
+/// encryption, and is caught all the same, since the dialects differ.
+#[tokio::test]
+#[ignore]
+async fn a_downgraded_negotiation_fails_at_the_first_tree_connect() {
+    let _ = env_logger::try_init();
+    for upstream in [ENCRYPTION_DESIRED_ADDR, AUTH_ADDR] {
+        for (mode, dialect) in [
+            (Rewrite::Drop311, smb2::types::Dialect::Smb3_0_2),
+            (Rewrite::Drop311Strip, smb2::types::Dialect::Smb3_0_2),
+            (Rewrite::Only2x, smb2::types::Dialect::Smb2_1),
+        ] {
+            let addr = negotiate_proxy(upstream, mode).await;
+            let mut client = SmbClient::connect(proxied_config(addr, false))
+                .await
+                .unwrap_or_else(|e| panic!("{upstream} {mode:?}: the login itself works: {e}"));
+            let params = client.params().unwrap();
+            assert_eq!(
+                params.dialect, dialect,
+                "{upstream} {mode:?}: the rewrite took"
+            );
+            if !matches!(mode, Rewrite::Drop311) {
+                assert!(params.cipher.is_none(), "{upstream} {mode:?}");
+            }
+
+            match client.connect_share("private").await {
+                Err(e @ smb2::Error::NegotiateValidationFailed { .. }) => {
+                    eprintln!("{upstream} {mode:?}: {e}");
+                    assert_eq!(e.kind(), smb2::ErrorKind::NegotiateValidationFailed);
+                }
+                other => panic!(
+                    "{upstream} {mode:?}: expected the validation to fail, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+            assert!(client.connection().is_disconnected(), "{upstream} {mode:?}");
+        }
+    }
+}
+
+/// An honest negotiation below 3.1.1 validates and works: a server capped at
+/// 3.0.2 (signed, then encrypted) and one capped at 2.1. And the proxy itself
+/// changes nothing when it rewrites nothing.
+#[tokio::test]
+#[ignore]
+async fn an_honest_negotiation_below_3_1_1_validates_and_works() {
+    use smb2::types::Dialect;
+    let _ = env_logger::try_init();
+    let direct = |addr: &str| addr.to_string();
+    for (addr, dialect, encrypts) in [
+        (direct(AUTH_SMB302_ADDR), Dialect::Smb3_0_2, false),
+        (direct(AUTH_SMB21_ADDR), Dialect::Smb2_1, false),
+        (direct(ENCRYPTION_AES128_ADDR), Dialect::Smb3_0_2, true),
+        (
+            negotiate_proxy(AUTH_ADDR, Rewrite::None).await,
+            Dialect::Smb3_1_1,
+            false,
+        ),
+    ] {
+        let mut client = SmbClient::connect(proxied_config(addr.clone(), false))
+            .await
+            .unwrap_or_else(|e| panic!("{addr}: {e}"));
+        assert_eq!(client.params().unwrap().dialect, dialect, "{addr}");
+        let mut tree = client
+            .connect_share("private")
+            .await
+            .unwrap_or_else(|e| panic!("{addr}: an honest negotiation validates: {e}"));
+        let conn = client.connection_for(&tree).unwrap();
+        assert_eq!(conn.should_encrypt(), encrypts, "{addr}");
+
+        let path = format!("validate-negotiate-{}.txt", u16::from(dialect));
+        client
+            .write_file(&tree, &path, b"validated")
+            .await
+            .unwrap_or_else(|e| panic!("{addr}: {e}"));
+        assert_eq!(
+            client.read_file(&mut tree, &path).await.unwrap(),
+            b"validated"
+        );
+        client.delete_file(&tree, &path).await.unwrap();
+
+        // A second share on the connection connects without asking again.
+        client.connect_share("private").await.unwrap();
+    }
+}
+
+/// `require_encryption` refuses the session a rewritten negotiation leaves in
+/// the clear before anything but the login crosses, and on a server that
+/// would let it go unencrypted, encrypts anyway.
+#[tokio::test]
+#[ignore]
+async fn require_encryption_refuses_the_clear_and_encrypts_unasked() {
+    let _ = env_logger::try_init();
+    for mode in [Rewrite::Drop311Strip, Rewrite::Only2x] {
+        let addr = negotiate_proxy(ENCRYPTION_DESIRED_ADDR, mode).await;
+        match SmbClient::connect(proxied_config(addr, true)).await {
+            Err(e @ smb2::Error::EncryptionRequired) => eprintln!("{mode:?}: {e}"),
+            other => panic!(
+                "{mode:?}: expected EncryptionRequired, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+    // A 2.1 server has no encryption to give.
+    assert!(matches!(
+        SmbClient::connect(proxied_config(AUTH_SMB21_ADDR.to_string(), true)).await,
+        Err(smb2::Error::EncryptionRequired)
+    ));
+
+    // smb-auth doesn't ask for encryption; the client encrypts on 3.1.1 and on
+    // 3.0.2 all the same.
+    for (addr, cipher) in [
+        (AUTH_ADDR, smb2::client::Cipher::Aes128Gcm),
+        (AUTH_SMB302_ADDR, smb2::client::Cipher::Aes128Ccm),
+    ] {
+        let mut client = SmbClient::connect(proxied_config(addr.to_string(), true))
+            .await
+            .unwrap_or_else(|e| panic!("{addr}: {e}"));
+        let mut tree = client.connect_share("private").await.unwrap();
+        assert_encrypts(&client, &tree, cipher);
+        let path = format!(
+            "require-encryption-{}.txt",
+            addr.rsplit(':').next().unwrap()
+        );
+        client.write_file(&tree, &path, b"sealed").await.unwrap();
+        assert_eq!(client.read_file(&mut tree, &path).await.unwrap(), b"sealed");
+        client.delete_file(&tree, &path).await.unwrap();
+    }
+}

@@ -355,6 +355,8 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 41. **Encryption takes a capability bit, a cipher the server picked, and keys of two different lengths from two different keys** ✅ -- Each one failed silently or loudly for months (#32). NEGOTIATE must send `SMB2_GLOBAL_CAP_ENCRYPTION` on every dialect: Samba reads the 3.1.1 cipher context only when it's set, so without it no cipher was picked, `required` refused the session, and `desired` served every encryption fixture in plaintext while its tests passed. The connection's cipher (`negotiated_cipher`) is AES-128-CCM on 3.0 / 3.0.2 when the server granted the bit, and the server's pick on 3.1.1; ❌ never a cipher we chose (the old AES-128-CCM fallback is what hid the missing bit), so a session or share demanding encryption without one fails with `Error::EncryptionUnavailable`. Then the keys: ❌ the signing key is ALWAYS 128 bits, from the first 16 bytes of the authentication's key (`Session.SessionKey`), whatever the cipher; deriving it at 256 bits failed every login to a server that picked AES-256, encrypting or not. And AES-256 encryption keys come from the FULL key (`Session.FullSessionKey`, MS-SMB2 § 3.2.5.3.1), which only differs from the first 16 bytes under Kerberos, so NTLM tests can't catch that one. Every encryption test asserts the connection actually encrypts. Spans `client/connection.rs` + `client/session.rs` + `client/mod.rs` + `crypto/kdf.rs`; see `crypto/CLAUDE.md` § Key derivation and `client/CLAUDE.md` § Encryption.
 
+42. **Below SMB 3.1.1 the negotiation is proven at the first tree connect, or the connection goes** ✅ -- 3.1.1's preauth hash proves the NEGOTIATE exchange; nothing proves an older one, so an on-path attacker taking 3.1.1 and `SMB2_GLOBAL_CAP_ENCRYPTION` out of the request moved a session to 3.0.2 or 2.1, signed but in the clear, against any server accepting an older dialect (Samba's defaults do). `Connection::validate_negotiate` sends the signed `FSCTL_VALIDATE_NEGOTIATE_INFO` (MS-SMB2 § 3.2.5.5) after every successful TREE_CONNECT until one validates, repeating what NEGOTIATE sent from the same constants, and compares the answer with `NegotiatedParams`; anything but a matching signed answer or a signed "not implemented" tears the connection down with `Error::NegotiateValidationFailed`. Samba answers a mismatch by hanging up, so a disconnect during the check is a failure. ❌ A new TREE_CONNECT site must call it; ❌ a guest session can't (it doesn't sign), so the check waits for a session that does. `ClientConfig::require_encryption` is the caller-side guard for the same gap: the session encrypts whatever the server asked, or the login fails with `Error::EncryptionRequired`. Spans `client/connection.rs` + `client/tree.rs` + `client/shares.rs` + `client/dfs.rs` + `client/session.rs` + `msg/ioctl.rs`; see `client/CLAUDE.md` § Secure negotiate.
+
 ## Testing
 
 See `tests/CLAUDE.md` for the full testing guide. Quick reference:
@@ -371,12 +373,15 @@ starts one container rather than 16.
 
 ### Docker test containers
 
-24 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+27 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
 | smb-guest             | 10445 | Guest access, basic operations                |
 | smb-auth              | 10446 | NTLM authentication                           |
+| smb-auth-smb302       | 10470 | smb-auth capped at SMB 3.0.2 (compose `--option`): an honest negotiation below 3.1.1 validates |
+| smb-auth-smb21        | 10471 | smb-auth capped at SMB 2.1: the same, and `require_encryption` refuses it |
+| smb-encryption-desired | 10469 | Default dialects, `server smb encrypt = desired`: a rewritten NEGOTIATE (through an in-test proxy) fails the negotiation check, and `require_encryption` refuses it |
 | smb-signing           | 10447 | Mandatory signing (server rejects unsigned)   |
 | smb-signing-hmac      | 10468 | SMB 3.1.1 signed with HMAC-SHA256 only: the client signs with the server's pick from `SMB2_SIGNING_CAPABILITIES` |
 | smb-readonly          | 10448 | Write/delete return clean NTSTATUS errors     |

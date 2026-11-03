@@ -89,6 +89,7 @@ async fn tree_connect_ipc(conn: &mut Connection) -> Result<TreeId> {
         .header
         .tree_id
         .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
+    conn.validate_negotiate(tree_id).await?;
 
     info!("shares: connected to IPC$, tree_id={}", tree_id);
     Ok(tree_id)
@@ -744,6 +745,7 @@ pub(crate) mod tests {
             max_transact_size: 65536,
             server_guid: Guid::ZERO,
             signing_required: false,
+            security_mode: Default::default(),
             capabilities: Capabilities::default(),
             signing_algorithm: crate::crypto::signing::SigningAlgorithm::HmacSha256,
             cipher: None,

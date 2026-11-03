@@ -1071,6 +1071,7 @@ mod oplock_break_tests {
             max_transact_size: 65536,
             server_guid: Guid::ZERO,
             signing_required: false,
+            security_mode: Default::default(),
             capabilities: Capabilities::default(),
             signing_algorithm: crate::crypto::signing::SigningAlgorithm::AesCmac,
             cipher: None,

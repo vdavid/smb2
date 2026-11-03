@@ -59,6 +59,7 @@ pub(crate) fn setup_connection_without_credits(mock: &Arc<MockTransport>) -> Con
         max_transact_size: 65536,
         server_guid: Guid::ZERO,
         signing_required: false,
+        security_mode: Default::default(),
         capabilities: Capabilities::default(),
         signing_algorithm: crate::crypto::signing::SigningAlgorithm::HmacSha256,
         cipher: None,

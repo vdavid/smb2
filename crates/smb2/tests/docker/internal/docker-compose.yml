@@ -18,6 +18,22 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10446:445"
 
+  # smb-auth capped at an older dialect: a negotiation below 3.1.1 that nobody
+  # rewrote, so the negotiation check has to pass.
+  smb-auth-smb302:
+    build:
+      context: smb-auth
+    command: ["smbd", "--foreground", "--no-process-group", "--debug-stdout", "--option=server max protocol=SMB3_02"]
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10470:445"
+
+  smb-auth-smb21:
+    build:
+      context: smb-auth
+    command: ["smbd", "--foreground", "--no-process-group", "--debug-stdout", "--option=server max protocol=SMB2_10"]
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10471:445"
+
   smb-signing:
     build:
       context: smb-signing
@@ -61,6 +77,12 @@ services:
       context: smb-encryption
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10452:445"
+
+  smb-encryption-desired:
+    build:
+      context: smb-encryption-desired
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10469:445"
 
   smb-encryption-required:
     build:
