@@ -49,6 +49,12 @@
       "enabled": false
     },
     {
+      "description": "Hold GitHub's Ubuntu runner below 26.04 while that image is a public preview (actions/runner-images#14226, still preview on 2026-11-03). The Homebrew publish job runs only at release time and no PR CI exercises it, so a preview image's instability or queueing would surface mid-release. Lift this rule once #14226 is closed and the 26.04 image is GA.",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["ubuntu"],
+      "allowedVersions": "/^2[2-5]\\./"
+    },
+    {
       "description": "Lock file maintenance (a weekly plain `cargo update`) runs only for the fuzz harness, and never automerges: Cmdr's weekly upgrades pass merges it once every version in it is at least three days old and the harness builds. It's its own workspace, so the main grouped PR never touches its lockfile, and its indirect deps otherwise drift until a release. Everywhere else it stays off: Renovate can't apply minimumReleaseAge to it (see docs/dependency-updates.md). Both paths are negated because matchFileNames also tests each package file's lockfiles.",
       "matchUpdateTypes": ["lockFileMaintenance"],
       "matchFileNames": ["!crates/smb2/fuzz/Cargo.toml", "!crates/smb2/fuzz/Cargo.lock"],
