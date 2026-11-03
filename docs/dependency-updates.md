@@ -10,6 +10,9 @@ Renovate PR, or before touching `rust-version`.
   oldest stable released within that window (or older, if nothing needs newer).
 - **Raising it** is a minor version bump (0.x: the `x`), with a **Breaking** changelog line. Raise it when a dependency
   or a language feature needs it; don't chase the window for its own sake.
+- **Held at 1.90 for OSS Verify**: its proof builds use rustc 1.90 (`nightly-2025-07-16`), and a `rust-version` above
+  that needs a patch on their side. So a raise also waits for OSS Verify's toolchain, unless a dependency forces it
+  (`crates/smb2/fuzz/CLAUDE.md`).
 - **Scope**: what consumers compile, so the library (every feature, smol-only too) and the CLI binary. Tests,
   examples, and dev-dependencies run on stable only.
 - ❌ **Never cap a dependency in `Cargo.toml` for the MSRV** (like `aes = ">=0.9.1, <0.9.3"`). A cap forces every
@@ -78,4 +81,6 @@ Touch every one of these in the same commit:
 - `justfile`: the `msrv` recipe (comments, the `rustup run` probe, every `cargo +1.xx.0`) and the header lines.
 - `README.md` and `crates/smb2/README.md`: the MSRV badge and the MSRV paragraph.
 - `CONTRIBUTING.md`: the MSRV section and the "Submitting changes" step.
+- `.github/workflows/fuzz.yml` and `crates/smb2/fuzz/CLAUDE.md`: the OSS Verify notes (a raise past its toolchain
+  needs `--ignore-rust-version` back on the `oss-verify-toolchain` build).
 - `CHANGELOG.md`: a **Breaking** entry ("The MSRV is now Rust B (was A)"), and a minor version bump at release.

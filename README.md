@@ -1,7 +1,7 @@
 # smb2 workspace
 
 [![CI](https://github.com/vdavid/smb2/actions/workflows/ci.yml/badge.svg)](https://github.com/vdavid/smb2/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.91-blue)](https://blog.rust-lang.org/2025/10/30/Rust-1.91.0/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.90-blue)](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/)
 
 Pure-Rust SMB2/3 for talking to a file share over the network. No `libsmbclient`, no FFI, no mounting. Async on
 tokio or smol, and faster than the native macOS SMB client on uploads, downloads, listings, and deletes.
@@ -23,7 +23,7 @@ waiting on a release.
 
 ## MSRV
 
-Both crates support the Rust releases from the last 12 months, currently Rust 1.91 or newer. Raising this minimum is a
+Both crates support the Rust releases from the last 12 months, currently Rust 1.90 or newer. Raising this minimum is a
 minor version bump, and the changelog always says so.
 
 ## Sister projects

@@ -22,6 +22,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 - **smb2-cli: `--require-encryption`**, a global flag that sets `ClientConfig::require_encryption` on every connection a command opens.
 - New Docker containers: `smb-encryption-desired` (default dialects, encryption preferred) and `smb-auth-smb302` / `smb-auth-smb21` (the auth fixture capped at an older dialect).
 
+### Changed
+
+- **The MSRV is now Rust 1.90 (was 1.91)**: one more Rust release can build smb2, and the build OSS Verify runs for its fuzzing proofs needs no `rust-version` patch any more.
+
 ### Fixed
 
 - **Servers that require encryption accept the session, and servers that offer it get it**: NEGOTIATE now sets the `ENCRYPTION` capability. Without it, Samba with `server smb encrypt = required` refused the session at setup, and with `desired` the session ran in plaintext. Contributed by acseven in [#34](https://github.com/vdavid/smb2/pull/34), also reported in [#32](https://github.com/vdavid/smb2/issues/32) by InstaZDLL. A new `smb-encryption-required` container covers it.

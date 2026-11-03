@@ -143,7 +143,7 @@ jobs:
   # It resolves dependencies afresh the way a consumer on the MSRV does, so the committed Cargo.lock (kept current by
   # Renovate) never has to stay MSRV-compatible. See docs/dependency-updates.md.
   msrv:
-    name: Verify MSRV (1.91, ${{ matrix.os }})
+    name: Verify MSRV (1.90, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -158,7 +158,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           # Keep in sync with rust-version in Cargo.toml. Renovate leaves it alone on purpose.
-          toolchain: "1.91"
+          toolchain: "1.90"
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2

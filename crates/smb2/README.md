@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/smb2)](https://docs.rs/smb2)
 [![CI](https://github.com/vdavid/smb2/actions/workflows/ci.yml/badge.svg)](https://github.com/vdavid/smb2/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/smb2)](https://github.com/vdavid/smb2/blob/main/LICENSE-MIT)
-[![MSRV](https://img.shields.io/badge/MSRV-1.91-blue)](https://blog.rust-lang.org/2025/10/30/Rust-1.91.0/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.90-blue)](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/)
 
 A pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. Faster than native macOS SMB in all
 operations: 1.3-5x faster on uploads, downloads, listings, and deletes.
@@ -347,7 +347,7 @@ uses tokio's channels and semaphores either way; they work on any executor.
 
 ### MSRV
 
-smb2 supports the Rust releases from the last 12 months, currently Rust 1.91 or newer. Raising this minimum is a minor
+smb2 supports the Rust releases from the last 12 months, currently Rust 1.90 or newer. Raising this minimum is a minor
 version bump (like 0.36 to 0.37), and the changelog always says so. When one of smb2's dependencies ships a release
 that needs a newer Rust than yours, Cargo's MSRV-aware resolver (on by default with `resolver = "3"` or edition 2024)
 picks a version your Rust can build.

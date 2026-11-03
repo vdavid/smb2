@@ -9,7 +9,7 @@
 #     clippy      - Run clippy with -D warnings
 #     test        - Run tests
 #     doc         - Build documentation
-#     msrv        - Check MSRV (1.91) compatibility
+#     msrv        - Check MSRV (1.90) compatibility
 #     audit       - Security audit (requires cargo-audit)
 #     deny        - License/dependency check (requires cargo-deny)
 #     udeps       - Find unused dependencies (requires nightly + cargo-udeps)
@@ -28,7 +28,7 @@
 #     clean       - Remove build artifacts
 #     install-tools - Install required development tools
 #
-# MSRV: 1.91
+# MSRV: 1.90
 
 set shell := ["bash", "-uc"]
 
@@ -112,25 +112,25 @@ doc:
     @cargo doc --no-deps --quiet
     @echo "[+] Docs built"
 
-# Check MSRV compatibility (requires rustup with 1.91 toolchain). Covers what consumers compile (the library with
+# Check MSRV compatibility (requires rustup with 1.90 toolchain). Covers what consumers compile (the library with
 # every feature, and the CLI binary), not tests or dev-dependencies, which only need stable. Same steps as CI's `msrv`
-# job: it resolves dependencies afresh like a consumer on 1.91 would, then puts the committed Cargo.lock back.
+# job: it resolves dependencies afresh like a consumer on 1.90 would, then puts the committed Cargo.lock back.
 msrv:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "[*] Checking MSRV (1.91) compatibility..."
-    if ! rustup run 1.91.0 rustc --version &> /dev/null; then
-        echo "[!] Rust 1.91 not found. Install with: rustup toolchain install 1.91.0"
+    echo "[*] Checking MSRV (1.90) compatibility..."
+    if ! rustup run 1.90.0 rustc --version &> /dev/null; then
+        echo "[!] Rust 1.90 not found. Install with: rustup toolchain install 1.90.0"
         exit 1
     fi
     mkdir -p target
     cp Cargo.lock target/Cargo.lock.msrv-backup
     trap 'mv target/Cargo.lock.msrv-backup Cargo.lock' EXIT
-    CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo +1.91.0 update --quiet
+    CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo +1.90.0 update --quiet
     export RUSTFLAGS="-D warnings" CARGO_TARGET_DIR=target/msrv
-    cargo +1.91.0 check --quiet
-    cargo +1.91.0 check -p smb2 --all-features --quiet
-    cargo +1.91.0 check -p smb2 --no-default-features --features smol --quiet
+    cargo +1.90.0 check --quiet
+    cargo +1.90.0 check -p smb2 --all-features --quiet
+    cargo +1.90.0 check -p smb2 --no-default-features --features smol --quiet
     echo "[+] MSRV check passed"
 
 # Run security audit (requires cargo-audit)

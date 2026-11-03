@@ -29,5 +29,6 @@ can't crash on any input. Its model is one Linux process whose only data is the 
 - express a property as `assert!` (Rust keeps it in release builds, and the panic aborts), never `debug_assert!`;
 - not install a panic hook or catch panics.
 
-OSS Verify builds with rustc 1.90 (nightly-2025-07-16), below our 1.91 MSRV. Its build patch lowers `rust-version`,
-so keep the parse paths compiling on 1.90; the weekly `oss-verify-toolchain` job catches a slip.
+OSS Verify builds with rustc 1.90 (nightly-2025-07-16), which is exactly our MSRV, so its build needs no
+`rust-version` patch. ❌ Raising the MSRV past 1.90 breaks the proof builds until OSS Verify moves its toolchain; the
+weekly `oss-verify-toolchain` job (no `--ignore-rust-version`) catches it.

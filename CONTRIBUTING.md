@@ -27,10 +27,10 @@ Run `just --list` to see all available commands.
 
 ### MSRV (minimum supported Rust version)
 
-We support the Rust releases from the last 12 months, currently Rust 1.91. Raising it is a minor version bump with a changelog line. Before submitting PRs, verify MSRV compatibility:
+We support the Rust releases from the last 12 months, currently Rust 1.90. Raising it is a minor version bump with a changelog line. Before submitting PRs, verify MSRV compatibility:
 
 ```bash
-rustup toolchain install 1.91.0  # One-time setup
+rustup toolchain install 1.90.0  # One-time setup
 just msrv                         # Check MSRV compatibility
 ```
 
@@ -142,7 +142,7 @@ Everything is little-endian on the wire (except the TCP transport framing, which
 1. Fork and create a branch
 2. Make your changes
 3. Run `just` (checks format, lint, test, and doc)
-4. Run `just msrv` to verify Rust 1.91 compatibility
+4. Run `just msrv` to verify Rust 1.90 compatibility
 5. If you have a Samba server, run integration tests
 6. Open a PR with a clear description including how you tested your changes
 
