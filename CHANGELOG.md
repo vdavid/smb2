@@ -7,6 +7,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Servers that require encryption accept the session**: NEGOTIATE now sets the `ENCRYPTION` capability. Without it, Samba with `server smb encrypt = required` refused the session at setup, and with `desired` the session ran in plaintext. A new `smb-encryption-required` container covers it.
+
 ## [0.40.0] - 2026-11-03
 
 ### Added

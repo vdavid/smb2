@@ -56,6 +56,12 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10452:445"
 
+  smb-encryption-required:
+    build:
+      context: smb-encryption-required
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10465:445"
+
   smb-encryption-aes128:
     build:
       context: smb-encryption-aes128

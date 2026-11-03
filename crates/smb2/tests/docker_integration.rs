@@ -2824,6 +2824,63 @@ async fn encryption_required_list_shares() {
     );
 }
 
+// ── Global mandatory encryption (smb-encryption-required, SMB 3.1.1) ──
+
+const ENCRYPTION_REQUIRED_ADDR: &str = "127.0.0.1:10465";
+
+/// `server smb encrypt = required` refuses any session that did not
+/// negotiate encryption, so this fails unless NEGOTIATE carries
+/// `Capabilities::ENCRYPTION`.
+#[tokio::test]
+#[ignore]
+async fn encryption_global_required_connect_and_operate() {
+    let _ = env_logger::try_init();
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: ENCRYPTION_REQUIRED_ADDR.to_string(),
+        timeout: TIMEOUT,
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        domain: String::new(),
+        auto_reconnect: false,
+        compression: false,
+        dfs_enabled: true,
+        dfs_target_overrides: HashMap::new(),
+        connect_options: None,
+        ..Default::default()
+    })
+    .await
+    .expect("SmbClient::connect to smb-encryption-required failed");
+    let mut tree = client
+        .connect_share("private")
+        .await
+        .expect("connect_share failed");
+    assert!(
+        client.connection_for(&tree).unwrap().should_encrypt(),
+        "session must be encrypted"
+    );
+
+    let test_path = "docker_test_required.tmp";
+    let test_data = b"required encryption round trip";
+    client
+        .write_file(&tree, test_path, test_data)
+        .await
+        .expect("write_file failed");
+    let data = client
+        .read_file(&mut tree, test_path)
+        .await
+        .expect("read_file failed");
+    assert_eq!(data, test_data);
+    client
+        .delete_file(&tree, test_path)
+        .await
+        .expect("delete_file failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
 // ── AES-128-CCM encryption (smb-encryption-aes128, SMB 3.0.2) ───────
 
 #[tokio::test]
