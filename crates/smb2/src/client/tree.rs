@@ -851,7 +851,8 @@ impl Tree {
     /// copy that keeps xattrs learns which ones a file has for no extra wait.
     ///
     /// The list is `None` when the server didn't answer it (a share with no
-    /// named streams, or a list too long for one credit's worth of buffer);
+    /// named streams, a list too long for one credit's worth of buffer, or an
+    /// empty file on a server that fails what follows its READ's END_OF_FILE);
     /// [`list_streams`](Self::list_streams) asks again. The bytes and the
     /// metadata don't depend on it: the listing goes after the READ, so a
     /// refusal can't take the read down with it. Ask only when you'll use the
@@ -979,7 +980,8 @@ impl Tree {
 
         // Check CREATE response.
         if create_header.status != NtStatus::SUCCESS {
-            // CREATE failed -- all three fail (cascaded). No handle to clean up.
+            // CREATE failed -- the rest fail with it (cascaded). No handle to
+            // clean up.
             return Err(Error::Protocol {
                 status: create_header.status,
                 command: Command::Create,
@@ -989,11 +991,11 @@ impl Tree {
         let mut cursor = ReadCursor::new(create_body);
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
-        // A refused listing takes the CLOSE after it down with it (pitfall 2),
-        // and then the handle is still open.
-        let listing_left_it_open = with_streams
-            && responses[2].header.status != NtStatus::SUCCESS
-            && close_header.status != NtStatus::SUCCESS;
+        // A CLOSE that didn't succeed left the handle open: a refused listing
+        // takes it down too, as can a server that fails what follows an empty
+        // file's END_OF_FILE (pitfall 2). It gets a standalone CLOSE, as
+        // `stat`'s does.
+        let close_failed = close_header.status != NtStatus::SUCCESS;
 
         // The READ can return at most `requested` bytes, so anything bigger
         // comes back truncated, and a file that is exactly `requested` bytes
@@ -1002,14 +1004,13 @@ impl Tree {
         // grew past the caller's `expected_size` between its scan and this
         // read is the case that would otherwise hand back a short buffer that
         // looks complete. `end_of_file` is the server's authoritative size and
-        // rides in this same frame, so the check is exact. The compound's
-        // CLOSE already released the handle, so there's nothing to clean up.
+        // rides in this same frame, so the check is exact.
         if create_resp.end_of_file > requested as u64 {
             debug!(
                 "tree: read_file_compound file is {} bytes > the {}-byte read issued for it path={:?}",
                 create_resp.end_of_file, requested, path
             );
-            if listing_left_it_open {
+            if close_failed {
                 let _ = self.close_handle(conn, file_id).await;
             }
             return Err(Error::FileTooLargeForSingleRead {
@@ -1043,17 +1044,13 @@ impl Tree {
             read_resp.data
         };
 
-        // Check CLOSE response. If it failed but CREATE and READ succeeded,
-        // the handle might still be open, but there's nothing we can do
-        // since we already have the data.
-        if close_header.status != NtStatus::SUCCESS {
+        // A failed CLOSE doesn't fail the read: the data is already here.
+        if close_failed {
             debug!(
-                "tree: compound CLOSE returned {:?} (non-fatal, data already read)",
+                "tree: compound CLOSE returned {:?} (non-fatal, data already read), issuing standalone CLOSE",
                 close_header.status,
             );
-            if listing_left_it_open {
-                let _ = self.close_handle(conn, file_id).await;
-            }
+            let _ = self.close_handle(conn, file_id).await;
         }
 
         trace!("tree: read_file_compound done, read {} bytes", data.len());

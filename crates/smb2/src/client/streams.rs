@@ -1428,6 +1428,46 @@ mod tests {
         assert_eq!(sent(&mock, 2).0, [Command::Close]);
     }
 
+    /// A server that fails what follows an empty file's END_OF_FILE takes the
+    /// listing and the CLOSE down with it: the read still answers, and the
+    /// handle still closes.
+    #[tokio::test]
+    async fn an_empty_file_whose_end_of_file_cascades_still_reads_and_closes() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 0),
+            crate::client::test_helpers::build_read_error_response(NtStatus::END_OF_FILE),
+            build_query_info_error_response(NtStatus::END_OF_FILE),
+            build_close_error_response(NtStatus::END_OF_FILE),
+        ]));
+        mock.queue_response(build_close_response());
+        let (data, info, streams) = tree
+            .read_file_compound_sized_with_streams(&mut conn, "empty.txt", 0)
+            .await
+            .unwrap();
+        assert!(data.is_empty());
+        assert_eq!(info.size, 0);
+        assert_eq!(streams, None);
+        assert_eq!(sent(&mock, 2).0, [Command::Close]);
+    }
+
+    #[tokio::test]
+    async fn a_plain_compound_read_closes_a_handle_its_failed_close_left_open() {
+        let (mock, mut conn, tree) = connected().await;
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(FILE, 3),
+            build_read_response(vec![1, 2, 3]),
+            build_close_error_response(NtStatus::INSUFFICIENT_RESOURCES),
+        ]));
+        mock.queue_response(build_close_response());
+        let (data, _) = tree
+            .read_file_compound_sized_with_info(&mut conn, "f.txt", 3)
+            .await
+            .unwrap();
+        assert_eq!(data, [1, 2, 3]);
+        assert_eq!(sent(&mock, 2).0, [Command::Close]);
+    }
+
     #[tokio::test]
     async fn an_overflowed_listing_reads_as_unknown_never_as_none() {
         let (mock, mut conn, tree) = connected().await;

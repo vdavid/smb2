@@ -382,7 +382,9 @@ impl Tree {
     /// [`FileDownload::streams`](crate::FileDownload::streams) or
     /// [`read_file_compound_sized_with_streams`](Self::read_file_compound_sized_with_streams)
     /// got with the open, so a copy learns a file's xattrs for one round trip
-    /// in all, and a file listing none for nothing.
+    /// in all, and a file listing none for nothing. Without an open to ride,
+    /// [`list_streams`](Self::list_streams) gives the same listing for one
+    /// round trip more.
     ///
     /// The results keep the listing's order, each independent. A stream removed
     /// since the listing is left out, since the file no longer has it; any

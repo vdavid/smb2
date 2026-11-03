@@ -3064,6 +3064,203 @@ async fn nas_streams_round_trip_big_and_small_and_leave_the_file_alone() {
     remove_scratch(&mut conn, &tree, dir).await;
 }
 
+/// A copy that keeps xattrs, the way Cmdr makes one: the source's read lists
+/// its streams in its own frame, `get_xattrs` reads them, and
+/// `set_xattrs_on_new_file` puts them on a fresh temp that a rename then lands.
+/// Then a rolled-back copy: a temp with xattrs, deleted. On the QNAP every
+/// value comes back byte for byte (the resource fork included, past one READ)
+/// and a rename keeps them, but a deleted file with a resource fork leaves its
+/// `._` file behind, which a consumer cleaning up its own temp has to delete.
+#[tokio::test]
+#[ignore]
+async fn nas_a_copy_keeps_its_xattrs_and_a_deleted_temp_leaves_its_fork_file() {
+    let (mut conn, tree) = connect_to_nas().await;
+    let dir = "_smb2_interop_nas_copy_xattrs";
+    remove_scratch(&mut conn, &tree, dir).await;
+    tree.create_directory(&mut conn, dir).await.unwrap();
+
+    let mut finder_info = vec![0u8; 32];
+    finder_info[..10].copy_from_slice(b"TESTCREA\x01\x02");
+    let fork: Vec<u8> = (0..=255u8).cycle().take(300 * 1024).collect();
+    let xattrs: Vec<(&str, &[u8])> = vec![
+        (TAG_XATTR, RED_TAG_PLIST),
+        (
+            "com.apple.metadata:kMDItemFinderComment",
+            b"bplist00 a comment",
+        ),
+        (smb2::XATTR_FINDER_INFO, &finder_info),
+        (smb2::XATTR_RESOURCE_FORK, &fork),
+        (DELETABLE_XATTR, b"v"),
+    ];
+    let sorted = |mut pairs: Vec<(String, Vec<u8>)>| {
+        pairs.sort();
+        pairs
+    };
+    let expected = sorted(
+        xattrs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_vec()))
+            .collect(),
+    );
+
+    let source = format!("{dir}/source.txt");
+    tree.write_file(&mut conn, &source, b"content")
+        .await
+        .unwrap();
+    for written in tree
+        .set_xattrs_on_new_file(&mut conn, &source, &xattrs)
+        .await
+    {
+        written.unwrap();
+    }
+
+    // The read lists them in its own frame, and both shapes agree.
+    let (data, _, listed) = tree
+        .read_file_compound_sized_with_streams(&mut conn, &source, 7)
+        .await
+        .unwrap();
+    assert_eq!(data, b"content");
+    let listed = listed.expect("the QNAP answers a compounded listing");
+    let download = tree
+        .download_with_streams(&mut conn, &source)
+        .await
+        .unwrap();
+    assert_eq!(download.streams(), Some(&listed[..]));
+    drop(download);
+    let read_all = |tree: Tree,
+                    mut conn: Connection,
+                    path: String,
+                    listed: Vec<smb2::StreamInfo>| async move {
+        let read = tree.get_xattrs(&mut conn, &path, &listed).await;
+        read.into_iter()
+            .map(|(name, value)| (name, value.unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let read = sorted(read_all(tree.clone(), conn.clone(), source.clone(), listed).await);
+    assert_eq!(read, expected);
+
+    // The copy: a temp, its xattrs, the landing rename.
+    let temp = format!("{dir}/.copy-temp");
+    let landed = format!("{dir}/copy.txt");
+    tree.write_file(&mut conn, &temp, b"content").await.unwrap();
+    let values: Vec<(&str, &[u8])> = read
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_slice()))
+        .collect();
+    for written in tree.set_xattrs_on_new_file(&mut conn, &temp, &values).await {
+        written.unwrap();
+    }
+    tree.rename(&mut conn, &temp, &landed).await.unwrap();
+    let listed = tree.list_streams(&mut conn, &landed).await.unwrap();
+    let copied = sorted(read_all(tree.clone(), conn.clone(), landed.clone(), listed).await);
+    assert_eq!(copied, expected);
+
+    // A rolled-back copy: its temp, with xattrs, deleted.
+    let rolled_back = format!("{dir}/.rolled-back-temp");
+    tree.write_file(&mut conn, &rolled_back, b"content")
+        .await
+        .unwrap();
+    for written in tree
+        .set_xattrs_on_new_file(&mut conn, &rolled_back, &xattrs)
+        .await
+    {
+        written.unwrap();
+    }
+    tree.delete_file(&mut conn, &rolled_back).await.unwrap();
+    let mut left: Vec<String> = tree
+        .list_directory(&mut conn, dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .filter(|name| name != "." && name != "..")
+        .collect();
+    left.sort();
+    // The resource fork lives in an AppleDouble `._` file beside its file
+    // (`fruit:resource = file`), visible here (`fruit:veto_appledouble = no`).
+    // The rename took it along, and the delete, which this share's recycle bin
+    // turns into a move, left it behind: macOS's own client leaves it too.
+    assert_eq!(
+        left,
+        [
+            "._.rolled-back-temp",
+            "._copy.txt",
+            "._source.txt",
+            "copy.txt",
+            "source.txt"
+        ]
+    );
+    tree.delete_file(&mut conn, &format!("{dir}/._.rolled-back-temp"))
+        .await
+        .expect("the leftover goes on its own");
+
+    for file in [&source, &landed] {
+        tree.delete_file(&mut conn, file).await.unwrap();
+        let (folder, name) = file.rsplit_once('/').unwrap();
+        tree.delete_file(&mut conn, &format!("{folder}/._{name}"))
+            .await
+            .unwrap();
+    }
+    tree.delete_directory(&mut conn, dir)
+        .await
+        .expect("nothing stays behind in the folder");
+}
+
+/// What the stream listing a copy compounds onto its read costs a plain small
+/// file over the LAN: the same files read one at a time, with and without it,
+/// interleaved file by file and flipped every run. Prints the medians; the
+/// numbers are in Cmdr's `docs/notes/smb-copy-xattrs-bench-2026-11-03.md`.
+#[tokio::test]
+#[ignore]
+async fn nas_the_listing_on_a_small_read_costs() {
+    const FILES: usize = 200;
+    const RUNS: usize = 7;
+    let (mut conn, tree) = connect_to_nas().await;
+    let dir = "_smb2_interop_nas_listing_cost";
+    remove_scratch(&mut conn, &tree, dir).await;
+    tree.create_directory(&mut conn, dir).await.unwrap();
+    let paths: Vec<String> = (0..FILES).map(|i| format!("{dir}/f{i:03}.bin")).collect();
+    for path in &paths {
+        tree.write_file(&mut conn, path, &[b'b'; 4096])
+            .await
+            .unwrap();
+    }
+    let (mut plain_runs, mut listed_runs) = (Vec::new(), Vec::new());
+    for run in 0..RUNS {
+        let (mut plain, mut listed) = (Duration::ZERO, Duration::ZERO);
+        for path in &paths {
+            for listing_first in [run % 2 == 0, run % 2 != 0] {
+                let started = std::time::Instant::now();
+                if listing_first {
+                    let (data, _, streams) = tree
+                        .read_file_compound_sized_with_streams(&mut conn, path, 4096)
+                        .await
+                        .unwrap();
+                    assert_eq!((data.len(), streams.map(|s| s.len())), (4096, Some(0)));
+                    listed += started.elapsed();
+                } else {
+                    let (data, _) = tree
+                        .read_file_compound_sized_with_info(&mut conn, path, 4096)
+                        .await
+                        .unwrap();
+                    assert_eq!(data.len(), 4096);
+                    plain += started.elapsed();
+                }
+            }
+        }
+        plain_runs.push(plain / FILES as u32);
+        listed_runs.push(listed / FILES as u32);
+    }
+    plain_runs.sort();
+    listed_runs.sort();
+    let (plain, listed) = (plain_runs[RUNS / 2], listed_runs[RUNS / 2]);
+    println!(
+        "{FILES} plain 4 KiB files, median of {RUNS} runs: {plain:?} per read, {listed:?} with the listing ({:+.1}%); runs: {plain_runs:?} / {listed_runs:?}",
+        (listed.as_secs_f64() / plain.as_secs_f64() - 1.0) * 100.0
+    );
+    remove_scratch(&mut conn, &tree, dir).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn nas_a_metadata_watch_hears_about_a_tag() {

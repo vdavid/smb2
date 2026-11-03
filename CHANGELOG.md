@@ -11,9 +11,17 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **A read can list the file's named streams in its own frame**: `Tree::download_with_streams` (with `FileDownload::streams`) and `Tree::read_file_compound_sized_with_streams`. So a copy that keeps Finder tags learns which xattrs a file has at no extra round trip, and a file with none costs nothing more. The listing goes after the READ in the compound, so a server that refuses it still hands back the bytes.
+- **A read can list the file's named streams in its own frame**: `Tree::download_with_streams` (with `FileDownload::streams`) and `Tree::read_file_compound_sized_with_streams`. So a copy that keeps Finder tags learns which xattrs a file has at no extra round trip; the server still does the listing's work (about 0.3 ms a file on a QNAP). The listing goes after the READ in the compound, so a server that refuses it still hands back the bytes.
 - **`Tree::get_xattrs`**: every xattr such a listing names, read overlapped, one round trip for the lot when they're small. FinderInfo comes out of its `AFP_AfpInfo` envelope, and a stream removed since the listing is left out.
 - **`Tree::set_xattrs_on_new_file`**: a copy's xattrs onto the file or folder it has just created, overlapped, without `set_xattr`'s existence check or FinderInfo's read-back. A stream opens beside a writer holding the file, and a rename keeps them. ❗ It creates a missing file, so it's only for a path you just made.
+
+### Fixed
+
+- **A compound read no longer leaks a handle when its CLOSE fails**: `read_file_compound*` now sends a standalone CLOSE for it, as `stat` already did. A server that fails what follows an empty file's `END_OF_FILE` is the case that leaked.
+
+### Notes
+
+- **On a QNAP, deleting a file with a resource fork leaves its `._` file behind**, through macOS's own client too: the share's recycle bin moves the file, so `vfs_fruit` never unlinks the AppleDouble. A consumer cleaning up its own temp deletes `._<name>` as well. Evidence: `docs/notes/named-streams-and-xattrs.md`.
 
 ## [0.39.0] - 2026-10-31
 
