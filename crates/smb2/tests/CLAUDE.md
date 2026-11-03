@@ -251,6 +251,8 @@ For Kerberos end-to-end testing, we use AWS EC2 to spin up a Windows Server with
 3. Watch progress with `smb2 cat //<ip>/C$/smb2setup/log.txt -u Administrator` (password `Smb2Admin!2026`, set by the script every boot for exactly this). Ready at `stage2: done`.
 4. Run the test, then terminate the instance and delete the security group.
 
+**Kerberos + AES-256 encryption**: add `Set-SmbServerConfiguration -EncryptData $true -EncryptionCiphers 'AES_256_GCM' -Force` to stage 2 of a copy of the script. Every session then encrypts with AES-256-GCM, keyed from the full 32-byte Kerberos subkey (`Session.FullSessionKey`), and the same test proves it; `RUST_LOG=smb2=debug` shows `cipher=Some(Aes256Gcm)`, `Kerberos key_len=32`, and `encrypt=true`. Passed 2026-11-03. The test's own `Tree::connect` doesn't activate share-level encryption (only `SmbClient` does), so it's the global setting that makes this work.
+
 Gotcha/Why: each reboot in the script is `exit 3010`, never `Restart-Computer`. EC2Launch v2 re-runs user data after a reboot only when the script itself asked for it with 3010; `Restart-Computer` ended the script for good after the rename, and the DC never got promoted (two blind attempts, 2026-09-23).
 
 ## Writing new tests

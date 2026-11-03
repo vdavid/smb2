@@ -42,7 +42,7 @@ AAD is the TRANSFORM_HEADER bytes 20..52 (Nonce + OriginalMessageSize + Reserved
 - **SMB 3.0/3.0.2**: Fixed ASCII label/context pairs (for example, `"SMB2AESCMAC\0"` / `"SmbSign\0"`)
 - **SMB 3.1.1**: New labels (`"SMBSigningKey\0"`) with preauth hash (64-byte SHA-512) as context
 - **The signing key is always 128 bits, from `Session.SessionKey`** (`session_key`: the first 16 bytes, zero-padded). ❌ Never derive it at the cipher's length: a 32-byte signing key failed every session with a server that picked AES-256, encrypting or not (#32).
-- **AES-256 encryption keys on 3.1.1 come from the FULL key** (`Session.FullSessionKey`, MS-SMB2 § 3.2.5.3.1), at 256 bits; everything else uses the first 16 bytes. With NTLM the two are the same bytes, so only Kerberos can catch a regression here; `aes_256_cipher_keys_come_from_the_full_session_key` pins it on the mock.
+- **AES-256 encryption keys on 3.1.1 come from the FULL key** (`Session.FullSessionKey`, MS-SMB2 § 3.2.5.3.1), at 256 bits; everything else uses the first 16 bytes. With NTLM the two are the same bytes, so only Kerberos can catch a regression here; `aes_256_cipher_keys_come_from_the_full_session_key` pins it on the mock. Verified against Windows Server 2022 AD DS with global encryption and AES-256-GCM only (2026-11-03): a 32-byte subkey, encrypted write/read/delete pass, and deriving from the first 16 bytes instead fails at the first encrypted request (`tests/CLAUDE.md` § AWS integration tests).
 
 `PreauthHasher` computes `SHA-512(prev_hash || message_bytes)` incrementally over negotiate and session-setup wire bytes. Cloned per session (spec requires per-session hash).
 
