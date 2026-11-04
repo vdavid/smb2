@@ -9296,5 +9296,62 @@ mod tests {
                 "only the compound's own CLOSE went out"
             );
         }
+
+        /// `execute_compound` returns normally when its last op runs out of
+        /// time, so the caller gets the CREATE's frame and owns its handle
+        /// (`durable.rs` `create_and_identify` carries on with it). The late
+        /// answer to that last op must not close it behind the caller's back.
+        #[tokio::test]
+        async fn a_compound_whose_last_op_timed_out_leaves_the_handle_to_its_caller() {
+            let mock = Arc::new(MockTransport::new());
+            let conn = setup_connection(&mock);
+            conn.set_response_timeout(Some(Duration::from_millis(20)));
+            let create = create_req();
+            let flush = FlushRequest {
+                file_id: FileId::SENTINEL,
+            };
+            let ops = [
+                CompoundOp::new(Command::Create, &create, Some(TreeId(10))),
+                CompoundOp::new(Command::Flush, &flush, Some(TreeId(10))),
+            ];
+            mock.queue_response(build_create_response(FID, 0));
+            let results = conn.execute_compound(&ops).await.unwrap();
+            assert!(results[0].is_ok(), "the CREATE was answered");
+            assert!(
+                matches!(results[1], Err(Error::Timeout)),
+                "{:?}",
+                results[1]
+            );
+
+            mock.queue_response(build_flush_response());
+            settle(&mock).await;
+            assert!(closes(&mock).is_empty(), "closed the caller's handle");
+        }
+
+        /// A chain with two CREATEs nothing in it closes hands both back to a
+        /// caller who is still there; neither may be closed under them.
+        #[tokio::test]
+        async fn a_finished_compound_with_two_unclosed_creates_closes_neither() {
+            const OTHER: FileId = FileId {
+                persistent: 0xCC,
+                volatile: 0xDD,
+            };
+            let mock = Arc::new(MockTransport::new());
+            let conn = setup_connection(&mock);
+            let (first, second) = (create_req(), create_req());
+            let ops = [
+                CompoundOp::new(Command::Create, &first, Some(TreeId(10))),
+                CompoundOp::new(Command::Create, &second, Some(TreeId(10))),
+            ];
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(FID, 0),
+                build_create_response(OTHER, 0),
+            ]));
+            let results = conn.execute_compound(&ops).await.unwrap();
+            assert!(results.iter().all(Result::is_ok));
+
+            settle(&mock).await;
+            assert!(closes(&mock).is_empty(), "closed {:?}", closes(&mock));
+        }
     }
 }

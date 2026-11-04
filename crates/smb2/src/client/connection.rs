@@ -106,6 +106,10 @@ pub(crate) struct WaiterGuard {
     /// Set on a CREATE nobody has claimed the answer to yet: where to send
     /// the CLOSE if the caller goes away first. See [`OrphanedOpen`].
     orphan: Option<OrphanedOpen>,
+    /// `orphan` is already in `Inner::orphaned_opens` ([`give_up`](Self::give_up)
+    /// put it there), so `Drop` mustn't note it again: the receiver task may
+    /// have taken and closed it in between, and a second note would outlive it.
+    orphan_noted: bool,
 }
 
 /// A CREATE whose caller may go away before it learns the file id.
@@ -173,6 +177,32 @@ impl WaiterGuard {
         routed.result
     }
 
+    /// Take this request out of the waiters map without waiting for its
+    /// answer, as the response deadline does.
+    ///
+    /// The caller is still here and gets an error back, so who owns an open
+    /// depends on what that caller knows:
+    /// - **A CREATE's own request**: the caller never learns the file id, so
+    ///   the open stays ours. Its note goes in BEFORE the map entry goes, so
+    ///   an answer routed in between finds it (see
+    ///   [`take_orphaned_open`](Inner::take_orphaned_open)).
+    /// - **An open `execute_compound` handed over**: the caller gets the
+    ///   CREATE's frame back with this error, so the handle is the caller's.
+    ///   ❌ Noting it here closed it behind the caller's back once the late
+    ///   answer came in (`durable.rs` `create_and_identify` keeps using it).
+    fn give_up(&mut self) {
+        match self.orphan {
+            Some(open) if open.file_id.is_none() => {
+                self.inner.remember_orphaned_open(self.msg_id, open);
+                self.orphan_noted = true;
+            }
+            Some(_) => self.orphan = None,
+            None => {}
+        }
+        self.inner.waiters.lock().unwrap().remove(&self.msg_id);
+        trace!("remove_waiter: msg_id={}", self.msg_id.0);
+    }
+
     /// The id this guard is holding a slot for.
     pub(crate) fn msg_id(&self) -> MessageId {
         self.msg_id
@@ -231,7 +261,7 @@ impl Drop for WaiterGuard {
         // Recorded BEFORE the map entry goes, so a response routed in
         // between finds it; see `Inner::take_orphaned_open`.
         let orphan = self.orphan.take();
-        if let Some(open) = orphan {
+        if let Some(open) = orphan.filter(|_| !self.orphan_noted) {
             self.inner.remember_orphaned_open(self.msg_id, open);
         }
         // Routing removes the entry when the response lands, and the response
@@ -2260,24 +2290,12 @@ struct Inner {
 }
 
 impl Inner {
-    /// Take `msg_id` out of the waiters map without waiting for its answer, as
-    /// the response deadline does. An open's note goes in BEFORE the map entry
-    /// goes, so an answer routed in between finds it (see
-    /// [`take_orphaned_open`](Self::take_orphaned_open)).
-    fn give_up_on(&self, msg_id: MessageId, orphan: Option<OrphanedOpen>) {
-        if let Some(open) = orphan {
-            self.remember_orphaned_open(msg_id, open);
-        }
-        self.waiters.lock().unwrap().remove(&msg_id);
-        trace!("remove_waiter: msg_id={}", msg_id.0);
-    }
-
     /// Note an open whose caller went away before claiming it.
     fn remember_orphaned_open(&self, msg_id: MessageId, open: OrphanedOpen) {
         let mut opens = self.orphaned_opens.lock().unwrap();
         if opens.len() >= ORPHANED_OPEN_MEMORY && !opens.contains_key(&msg_id) {
             // MessageIds only grow within a session, so the smallest is the
-            // oldest. ponytail: O(n) scan, only ever at the cap.
+            // oldest. An O(n) scan, but only ever at the cap.
             if let Some(oldest) = opens.keys().min_by_key(|id| id.0).copied() {
                 opens.remove(&oldest);
             }
@@ -4904,24 +4922,27 @@ impl Connection {
         // and a server may split a compound's answers, so the caller can go
         // away in between. The open passes to the chain's last request: its
         // answer means the server is done with the handle, and that guard
-        // closes it if nobody claims that answer (see `OrphanedOpen`).
+        // closes it if nobody claims that answer (see `OrphanedOpen`). Once
+        // this returns, whatever happened to the last request, the caller has
+        // the CREATE's frame and the handle is theirs (`give_up` lets go of
+        // it at the response deadline for that reason).
         let mut results: Vec<Result<Frame>> = Vec::with_capacity(guards.len());
         for op in ops {
             let guard = guards.pop_front().expect("one guard per op");
             let open = guard.orphan;
             let result = self.await_response(guard, op.command).await;
             if let (Some(open), Ok(frame), Some(last)) = (open, &result, guards.back_mut()) {
-                if let Some(file_id) = created_file_id(frame) {
-                    let open = OrphanedOpen {
-                        file_id: Some(file_id),
-                        ..open
-                    };
-                    // ponytail: one open per guard. A chain with two
-                    // unclosed CREATEs closes the earlier one now instead.
-                    if last.orphan.is_none() {
-                        last.orphan = Some(open);
-                    } else {
-                        self.inner.close_file(open, file_id);
+                // A guard carries one open. When the last request already has
+                // one (its own CREATE's, or an earlier one handed over), this
+                // one isn't covered and stays open if the caller goes away,
+                // as before. ❌ Never close it here: the caller is still
+                // waiting for this chain and will get its file id back.
+                if last.orphan.is_none() {
+                    if let Some(file_id) = created_file_id(frame) {
+                        last.orphan = Some(OrphanedOpen {
+                            file_id: Some(file_id),
+                            ..open
+                        });
                     }
                 }
             }
@@ -5182,6 +5203,7 @@ impl Connection {
             landed: None,
             arrived_at: None,
             orphan: None,
+            orphan_noted: false,
         })
     }
 
@@ -5397,68 +5419,68 @@ impl Connection {
         // Check often enough that a short timeout is honored promptly, rarely
         // enough that the default costs one wakeup a second per request.
         let tick = (timeout / 4).clamp(Duration::from_millis(25), Duration::from_secs(1));
-        // Read before the wait borrows the guard, for the deadline below.
-        let orphan = guard.orphan;
         let mut receiving = Box::pin(guard.recv());
         let mut extended = false;
         loop {
             let idle_check = Box::pin(rt::sleep(tick));
-            match select(receiving, idle_check).await {
+            // The match ends here, not around the checks below, so the wait's
+            // borrow of the guard can end before `give_up`.
+            receiving = match select(receiving, idle_check).await {
                 Either::Left((frame, _)) => return frame,
-                Either::Right((_, still_receiving)) => {
-                    receiving = still_receiving;
-                    // Before any clock on this connection is read: a tick that
-                    // came back late because nothing was scheduled has to be
-                    // taken off every clock first, or this request is about to
-                    // be timed out over silence nobody was listening to.
-                    self.inner.forgive_scheduling_stall();
-                    // `None` means the response has been routed and the next
-                    // poll will produce it — never a timeout.
-                    if let Some(idle) = self.inner.waiter_idle_for(msg_id) {
-                        if idle < timeout {
-                            continue;
-                        }
-                        if idle < alive_ceiling && self.inner.liveness_is_proven() {
-                            if !extended {
-                                extended = true;
-                                self.inner
-                                    .metrics
-                                    .response_deadline_extensions
-                                    .fetch_add(1, Ordering::Relaxed);
-                                debug!(
-                                    "slow but alive: cmd={:?}, msg_id={}, silent for {:?}, but the \
-                                     server is answering on this connection; waiting up to {:?}",
-                                    command, msg_id.0, idle, alive_ceiling
-                                );
-                            }
-                            continue;
-                        }
-                        // Read the connection's verdict BEFORE dropping out of
-                        // the waiters map: `quiet_for` measures from the
-                        // oldest outstanding request, so a lone waiter that
-                        // deregisters first takes the evidence with it.
-                        let verdict = self.inner.unresponsive_for();
-                        self.inner.give_up_on(msg_id, orphan);
+                Either::Right((_, still_receiving)) => still_receiving,
+            };
+            // Before any clock on this connection is read: a tick that
+            // came back late because nothing was scheduled has to be
+            // taken off every clock first, or this request is about to
+            // be timed out over silence nobody was listening to.
+            self.inner.forgive_scheduling_stall();
+            // `None` means the response has been routed and the next
+            // poll will produce it — never a timeout.
+            if let Some(idle) = self.inner.waiter_idle_for(msg_id) {
+                if idle < timeout {
+                    continue;
+                }
+                if idle < alive_ceiling && self.inner.liveness_is_proven() {
+                    if !extended {
+                        extended = true;
                         self.inner
                             .metrics
-                            .response_timeouts
+                            .response_deadline_extensions
                             .fetch_add(1, Ordering::Relaxed);
-                        // Two different diagnoses, and the error has to say
-                        // which: a connection that went quiet is a network or
-                        // server death, while one that kept answering has a
-                        // single stalled operation on it.
-                        if let Some(silent_for) = verdict {
-                            return Err(self.declare_unresponsive(silent_for, command, msg_id));
-                        }
-                        warn!(
-                            "no response: cmd={:?}, msg_id={}, silent for {:?}; giving up — \
+                        debug!(
+                            "slow but alive: cmd={:?}, msg_id={}, silent for {:?}, but the \
+                                     server is answering on this connection; waiting up to {:?}",
+                            command, msg_id.0, idle, alive_ceiling
+                        );
+                    }
+                    continue;
+                }
+                // Read the connection's verdict BEFORE dropping out of
+                // the waiters map: `quiet_for` measures from the
+                // oldest outstanding request, so a lone waiter that
+                // deregisters first takes the evidence with it.
+                let verdict = self.inner.unresponsive_for();
+                // Ends the wait's borrow of the guard.
+                drop(receiving);
+                guard.give_up();
+                self.inner
+                    .metrics
+                    .response_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                // Two different diagnoses, and the error has to say
+                // which: a connection that went quiet is a network or
+                // server death, while one that kept answering has a
+                // single stalled operation on it.
+                if let Some(silent_for) = verdict {
+                    return Err(self.declare_unresponsive(silent_for, command, msg_id));
+                }
+                warn!(
+                    "no response: cmd={:?}, msg_id={}, silent for {:?}; giving up — \
                              nothing here says the connection itself is gone, so this is one \
                              stalled operation",
-                            command, msg_id.0, idle
-                        );
-                        return Err(Error::Timeout);
-                    }
-                }
+                    command, msg_id.0, idle
+                );
+                return Err(Error::Timeout);
             }
         }
     }
