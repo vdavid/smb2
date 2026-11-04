@@ -34,7 +34,7 @@ IDs are stable: code cites them. The `D` series set up the actor, the `E` series
   fails, and the caller needs the CREATE's `FileId` to send a standalone CLOSE. A sub-op's NTSTATUS rides in
   `frame.header.status`; the inner `Err` is for waiter-level failures (session expired, bad signature, connection lost).
 - **E4, `CompoundOp` is a typed struct** (`command`, `body`, `tree_id`, `credit_charge`), passed as a slice.
-- **E5, handshake mutators keep `&mut self`** (`activate_signing`, `set_session_id`, and friends). They run once, on
+- **E5, handshake mutators keep `&mut self`** (`install_signing`, `install_encryption`, `set_session_id`, and friends, all crate-private; `encrypt_for_share` is a tree-connect step, not a handshake one, and takes `&self`). They run once, on
   one task, during session setup; flipping them to `&self` buys nothing. Flip one only when a real need to call it from
   any clone shows up.
 - **E6, tear down on an unrecoverable frame.** A decrypt failure, a decompress failure, or a malformed sub-frame header

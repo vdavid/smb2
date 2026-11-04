@@ -448,6 +448,11 @@ impl Session {
 /// inactive when it doesn't, so a [`Tree::connect`](crate::Tree::connect) to
 /// a share flagged `SMB2_SHAREFLAG_ENCRYPT_DATA` can turn them on there. The
 /// session itself keeps no key.
+///
+/// Both keys replace whatever an earlier session on this connection left,
+/// including with nothing: a guest or anonymous session has no key the server
+/// shares, so it gets no signing key (unless the server requires signing) and
+/// no staged encryption keys, and the previous session's go.
 fn establish(
     conn: &mut Connection,
     params: &NegotiatedParams,
@@ -456,15 +461,17 @@ fn establish(
     signing_key: Vec<u8>,
     encryption: Option<EncryptionKeys>,
 ) -> Result<Session> {
-    let should_sign = params.signing_required || !flags.is_guest() && !flags.is_null();
+    let keyed = !flags.is_guest() && !flags.is_null();
+    let should_sign = params.signing_required || keyed;
     let should_encrypt = session_cipher(params, flags, conn.require_encryption())?.is_some();
 
-    if should_sign {
-        conn.activate_signing(signing_key, params.signing_algorithm);
-    }
+    conn.install_signing(should_sign.then_some((signing_key, params.signing_algorithm)));
     // `session_keys` derives encryption keys exactly when the connection has
     // a cipher, which is also the only case `session_cipher` encrypts in.
-    conn.install_encryption(encryption, should_encrypt);
+    conn.install_encryption(
+        encryption.filter(|_| should_encrypt || keyed),
+        should_encrypt,
+    );
 
     let session = Session {
         session_id,
@@ -1174,6 +1181,91 @@ mod tests {
             signing_key,
             algorithm,
         }
+    }
+
+    // ── A second session setup on the same connection ──
+
+    /// A guest login after a signed session on the same connection leaves the
+    /// connection holding none of the old session's keys: it stops signing
+    /// with the old signing key, and drops the old encryption keys, active or
+    /// staged. A guest session has no key of its own to sign or encrypt with,
+    /// and the server signs nothing for it.
+    #[tokio::test]
+    async fn a_guest_setup_after_a_signed_session_drops_the_old_keys() {
+        const OLD_KEY: [u8; 16] = [0x5A; 16];
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        set_test_params_with(&mut conn, Dialect::Smb3_0_2, None);
+        let mut params = conn.params().unwrap();
+        params.cipher = Some(Cipher::Aes128Ccm);
+        let algorithm = params.signing_algorithm;
+        conn.set_test_params(params);
+
+        // What the previous, signed session left behind.
+        let old_session = SessionId(0x4242);
+        conn.set_session_id(old_session);
+        conn.activate_signing(OLD_KEY.to_vec(), algorithm);
+        conn.install_encryption(
+            Some(EncryptionKeys {
+                cipher: Cipher::Aes128Ccm,
+                encryption_key: vec![0x2B; 16],
+                decryption_key: vec![0x3C; 16],
+            }),
+            false,
+        );
+
+        // Until the new session's keys exist, the server's answers on the old
+        // session are signed with the old key, so the receiver accepts them.
+        let signed_by_old = |mut frame: Vec<u8>, id: u64| {
+            frame[24..32].copy_from_slice(&id.to_le_bytes());
+            let mut flags = crate::types::flags::HeaderFlags(u32::from_le_bytes(
+                frame[16..20].try_into().unwrap(),
+            ));
+            flags.set_signed();
+            frame[16..20].copy_from_slice(&flags.0.to_le_bytes());
+            crate::crypto::signing::sign_message_as_server(
+                &mut frame, &OLD_KEY, algorithm, id, false,
+            )
+            .unwrap();
+            frame
+        };
+        mock.queue_response(signed_by_old(
+            build_session_setup_response(
+                NtStatus::MORE_PROCESSING_REQUIRED,
+                old_session,
+                build_ntlm_challenge(),
+                SessionFlags(0),
+            ),
+            0,
+        ));
+        mock.queue_response(signed_by_old(
+            build_session_setup_response(
+                NtStatus::SUCCESS,
+                old_session,
+                vec![],
+                SessionFlags(SessionFlags::IS_GUEST),
+            ),
+            1,
+        ));
+
+        let session = Session::setup(&mut conn, "", "", "").await.unwrap();
+
+        assert!(!session.should_sign);
+        assert!(
+            !conn.diagnostics().signing.active,
+            "no signing with the old key"
+        );
+        assert_eq!(
+            conn.key_lengths(),
+            (None, None),
+            "no key of the old session is left"
+        );
+        assert!(!conn.should_encrypt());
     }
 
     // ── A share that asks for encryption, on the low-level path (#35) ──

@@ -3677,19 +3677,8 @@ impl Connection {
         self.inner.preauth_hasher.lock().unwrap().clone()
     }
 
-    /// Run a closure with a mutable borrow of the preauth hasher.
-    ///
-    /// The hasher lives behind a lock now that `Connection` is `Clone`; a
-    /// naked `&mut PreauthHasher` can no longer be handed out. Closure-based
-    /// access keeps the lock scoped to the caller's update.
-    #[doc(hidden)] // unused outside the crate; kept for crate-internal parity.
-    pub fn with_preauth_hasher_mut<R>(&self, f: impl FnOnce(&mut PreauthHasher) -> R) -> R {
-        let mut h = self.inner.preauth_hasher.lock().unwrap();
-        f(&mut h)
-    }
-
-    /// Set the session ID.
-    pub fn set_session_id(&mut self, id: SessionId) {
+    /// Set the session ID. Session setup's; a consumer never needs it.
+    pub(crate) fn set_session_id(&mut self, id: SessionId) {
         self.inner.crypto.lock().unwrap().session_id = id;
     }
 
@@ -3698,17 +3687,33 @@ impl Connection {
         self.inner.crypto.lock().unwrap().session_id
     }
 
-    /// Activate signing with the given key and algorithm.
-    pub fn activate_signing(&mut self, key: Vec<u8>, algorithm: SigningAlgorithm) {
-        debug!(
-            "signing: activated, algo={:?}, key_len={}",
-            algorithm,
-            key.len()
-        );
+    /// Sign from here on with `key` and `algorithm`: a test's stand-in for a
+    /// session setup that signs.
+    #[cfg(test)]
+    pub(crate) fn activate_signing(&mut self, key: Vec<u8>, algorithm: SigningAlgorithm) {
+        self.install_signing(Some((key, algorithm)));
+    }
+
+    /// Hand this connection the signing key the session just set up derived,
+    /// or `None` when it doesn't sign (a guest or anonymous session),
+    /// replacing whatever an earlier session left. Like
+    /// [`install_encryption`](Self::install_encryption), it never keeps an
+    /// earlier session's key: a guest setup after a signed one used to go on
+    /// signing with the old session's key, which the server no longer holds.
+    pub(crate) fn install_signing(&mut self, signing: Option<(Vec<u8>, SigningAlgorithm)>) {
+        if let Some((key, algorithm)) = &signing {
+            debug!(
+                "signing: activated, algo={:?}, key_len={}",
+                algorithm,
+                key.len()
+            );
+        }
         let mut c = self.inner.crypto.lock().unwrap();
-        c.signing_key = Some(key);
-        c.signing_algorithm = Some(algorithm);
-        c.should_sign = true;
+        c.should_sign = signing.is_some();
+        (c.signing_key, c.signing_algorithm) = match signing {
+            Some((key, algorithm)) => (Some(key), Some(algorithm)),
+            None => (None, None),
+        };
     }
 
     /// Hand this connection the encryption keys the session just set up
@@ -3721,7 +3726,7 @@ impl Connection {
     /// same connection starts from its own keys and its own verdict, so a
     /// share the previous session encrypted for doesn't leave this one
     /// encrypting with keys the server has dropped.
-    pub(crate) fn install_encryption(&self, keys: Option<EncryptionKeys>, active: bool) {
+    pub(crate) fn install_encryption(&mut self, keys: Option<EncryptionKeys>, active: bool) {
         let active = active && keys.is_some();
         if let Some(keys) = &keys {
             debug!(
@@ -5716,7 +5721,7 @@ impl Connection {
     ///
     /// Called by [`Session::setup`](crate::Session::setup); consumers should
     /// not need it.
-    pub fn adopt_session(&self, session: &crate::client::Session) {
+    pub(crate) fn adopt_session(&self, session: &crate::client::Session) {
         // The old session is superseded; announcing it again on a later setup
         // would point at something twice-dead.
         self.inner.previous_session_id.store(0, Ordering::Release);
@@ -9046,7 +9051,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
 
-        let conn = Connection::from_transport(
+        let mut conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",
@@ -9572,7 +9577,7 @@ mod tests {
     async fn staged_encryption_is_inactive_until_a_share_asks() {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
-        let conn = Connection::from_transport(
+        let mut conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",
