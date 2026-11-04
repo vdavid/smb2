@@ -103,6 +103,36 @@ pub(crate) struct WaiterGuard {
     landed: Option<Routed>,
     /// When the response's frame came off the wire, once it has landed.
     arrived_at: Option<rt::Instant>,
+    /// Set on a CREATE nobody has claimed the answer to yet: where to send
+    /// the CLOSE if the caller goes away first. See [`OrphanedOpen`].
+    orphan: Option<OrphanedOpen>,
+}
+
+/// A CREATE whose caller may go away before it learns the file id.
+///
+/// The server opens the file whether or not anyone is left to hear the
+/// answer, so a CREATE abandoned in flight (a `select!` arm that lost, a
+/// timeout around the call, an aborted task) leaves a handle open on the
+/// server until the session ends. With share modes that can lock the file
+/// against everyone else, and it counts against the server's per-session
+/// open limit. Whoever ends up holding the answer once the caller is gone
+/// (the guard as it drops, or the receiver task for an answer that arrives
+/// later) sends the CLOSE, through
+/// [`close_dropped_handle_on`](crate::client::tree::close_dropped_handle_on).
+///
+/// ❌ Never set for a CREATE whose compound also carries a CLOSE for it: that
+/// CLOSE is already on the wire, the server may hand the same file id to the
+/// next open, and a second CLOSE would close that one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OrphanedOpen {
+    pin: SessionPin,
+    tree_id: TreeId,
+    /// `None` on the CREATE's own request, whose answer carries the file id.
+    /// `Some` once [`Connection::execute_compound`] has claimed that answer
+    /// and handed the open to the chain's last request: the CLOSE then waits
+    /// for that request's answer, so it never reaches the server while the
+    /// chain still has work (an async FLUSH, say) pending on the handle.
+    file_id: Option<FileId>,
 }
 
 impl WaiterGuard {
@@ -138,6 +168,8 @@ impl WaiterGuard {
 
     fn claim(&mut self, routed: Routed) -> Result<Frame> {
         self.arrived_at = routed.arrived_at;
+        // The caller has the answer now; its handle is the caller's to close.
+        self.orphan = None;
         routed.result
     }
 
@@ -196,6 +228,12 @@ impl WaiterGuard {
 
 impl Drop for WaiterGuard {
     fn drop(&mut self) {
+        // Recorded BEFORE the map entry goes, so a response routed in
+        // between finds it; see `Inner::take_orphaned_open`.
+        let orphan = self.orphan.take();
+        if let Some(open) = orphan {
+            self.inner.remember_orphaned_open(self.msg_id, open);
+        }
         // Routing removes the entry when the response lands, and the response
         // deadline removes it when it gives up, so this is usually a no-op.
         // It is idempotent by design: MessageIds are never reused, so a late
@@ -217,6 +255,21 @@ impl Drop for WaiterGuard {
                 "waiter deregistered without a response: msg_id={}",
                 self.msg_id.0
             );
+        }
+        if orphan.is_some() {
+            // Closing the receiver settles the race with the receiver task: a
+            // response sent before this is ours to take below, and one sent
+            // after fails to send, so the receiver task takes the record.
+            if let Some(rx) = self.rx.as_mut() {
+                rx.close();
+            }
+            let routed = self
+                .landed
+                .take()
+                .or_else(|| self.rx.as_mut().and_then(|rx| rx.try_recv().ok()));
+            if let Some(routed) = routed {
+                self.inner.close_orphaned_open(self.msg_id, routed.result);
+            }
         }
     }
 }
@@ -509,6 +562,24 @@ const WRITE_QUEUE_DEPTH: usize = 256;
 /// Only needs to span one round trip (a response already in flight when its
 /// caller gave up), so this is generous.
 const ABANDONED_ID_MEMORY: usize = 512;
+
+/// How many orphaned opens to remember (see [`OrphanedOpen`]).
+///
+/// An entry lives until its answer arrives, so this has to cover every open
+/// that can be in flight at once, which the credit window bounds: servers
+/// grant up to a few thousand. Past it the oldest goes, and its handle stays
+/// open until the session ends, as every abandoned open did before this.
+const ORPHANED_OPEN_MEMORY: usize = 8192;
+
+/// The file id a successful CREATE's answer carries.
+fn created_file_id(frame: &Frame) -> Option<FileId> {
+    if frame.header.command != Command::Create || frame.header.status != NtStatus::SUCCESS {
+        return None;
+    }
+    CreateResponse::unpack(&mut ReadCursor::new(&frame.body))
+        .ok()
+        .map(|resp| resp.file_id)
+}
 
 /// One frame waiting for the socket.
 struct WriteJob {
@@ -1423,6 +1494,7 @@ use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
 use crate::crypto::signing::{self, SigningAlgorithm};
 use crate::error::{Error, Result};
+use crate::msg::create::CreateResponse;
 use crate::msg::echo::EchoRequest;
 use crate::msg::header::Header;
 use crate::msg::ioctl::{
@@ -1994,6 +2066,11 @@ struct Inner {
     /// and stop meaning "protocol anomaly". A late response arrives within one
     /// round trip of the cancellation, so a small ring covers it.
     abandoned: StdMutex<VecDeque<MessageId>>,
+    /// Opens whose caller went away before claiming them, by the MessageId
+    /// the answer that settles them comes back on, capped at
+    /// [`ORPHANED_OPEN_MEMORY`]. Whoever takes an entry out sends its CLOSE.
+    /// See [`OrphanedOpen`].
+    orphaned_opens: StdMutex<HashMap<MessageId, OrphanedOpen>>,
     /// Frames handed to the writer task and not yet acked. A gauge for
     /// diagnostics and for the stale-waiter warning, which reports it so a
     /// backlog names itself.
@@ -2183,6 +2260,77 @@ struct Inner {
 }
 
 impl Inner {
+    /// Take `msg_id` out of the waiters map without waiting for its answer, as
+    /// the response deadline does. An open's note goes in BEFORE the map entry
+    /// goes, so an answer routed in between finds it (see
+    /// [`take_orphaned_open`](Self::take_orphaned_open)).
+    fn give_up_on(&self, msg_id: MessageId, orphan: Option<OrphanedOpen>) {
+        if let Some(open) = orphan {
+            self.remember_orphaned_open(msg_id, open);
+        }
+        self.waiters.lock().unwrap().remove(&msg_id);
+        trace!("remove_waiter: msg_id={}", msg_id.0);
+    }
+
+    /// Note an open whose caller went away before claiming it.
+    fn remember_orphaned_open(&self, msg_id: MessageId, open: OrphanedOpen) {
+        let mut opens = self.orphaned_opens.lock().unwrap();
+        if opens.len() >= ORPHANED_OPEN_MEMORY && !opens.contains_key(&msg_id) {
+            // MessageIds only grow within a session, so the smallest is the
+            // oldest. ponytail: O(n) scan, only ever at the cap.
+            if let Some(oldest) = opens.keys().min_by_key(|id| id.0).copied() {
+                opens.remove(&oldest);
+            }
+        }
+        opens.insert(msg_id, open);
+    }
+
+    /// Take the note for `msg_id` out, if there is one for this session.
+    /// Whoever gets it sends the CLOSE, so the guard and the receiver task
+    /// can't both send one.
+    ///
+    /// The generation check matters: MessageIds restart after a revival, so a
+    /// note a dead session's guard left behind can carry a live request's id.
+    fn take_orphaned_open(&self, msg_id: MessageId) -> Option<OrphanedOpen> {
+        let mut opens = self.orphaned_opens.lock().unwrap();
+        if opens.is_empty() {
+            return None;
+        }
+        let open = opens.remove(&msg_id)?;
+        (open.pin.generation == self.revivals.load(Ordering::Acquire)).then_some(open)
+    }
+
+    /// Close what the abandoned request `msg_id` left open, if nobody else
+    /// has taken it on and `result` says there is something to close.
+    fn close_orphaned_open(self: &Arc<Self>, msg_id: MessageId, result: Result<Frame>) {
+        if let Some(open) = self.take_orphaned_open(msg_id) {
+            self.close_open(open, result);
+        }
+    }
+
+    /// Send the CLOSE for an orphaned open, on the session that opened it.
+    /// `result` is the answer that settles it: the CREATE's own (a failed
+    /// CREATE opened nothing), or the last answer of its compound.
+    fn close_open(self: &Arc<Self>, open: OrphanedOpen, result: Result<Frame>) {
+        let Ok(frame) = result else { return };
+        if let Some(file_id) = open.file_id.or_else(|| created_file_id(&frame)) {
+            self.close_file(open, file_id);
+        }
+    }
+
+    fn close_file(self: &Arc<Self>, open: OrphanedOpen, file_id: FileId) {
+        let conn = Connection {
+            inner: Arc::clone(self),
+            pin: Some(open.pin),
+        };
+        crate::client::tree::close_dropped_handle_on(
+            conn,
+            open.tree_id,
+            file_id,
+            "CREATE whose caller went away",
+        );
+    }
+
     /// Bring the write-budget semaphore in line with the target, and report the
     /// target in units.
     ///
@@ -2235,6 +2383,7 @@ impl Inner {
             disconnected: AtomicBool::new(false),
             write_tx: StdMutex::new(write_tx),
             abandoned: StdMutex::new(VecDeque::new()),
+            orphaned_opens: StdMutex::new(HashMap::new()),
             send_queue_depth: AtomicUsize::new(0),
             write_budget: Arc::new(Semaphore::new(
                 budget_units(DEFAULT_WRITE_BUDGET_BYTES) as usize
@@ -4076,7 +4225,7 @@ impl Connection {
         let mut msg_bytes = pack_message(&header, body);
         let captured = msg_bytes.clone();
 
-        let guard = self.register_waiter(msg_id, command)?;
+        let guard = self.register_request_waiter(msg_id, command, session_id, tree_id)?;
 
         let wire_bytes = if should_encrypt {
             match self.encrypt_bytes(&msg_bytes) {
@@ -4193,7 +4342,7 @@ impl Connection {
         // teardown between the early fast-path check above and this
         // insertion returns `Err(Disconnected)` instead of leaving a
         // ghost Sender that never gets routed.
-        let guard = self.register_waiter(msg_id, command)?;
+        let guard = self.register_request_waiter(msg_id, command, session_id, tree_id)?;
 
         // Build the wire bytes with encryption / signing / compression.
         let wire_bytes = if should_encrypt {
@@ -4427,7 +4576,7 @@ impl Connection {
 
         let mut msg_bytes = pack_message(&header, body);
 
-        let guard = self.register_waiter(msg_id, command)?;
+        let guard = self.register_request_waiter(msg_id, command, session_id, tree_id)?;
 
         if should_encrypt {
             let wire = self.encrypt_bytes(&msg_bytes)?;
@@ -4696,9 +4845,23 @@ impl Connection {
         // registration error, unregister the ones we already inserted.
         // The guards deregister on drop, so an error anywhere below unwinds
         // every sub-op's map entry without a manual rollback list.
-        let mut guards: Vec<WaiterGuard> = Vec::with_capacity(message_ids.len());
+        //
+        // A CREATE whose chain closes it is closed by that CLOSE, so it must
+        // not be closed again if the caller goes away (see `OrphanedOpen`).
+        // A related CLOSE closes the most recent CREATE's handle, so that is
+        // a CREATE whose next CREATE-or-CLOSE is a CLOSE.
+        let mut guards: VecDeque<WaiterGuard> = VecDeque::with_capacity(message_ids.len());
         for (idx, id) in message_ids.iter().enumerate() {
-            guards.push(self.register_waiter(*id, ops[idx].command)?);
+            let closed_later = ops[idx + 1..]
+                .iter()
+                .find(|op| matches!(op.command, Command::Create | Command::Close))
+                .is_some_and(|op| op.command == Command::Close);
+            let mut guard =
+                self.register_request_waiter(*id, ops[idx].command, session_id, ops[idx].tree_id)?;
+            if closed_later {
+                guard.orphan = None;
+            }
+            guards.push_back(guard);
         }
 
         let total_len: usize = sub_requests.iter().map(|r| r.len()).sum();
@@ -4736,9 +4899,33 @@ impl Connection {
         // frame by `NextCommand` and routes each sub-response to its own
         // waiter, so we can await them sequentially without blocking any
         // of them (they may already all be resolved by the time we loop).
+        //
+        // A CREATE's answer claimed here is still ours until this returns,
+        // and a server may split a compound's answers, so the caller can go
+        // away in between. The open passes to the chain's last request: its
+        // answer means the server is done with the handle, and that guard
+        // closes it if nobody claims that answer (see `OrphanedOpen`).
         let mut results: Vec<Result<Frame>> = Vec::with_capacity(guards.len());
-        for (idx, guard) in guards.into_iter().enumerate() {
-            results.push(self.await_response(guard, ops[idx].command).await);
+        for op in ops {
+            let guard = guards.pop_front().expect("one guard per op");
+            let open = guard.orphan;
+            let result = self.await_response(guard, op.command).await;
+            if let (Some(open), Ok(frame), Some(last)) = (open, &result, guards.back_mut()) {
+                if let Some(file_id) = created_file_id(frame) {
+                    let open = OrphanedOpen {
+                        file_id: Some(file_id),
+                        ..open
+                    };
+                    // ponytail: one open per guard. A chain with two
+                    // unclosed CREATEs closes the earlier one now instead.
+                    if last.orphan.is_none() {
+                        last.orphan = Some(open);
+                    } else {
+                        self.inner.close_file(open, file_id);
+                    }
+                }
+            }
+            results.push(result);
         }
         Ok(results)
     }
@@ -4994,7 +5181,38 @@ impl Connection {
             rx: Some(rx),
             landed: None,
             arrived_at: None,
+            orphan: None,
         })
+    }
+
+    /// [`register_waiter`](Self::register_waiter) for a request going out on
+    /// `session_id` and `tree_id`: a CREATE also gets the means to close what
+    /// it opens if its caller goes away first (see [`OrphanedOpen`]).
+    fn register_request_waiter(
+        &self,
+        msg_id: MessageId,
+        command: Command,
+        session_id: SessionId,
+        tree_id: Option<TreeId>,
+    ) -> Result<WaiterGuard> {
+        let mut guard = self.register_waiter(msg_id, command)?;
+        if command == Command::Create && session_id != SessionId(0) {
+            if let Some(tree_id) = tree_id {
+                guard.orphan = Some(OrphanedOpen {
+                    // The generation the guard took, not a fresh read: if a
+                    // revival slipped in since the session id was read, the
+                    // pin is already stale and the CLOSE is never sent.
+                    pin: SessionPin {
+                        connection: self.inner.client_guid,
+                        generation: guard.generation,
+                        session_id,
+                    },
+                    tree_id,
+                    file_id: None,
+                });
+            }
+        }
+        Ok(guard)
     }
 
     /// Set how long a request may go unanswered before the background sweeper
@@ -5179,6 +5397,8 @@ impl Connection {
         // Check often enough that a short timeout is honored promptly, rarely
         // enough that the default costs one wakeup a second per request.
         let tick = (timeout / 4).clamp(Duration::from_millis(25), Duration::from_secs(1));
+        // Read before the wait borrows the guard, for the deadline below.
+        let orphan = guard.orphan;
         let mut receiving = Box::pin(guard.recv());
         let mut extended = false;
         loop {
@@ -5218,7 +5438,7 @@ impl Connection {
                         // oldest outstanding request, so a lone waiter that
                         // deregisters first takes the evidence with it.
                         let verdict = self.inner.unresponsive_for();
-                        self.remove_waiter(msg_id);
+                        self.inner.give_up_on(msg_id, orphan);
                         self.inner
                             .metrics
                             .response_timeouts
@@ -5996,6 +6216,10 @@ impl Connection {
         *inner.read_lateness_hint.lock().unwrap() = None;
         *inner.write_lateness_hint.lock().unwrap() = None;
         inner.abandoned.lock().unwrap().clear();
+        // Their session is gone: the server closed its opens with it, or holds
+        // a durable one until its durable timeout. Neither can be closed from
+        // a new session.
+        inner.orphaned_opens.lock().unwrap().clear();
         inner.dfs_trees.lock().unwrap().clear();
         *inner.ipc_tree.lock().unwrap() = None;
         inner.oplock_trees.lock().unwrap().clear();
@@ -6461,10 +6685,11 @@ async fn receiver_loop(
                         result,
                         arrived_at: Some(arrived_at),
                     };
-                    if tx.send(routed).is_err() {
+                    if let Err(routed) = tx.send(routed) {
                         // Caller's oneshot::Receiver was dropped — typical
                         // spawn/abort pattern. Counted distinctly from
                         // stray frames (None branch below).
+                        inner.close_orphaned_open(msg_id, routed.result);
                         counter.fetch_sub(1, Ordering::Relaxed);
                         inner
                             .metrics
@@ -6507,6 +6732,9 @@ async fn receiver_loop(
                             ),
                         }
                     }
+                    // A CREATE answered after its caller went away (it gave
+                    // up, or the response deadline did) still opened a file.
+                    inner.close_orphaned_open(msg_id, result);
                 }
             }
         }

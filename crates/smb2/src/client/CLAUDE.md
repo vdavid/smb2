@@ -566,9 +566,21 @@ Every type that owns an open handle (`FileWriter`, `FileReader`, `FileUpload`, `
 - ❌ **Never a second CLOSE.** Each type marks the CLOSE as started *before* sending it (`done` / `closed` / `close_started` / `State::Closing`), and `Drop` sends nothing once it is, even when the future that started it was dropped before its frame got out (that handle then stays open until the session ends). A second CLOSE is worse than a leak: the server may have given the same file id to a new open in between (Windows reuses volatile ids), and the stray CLOSE would close somebody else's file on this session.
 - **A handle from a session that ended sends nothing** (`pinned_session_is_current`), as with an explicit close: the server let go of it with the session.
 - **A handle holding the connection's last clone** takes the connection down with it on drop (`Inner::drop` stops the writer task, so the queued CLOSE never goes out). That's fine: the socket closes, and the server releases every handle with the session.
-- **Known limit: an `async fn` dropped mid-call.** A `Tree` method holding a handle only for the call (`write_file_compound`, the pipelined reads and writes, `copy`, and so on) closes it as its last step, and a caller dropping that future between the CREATE and the CLOSE leaves the handle open until the session ends. The widest window is the CREATE's own answer: until it arrives the client doesn't know the file id, so nothing caller-side can close it. Fixing that needs the receiver task to close the handle of a CREATE answered after its caller left (and not one a compound already closed): issue #24.
+- **Known limit: an `async fn` dropped mid-call.** A `Tree` method holding a handle only for the call (`write_file_compound`, the pipelined reads and writes, `copy`, and so on) closes it as its last step, and a caller dropping that future after the CREATE's answer was claimed and before the CLOSE leaves the handle open until the session ends. Before the answer is claimed, the CREATE itself is covered (below).
 
 Pinned by the `stream.rs` close-on-drop tests (`file_writer_dropped_mid_upload_closes_before_anything_sent_after`, `..._outside_any_runtime_still_closes`, `a_finished_or_closed_handle_sends_no_second_close_on_drop`, and one per type), `directory.rs` `a_dropped_reader_closes_after_its_query_and_never_twice`, and `watcher.rs` `close_on_drop_tests`.
+
+### A CREATE abandoned in flight (`OrphanedOpen`)
+
+The server opens the file whether or not anyone is left to hear the answer, so a caller that goes away before claiming a CREATE's answer (a lost `select!` arm, a timeout around the call, the response deadline) used to leave the handle open until the session ended. `register_request_waiter` marks every CREATE's `WaiterGuard` with an `OrphanedOpen` (its session pin and tree id); `claim` clears it. Whoever holds the answer once the caller is gone sends the CLOSE through `close_dropped_handle_on`, the free-function form of `Tree::close_dropped_handle`:
+
+- **The guard as it drops**, for an answer that already landed (`landed`, or still in the oneshot).
+- **The receiver task**, for one that lands later: the guard notes the open in `Inner::orphaned_opens` by MessageId, and the receiver takes the note when the answer finds no waiter (or its `tx.send` fails).
+- **Exactly one of them.** The note goes in BEFORE the map entry goes (`Drop`, and `Inner::give_up_on` for the response deadline), and the guard closes its oneshot before its last look, so an answer is either in the guard's hands or fails to send. Whoever takes the note out closes; nobody else can. Notes are matched by generation too: MessageIds restart after a revival.
+- **Compounds.** A CREATE whose chain closes it (its next CREATE-or-CLOSE is a CLOSE, since a related CLOSE closes the most recent CREATE) is never marked: that CLOSE is on the wire, and a second one could close a reused file id. Once `execute_compound` claims an unclosed CREATE's answer, the open (now with its file id) passes to the chain's last guard, so the CLOSE waits for the chain's last answer and never reaches the server while an async FLUSH is still pending on the handle.
+- **Known limits.** A chain whose own CLOSE fails (a cascaded related-op failure) while its caller is gone stays open: the CREATE was never marked. A session that ends first sends nothing; the server closes its opens with it, or holds a durable one for its durable timeout.
+
+Pinned by the `tree.rs` `orphaned_opens` tests.
 
 ## Resuming an upload
 

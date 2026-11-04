@@ -3718,64 +3718,77 @@ impl Tree {
         file_id: FileId,
         owner: &'static str,
     ) {
-        let conn = self.pinned_conn(conn);
-        if !conn.pinned_session_is_current() {
-            return;
-        }
-        // See `close_handle`.
-        conn.forget_oplock(file_id);
-        let req = CloseRequest { flags: 0, file_id };
-        let tree_id = self.tree_id;
-        match conn.dispatch_without_waiting(Command::Close, &req, Some(tree_id)) {
-            Ok(Some(queued)) => {
-                trace!("{owner} dropped while open; its CLOSE is queued");
-                // Only to hear the answer. With no runtime to wait on, the
-                // CLOSE goes out all the same and its answer is discarded.
-                if let Some(task) = rt::try_spawn(async move {
-                    match queued
-                        .response()
-                        .await
-                        .and_then(|frame| close_outcome(&frame))
-                    {
-                        Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
-                        Err(e) => debug!("{owner} dropped while open; its CLOSE failed: {e}"),
-                    }
-                }) {
-                    task.detach();
+        close_dropped_handle_on(self.pinned_conn(conn), self.tree_id, file_id, owner);
+    }
+}
+
+/// [`Tree::close_dropped_handle`] for a handle known only by its tree id: the
+/// CLOSE goes out on `conn`, which is pinned to the session that opened it.
+/// The receiver task uses it for a CREATE answered after its caller went away
+/// (see `Connection`'s orphaned opens), where there's no `Tree` to hand.
+///
+/// The same rule holds: never for a handle whose CLOSE was already started.
+pub(crate) fn close_dropped_handle_on(
+    conn: Connection,
+    tree_id: TreeId,
+    file_id: FileId,
+    owner: &'static str,
+) {
+    if !conn.pinned_session_is_current() {
+        return;
+    }
+    // See `close_handle`.
+    conn.forget_oplock(file_id);
+    let req = CloseRequest { flags: 0, file_id };
+    match conn.dispatch_without_waiting(Command::Close, &req, Some(tree_id)) {
+        Ok(Some(queued)) => {
+            trace!("{owner} dropped while open; its CLOSE is queued");
+            // Only to hear the answer. With no runtime to wait on, the
+            // CLOSE goes out all the same and its answer is discarded.
+            if let Some(task) = rt::try_spawn(async move {
+                match queued
+                    .response()
+                    .await
+                    .and_then(|frame| close_outcome(&frame))
+                {
+                    Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
+                    Err(e) => debug!("{owner} dropped while open; its CLOSE failed: {e}"),
                 }
+            }) {
+                task.detach();
             }
-            Ok(None) => {
-                let task = rt::try_spawn(async move {
-                    let result = match conn.dispatch(Command::Close, &req, Some(tree_id)).await {
-                        Ok(mut guard) => conn
-                            .await_response_in_place(&mut guard, Command::Close)
-                            .await
-                            .and_then(|frame| close_outcome(&frame)),
-                        Err(e) => Err(e),
-                    };
-                    match result {
-                        Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
-                        Err(e) => debug!(
-                            "{owner} dropped while open; its CLOSE failed, so the handle stays \
+        }
+        Ok(None) => {
+            let task = rt::try_spawn(async move {
+                let result = match conn.dispatch(Command::Close, &req, Some(tree_id)).await {
+                    Ok(mut guard) => conn
+                        .await_response_in_place(&mut guard, Command::Close)
+                        .await
+                        .and_then(|frame| close_outcome(&frame)),
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
+                    Err(e) => debug!(
+                        "{owner} dropped while open; its CLOSE failed, so the handle stays \
                              open on the server until the session ends: {e}"
-                        ),
-                    }
-                });
-                match task {
-                    Some(task) => task.detach(),
-                    None => debug!(
-                        "{owner} dropped while open, outside an async runtime and with no credit \
-                         on hand to queue a CLOSE; the handle stays open on the server until the \
-                         session ends"
                     ),
                 }
+            });
+            match task {
+                Some(task) => task.detach(),
+                None => debug!(
+                    "{owner} dropped while open, outside an async runtime and with no credit \
+                         on hand to queue a CLOSE; the handle stays open on the server until the \
+                         session ends"
+                ),
             }
-            Err(Error::HandleInvalidated { .. }) => {}
-            Err(e) => debug!(
-                "{owner} dropped while open; no CLOSE could be sent, so the handle stays open on \
-                 the server until the session ends: {e}"
-            ),
         }
+        Err(Error::HandleInvalidated { .. }) => {}
+        Err(e) => debug!(
+            "{owner} dropped while open; no CLOSE could be sent, so the handle stays open on \
+                 the server until the session ends: {e}"
+        ),
     }
 }
 
@@ -9030,5 +9043,258 @@ mod tests {
             65536,
         );
         assert!(download.info().is_none());
+    }
+
+    /// A CREATE whose caller goes away before claiming the answer still
+    /// opened a file on the server; the crate closes it (issue #24).
+    mod orphaned_opens {
+        use super::*;
+        use crate::client::connection::CompoundOp;
+        use crate::client::test_helpers::{build_compound_response_frame, build_flush_response};
+        use crate::msg::close::CloseRequest;
+        use crate::msg::flush::FlushRequest;
+        use crate::pack::{ReadCursor, Unpack};
+        use crate::types::SessionId;
+        use std::time::Duration;
+
+        const FID: FileId = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+
+        fn tree() -> Tree {
+            Tree {
+                pin: None,
+                tree_id: TreeId(10),
+                share_name: "share".to_string(),
+                server: "server".to_string(),
+                is_dfs: false,
+                encrypt_data: false,
+                dfs_origin: None,
+            }
+        }
+
+        /// The file ids of the stand-alone CLOSEs the mock saw.
+        fn closes(mock: &MockTransport) -> Vec<FileId> {
+            mock.sent_messages()
+                .iter()
+                .filter(|b| {
+                    Header::unpack(&mut ReadCursor::new(b)).unwrap().command == Command::Close
+                })
+                .map(|b| {
+                    CloseRequest::unpack(&mut ReadCursor::new(&b[Header::SIZE..]))
+                        .unwrap()
+                        .file_id
+                })
+                .collect()
+        }
+
+        async fn wait_until(mut f: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !f() {
+                assert!(std::time::Instant::now() < deadline, "never happened in 5s");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Long enough for the receiver task to have routed what is queued.
+        async fn settle(mock: &MockTransport) {
+            wait_until(|| mock.pending_responses() == 0).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        /// Drop an `open_file` before the server answers.
+        async fn abandon_open(conn: &mut Connection) {
+            let opened =
+                tokio::time::timeout(Duration::from_millis(50), tree().open_file(conn, "a.txt"))
+                    .await;
+            assert!(
+                opened.is_err(),
+                "nothing was queued, so the open can't finish"
+            );
+        }
+
+        fn create_req() -> CreateRequest {
+            CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: FileAccessMask::new(FileAccessMask::FILE_READ_DATA),
+                file_attributes: 0,
+                share_access: ShareAccess(ShareAccess::FILE_SHARE_READ),
+                create_disposition: CreateDisposition::FileOpen,
+                create_options: 0,
+                name: "a.txt".to_string(),
+                create_contexts: vec![],
+            }
+        }
+
+        #[tokio::test]
+        async fn a_create_answered_after_its_caller_left_is_closed() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            abandon_open(&mut conn).await;
+
+            mock.queue_response(build_create_response(FID, 0));
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        #[tokio::test]
+        async fn a_create_answered_after_the_response_deadline_is_closed() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            conn.set_response_timeout(Some(Duration::from_millis(20)));
+            let opened = tree().open_file(&mut conn, "a.txt").await;
+            assert!(matches!(opened, Err(Error::Timeout)), "{opened:?}");
+
+            mock.queue_response(build_create_response(FID, 0));
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        #[tokio::test]
+        async fn an_answer_that_landed_but_was_never_claimed_is_closed() {
+            let mock = Arc::new(MockTransport::new());
+            let conn = setup_connection(&mock);
+            let mut guard = conn
+                .dispatch(Command::Create, &create_req(), Some(TreeId(10)))
+                .await
+                .unwrap();
+            mock.queue_response(build_create_response(FID, 0));
+            wait_until(|| guard.has_landed()).await;
+            drop(guard);
+
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        #[tokio::test]
+        async fn a_claimed_answer_is_the_callers_to_close() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            mock.queue_response(build_create_response(FID, 0));
+            let (file_id, _) = tree().open_file(&mut conn, "a.txt").await.unwrap();
+            assert_eq!(file_id, FID);
+            settle(&mock).await;
+
+            assert!(closes(&mock).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_failed_create_sends_no_close() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            abandon_open(&mut conn).await;
+
+            mock.queue_response(build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND));
+            settle(&mock).await;
+            assert!(closes(&mock).is_empty());
+        }
+
+        /// The server let go of the session's opens with the session, and the
+        /// file id may name something else on the new one.
+        #[tokio::test]
+        async fn a_create_from_a_session_that_has_ended_sends_no_close() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            abandon_open(&mut conn).await;
+            conn.set_session_id(SessionId(0x5678));
+
+            mock.queue_response(build_create_response(FID, 0));
+            settle(&mock).await;
+            assert!(closes(&mock).is_empty());
+        }
+
+        /// A server may answer a compound's parts in separate frames, so the
+        /// caller can leave after the CREATE's answer was claimed.
+        #[tokio::test]
+        async fn a_compound_abandoned_after_its_create_was_answered_closes_it() {
+            let mock = Arc::new(MockTransport::new());
+            let conn = setup_connection(&mock);
+            let create = create_req();
+            let flush = FlushRequest {
+                file_id: FileId::SENTINEL,
+            };
+            let ops = [
+                CompoundOp::new(Command::Create, &create, Some(TreeId(10))),
+                CompoundOp::new(Command::Flush, &flush, Some(TreeId(10))),
+            ];
+            mock.queue_response(build_create_response(FID, 0));
+            let done =
+                tokio::time::timeout(Duration::from_millis(100), conn.execute_compound(&ops)).await;
+            assert!(done.is_err(), "the FLUSH was never answered");
+
+            // Not while the FLUSH may still be working on the handle.
+            settle(&mock).await;
+            assert!(closes(&mock).is_empty());
+            mock.queue_response(build_flush_response());
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        /// A related CLOSE closes the most recent CREATE's handle only.
+        #[tokio::test]
+        async fn a_compound_close_spares_only_the_create_it_closes() {
+            const OTHER: FileId = FileId {
+                persistent: 0xCC,
+                volatile: 0xDD,
+            };
+            let mock = Arc::new(MockTransport::new());
+            let conn = setup_connection(&mock);
+            let (first, second) = (create_req(), create_req());
+            let close = CloseRequest {
+                flags: 0,
+                file_id: FileId::SENTINEL,
+            };
+            let ops = [
+                CompoundOp::new(Command::Create, &first, Some(TreeId(10))),
+                CompoundOp::new(Command::Create, &second, Some(TreeId(10))),
+                CompoundOp::new(Command::Close, &close, Some(TreeId(10))),
+            ];
+            let done =
+                tokio::time::timeout(Duration::from_millis(50), conn.execute_compound(&ops)).await;
+            assert!(
+                done.is_err(),
+                "nothing was queued, so the compound can't finish"
+            );
+
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(FID, 0),
+                build_create_response(OTHER, 0),
+                build_close_response(),
+            ]));
+            wait_until(|| closes(&mock) == vec![FID]).await;
+            settle(&mock).await;
+            assert_eq!(closes(&mock), vec![FID]);
+        }
+
+        /// The chain's own CLOSE already closed it; a second CLOSE could hit
+        /// whatever the server gave the same file id next.
+        #[tokio::test]
+        async fn a_compound_that_closes_its_own_create_sends_no_second_close() {
+            let mock = Arc::new(MockTransport::new());
+            let conn = setup_connection(&mock);
+            let create = create_req();
+            let close = CloseRequest {
+                flags: 0,
+                file_id: FileId::SENTINEL,
+            };
+            let ops = [
+                CompoundOp::new(Command::Create, &create, Some(TreeId(10))),
+                CompoundOp::new(Command::Close, &close, Some(TreeId(10))),
+            ];
+            let done =
+                tokio::time::timeout(Duration::from_millis(50), conn.execute_compound(&ops)).await;
+            assert!(
+                done.is_err(),
+                "nothing was queued, so the compound can't finish"
+            );
+
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(FID, 0),
+                build_close_response(),
+            ]));
+            settle(&mock).await;
+            assert!(
+                closes(&mock).is_empty(),
+                "only the compound's own CLOSE went out"
+            );
+        }
     }
 }
