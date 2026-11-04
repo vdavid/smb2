@@ -716,6 +716,52 @@ async fn guest_a_dropped_writer_lets_go_of_the_file_before_the_next_request() {
         .expect("the drop closed the handle before the delete got there");
 }
 
+/// Issue #24 against a real Samba: a `Tree` call dropped anywhere between its
+/// CREATE and its CLOSE lets go of the file. The write shares nothing, so a
+/// handle left open refuses the delete with `SharingViolation` for the rest
+/// of the session. Dropped after the CREATE's answer, the call's own guard
+/// queues the CLOSE before the delete; dropped before it, the CLOSE follows
+/// the late answer, so the delete may need a moment.
+#[tokio::test]
+#[ignore]
+async fn guest_a_write_dropped_mid_call_lets_go_of_the_file() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let path = "docker_test_dropped_mid_call.tmp";
+    let data = vec![0x5a; 8 * 1024 * 1024];
+
+    let mut dropped = 0;
+    for after_ms in [0, 1, 2, 3, 5, 8, 13, 21, 34, 55] {
+        let write = tree.write_file_pipelined(&mut conn, path, &data);
+        if tokio::time::timeout(Duration::from_millis(after_ms), write)
+            .await
+            .is_err()
+        {
+            dropped += 1;
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tree.delete_file(&mut conn, path).await {
+                Ok(()) => break,
+                Err(e) if e.kind() == smb2::ErrorKind::NotFound => break,
+                Err(e) if e.kind() == smb2::ErrorKind::SharingViolation => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a write dropped after {after_ms} ms kept the file open: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("delete after a write dropped at {after_ms} ms: {e}"),
+            }
+        }
+    }
+    assert!(
+        dropped > 0,
+        "every write finished, so nothing was dropped mid-call"
+    );
+}
+
 // ── Attributes (smb-guest) ──────────────────────────────────────────
 
 fn attrs(bits: u32) -> smb2::FileAttributes {

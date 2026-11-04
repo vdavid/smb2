@@ -2079,6 +2079,8 @@ impl Tree {
         let mut cursor = ReadCursor::new(create_body);
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
+        // So a WRITE answer that doesn't parse can't leave the handle open.
+        let open = OpenHandle::new(self, conn, file_id, "write_file_compound");
 
         // Check WRITE response.
         if write_header.status != NtStatus::SUCCESS {
@@ -2086,7 +2088,7 @@ impl Tree {
                 "tree: compound WRITE failed ({:?}), issuing standalone CLOSE",
                 write_header.status
             );
-            let _ = self.close_handle(conn, file_id).await;
+            let _ = open.close(self, conn).await;
             return Err(Error::Protocol {
                 status: write_header.status,
                 command: Command::Write,
@@ -2100,13 +2102,13 @@ impl Tree {
         if flush_header.status != NtStatus::SUCCESS {
             // Nothing vouches for the data, so the write isn't done. The
             // handle still has to go.
-            let _ = self.close_handle(conn, file_id).await;
+            let _ = open.close(self, conn).await;
             return Err(Error::Protocol {
                 status: flush_header.status,
                 command: Command::Flush,
             });
         }
-        if let Err(e) = self.close_handle(conn, file_id).await {
+        if let Err(e) = open.close(self, conn).await {
             // Written and flushed; the handle goes with the session at worst.
             debug!("tree: CLOSE after the compound write failed: {e} (data already flushed)");
         }
@@ -2153,13 +2155,14 @@ impl Tree {
 
         // Open the file.
         let (file_id, file_size) = self.open_file(conn, path).await?;
+        let open = OpenHandle::new(self, conn, file_id, "read_file_pipelined");
 
         if file_size == 0 {
             trace!(
                 "tree: read_file_pipelined path={:?}, size=0 (empty file)",
                 path
             );
-            self.close_handle(conn, file_id).await?;
+            open.close(self, conn).await?;
             return Ok(Vec::new());
         }
 
@@ -2200,7 +2203,7 @@ impl Tree {
             .await;
 
         // Close the handle regardless of read result.
-        let close_result = self.close_handle(conn, file_id).await;
+        let close_result = open.close(self, conn).await;
 
         let data = result?;
         close_result?;
@@ -2260,12 +2263,15 @@ impl Tree {
         let conn = &mut self.pinned_conn(conn);
         // A no-op when the caller pinned before the open, as it should.
         let conn = &mut conn.pinned_to_session();
+        // Armed before the first await, so nothing since the open could drop
+        // the call without it.
+        let open = OpenHandle::new(self, conn, file_id, "read_file_pipelined_with_progress");
         if file_size == 0 {
             trace!(
                 "tree: read_file_pipelined_with_progress path={:?}, size=0 (empty file)",
                 path
             );
-            self.close_handle(conn, file_id).await?;
+            open.close(self, conn).await?;
             let _ = on_progress(Progress {
                 bytes_transferred: 0,
                 total_bytes: Some(0),
@@ -2301,7 +2307,7 @@ impl Tree {
             .await;
 
         // Close the handle regardless of read result.
-        let close_result = self.close_handle(conn, file_id).await;
+        let close_result = open.close(self, conn).await;
 
         let data = result?;
         close_result?;
@@ -2443,6 +2449,7 @@ impl Tree {
         let mut cursor = ReadCursor::new(&frame.body);
         let create_resp = CreateResponse::unpack(&mut cursor)?;
         let file_id = create_resp.file_id;
+        let open = OpenHandle::new(self, conn, file_id, "write_file_pipelined");
 
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
@@ -2467,13 +2474,14 @@ impl Tree {
         }
         .await;
 
-        // Flush to ensure data is persisted on the server.
+        // Flush to ensure data is persisted on the server. A refused FLUSH
+        // returns here, and `open` closes the handle as it drops.
         if result.is_ok() {
             self.flush_handle(conn, file_id).await?;
         }
 
         // Close the handle.
-        let close_result = self.close_handle(conn, file_id).await;
+        let close_result = open.close(self, conn).await;
 
         let bytes_written = result?;
         close_result?;
@@ -2586,19 +2594,23 @@ impl Tree {
         let conn = &mut self.pinned_conn(conn);
         // A no-op when the caller pinned before the open, as it should.
         let conn = &mut conn.pinned_to_session();
+        // Armed before the first await, so nothing since the open could drop
+        // the call without it.
+        let open = OpenHandle::new(self, conn, file_id, "write_file_streamed");
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
 
         let start = std::time::Instant::now();
         let result = write_streamed(&mut pipe, next_chunk).await;
 
-        // Flush to ensure data is persisted on the server.
+        // Flush to ensure data is persisted on the server. A refused FLUSH
+        // returns here, and `open` closes the handle as it drops.
         if result.is_ok() {
             self.flush_handle(conn, file_id).await?;
         }
 
         // Close the handle (always, even on error).
-        let close_result = self.close_handle(conn, file_id).await;
+        let close_result = open.close(self, conn).await;
 
         let bytes_written = result?;
         close_result?;
@@ -3719,6 +3731,70 @@ impl Tree {
         owner: &'static str,
     ) {
         close_dropped_handle_on(self.pinned_conn(conn), self.tree_id, file_id, owner);
+    }
+}
+
+/// A handle a `Tree` call holds only until its own CLOSE, closed if the call
+/// never gets there (issue #24).
+///
+/// A call that awaits between its CREATE's answer and its CLOSE (a pipelined
+/// read or write, a server-side copy, a chunked stream) can be dropped in
+/// between, and consumers drop futures routinely: a copy driver stopping on
+/// its first failure, a `select!` arm that lost, a timeout. An early `?` in
+/// between used to leave the handle open the same way. Armed once the
+/// answer is in hand, it queues the CLOSE on drop the way a dropped
+/// `FileWriter` does (`client/CLAUDE.md` § Dropping a handle), so the CLOSE
+/// lands after every request the call already queued on the handle.
+///
+/// ❌ [`close`](Self::close) disarms it BEFORE its CLOSE starts, and the
+/// call's own CLOSE goes through nothing else: a call dropped mid-CLOSE then
+/// sends nothing more, because a second CLOSE could close whatever the server
+/// gave the same file id next.
+#[must_use = "dropping it closes the handle"]
+pub(crate) struct OpenHandle {
+    conn: Connection,
+    tree_id: TreeId,
+    file_id: FileId,
+    owner: &'static str,
+    armed: bool,
+}
+
+impl OpenHandle {
+    /// Arm one for `file_id`, which `tree` opened on `conn` (pinned to the
+    /// session that opened it). `owner` names the call in the log line.
+    pub(crate) fn new(
+        tree: &Tree,
+        conn: &Connection,
+        file_id: FileId,
+        owner: &'static str,
+    ) -> Self {
+        OpenHandle {
+            conn: tree.pinned_conn(conn),
+            tree_id: tree.tree_id,
+            file_id,
+            owner,
+            armed: true,
+        }
+    }
+
+    /// The handle's file id.
+    pub(crate) fn id(&self) -> FileId {
+        self.file_id
+    }
+
+    /// The call's own CLOSE. Disarmed on the first poll, before anything is
+    /// sent, so dropping this future sends nothing more either way.
+    pub(crate) async fn close(mut self, tree: &Tree, conn: &mut Connection) -> Result<()> {
+        self.armed = false;
+        tree.close_handle(conn, self.file_id).await
+    }
+}
+
+impl Drop for OpenHandle {
+    fn drop(&mut self) {
+        if self.armed {
+            close_dropped_handle_on(self.conn.clone(), self.tree_id, self.file_id, self.owner);
+        }
     }
 }
 
@@ -9057,12 +9133,12 @@ mod tests {
         use crate::types::SessionId;
         use std::time::Duration;
 
-        const FID: FileId = FileId {
+        pub(super) const FID: FileId = FileId {
             persistent: 0xAA,
             volatile: 0xBB,
         };
 
-        fn tree() -> Tree {
+        pub(super) fn tree() -> Tree {
             Tree {
                 pin: None,
                 tree_id: TreeId(10),
@@ -9075,7 +9151,7 @@ mod tests {
         }
 
         /// The file ids of the stand-alone CLOSEs the mock saw.
-        fn closes(mock: &MockTransport) -> Vec<FileId> {
+        pub(super) fn closes(mock: &MockTransport) -> Vec<FileId> {
             mock.sent_messages()
                 .iter()
                 .filter(|b| {
@@ -9089,7 +9165,7 @@ mod tests {
                 .collect()
         }
 
-        async fn wait_until(mut f: impl FnMut() -> bool) {
+        pub(super) async fn wait_until(mut f: impl FnMut() -> bool) {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while !f() {
                 assert!(std::time::Instant::now() < deadline, "never happened in 5s");
@@ -9098,7 +9174,7 @@ mod tests {
         }
 
         /// Long enough for the receiver task to have routed what is queued.
-        async fn settle(mock: &MockTransport) {
+        pub(super) async fn settle(mock: &MockTransport) {
             wait_until(|| mock.pending_responses() == 0).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -9352,6 +9428,123 @@ mod tests {
 
             settle(&mock).await;
             assert!(closes(&mock).is_empty(), "closed {:?}", closes(&mock));
+        }
+    }
+
+    /// A `Tree` call that holds a handle across round trips closes it when
+    /// it's dropped (or fails) before its own CLOSE, and never twice (issue
+    /// #24, `OpenHandle`).
+    mod dropped_mid_call {
+        use super::orphaned_opens::{closes, settle, tree, wait_until, FID};
+        use super::*;
+        use crate::client::test_helpers::{build_flush_error_response, build_flush_response};
+        use std::time::Duration;
+
+        /// Run `call` until it has nothing left the mock will answer, then
+        /// drop it.
+        async fn drop_midway<T>(call: impl std::future::Future<Output = T>) {
+            let done = tokio::time::timeout(Duration::from_millis(50), call).await;
+            assert!(done.is_err(), "the call finished; the test needs it stuck");
+        }
+
+        #[tokio::test]
+        async fn a_pipelined_read_dropped_mid_read_closes_its_handle() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            mock.queue_response(build_create_response(FID, 1024 * 1024));
+            drop_midway(tree().read_file_pipelined(&mut conn, "a.bin")).await;
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        #[tokio::test]
+        async fn a_pipelined_write_dropped_mid_write_closes_its_handle() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            mock.queue_response(build_create_response(FID, 0));
+            let data = vec![7u8; 64 * 1024];
+            drop_midway(tree().write_file_pipelined(&mut conn, "a.bin", &data)).await;
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        #[tokio::test]
+        async fn a_streamed_write_dropped_mid_write_closes_its_handle() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            mock.queue_response(build_create_response(FID, 0));
+            let mut chunks = vec![Ok(vec![7u8; 4096])].into_iter();
+            let mut next = || chunks.next();
+            drop_midway(tree().write_file_streamed(&mut conn, "a.bin", &mut next)).await;
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        /// The source is open while the destination's CREATE is still out.
+        #[tokio::test]
+        async fn a_server_side_copy_dropped_after_its_source_opened_closes_it() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            mock.queue_response(build_create_response(FID, 10));
+            drop_midway(tree().server_side_copy_file(&mut conn, "a.bin", "b.bin")).await;
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        /// An early return between the open and the CLOSE used to leave the
+        /// handle open too.
+        #[tokio::test]
+        async fn a_pipelined_write_whose_flush_fails_still_closes_its_handle() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            let data = vec![7u8; 4096];
+            mock.queue_response(build_create_response(FID, 0));
+            mock.queue_response(build_write_response(data.len() as u32));
+            mock.queue_response(build_flush_error_response(NtStatus::ACCESS_DENIED));
+            mock.queue_response(build_close_response());
+            let written = tree().write_file_pipelined(&mut conn, "a.bin", &data).await;
+            assert!(written.is_err(), "{written:?}");
+            wait_until(|| closes(&mock) == vec![FID]).await;
+        }
+
+        #[tokio::test]
+        async fn a_finished_pipelined_read_sends_one_close() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            mock.queue_response(build_create_response(FID, 5));
+            mock.queue_response(build_read_response(NtStatus::SUCCESS, b"hello".to_vec()));
+            mock.queue_response(build_close_response());
+            let data = tree()
+                .read_file_pipelined(&mut conn, "a.bin")
+                .await
+                .unwrap();
+            assert_eq!(data, b"hello");
+            settle(&mock).await;
+            assert_eq!(closes(&mock), vec![FID]);
+        }
+
+        /// Its own CLOSE is out, so the drop must not send another: the
+        /// server may have handed the same file id to a new open.
+        #[tokio::test]
+        async fn a_pipelined_read_dropped_during_its_close_sends_no_second() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            mock.queue_response(build_create_response(FID, 5));
+            mock.queue_response(build_read_response(NtStatus::SUCCESS, b"hello".to_vec()));
+            drop_midway(tree().read_file_pipelined(&mut conn, "a.bin")).await;
+            settle(&mock).await;
+            assert_eq!(closes(&mock), vec![FID]);
+        }
+
+        #[tokio::test]
+        async fn a_finished_pipelined_write_sends_one_close() {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn = setup_connection(&mock);
+            let data = vec![7u8; 4096];
+            mock.queue_response(build_create_response(FID, 0));
+            mock.queue_response(build_write_response(data.len() as u32));
+            mock.queue_response(build_flush_response());
+            mock.queue_response(build_close_response());
+            let written = tree().write_file_pipelined(&mut conn, "a.bin", &data).await;
+            assert_eq!(written.unwrap(), data.len() as u64);
+            settle(&mock).await;
+            assert_eq!(closes(&mock), vec![FID]);
         }
     }
 }

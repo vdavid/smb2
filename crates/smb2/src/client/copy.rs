@@ -45,7 +45,7 @@ use std::fmt;
 use log::debug;
 
 use crate::client::connection::Connection;
-use crate::client::tree::Tree;
+use crate::client::tree::{OpenHandle, Tree};
 use crate::client::SmbClient;
 use crate::error::{Error, Result};
 use crate::msg::copychunk::{
@@ -509,19 +509,22 @@ impl Tree {
         let conn = &mut conn.pinned_to_session();
 
         let (src_id, src_size) = self.open_file(conn, source_path).await?;
+        // Each handle closes itself if the copy is dropped before its CLOSE.
+        let src = OpenHandle::new(self, conn, src_id, "server-side copy (source)");
 
         let dst_open = if truncate_dest {
             self.open_readwrite_overwrite(conn, dest_path).await
         } else {
             self.open_file_readwrite(conn, dest_path).await
         };
-        let dst_id = match dst_open {
-            Ok((id, _)) => id,
+        let dst = match dst_open {
+            Ok((id, _)) => OpenHandle::new(self, conn, id, "server-side copy (destination)"),
             Err(e) => {
-                let _ = self.close_handle(conn, src_id).await;
+                let _ = src.close(self, conn).await;
                 return Err(e);
             }
         };
+        let dst_id = dst.id();
 
         let len = length.unwrap_or(src_size);
 
@@ -536,8 +539,8 @@ impl Tree {
         }
         .await;
 
-        let _ = self.close_handle(conn, dst_id).await;
-        let _ = self.close_handle(conn, src_id).await;
+        let _ = dst.close(self, conn).await;
+        let _ = src.close(self, conn).await;
         result
     }
 }

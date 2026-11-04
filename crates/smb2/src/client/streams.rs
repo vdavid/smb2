@@ -20,7 +20,7 @@ use log::{debug, trace};
 
 use crate::client::connection::{CompoundOp, Connection, Frame};
 use crate::client::credits;
-use crate::client::tree::{all_or_first_err, SHARE_ALL};
+use crate::client::tree::{all_or_first_err, OpenHandle, SHARE_ALL};
 use crate::client::watcher::decode_utf16le;
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
@@ -468,6 +468,7 @@ impl Tree {
             return Err(protocol(frame.header.status, Command::Create));
         }
         let file_id = CreateResponse::unpack(&mut ReadCursor::new(&frame.body))?.file_id;
+        let open = OpenHandle::new(self, conn, file_id, "read_stream");
 
         let mut data = Vec::with_capacity(size.min(64 * 1024 * 1024) as usize);
         let outcome = loop {
@@ -509,7 +510,7 @@ impl Tree {
             }
             data.extend_from_slice(&resp.data);
         };
-        let _ = self.close_handle(conn, file_id).await;
+        let _ = open.close(self, conn).await;
         outcome.map(|()| data)
     }
 
@@ -681,6 +682,7 @@ impl Tree {
             return Err(protocol(frame.header.status, Command::Create));
         }
         let file_id = CreateResponse::unpack(&mut ReadCursor::new(&frame.body))?.file_id;
+        let open = OpenHandle::new(self, conn, file_id, "write_stream");
 
         let mut outcome = Ok(());
         for (index, piece) in data.chunks(chunk).enumerate() {
@@ -712,7 +714,7 @@ impl Tree {
                 break;
             }
         }
-        let closed = self.close_handle(conn, file_id).await;
+        let closed = open.close(self, conn).await;
         outcome.and(closed)
     }
 

@@ -2613,6 +2613,9 @@ impl SmbClient {
         // The rest runs where the file was opened: the link's target, if any.
         let tree = moved_to.as_ref().map_or(tree, |link| &link.tree);
         let conn = &mut conn;
+        // Nothing awaits between the open and here, so the handle is covered
+        // from its CREATE's answer to its CLOSE (issue #24).
+        let open = tree::OpenHandle::new(tree, conn, file_id, "write_file_with_progress");
 
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = write_pipe::WritePipe::new(conn.clone(), tree.tree_id, file_id, max_write);
@@ -2657,7 +2660,7 @@ impl SmbClient {
                 // Cancelled: wait out what's on the wire, then close without
                 // a flush (best-effort).
                 pipe.abandon().await;
-                let _ = tree.close_handle(conn, file_id).await;
+                let _ = open.close(tree, conn).await;
                 return Err(crate::Error::Cancelled);
             }
             Err(e) => {
@@ -2668,17 +2671,21 @@ impl SmbClient {
                         ..
                     }
                 ) {
-                    let _ = tree.close_handle(conn, file_id).await;
+                    let _ = open.close(tree, conn).await;
                 }
+                // Any other error may be the connection itself, so nothing
+                // waits on a CLOSE: `open` queues one as it drops, which a
+                // session that has ended never sends.
                 return Err(e);
             }
         };
 
-        // Flush to ensure data is persisted.
+        // Flush to ensure data is persisted. A refused FLUSH returns here,
+        // and `open` closes the handle as it drops.
         tree.flush_handle(conn, file_id).await?;
 
         // Close the handle.
-        tree.close_handle(conn, file_id).await?;
+        open.close(tree, conn).await?;
 
         Ok(total_written)
     }
