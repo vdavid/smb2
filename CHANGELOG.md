@@ -7,6 +7,16 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- **`Session` holds no keys**: `signing_key`, `encryption_key`, and `decryption_key` are gone, and the `Connection` that session setup ran on is the only place they live. `Session` is now `Clone`, with a derived `Debug`.
+- **`Connection::activate_encryption` is gone.** Session setup hands the connection its keys, and `Tree::connect` turns them on for a share that asks (below), so nothing outside the crate has keys to pass it.
+
+### Fixed
+
+- **The low-level `Tree::connect` encrypts a share that asks for it** (`SMB2_SHAREFLAG_ENCRYPT_DATA`), like `SmbClient::connect_share` always did: a `Connection` + `Session::setup` + `Tree::connect` caller used to get a tree reporting `encrypt_data` and a connection that stayed in the clear, which a server enforcing the flag refused request by request. Session setup now stages its encryption keys on the connection, and every tree connect turns them on when the share asks, the IPC$ trees behind share listing and DFS referrals included. No cipher negotiated is still `Error::EncryptionUnavailable`, with the share disconnected again. On SMB 3.0 / 3.0.2 the negotiation check for such a share now goes out encrypted, as MS-SMB2 § 3.2.4.1.8 asks (closes #35).
+- **A second `Session::setup` on the same connection no longer inherits the previous session's encryption.** It starts from its own keys and its own verdict, where it used to keep encrypting with the old session's keys whenever it didn't encrypt itself.
+
 ## [0.41.0] - 2026-11-04
 
 ### Breaking

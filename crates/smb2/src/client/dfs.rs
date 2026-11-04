@@ -31,7 +31,6 @@ use crate::msg::dfs::{ReferralHeaderFlags, ReqGetDfsReferral, RespGetDfsReferral
 use crate::msg::ioctl::{
     IoctlRequest, IoctlResponse, FSCTL_DFS_GET_REFERRALS, SMB2_0_IOCTL_IS_FSCTL,
 };
-use crate::msg::tree_connect::{TreeConnectRequest, TreeConnectRequestFlags, TreeConnectResponse};
 use crate::pack::{Pack, ReadCursor, Unpack, WriteCursor};
 use crate::types::status::NtStatus;
 use crate::types::{Command, FileId, TreeId};
@@ -116,38 +115,9 @@ async fn ensure_ipc_tree(conn: &mut Connection) -> Result<TreeId> {
 
 /// Connect to the IPC$ share, returning the tree ID.
 async fn tree_connect_ipc(conn: &mut Connection) -> Result<TreeId> {
-    let server = conn.server_name().to_string();
-    let unc_path = format!(r"\\{}\IPC$", server);
-
-    let req = TreeConnectRequest {
-        flags: TreeConnectRequestFlags::default(),
-        path: unc_path,
-    };
-
-    let frame = conn.execute(Command::TreeConnect, &req, None).await?;
-
-    if frame.header.command != Command::TreeConnect {
-        return Err(Error::invalid_data(format!(
-            "expected TreeConnect response, got {:?}",
-            frame.header.command
-        )));
-    }
-
-    if frame.header.status != NtStatus::SUCCESS {
-        return Err(Error::Protocol {
-            status: frame.header.status,
-            command: Command::TreeConnect,
-        });
-    }
-
-    let mut cursor = ReadCursor::new(&frame.body);
-    let _resp = TreeConnectResponse::unpack(&mut cursor)?;
-
-    let tree_id = frame
-        .header
-        .tree_id
-        .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
-    conn.validate_negotiate(tree_id).await?;
+    // The same tree connect as any share's: encryption if IPC$ asks for it,
+    // and the negotiation proven before the referral goes out.
+    let (tree_id, _) = crate::client::tree::tree_connect(conn, "IPC$").await?;
 
     debug!("dfs: connected to IPC$, tree_id={}", tree_id);
     Ok(tree_id)

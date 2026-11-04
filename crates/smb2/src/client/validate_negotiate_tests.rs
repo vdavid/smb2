@@ -312,3 +312,61 @@ async fn a_session_that_does_not_sign_waits_for_one_that_does() {
     connect(&mut conn).await.unwrap();
     assert_eq!(mock.sent_count(), 3);
 }
+
+/// On a share that asks for encryption, the validation itself goes out
+/// encrypted (MS-SMB2 § 3.2.4.1.8 encrypts everything on such a tree), and an
+/// encrypted answer validates: the AEAD vouches for it the way a signature
+/// would. Validating first in the clear would be refused by a server that
+/// enforces the share's flag, and read as a failed validation (#35).
+#[tokio::test]
+async fn on_an_encrypting_share_the_validation_goes_out_encrypted() {
+    use crate::client::connection::EncryptionKeys;
+    use crate::crypto::encryption::{self, Cipher};
+
+    const DECRYPT: [u8; 16] = [0x3C; 16];
+    let (mock, mut conn) = connection(Dialect::Smb3_0_2, true);
+    let mut params = conn.params().unwrap();
+    params.cipher = Some(Cipher::Aes128Ccm);
+    conn.set_test_params(params);
+    conn.install_encryption(
+        Some(EncryptionKeys {
+            cipher: Cipher::Aes128Ccm,
+            encryption_key: vec![0x2B; 16],
+            decryption_key: DECRYPT.to_vec(),
+        }),
+        false,
+    );
+
+    let tree = crate::client::test_helpers::build_encrypting_tree_connect_response(TREE);
+    mock.queue_response(signed(tree, 0));
+    // The server encrypts its answer with the key the client decrypts with.
+    let mut answer = ioctl_answer(NtStatus::SUCCESS, Some(genuine()));
+    answer[24..32].copy_from_slice(&1u64.to_le_bytes());
+    answer[40..48].copy_from_slice(&SESSION.0.to_le_bytes());
+    let (mut wire, ciphertext) =
+        encryption::encrypt_message(&answer, &DECRYPT, Cipher::Aes128Ccm, &[7; 16], SESSION.0)
+            .unwrap();
+    wire.extend_from_slice(&ciphertext);
+
+    // The mock can't pair an encrypted frame with its request, so it's queued
+    // only once the request is out; queued earlier, it arrives first and is
+    // dropped as unasked-for.
+    let mut connecting = conn.clone();
+    let task = tokio::spawn(async move { connect(&mut connecting).await });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while mock.sent_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the validation never went out"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    mock.queue_response(wire);
+    let tree = task.await.unwrap().expect("the share connects");
+
+    assert!(tree.encrypt_data);
+    assert!(conn.should_encrypt());
+    let validation = mock.sent_message(1).expect("the validation went out");
+    assert_eq!(&validation[..4], b"\xFDSMB", "encrypted on the wire");
+    assert!(!conn.is_disconnected());
+}

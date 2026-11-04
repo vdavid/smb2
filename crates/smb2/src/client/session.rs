@@ -6,7 +6,7 @@
 use log::{debug, info, trace};
 
 use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
-use crate::client::connection::{Connection, NegotiatedParams};
+use crate::client::connection::{Connection, EncryptionKeys, NegotiatedParams};
 use crate::crypto::encryption::Cipher;
 use crate::crypto::kdf::{self, derive_session_keys};
 use crate::crypto::signing::{self, SigningAlgorithm};
@@ -21,70 +21,29 @@ use crate::Error;
 
 use crate::msg::session_setup::SessionSetupRequestFlags;
 
-/// An authenticated SMB2 session with derived keys.
+/// An authenticated SMB2 session: what [`setup`](Self::setup) established.
 ///
-/// `Debug` shows the keys as `***`.
+/// It holds no key. Setup hands the signing and encryption keys to the
+/// [`Connection`], which is the only place they live: the connection signs,
+/// encrypts, and decrypts, a revival replaces them along with everything else
+/// about the dead session, and a [`Tree::connect`](crate::Tree::connect) to a
+/// share that asks for encryption turns it on from there.
+#[derive(Debug, Clone)]
 pub struct Session {
     /// The session ID assigned by the server.
     pub session_id: SessionId,
-    /// Key used to sign outgoing messages.
-    pub signing_key: Vec<u8>,
-    /// Key used to encrypt outgoing messages (SMB 3.x).
-    pub encryption_key: Option<Vec<u8>>,
-    /// Key used to decrypt incoming messages (SMB 3.x).
-    pub decryption_key: Option<Vec<u8>>,
     /// The signing algorithm to use.
     pub signing_algorithm: SigningAlgorithm,
-    /// Whether outgoing messages should be signed.
+    /// Whether outgoing messages are signed.
     pub should_sign: bool,
-    /// Whether outgoing messages should be encrypted.
+    /// Whether the session encrypts everything (`ENCRYPT_DATA`, or
+    /// [`ClientConfig::require_encryption`](crate::ClientConfig::require_encryption)).
+    /// A share can still turn encryption on for a session that doesn't; see
+    /// [`Connection::should_encrypt`] for what the connection does now.
     pub should_encrypt: bool,
 }
 
-impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::crypto::Redacted;
-        // Destructured, so a new field can't be left out of the output.
-        let Self {
-            session_id,
-            signing_key: _,
-            encryption_key,
-            decryption_key,
-            signing_algorithm,
-            should_sign,
-            should_encrypt,
-        } = self;
-        f.debug_struct("Session")
-            .field("session_id", session_id)
-            .field("signing_key", &Redacted)
-            .field("encryption_key", &encryption_key.as_ref().map(|_| Redacted))
-            .field("decryption_key", &decryption_key.as_ref().map(|_| Redacted))
-            .field("signing_algorithm", signing_algorithm)
-            .field("should_sign", should_sign)
-            .field("should_encrypt", should_encrypt)
-            .finish()
-    }
-}
-
 impl Session {
-    /// A by-value copy.
-    ///
-    /// `Session` deliberately isn't `Clone`: it holds signing and encryption
-    /// keys, and a derive would make duplicating them invisible. Copying here
-    /// is explicit and has one caller — [`Connection::adopt_session`], which
-    /// keeps the current session reachable from a `Connection` alone.
-    pub(crate) fn snapshot(&self) -> Session {
-        Session {
-            session_id: self.session_id,
-            signing_key: self.signing_key.clone(),
-            encryption_key: self.encryption_key.clone(),
-            decryption_key: self.decryption_key.clone(),
-            signing_algorithm: self.signing_algorithm,
-            should_sign: self.should_sign,
-            should_encrypt: self.should_encrypt,
-        }
-    }
-
     /// Perform the multi-round-trip SESSION_SETUP exchange.
     ///
     /// Steps:
@@ -254,8 +213,7 @@ impl Session {
             "session: deriving keys, session_key_len={}",
             session_key.len()
         );
-        let (signing_key, encryption_key, decryption_key) =
-            session_keys(&session_key, &params, session_hasher.value());
+        let (signing_key, encryption) = session_keys(&session_key, &params, session_hasher.value());
 
         // Nothing below may read `session_flags` before this: they decide
         // whether signing and encryption turn on at all.
@@ -270,46 +228,18 @@ impl Session {
             account,
         )?;
 
-        // Determine if we should sign.
-        let should_sign = params.signing_required
-            || !setup_resp2.session_flags.is_guest() && !setup_resp2.session_flags.is_null();
-
-        let encrypt_with = session_cipher(
+        let session = establish(
+            conn,
             &params,
+            session_id,
             setup_resp2.session_flags,
-            conn.require_encryption(),
+            signing_key,
+            encryption,
         )?;
-        let should_encrypt = encrypt_with.is_some();
-
-        // Activate signing on the connection.
-        if should_sign {
-            conn.activate_signing(signing_key.clone(), signing_algorithm);
-        }
-        // `session_keys` derives both keys whenever the connection has a cipher.
-        if let (Some(cipher), Some(enc_key), Some(dec_key)) =
-            (encrypt_with, &encryption_key, &decryption_key)
-        {
-            conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
-        }
-
         info!(
             "session: established, session_id={}, sign={}, encrypt={}",
-            session_id, should_sign, should_encrypt
+            session_id, session.should_sign, session.should_encrypt
         );
-
-        let session = Session {
-            session_id,
-            signing_key,
-            encryption_key,
-            decryption_key,
-            signing_algorithm,
-            should_sign,
-            should_encrypt,
-        };
-        // Publish it on the connection so a caller holding only a `Connection`
-        // (an auto-reconnect that re-authenticated behind everyone's back, for
-        // instance) can pick up the new keys instead of using a dead session's.
-        conn.adopt_session(&session);
         Ok(session)
     }
 
@@ -480,8 +410,7 @@ impl Session {
             signing_algorithm, params.dialect
         );
 
-        let (signing_key, encryption_key, decryption_key) =
-            session_keys(&full_key, &params, session_hasher.value());
+        let (signing_key, encryption) = session_keys(&full_key, &params, session_hasher.value());
 
         // A Kerberos login always names an account, so the final response
         // has to prove itself before its flags are believed.
@@ -495,47 +424,64 @@ impl Session {
             Some(account),
         )?;
 
-        let should_sign = params.signing_required
-            || !setup_resp.session_flags.is_guest() && !setup_resp.session_flags.is_null();
-
-        let encrypt_with =
-            session_cipher(&params, setup_resp.session_flags, conn.require_encryption())?;
-        let should_encrypt = encrypt_with.is_some();
-
-        if should_sign {
-            conn.activate_signing(signing_key.clone(), signing_algorithm);
-        }
-        if let (Some(cipher), Some(enc_key), Some(dec_key)) =
-            (encrypt_with, &encryption_key, &decryption_key)
-        {
-            conn.activate_encryption(enc_key.clone(), dec_key.clone(), cipher);
-        }
-
+        let session = establish(
+            conn,
+            &params,
+            session_id,
+            setup_resp.session_flags,
+            signing_key,
+            encryption,
+        )?;
         info!(
             "session: Kerberos established, session_id={}, sign={}, encrypt={}",
-            session_id, should_sign, should_encrypt
+            session_id, session.should_sign, session.should_encrypt
         );
-
-        let session = Session {
-            session_id,
-            signing_key,
-            encryption_key,
-            decryption_key,
-            signing_algorithm,
-            should_sign,
-            should_encrypt,
-        };
-        // Publish it on the connection so a caller holding only a `Connection`
-        // (an auto-reconnect that re-authenticated behind everyone's back, for
-        // instance) can pick up the new keys instead of using a dead session's.
-        conn.adopt_session(&session);
         Ok(session)
     }
 }
 
-/// The signing key and the encryption and decryption keys a session uses
-/// (MS-SMB2 § 3.2.5.3.1), from the whole key the authentication protocol
-/// produced (`gss_key`: NTLM's 16 bytes, or the full Kerberos subkey).
+/// The last step of every session setup, once the final response has proven
+/// itself ([`authenticate_final_response`]): decide signing and encryption
+/// from its flags, and hand the keys to the connection.
+///
+/// The encryption keys go over whether or not the session encrypts, staged
+/// inactive when it doesn't, so a [`Tree::connect`](crate::Tree::connect) to
+/// a share flagged `SMB2_SHAREFLAG_ENCRYPT_DATA` can turn them on there. The
+/// session itself keeps no key.
+fn establish(
+    conn: &mut Connection,
+    params: &NegotiatedParams,
+    session_id: SessionId,
+    flags: SessionFlags,
+    signing_key: Vec<u8>,
+    encryption: Option<EncryptionKeys>,
+) -> Result<Session> {
+    let should_sign = params.signing_required || !flags.is_guest() && !flags.is_null();
+    let should_encrypt = session_cipher(params, flags, conn.require_encryption())?.is_some();
+
+    if should_sign {
+        conn.activate_signing(signing_key, params.signing_algorithm);
+    }
+    // `session_keys` derives encryption keys exactly when the connection has
+    // a cipher, which is also the only case `session_cipher` encrypts in.
+    conn.install_encryption(encryption, should_encrypt);
+
+    let session = Session {
+        session_id,
+        signing_algorithm: params.signing_algorithm,
+        should_sign,
+        should_encrypt,
+    };
+    // Publish it on the connection so a caller holding only a `Connection`
+    // (an auto-reconnect that re-authenticated behind everyone's back, for
+    // instance) sees the current session instead of a dead one.
+    conn.adopt_session(&session);
+    Ok(session)
+}
+
+/// The signing key and the encryption keys a session uses (MS-SMB2
+/// § 3.2.5.3.1), from the whole key the authentication protocol produced
+/// (`gss_key`: NTLM's 16 bytes, or the full Kerberos subkey).
 ///
 /// SMB 2.x signs with `Session.SessionKey` itself and has no encryption. On
 /// 3.x the encryption keys exist only when the connection negotiated a
@@ -545,21 +491,19 @@ fn session_keys(
     gss_key: &[u8],
     params: &NegotiatedParams,
     preauth_hash: &[u8; 64],
-) -> (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) {
+) -> (Vec<u8>, Option<EncryptionKeys>) {
     match params.dialect {
         Dialect::Smb3_0 | Dialect::Smb3_0_2 | Dialect::Smb3_1_1 => {
             let hash = (params.dialect == Dialect::Smb3_1_1).then_some(preauth_hash);
             let keys = derive_session_keys(gss_key, params.dialect, hash, params.cipher);
-            match params.cipher {
-                Some(_) => (
-                    keys.signing_key,
-                    Some(keys.encryption_key),
-                    Some(keys.decryption_key),
-                ),
-                None => (keys.signing_key, None, None),
-            }
+            let encryption = params.cipher.map(|cipher| EncryptionKeys {
+                cipher,
+                encryption_key: keys.encryption_key,
+                decryption_key: keys.decryption_key,
+            });
+            (keys.signing_key, encryption)
         }
-        _ => (kdf::session_key(gss_key).to_vec(), None, None),
+        _ => (kdf::session_key(gss_key).to_vec(), None),
     }
 }
 
@@ -870,7 +814,8 @@ mod tests {
         set_test_params(&mut conn, Dialect::Smb2_0_2);
 
         let session = Session::setup(&mut conn, "user", "pass", "").await.unwrap();
-        assert!(!session.signing_key.is_empty());
+        assert!(session.should_sign);
+        assert_eq!(conn.key_lengths(), (Some(16), None));
     }
 
     #[tokio::test]
@@ -1102,6 +1047,30 @@ mod tests {
         flags: SessionFlags,
         finish: Final,
     ) -> (Result<Session>, Connection) {
+        let s = scripted_setup(dialect, selected, cipher, username, password, flags, finish).await;
+        (s.result, s.conn)
+    }
+
+    /// The outcome of a scripted session setup, plus what the test needs to
+    /// keep playing the server: its mock and the key it signs with.
+    struct Scripted {
+        result: Result<Session>,
+        conn: Connection,
+        mock: Arc<MockTransport>,
+        signing_key: Vec<u8>,
+        algorithm: SigningAlgorithm,
+    }
+
+    /// [`setup_with_cipher`], keeping the server's side for what follows.
+    async fn scripted_setup(
+        dialect: Dialect,
+        selected: Option<SigningAlgorithm>,
+        cipher: Option<Cipher>,
+        username: &str,
+        password: &str,
+        flags: SessionFlags,
+        finish: Final,
+    ) -> Scripted {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
         let session_id = SessionId(0x4242);
@@ -1197,7 +1166,140 @@ mod tests {
         }
         mock.queue_response(response);
 
-        task.await.unwrap()
+        let (result, conn) = task.await.unwrap();
+        Scripted {
+            result,
+            conn,
+            mock,
+            signing_key,
+            algorithm,
+        }
+    }
+
+    // ── A share that asks for encryption, on the low-level path (#35) ──
+
+    use crate::client::tree::Tree;
+
+    /// Answer the next request on `s`'s connection with `frame`, signed the
+    /// way the server would sign it, once the request is on the wire.
+    async fn answer_signed(s: &Scripted, already_sent: usize, mut frame: Vec<u8>) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.mock.sent_count() <= already_sent {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the request never went out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let request = s.mock.sent_message(already_sent).unwrap();
+        let id = u64::from_le_bytes(request[24..32].try_into().unwrap());
+        frame[24..32].copy_from_slice(&id.to_le_bytes());
+        frame[40..48].copy_from_slice(&0x4242u64.to_le_bytes());
+        let mut header_flags =
+            crate::types::flags::HeaderFlags(u32::from_le_bytes(frame[16..20].try_into().unwrap()));
+        header_flags.set_signed();
+        frame[16..20].copy_from_slice(&header_flags.0.to_le_bytes());
+        crate::crypto::signing::sign_message_as_server(
+            &mut frame,
+            &s.signing_key,
+            s.algorithm,
+            id,
+            false,
+        )
+        .unwrap();
+        s.mock.queue_response(frame);
+        request
+    }
+
+    fn encrypting_share_answer() -> Vec<u8> {
+        crate::client::test_helpers::build_encrypting_tree_connect_response(crate::types::TreeId(5))
+    }
+
+    /// The low-level path: `Connection` + `Session::setup` + `Tree::connect`
+    /// on a share that asks for encryption ends up encrypting, with the keys
+    /// session setup staged on the connection. Before #35 only `SmbClient`
+    /// turned it on, so the tree reported `encrypt_data` and every request
+    /// after it went out in the clear.
+    #[tokio::test]
+    async fn a_low_level_tree_connect_to_an_encrypting_share_encrypts() {
+        let s = scripted_setup(
+            Dialect::Smb3_1_1,
+            Some(SigningAlgorithm::AesGmac),
+            Some(Cipher::Aes128Gcm),
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Signed,
+        )
+        .await;
+        s.result.as_ref().unwrap();
+        assert!(
+            !s.conn.should_encrypt(),
+            "the session itself doesn't encrypt"
+        );
+
+        let sent = s.mock.sent_count();
+        let mut conn = s.conn.clone();
+        let connecting = tokio::spawn(async move { Tree::connect(&mut conn, "secret").await });
+        answer_signed(&s, sent, encrypting_share_answer()).await;
+        let tree = connecting.await.unwrap().expect("the share connects");
+
+        assert!(tree.encrypt_data);
+        assert!(s.conn.should_encrypt(), "the share's flag turned it on");
+
+        // And the next request on the tree goes out wrapped in a
+        // TRANSFORM_HEADER. Nothing answers it; it only has to leave.
+        let sent = s.mock.sent_count();
+        let mut conn = s.conn.clone();
+        let next = tokio::spawn(async move { tree.disconnect(&mut conn).await });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.mock.sent_count() <= sent {
+            assert!(tokio::time::Instant::now() < deadline, "nothing went out");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        next.abort();
+        let frame = s.mock.sent_message(sent).unwrap();
+        assert_eq!(&frame[..4], b"\xFDSMB", "encrypted on the wire");
+    }
+
+    /// The same path on a connection that negotiated no cipher: the share is
+    /// refused with `EncryptionUnavailable` and disconnected again, and
+    /// nothing is encrypted with a cipher the server never agreed to.
+    #[tokio::test]
+    async fn a_low_level_tree_connect_without_a_cipher_is_refused() {
+        let s = scripted_setup(
+            Dialect::Smb3_1_1,
+            Some(SigningAlgorithm::AesGmac),
+            None,
+            USER,
+            PASS,
+            SessionFlags(0),
+            Final::Signed,
+        )
+        .await;
+        s.result.as_ref().unwrap();
+
+        let sent = s.mock.sent_count();
+        let mut conn = s.conn.clone();
+        let connecting = tokio::spawn(async move { Tree::connect(&mut conn, "secret").await });
+        answer_signed(&s, sent, encrypting_share_answer()).await;
+        let disconnect = answer_signed(
+            &s,
+            sent + 1,
+            crate::client::test_helpers::build_tree_disconnect_response(),
+        )
+        .await;
+        let err = connecting.await.unwrap().unwrap_err();
+
+        assert!(
+            matches!(&err, Error::EncryptionUnavailable { share: Some(s) } if s == "secret"),
+            "{err:?}"
+        );
+        assert_eq!(err.kind(), crate::ErrorKind::Unsupported);
+        assert!(!s.conn.should_encrypt());
+        let header = Header::unpack(&mut ReadCursor::new(&disconnect)).unwrap();
+        assert_eq!(header.command, Command::TreeDisconnect);
+        assert_eq!(s.mock.sent_count(), sent + 2, "nothing else went out");
     }
 
     /// The cipher a server that grants encryption leaves each dialect with.
@@ -1321,9 +1423,9 @@ mod tests {
                 )
                 .await;
                 let session = session.unwrap_or_else(|e| panic!("{cipher:?}: {e}"));
-                assert_eq!(session.signing_key.len(), 16, "{cipher:?}");
-                assert_eq!(session.encryption_key.as_ref().map(Vec::len), Some(32));
-                assert_eq!(session.decryption_key.as_ref().map(Vec::len), Some(32));
+                // Staged whether the session encrypts or not, so a share
+                // that asks can turn them on.
+                assert_eq!(conn.key_lengths(), (Some(16), Some((32, 32))), "{cipher:?}");
                 assert_eq!(session.should_encrypt, encrypts, "{cipher:?}");
                 assert_eq!(conn.should_encrypt(), encrypts, "{cipher:?}");
             }
@@ -1412,7 +1514,7 @@ mod tests {
     /// encryption works as before.
     #[tokio::test]
     async fn a_connection_without_a_cipher_derives_no_encryption_keys() {
-        let (session, _conn) = setup_with_cipher(
+        let (session, conn) = setup_with_cipher(
             Dialect::Smb3_1_1,
             Some(SigningAlgorithm::AesGmac),
             None,
@@ -1423,8 +1525,7 @@ mod tests {
         )
         .await;
         let session = session.unwrap();
-        assert!(session.encryption_key.is_none());
-        assert!(session.decryption_key.is_none());
+        assert_eq!(conn.key_lengths().1, None);
         assert!(!session.should_encrypt);
     }
 
@@ -1672,20 +1773,16 @@ mod tests {
     }
 
     #[test]
-    fn a_sessions_debug_output_hides_its_keys() {
-        let session = Session {
-            session_id: SessionId(7),
-            signing_key: vec![0xAB; 16],
-            encryption_key: Some(vec![0xAB; 16]),
-            decryption_key: None,
-            signing_algorithm: SigningAlgorithm::AesCmac,
-            should_sign: true,
-            should_encrypt: true,
+    fn encryption_keys_debug_output_hides_the_keys() {
+        let keys = EncryptionKeys {
+            cipher: Cipher::Aes128Gcm,
+            encryption_key: vec![0xAB; 16],
+            decryption_key: vec![0xAB; 16],
         };
-        let printed = format!("{session:?}");
+        let printed = format!("{keys:?}");
         assert!(!printed.contains("171"), "{printed}");
-        assert!(printed.contains("encryption_key: Some(***)"), "{printed}");
-        assert!(printed.contains("decryption_key: None"), "{printed}");
-        assert!(printed.contains("should_encrypt: true"), "{printed}");
+        assert!(printed.contains("encryption_key: ***"), "{printed}");
+        assert!(printed.contains("decryption_key: ***"), "{printed}");
+        assert!(printed.contains("Aes128Gcm"), "{printed}");
     }
 }

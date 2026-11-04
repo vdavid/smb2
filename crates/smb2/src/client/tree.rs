@@ -40,7 +40,7 @@ use crate::types::reparse::ReparseTag;
 use crate::types::status::NtStatus;
 #[cfg(test)]
 use crate::types::MessageId;
-use crate::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
+use crate::types::{Command, CreditCharge, Dialect, FileId, OplockLevel, TreeId};
 use crate::Error;
 
 /// Maximum number of READs to keep in flight during a pipelined read.
@@ -468,65 +468,138 @@ pub struct Tree {
     pub(crate) pin: Option<SessionPin>,
 }
 
+/// TREE_CONNECT to `share_name` on `conn`'s server, and everything a tree
+/// owes before it carries a request: the share's encryption, then the
+/// negotiate validation. Every tree connect goes through here
+/// ([`Tree::connect`], and the IPC$ trees behind share listing and DFS
+/// referrals), so none can skip either.
+///
+/// ❌ The order is load-bearing. Encryption goes on first, so on a share that
+/// asks for it the `FSCTL_VALIDATE_NEGOTIATE_INFO` already goes out encrypted
+/// (MS-SMB2 § 3.2.4.1.8 encrypts everything on such a tree); a server that
+/// enforces the flag would refuse it in the clear, and that refusal would read
+/// as a failed validation and tear down an honest connection.
+///
+/// A share asking for encryption on a connection that negotiated no cipher
+/// (so session setup staged no keys) fails with [`Error::EncryptionUnavailable`]
+/// and the tree is disconnected again. ❌ Never pick a cipher here: the server
+/// agreed to none, so it would decrypt nothing, and carrying on in the clear
+/// is what the share asked not to happen. MS-SMB2 § 3.2.5.5 would have the
+/// client ignore the flag there; we refuse instead, since a share that wants
+/// encryption and a client that quietly doesn't is the outcome #32 was about.
+/// The flag means nothing below SMB 3.0 (§ 2.2.10), so it's ignored there.
+pub(crate) async fn tree_connect(
+    conn: &Connection,
+    share_name: &str,
+) -> Result<(TreeId, TreeConnectResponse)> {
+    let unc_path = format!(r"\\{}\{}", conn.server_name(), share_name);
+    let req = TreeConnectRequest {
+        flags: TreeConnectRequestFlags::default(),
+        path: unc_path,
+    };
+
+    let frame = conn.execute(Command::TreeConnect, &req, None).await?;
+
+    if frame.header.command != Command::TreeConnect {
+        return Err(Error::invalid_data(format!(
+            "expected TreeConnect response, got {:?}",
+            frame.header.command
+        )));
+    }
+
+    if frame.header.status != NtStatus::SUCCESS {
+        // `STATUS_BAD_NETWORK_NAME` stands for two unrelated things, and
+        // only the error context tells them apart: a share that isn't
+        // there, and a scale-out cluster moving one to another node
+        // (MS-SMB2 § 2.2.2.2.2). They get different errors, so nothing
+        // downstream — DFS namespace-root resolution above all — can
+        // mistake a redirect for a namespace.
+        if frame.header.status == NtStatus::BAD_NETWORK_NAME {
+            let mut cursor = ReadCursor::new(&frame.body);
+            if let Ok(err) = crate::msg::header::ErrorResponse::unpack(&mut cursor) {
+                if err.is_share_redirect() {
+                    debug!("tree: redirected to another cluster node share={share_name:?}");
+                    return Err(Error::ShareRedirected {
+                        share: share_name.to_string(),
+                    });
+                }
+            }
+        }
+        return Err(Error::Protocol {
+            status: frame.header.status,
+            command: Command::TreeConnect,
+        });
+    }
+
+    let mut cursor = ReadCursor::new(&frame.body);
+    let resp = TreeConnectResponse::unpack(&mut cursor)?;
+
+    let tree_id = frame
+        .header
+        .tree_id
+        .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
+
+    let smb3 = conn.params().is_some_and(|p| {
+        matches!(
+            p.dialect,
+            Dialect::Smb3_0 | Dialect::Smb3_0_2 | Dialect::Smb3_1_1
+        )
+    });
+    let wants_encryption = resp
+        .share_flags
+        .contains(crate::types::flags::ShareFlags::ENCRYPT_DATA);
+    if smb3 && wants_encryption && !conn.encrypt_for_share()? {
+        debug!(
+            "tree: share requires encryption but the connection has no cipher, refusing share={share_name:?}"
+        );
+        if let Err(e) = disconnect_tree(conn, tree_id).await {
+            debug!("tree: disconnecting the refused share failed: {e} share={share_name:?}");
+        }
+        return Err(Error::EncryptionUnavailable {
+            share: Some(share_name.to_string()),
+        });
+    }
+
+    // Nothing goes out on a tree until the negotiation is proven.
+    conn.validate_negotiate(tree_id).await?;
+    Ok((tree_id, resp))
+}
+
+/// TREE_DISCONNECT `tree_id`, checking only the status.
+async fn disconnect_tree(conn: &Connection, tree_id: TreeId) -> Result<()> {
+    let frame = conn
+        .execute(
+            Command::TreeDisconnect,
+            &TreeDisconnectRequest,
+            Some(tree_id),
+        )
+        .await?;
+    if frame.header.status != NtStatus::SUCCESS {
+        return Err(Error::Protocol {
+            status: frame.header.status,
+            command: Command::TreeDisconnect,
+        });
+    }
+    Ok(())
+}
+
 impl Tree {
     /// Connect to a share on the server.
     ///
     /// Sends a TREE_CONNECT request with the UNC path `\\server\share`
     /// encoded in UTF-16LE.
+    ///
+    /// A share flagged `SMB2_SHAREFLAG_ENCRYPT_DATA` turns encryption on for
+    /// the connection before anything else goes out on the tree, with the
+    /// keys the session setup staged there. On a connection that negotiated no
+    /// cipher it's refused with [`Error::EncryptionUnavailable`] and
+    /// disconnected again; below SMB 3.0 the flag means nothing and is ignored.
     pub async fn connect(conn: &mut Connection, share_name: &str) -> Result<Tree> {
         // Pinned before the TREE_CONNECT, so a revival that lands before the
         // answer leaves the tree pinned to the dead session it belongs to.
         let conn = &mut conn.pinned_to_session();
         let server = conn.server_name().to_string();
-        let unc_path = format!(r"\\{}\{}", server, share_name);
-
-        let req = TreeConnectRequest {
-            flags: TreeConnectRequestFlags::default(),
-            path: unc_path,
-        };
-
-        let frame = conn.execute(Command::TreeConnect, &req, None).await?;
-
-        if frame.header.command != Command::TreeConnect {
-            return Err(Error::invalid_data(format!(
-                "expected TreeConnect response, got {:?}",
-                frame.header.command
-            )));
-        }
-
-        if frame.header.status != NtStatus::SUCCESS {
-            // `STATUS_BAD_NETWORK_NAME` stands for two unrelated things, and
-            // only the error context tells them apart: a share that isn't
-            // there, and a scale-out cluster moving one to another node
-            // (MS-SMB2 § 2.2.2.2.2). They get different errors, so nothing
-            // downstream — DFS namespace-root resolution above all — can
-            // mistake a redirect for a namespace.
-            if frame.header.status == NtStatus::BAD_NETWORK_NAME {
-                let mut cursor = ReadCursor::new(&frame.body);
-                if let Ok(err) = crate::msg::header::ErrorResponse::unpack(&mut cursor) {
-                    if err.is_share_redirect() {
-                        debug!("tree: redirected to another cluster node share={share_name:?}");
-                        return Err(Error::ShareRedirected {
-                            share: share_name.to_string(),
-                        });
-                    }
-                }
-            }
-            return Err(Error::Protocol {
-                status: frame.header.status,
-                command: Command::TreeConnect,
-            });
-        }
-
-        let mut cursor = ReadCursor::new(&frame.body);
-        let resp = TreeConnectResponse::unpack(&mut cursor)?;
-
-        let tree_id = frame
-            .header
-            .tree_id
-            .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
-        // Nothing goes out on a tree until the negotiation is proven.
-        conn.validate_negotiate(tree_id).await?;
+        let (tree_id, resp) = tree_connect(conn, share_name).await?;
 
         let is_dfs = resp
             .capabilities

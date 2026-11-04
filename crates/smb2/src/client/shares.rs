@@ -13,7 +13,6 @@ use crate::msg::create::{
     CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
 };
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
-use crate::msg::tree_connect::{TreeConnectRequest, TreeConnectRequestFlags, TreeConnectResponse};
 use crate::msg::tree_disconnect::TreeDisconnectRequest;
 use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{ReadCursor, Unpack};
@@ -58,38 +57,9 @@ pub async fn list_shares(conn: &mut Connection) -> Result<Vec<ShareInfo>> {
 
 /// Connect to the IPC$ share, returning the tree ID.
 async fn tree_connect_ipc(conn: &mut Connection) -> Result<TreeId> {
-    let server = conn.server_name().to_string();
-    let unc_path = format!(r"\\{}\IPC$", server);
-
-    let req = TreeConnectRequest {
-        flags: TreeConnectRequestFlags::default(),
-        path: unc_path,
-    };
-
-    let frame = conn.execute(Command::TreeConnect, &req, None).await?;
-
-    if frame.header.command != Command::TreeConnect {
-        return Err(Error::invalid_data(format!(
-            "expected TreeConnect response, got {:?}",
-            frame.header.command
-        )));
-    }
-
-    if frame.header.status != NtStatus::SUCCESS {
-        return Err(Error::Protocol {
-            status: frame.header.status,
-            command: Command::TreeConnect,
-        });
-    }
-
-    let mut cursor = ReadCursor::new(&frame.body);
-    let _resp = TreeConnectResponse::unpack(&mut cursor)?;
-
-    let tree_id = frame
-        .header
-        .tree_id
-        .ok_or_else(|| Error::invalid_data("TreeConnect response missing tree ID"))?;
-    conn.validate_negotiate(tree_id).await?;
+    // The same tree connect as any share's, so an IPC$ that asks for
+    // encryption gets it and the negotiation is proven before the pipe opens.
+    let (tree_id, _) = crate::client::tree::tree_connect(conn, "IPC$").await?;
 
     info!("shares: connected to IPC$, tree_id={}", tree_id);
     Ok(tree_id)

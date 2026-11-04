@@ -479,6 +479,31 @@ pub(crate) fn build_tree_connect_response(tree_id: TreeId, share_type: ShareType
     pack_message(&h, &body)
 }
 
+/// A TREE_CONNECT response for a share that demands encryption
+/// (`SMB2_SHAREFLAG_ENCRYPT_DATA`).
+pub(crate) fn build_encrypting_tree_connect_response(tree_id: TreeId) -> Vec<u8> {
+    let mut h = Header::new_request(Command::TreeConnect);
+    h.flags.set_response();
+    h.credits = 32;
+    h.tree_id = Some(tree_id);
+
+    let body = TreeConnectResponse {
+        share_type: ShareType::Disk,
+        share_flags: ShareFlags::new(ShareFlags::ENCRYPT_DATA),
+        capabilities: ShareCapabilities::default(),
+        maximal_access: 0x001F_01FF,
+    };
+    pack_message(&h, &body)
+}
+
+/// A successful TREE_DISCONNECT response.
+pub(crate) fn build_tree_disconnect_response() -> Vec<u8> {
+    let mut h = Header::new_request(Command::TreeDisconnect);
+    h.flags.set_response();
+    h.credits = 32;
+    pack_message(&h, &crate::msg::tree_disconnect::TreeDisconnectResponse)
+}
+
 /// Concatenate sub-responses into one compound transport frame, chaining them
 /// with `NextCommand` offsets the way a server does.
 pub(crate) fn build_compound_response_frame(responses: &[Vec<u8>]) -> Vec<u8> {

@@ -3096,6 +3096,57 @@ async fn encryption_aes256_gcm_share_round_trips_encrypted() {
     round_trip(&mut client, &mut tree, "docker_test_aes256_gcm.tmp").await;
 }
 
+/// The low-level path to the same share: `Connection` + `Session::setup` +
+/// `Tree::connect`, no `SmbClient`. The session doesn't encrypt; the share's
+/// `smb encrypt = required` turns it on at the tree connect, with the keys
+/// session setup staged on the connection. Before #35 the tree reported
+/// `encrypt_data` and went on in the clear, and Samba refused every request
+/// on it with `STATUS_ACCESS_DENIED`.
+#[tokio::test]
+#[ignore]
+async fn encryption_low_level_tree_connect_encrypts_a_share_that_requires_it() {
+    let _ = env_logger::try_init();
+
+    let mut conn = Connection::connect(ENCRYPTION_AES256_ADDR, TIMEOUT)
+        .await
+        .expect("connect failed");
+    conn.negotiate().await.expect("negotiate failed");
+    let session = Session::setup(&mut conn, "testuser", "testpass", "")
+        .await
+        .expect("session setup failed");
+    assert!(
+        !session.should_encrypt,
+        "the session itself doesn't encrypt"
+    );
+    assert!(!conn.should_encrypt());
+
+    let tree = Tree::connect(&mut conn, "encrypted")
+        .await
+        .expect("tree connect failed");
+    assert!(tree.encrypt_data);
+    assert!(conn.should_encrypt(), "the share's flag turned it on");
+    assert_eq!(
+        conn.params().and_then(|p| p.cipher),
+        Some(smb2::client::Cipher::Aes256Gcm)
+    );
+
+    let path = "docker_test_low_level_encrypted.tmp";
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    tree.write_file(&mut conn, path, &data)
+        .await
+        .expect("write_file failed");
+    assert_eq!(
+        tree.read_file(&mut conn, path)
+            .await
+            .expect("read_file failed"),
+        data
+    );
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("delete_file failed");
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
 /// AES-256-CCM, required for the whole session: 256-bit keys with CCM's
 /// 11-byte nonce, the one combination no other fixture negotiates.
 #[tokio::test]

@@ -1287,9 +1287,6 @@ mod tests {
     fn fake_session() -> crate::client::Session {
         crate::client::Session {
             session_id: crate::types::SessionId(0x1234_5678_9ABC_DEF0),
-            signing_key: vec![],
-            encryption_key: None,
-            decryption_key: None,
             signing_algorithm: crate::crypto::signing::SigningAlgorithm::HmacSha256,
             should_sign: false,
             should_encrypt: false,

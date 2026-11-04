@@ -1826,15 +1826,24 @@ impl<'a> CompoundOp<'a> {
 /// (verifying signatures, decrypting).
 ///
 /// Uses `std::sync::Mutex` because the critical sections are short and never
-/// hold the lock across an `.await`. Mutation is rare (once at session setup),
-/// reads happen once per frame on either side.
+/// hold the lock across an `.await`. Mutation is rare (session setup, a tree
+/// connect to a share that encrypts), reads happen once per frame on either
+/// side.
+///
+/// This is where a session's keys live, and the only place: session setup
+/// hands them over and keeps no copy. A revival replaces the whole state
+/// (`install_transport`), so no key outlives its session.
 struct CryptoState {
     signing_key: Option<Vec<u8>>,
     signing_algorithm: Option<SigningAlgorithm>,
     should_sign: bool,
-    encryption_key: Option<Vec<u8>>,
-    decryption_key: Option<Vec<u8>>,
-    encryption_cipher: Option<Cipher>,
+    /// The session's encryption keys, from session setup on SMB 3.x with a
+    /// negotiated cipher, whether or not anything is encrypted yet. Incoming
+    /// TRANSFORM frames decrypt with them either way.
+    encryption: Option<EncryptionKeys>,
+    /// Whether outgoing requests are encrypted: the session asked
+    /// (`ENCRYPT_DATA`, or `require_encryption`), or a share did
+    /// (`SMB2_SHAREFLAG_ENCRYPT_DATA`, at its tree connect).
     should_encrypt: bool,
     nonce_gen: Option<NonceGenerator>,
     session_id: SessionId,
@@ -1846,13 +1855,35 @@ impl CryptoState {
             signing_key: None,
             signing_algorithm: None,
             should_sign: false,
-            encryption_key: None,
-            decryption_key: None,
-            encryption_cipher: None,
+            encryption: None,
             should_encrypt: false,
             nonce_gen: None,
             session_id: SessionId::NONE,
         }
+    }
+}
+
+/// The keys a session encrypts and decrypts with (MS-SMB2 § 3.2.5.3.1
+/// `Session.EncryptionKey` / `Session.DecryptionKey`), and the cipher they're
+/// for. Only session setup makes one.
+///
+/// `Debug` shows the keys as `***`.
+pub(crate) struct EncryptionKeys {
+    pub(crate) cipher: Cipher,
+    /// Encrypts what this client sends.
+    pub(crate) encryption_key: Vec<u8>,
+    /// Decrypts what the server sends.
+    pub(crate) decryption_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for EncryptionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::crypto::Redacted;
+        f.debug_struct("EncryptionKeys")
+            .field("cipher", &self.cipher)
+            .field("encryption_key", &Redacted)
+            .field("decryption_key", &Redacted)
+            .finish()
     }
 }
 
@@ -3680,20 +3711,82 @@ impl Connection {
         c.should_sign = true;
     }
 
-    /// Activate encryption with the given keys and cipher.
-    pub fn activate_encryption(&mut self, enc_key: Vec<u8>, dec_key: Vec<u8>, cipher: Cipher) {
-        debug!(
-            "encryption: activated, cipher={:?}, enc_key_len={}, dec_key_len={}",
-            cipher,
-            enc_key.len(),
-            dec_key.len()
-        );
+    /// Hand this connection the encryption keys the session just set up
+    /// derived (`None`: it has none), replacing any earlier session's, and
+    /// encrypt from here on only if `active`.
+    ///
+    /// Inactive keys are staged: incoming TRANSFORM frames decrypt with them,
+    /// and [`encrypt_for_share`](Self::encrypt_for_share) turns them on when a
+    /// tree connect finds a share that asks. A second session setup on the
+    /// same connection starts from its own keys and its own verdict, so a
+    /// share the previous session encrypted for doesn't leave this one
+    /// encrypting with keys the server has dropped.
+    pub(crate) fn install_encryption(&self, keys: Option<EncryptionKeys>, active: bool) {
+        let active = active && keys.is_some();
+        if let Some(keys) = &keys {
+            debug!(
+                "encryption: keys staged, cipher={:?}, enc_key_len={}, dec_key_len={}, active={}",
+                keys.cipher,
+                keys.encryption_key.len(),
+                keys.decryption_key.len(),
+                active
+            );
+        }
         let mut c = self.inner.crypto.lock().unwrap();
-        c.encryption_key = Some(enc_key);
-        c.decryption_key = Some(dec_key);
-        c.encryption_cipher = Some(cipher);
-        c.nonce_gen = Some(NonceGenerator::new());
+        c.encryption = keys;
+        c.should_encrypt = active;
+        c.nonce_gen = active.then(NonceGenerator::new);
+    }
+
+    /// Encrypt from here on with the keys session setup staged, for a share
+    /// that asked (`SMB2_SHAREFLAG_ENCRYPT_DATA`, MS-SMB2 § 3.2.5.5).
+    ///
+    /// `Ok(true)` once encrypting (already, or now), `Ok(false)` when there
+    /// are no keys to encrypt with: no cipher was negotiated, or the dialect
+    /// has no encryption. A pinned clone whose session is gone gets
+    /// [`Error::HandleInvalidated`]: the keys staged now are a later
+    /// session's, and that tree's flag says nothing about it.
+    pub(crate) fn encrypt_for_share(&self) -> Result<bool> {
+        let generation = self.generation();
+        let mut c = self.inner.crypto.lock().unwrap();
+        // The pin check reads the session id, so it's done here under the
+        // lock that `install_encryption` and `set_session_id` take.
+        if let Some(pin) = self.pin {
+            let current = pin.connection == self.inner.client_guid
+                && pin.generation == generation
+                && pin.session_id != SessionId::NONE
+                && pin.session_id == c.session_id;
+            if !current {
+                return Err(Error::HandleInvalidated {
+                    opened_on: pin.generation,
+                    current: generation,
+                });
+            }
+        }
+        if c.should_encrypt {
+            return Ok(true);
+        }
+        let Some(cipher) = c.encryption.as_ref().map(|k| k.cipher) else {
+            return Ok(false);
+        };
         c.should_encrypt = true;
+        c.nonce_gen = Some(NonceGenerator::new());
+        drop(c);
+        debug!("encryption: activated for a share that asks for it, cipher={cipher:?}");
+        Ok(true)
+    }
+
+    /// The lengths of the keys this connection holds: the signing key, and the
+    /// encryption and decryption keys (staged or active).
+    #[cfg(test)]
+    pub(crate) fn key_lengths(&self) -> (Option<usize>, Option<(usize, usize)>) {
+        let c = self.inner.crypto.lock().unwrap();
+        (
+            c.signing_key.as_ref().map(Vec::len),
+            c.encryption
+                .as_ref()
+                .map(|k| (k.encryption_key.len(), k.decryption_key.len())),
+        )
     }
 
     /// Whether encryption is active on this connection.
@@ -4775,14 +4868,11 @@ impl Connection {
     /// Encrypt plaintext into a TRANSFORM_HEADER + ciphertext frame.
     fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut c = self.inner.crypto.lock().unwrap();
-        let enc_key = c
-            .encryption_key
+        let (enc_key, cipher) = c
+            .encryption
             .as_ref()
-            .ok_or_else(|| Error::invalid_data("encryption active but no encryption key"))?
-            .clone();
-        let cipher = c
-            .encryption_cipher
-            .ok_or_else(|| Error::invalid_data("encryption active but no cipher"))?;
+            .map(|k| (k.encryption_key.clone(), k.cipher))
+            .ok_or_else(|| Error::invalid_data("encryption active but no encryption key"))?;
         let session_id = c.session_id.0;
         let nonce = c
             .nonce_gen
@@ -5630,7 +5720,7 @@ impl Connection {
         // The old session is superseded; announcing it again on a later setup
         // would point at something twice-dead.
         self.inner.previous_session_id.store(0, Ordering::Release);
-        *self.inner.session.lock().unwrap() = Some(Arc::new(session.snapshot()));
+        *self.inner.session.lock().unwrap() = Some(Arc::new(session.clone()));
     }
 
     /// The session currently established on this connection, or `None` before
@@ -6054,7 +6144,13 @@ impl Connection {
                 },
                 EncryptionInfo {
                     active: c.should_encrypt,
-                    cipher: c.encryption_cipher,
+                    // Staged keys aren't encryption: the cipher shows once
+                    // something is encrypted with it.
+                    cipher: c
+                        .encryption
+                        .as_ref()
+                        .filter(|_| c.should_encrypt)
+                        .map(|k| k.cipher),
                 },
             )
         };
@@ -6654,14 +6750,11 @@ fn clone_err_for_waiters(e: &Error) -> Error {
 
 fn decrypt_frame(data: &[u8], inner: &Inner) -> Result<Vec<u8>> {
     let c = inner.crypto.lock().unwrap();
-    let dec_key = c
-        .decryption_key
+    let (dec_key, cipher) = c
+        .encryption
         .as_ref()
-        .ok_or_else(|| Error::invalid_data("received encrypted message but no decryption key"))?
-        .clone();
-    let cipher = c
-        .encryption_cipher
-        .ok_or_else(|| Error::invalid_data("received encrypted message but no cipher"))?;
+        .map(|k| (k.decryption_key.clone(), k.cipher))
+        .ok_or_else(|| Error::invalid_data("received encrypted message but no decryption key"))?;
     drop(c);
 
     if data.len() < TransformHeader::SIZE {
@@ -8953,7 +9046,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
 
-        let mut conn = Connection::from_transport(
+        let conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",
@@ -8964,7 +9057,14 @@ mod tests {
         // malformed frame was "encrypted" with — decrypt will fail auth.
         let enc_key = vec![0x42; 16];
         let dec_key = vec![0x99; 16]; // deliberately wrong decryption key
-        conn.activate_encryption(enc_key, dec_key, Cipher::Aes128Gcm);
+        conn.install_encryption(
+            Some(EncryptionKeys {
+                cipher: Cipher::Aes128Gcm,
+                encryption_key: enc_key,
+                decryption_key: dec_key,
+            }),
+            true,
+        );
 
         // Register a waiter manually so we can inject a bad frame without
         // racing with a real send.
@@ -9469,20 +9569,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activate_encryption_sets_state() {
+    async fn staged_encryption_is_inactive_until_a_share_asks() {
         let mock = Arc::new(MockTransport::new());
         mock.enable_auto_rewrite_msg_id();
+        let conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        let keys = || EncryptionKeys {
+            cipher: Cipher::Aes128Gcm,
+            encryption_key: vec![0x42; 16],
+            decryption_key: vec![0x43; 16],
+        };
+
+        assert!(!conn.encrypt_for_share().unwrap(), "no keys, no encryption");
+
+        conn.install_encryption(Some(keys()), false);
+        assert!(!conn.should_encrypt(), "staged keys encrypt nothing");
+        assert!(conn.diagnostics().encryption.cipher.is_none());
+
+        assert!(conn.encrypt_for_share().unwrap());
+        assert!(conn.should_encrypt());
+        assert_eq!(
+            conn.diagnostics().encryption.cipher,
+            Some(Cipher::Aes128Gcm)
+        );
+
+        // A later session setup starts from its own verdict.
+        conn.install_encryption(Some(keys()), false);
+        assert!(!conn.should_encrypt());
+        conn.install_encryption(None, true);
+        assert!(!conn.should_encrypt(), "nothing to encrypt with");
+    }
+
+    /// A tree pinned to a session that has since been replaced can't turn on
+    /// the new session's keys: its share's flag says nothing about it.
+    #[tokio::test]
+    async fn a_stale_pin_cannot_turn_on_a_later_sessions_keys() {
+        let mock = Arc::new(MockTransport::new());
         let mut conn = Connection::from_transport(
             Box::new(mock.clone()),
             Box::new(mock.clone()),
             "test-server",
         );
+        conn.set_session_id(SessionId(1));
+        let pinned = conn.pinned_to_session();
+        conn.set_session_id(SessionId(2));
+        conn.install_encryption(
+            Some(EncryptionKeys {
+                cipher: Cipher::Aes128Gcm,
+                encryption_key: vec![0x42; 16],
+                decryption_key: vec![0x43; 16],
+            }),
+            false,
+        );
 
+        assert!(matches!(
+            pinned.encrypt_for_share(),
+            Err(Error::HandleInvalidated { .. })
+        ));
         assert!(!conn.should_encrypt());
-
-        conn.activate_encryption(vec![0x42; 16], vec![0x42; 16], Cipher::Aes128Gcm);
-
-        assert!(conn.should_encrypt());
     }
 
     // ── DFS flag tests ─────────────────────────────────────────────────
