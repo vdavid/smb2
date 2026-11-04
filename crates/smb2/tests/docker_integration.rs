@@ -3220,36 +3220,32 @@ async fn encryption_aes256_ccm_session_round_trips_encrypted() {
 async fn flaky_connect_during_up_phase() {
     let _ = env_logger::try_init();
 
-    // The flaky server cycles 5s up / 5s down. We retry the full
-    // connect+negotiate sequence for up to 15 seconds to catch an "up" window.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    let (mut conn, tree) = loop {
-        let connect_result = async {
-            let mut c = Connection::connect(FLAKY_ADDR, Duration::from_secs(2)).await?;
-            c.negotiate().await?;
-            let _session = Session::setup(&mut c, "", "", "").await?;
-            let t = Tree::connect(&mut c, "public").await?;
-            Ok::<_, smb2::Error>((c, t))
+    // The flaky server cycles 5s up / 5s down, so the whole sequence (connect
+    // through listing and disconnect) has to land inside one up phase, and
+    // an attempt the down phase cuts short starts over. Retrying only the
+    // connect let the server go down between it and the listing
+    // (`list_directory failed: Disconnected`, CI 2026-11-04). 25s covers two
+    // full cycles.
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let attempt = async {
+            let mut conn = Connection::connect(FLAKY_ADDR, Duration::from_secs(2)).await?;
+            conn.negotiate().await?;
+            let _session = Session::setup(&mut conn, "", "", "").await?;
+            let tree = Tree::connect(&mut conn, "public").await?;
+            tree.list_directory(&mut conn, "").await?;
+            tree.disconnect(&mut conn).await
         }
         .await;
 
-        match connect_result {
-            Ok(result) => break result,
+        match attempt {
+            Ok(()) => break,
             Err(_) if std::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            Err(e) => panic!("could not connect to flaky server within 15s: {}", e),
+            Err(e) => panic!("no whole up phase with the flaky server within 25s: {e}"),
         }
-    };
-
-    // Verify basic operation works during the up phase.
-    let entries = tree
-        .list_directory(&mut conn, "")
-        .await
-        .expect("list_directory failed");
-    drop(entries);
-
-    tree.disconnect(&mut conn).await.expect("disconnect failed");
+    }
 }
 
 #[tokio::test]
@@ -3257,36 +3253,37 @@ async fn flaky_connect_during_up_phase() {
 async fn flaky_error_is_clean_not_hang() {
     let _ = env_logger::try_init();
 
-    // Connect during an up phase.
-    let deadline = std::time::Instant::now() + Duration::from_secs(12);
-    let mut client = loop {
-        match SmbClient::connect(ClientConfig {
-            addr: FLAKY_ADDR.to_string(),
-            timeout: Duration::from_secs(1),
-            username: String::new(),
-            password: String::new(),
-            domain: String::new(),
-            auto_reconnect: false,
-            compression: false,
-            dfs_enabled: true,
-            dfs_target_overrides: HashMap::new(),
-            connect_options: None,
-            ..Default::default()
-        })
-        .await
-        {
-            Ok(c) => break c,
+    // Connect during an up phase. The share connect is part of the attempt:
+    // the server can go down between it and the client connect.
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let (mut client, mut tree) = loop {
+        let attempt = async {
+            let mut client = SmbClient::connect(ClientConfig {
+                addr: FLAKY_ADDR.to_string(),
+                timeout: Duration::from_secs(1),
+                username: String::new(),
+                password: String::new(),
+                domain: String::new(),
+                auto_reconnect: false,
+                compression: false,
+                dfs_enabled: true,
+                dfs_target_overrides: HashMap::new(),
+                connect_options: None,
+                ..Default::default()
+            })
+            .await?;
+            let tree = client.connect_share("public").await?;
+            Ok::<_, smb2::Error>((client, tree))
+        }
+        .await;
+        match attempt {
+            Ok(connected) => break connected,
             Err(_) if std::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            Err(e) => panic!("could not connect to flaky server within 12s: {}", e),
+            Err(e) => panic!("could not connect to flaky server within 25s: {e}"),
         }
     };
-
-    let mut tree = client
-        .connect_share("public")
-        .await
-        .expect("connect_share failed");
 
     // Wait for the server to cycle down (up to 10s).
     // Keep trying operations — eventually one should fail with a clean error.
