@@ -7,6 +7,8 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-11-04
+
 ### Fixed
 
 - **A CREATE abandoned in flight no longer leaves its handle open on the server.** The server opens the file whether or not anyone is left to hear the answer, so a caller that went away before claiming it (a `select!` arm that lost, a timeout around the call, an aborted task, or the response deadline itself) used to leave the handle open until the session ended, holding its share modes and counting against the server's open limit. Whoever holds the answer once the caller is gone now sends the CLOSE: the request's guard as it drops, or the receiver task for an answer that arrives later. The same goes for a compound abandoned after its CREATE was answered but before the rest of it (a server may split a compound's answers); that CLOSE waits for the chain's last answer, so it never lands while the chain still has work pending on the handle. A CREATE its own compound closes is left alone, and so is one from a session that has since ended. Thanks, @acseven! (#36)
