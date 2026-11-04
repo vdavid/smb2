@@ -7,6 +7,8 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-11-04
+
 ### Breaking
 
 - **`Session` holds no keys**: `signing_key`, `encryption_key`, and `decryption_key` are gone, and the `Connection` that session setup ran on is the only place they live. `Session` is now `Clone`, with a derived `Debug`.
