@@ -28,7 +28,7 @@ minor version bump, and the changelog always says so.
 
 ## Sister projects
 
-- [Cmdr](https://github.com/vdavid/cmdr): an AI-native file manager that uses `smb2` for SMB access.
+- [Cmdr](https://github.com/vdavid/cmdr): an extremely fast, keyboard-driven two-pane file manager for macOS that uses `smb2` for SMB access.
 - [mtp-rs](https://github.com/vdavid/mtp-rs): the same idea for MTP, so a phone or camera is reachable without
   `libmtp`.
 
