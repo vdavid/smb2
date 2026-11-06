@@ -7,6 +7,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Share listing no longer trusts the server's entry count to size its buffers.** `list_shares` decoded a `NetShareEnumAll` reply by allocating room for as many entries as the reply claimed, before checking that it held them, so a malformed or hostile reply of a few bytes could ask for gigabytes. A count larger than the reply has room for is now refused with `ErrorKind::InvalidData`, and the reassembled reply (every RPC fragment and `STATUS_BUFFER_OVERFLOW` read) is capped at 4 MiB, room for tens of thousands of shares.
+
 ## [0.42.1] - 2026-11-04
 
 ### Fixed
