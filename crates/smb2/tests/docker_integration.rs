@@ -6776,6 +6776,111 @@ async fn guest_a_durable_reader_carries_on_after_a_reconnect_and_refuses_a_chang
     other.delete_file(&other_tree, path).await.ok();
 }
 
+/// A download against real Samba, end to end: it loses its session halfway
+/// through a multi-MB file, resumes from its checkpoint on the tree it was
+/// opened with (stale after the reconnect, so the resume heals it first), and
+/// the bytes on either side of the gap make exactly the original file. Then
+/// a file rewritten to the same length (so only its times move) refuses to
+/// resume.
+#[tokio::test]
+#[ignore]
+async fn guest_a_download_resumes_after_a_reconnect_and_refuses_a_changed_file() {
+    use smb2::error::FileChange;
+    use smb2::ErrorKind;
+
+    let mut client = SmbClient::connect(ClientConfig {
+        addr: GUEST_ADDR.to_string(),
+        timeout: TIMEOUT,
+        auto_reconnect: true,
+        ..Default::default()
+    })
+    .await
+    .expect("connect");
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let path = "resumable_download.bin";
+    let original: Vec<u8> = (0..6 * 1024 * 1024u32)
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect();
+    client
+        .write_file(&tree, path, &original)
+        .await
+        .expect("seed");
+
+    // ── Halfway, the session goes ─────────────────────────────────────
+    let mut download = client.open_file_download(&tree, path).await.expect("open");
+    let mut got = Vec::new();
+    while got.len() < 2 * 1024 * 1024 {
+        got.extend(download.next_chunk().await.expect("more").expect("chunk"));
+    }
+    client.reconnect().await.expect("reconnect");
+    // Whatever had already arrived is handed out; then the dead handle says so.
+    loop {
+        match download.next_chunk().await {
+            Some(Ok(chunk)) => got.extend(chunk),
+            Some(Err(e)) => {
+                assert_eq!(e.kind(), ErrorKind::ConnectionLost, "{e}");
+                break;
+            }
+            None => panic!("a download from a dead session can't finish"),
+        }
+    }
+    let checkpoint = download.checkpoint().expect("opened from a path");
+    drop(download);
+    assert_eq!(checkpoint.offset, got.len() as u64, "exactly what we got");
+    assert!(
+        checkpoint.offset < original.len() as u64,
+        "the session went before the download finished"
+    );
+    assert_eq!(checkpoint.path, path);
+    assert_eq!(checkpoint.version.size, original.len() as u64);
+    assert!(checkpoint.version.identity.is_some(), "Samba answers it");
+
+    // ── Resume: the rest, and nothing twice ───────────────────────────
+    let resumed = client
+        .resume_download(&mut tree, &checkpoint)
+        .await
+        .expect("the same file, unchanged");
+    assert_eq!(resumed.progress().bytes_transferred, checkpoint.offset);
+    got.extend(resumed.collect().await.expect("the rest"));
+    assert_eq!(got.len(), original.len());
+    assert!(got == original, "the bytes either side of the gap differ");
+
+    // ── Rewritten to the same length: refused ─────────────────────────
+    let mut download = client.open_file_download(&tree, path).await.expect("open");
+    download
+        .next_chunk()
+        .await
+        .expect("a chunk")
+        .expect("chunk");
+    let checkpoint = download.checkpoint().unwrap();
+    // `write_file` shares nothing, so the download's handle goes first.
+    drop(download);
+    let rewritten: Vec<u8> = original.iter().map(|b| b ^ 0xFF).collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.write_file(&tree, path, &rewritten).await {
+            Ok(_) => break,
+            // The dropped download's CLOSE may still be on its way.
+            Err(e)
+                if e.kind() == ErrorKind::SharingViolation
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("rewrite: {e}"),
+        }
+    }
+    match client.resume_download(&mut tree, &checkpoint).await {
+        Err(smb2::Error::FileChanged { change, .. }) => {
+            assert_eq!(change, FileChange::Modified, "same length, new times")
+        }
+        Err(e) => panic!("expected FileChanged, got {e}"),
+        Ok(_) => panic!("a rewritten file must not resume"),
+    }
+
+    client.delete_file(&tree, path).await.ok();
+}
+
 /// A revival re-derives the signing keys, and the server proves it by
 /// accepting what we sign afterwards.
 ///
