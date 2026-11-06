@@ -112,7 +112,7 @@ Two traps when several sessions share the machine:
 
 | Container | Port | Focus |
 |-----------|------|-------|
-| smb-guest | 10445 | Guest auth, a named login mapped to guest is refused, CRUD, compound, pipelined, streamed write, streaming, progress, cancel, fs_info, reconnect, file watching |
+| smb-guest | 10445 | Guest auth, a named login mapped to guest is refused, CRUD, compound, pipelined, streamed write, streaming, progress, cancel, fs_info, reconnect, durable handles (a durable reader reclaimed across a reconnect, its oplock break, and a refused reopen of a rewritten file), file watching |
 | smb-auth | 10446 | NTLM auth, wrong-password rejection |
 | smb-signing | 10447 | Mandatory signing: write/read, compound, pipelined 512 KB, streamed write |
 | smb-signing-hmac | 10468 | SMB 3.1.1 only, mandatory signing, `server smb3 signing algorithms = HMAC-SHA256`: the server picks HMAC-SHA256 from the signing context and the session signs with it (issue #33). Connect, write, read |

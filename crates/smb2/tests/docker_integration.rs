@@ -6654,6 +6654,130 @@ async fn guest_durable_handle_survives_a_reconnect_when_the_server_grants_one() 
     tree.delete_file(conn, path).await.ok();
 }
 
+/// A durable read-only reader against real Samba, end to end: it carries on
+/// across a reconnect by reclaiming its handle, its batch oplock costs another
+/// client no wait (the break is acknowledged at once, which ends the
+/// durability), and once another client has rewritten the file, the reopen
+/// refuses rather than reading on into the new version.
+///
+/// `write_file` opens share-exclusive, so the rewrite can only happen once
+/// our reader's handle is gone: after the second reconnect, when the
+/// durability the break took away means the server closes it with the
+/// session. Samba 4.20 grants a durable handle on `smb-guest` (verified by
+/// hand, 2026-11-06), so a decline fails the test here.
+#[tokio::test]
+#[ignore]
+async fn guest_a_durable_reader_carries_on_after_a_reconnect_and_refuses_a_changed_file() {
+    use smb2::error::FileChange;
+    use smb2::{ErrorKind, ReaderOptions};
+    use std::time::Instant;
+
+    let config = || ClientConfig {
+        addr: GUEST_ADDR.to_string(),
+        timeout: TIMEOUT,
+        auto_reconnect: true,
+        ..Default::default()
+    };
+    let mut client = SmbClient::connect(config()).await.expect("connect");
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let path = "durable_reader.bin";
+    let original: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    client
+        .write_file(&tree, path, &original)
+        .await
+        .expect("seed");
+
+    // ── Open: read-only, durable, with its version and name ───────────
+    let reader = client
+        .open_file_reader_with(&tree, path, ReaderOptions::new().durable(true))
+        .await
+        .expect("open");
+    let handle = *reader
+        .durable_handle()
+        .expect("Samba 4.20 grants a durable handle to a batch-oplocked read");
+    assert!(handle.is_read_only());
+    assert_eq!(reader.resolved_path(), Some(path));
+    let version = reader.version();
+    assert_eq!(version.size, original.len() as u64);
+    assert!(version.identity.is_some(), "Samba answers the identity");
+    assert_eq!(reader.read_at(0, 16).await.unwrap(), original[..16]);
+
+    // ── Reconnect: the reopen reclaims the handle ─────────────────────
+    client.reconnect().await.expect("reconnect");
+    tree = client.connect_share("public").await.expect("re-connect");
+    assert!(!reader.is_current(), "its session is gone");
+    let reopened = client
+        .reopen_file_reader(&mut tree, path, &reader)
+        .await
+        .expect("the same file, unchanged");
+    let reclaimed = reopened
+        .durable_handle()
+        .expect("the reopen reclaimed the durable handle");
+    assert_eq!(reclaimed.identity(), handle.identity());
+    assert!(reclaimed.is_read_only());
+    assert_eq!(reopened.version(), version, "verified against the open");
+    assert_eq!(
+        reopened.resolved_path(),
+        Some(path),
+        "the reclaim names it too"
+    );
+    assert_eq!(
+        reopened.read_at(1000, 64).await.unwrap(),
+        original[1000..1064],
+        "it reads through the reclaimed handle"
+    );
+    // Its session is gone, so this sends nothing.
+    reader.close().await.expect("close the stale reader");
+
+    // ── Another client opens it: the break costs it no wait ───────────
+    let mut other = SmbClient::connect(config()).await.expect("other connect");
+    let other_tree = other.connect_share("public").await.expect("other share");
+    let started = Instant::now();
+    let theirs = other
+        .open_file_reader(&other_tree, path)
+        .await
+        .expect("the other client's open");
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(5),
+        "an unanswered break holds the other client ~35 s; it waited {waited:?}"
+    );
+    theirs.close().await.expect("close theirs");
+
+    // ── Reconnect again, rewrite, and the reopen refuses ──────────────
+    client.reconnect().await.expect("second reconnect");
+    tree = client
+        .connect_share("public")
+        .await
+        .expect("re-connect again");
+    let rewritten = b"a different, shorter file";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match other.write_file(&other_tree, path, rewritten).await {
+            Ok(_) => break,
+            // The server may still be letting go of the dead session's open.
+            Err(e) if e.kind() == ErrorKind::SharingViolation && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("rewrite: {e}"),
+        }
+    }
+    match client.reopen_file_reader(&mut tree, path, &reopened).await {
+        Err(smb2::Error::FileChanged { change, .. }) => assert_eq!(
+            change,
+            FileChange::Size {
+                was: original.len() as u64,
+                now: rewritten.len() as u64,
+            }
+        ),
+        Err(e) => panic!("expected FileChanged, got {e}"),
+        Ok(_) => panic!("a rewritten file must not reopen"),
+    }
+
+    reopened.close().await.ok();
+    other.delete_file(&other_tree, path).await.ok();
+}
+
 /// A revival re-derives the signing keys, and the server proves it by
 /// accepting what we sign afterwards.
 ///
