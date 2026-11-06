@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use crate::client::connection::{pack_message, Connection};
 use crate::client::durable::FileIdentity;
-use crate::client::stream::{resume_file_download, DownloadCheckpoint, FileDownload, ReadAhead};
+use crate::client::stream::{
+    resume_file_download, DownloadCheckpoint, FileDownload, FileVersion, ReadAhead,
+};
 use crate::client::test_helpers::{
     build_close_response, build_download_open_with_listing, build_query_info_error_response,
     build_read_response, build_reader_open_refused, build_reader_open_response,
@@ -325,6 +327,51 @@ async fn a_dropped_next_chunk_moves_the_checkpoint_nowhere() {
     assert_eq!(download.checkpoint().unwrap().offset, u64::from(CHUNK));
 }
 
+/// The head's answer, granting the client no credits back.
+fn read_granting_nothing(data: Vec<u8>) -> Vec<u8> {
+    let mut answer = build_read_response(data);
+    // CreditResponse, bytes 14..16 of the SMB2 header.
+    answer[14..16].copy_from_slice(&0u16.to_le_bytes());
+    answer
+}
+
+/// A chunk taken off the wire but not yet returned is not the caller's: a
+/// `next_chunk` dropped while it waits for credit to send the next READ
+/// leaves the chunk parked, and the checkpoint stops before it. The next
+/// call hands it out, and only then does the checkpoint count it.
+#[tokio::test]
+async fn a_chunk_parked_by_a_dropped_next_chunk_is_not_counted_until_handed_out() {
+    let mock = Arc::new(MockTransport::new());
+    let mut conn = connection(&mock);
+    let side = conn.clone();
+    let tree = share();
+    mock.queue_response(opened(file(1), UNCHANGED));
+    let mut download = tree
+        .download(&mut conn, PATH)
+        .await
+        .unwrap()
+        .with_read_ahead(ReadAhead::Fixed(2));
+    // Room for the first two READs and nothing more.
+    side.set_credits(2);
+
+    // The head lands and grants nothing back, so the READ after it waits
+    // for the second READ's answer to fund it; the call goes away there.
+    mock.queue_response(read_granting_nothing(chunk_of(1)));
+    let parked = tokio::time::timeout(Duration::from_millis(100), download.next_chunk()).await;
+    assert!(parked.is_err(), "the next READ is waiting for credit");
+    assert_eq!(sent_reads(&mock).len(), 2);
+    assert_eq!(
+        download.checkpoint().unwrap().offset,
+        0,
+        "the parked chunk hasn't been handed out"
+    );
+
+    // The second READ's answer funds the third; the parked chunk comes out.
+    mock.queue_response(build_read_response(chunk_of(2)));
+    assert_eq!(download.next_chunk().await.unwrap().unwrap(), chunk_of(1));
+    assert_eq!(download.checkpoint().unwrap().offset, u64::from(CHUNK));
+}
+
 /// A chunk that came off the wire just before the session died is good
 /// data: it's handed out, counted, and the error follows on the next call.
 /// Thrown away, the checkpoint would vouch for bytes nobody received.
@@ -559,19 +606,37 @@ async fn a_resume_at_the_end_reads_nothing_and_closes() {
     assert_eq!(sent_commands(&mock).last(), Some(&Command::Close));
 }
 
+/// A checkpoint a consumer persisted its own way (no `serde`) is rebuilt
+/// with the public constructors, and resumes like the one the download
+/// handed out.
+#[tokio::test]
+async fn a_checkpoint_rebuilt_from_its_parts_resumes() {
+    let mock = Arc::new(MockTransport::new());
+    let mut conn = connection(&mock);
+    let tree = share();
+    let handed_out = one_chunk_in(&mock, &tree, &mut conn).await;
+    let v = handed_out.version;
+
+    let rebuilt = DownloadCheckpoint::new(
+        handed_out.path.clone(),
+        handed_out.offset,
+        FileVersion::new(v.size, v.modified, v.changed, v.identity),
+    );
+    assert_eq!(rebuilt, handed_out);
+
+    mock.queue_response(opened(file(2), UNCHANGED));
+    let resumed = tree.resume_download(&mut conn, &rebuilt).await.unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), handed_out);
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn a_checkpoint_round_trips_through_json() {
-    let checkpoint = DownloadCheckpoint {
-        path: PATH.to_string(),
-        offset: 42,
-        version: crate::client::stream::FileVersion {
-            size: SIZE,
-            modified: WRITTEN,
-            changed: WRITTEN,
-            identity: Some(OURS),
-        },
-    };
+    let checkpoint = DownloadCheckpoint::new(
+        PATH,
+        42,
+        FileVersion::new(SIZE, WRITTEN, WRITTEN, Some(OURS)),
+    );
     let json = serde_json::to_string(&checkpoint).unwrap();
     assert_eq!(
         serde_json::from_str::<DownloadCheckpoint>(&json).unwrap(),

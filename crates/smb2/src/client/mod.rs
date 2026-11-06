@@ -3354,16 +3354,8 @@ mod tests {
 
     /// A download checkpoint at `path`, for a file that is 10 bytes long.
     fn resumable_download(path: &str) -> stream::DownloadCheckpoint {
-        stream::DownloadCheckpoint {
-            path: path.to_string(),
-            offset: 4,
-            version: stream::FileVersion {
-                size: 10,
-                modified: crate::pack::FileTime::ZERO,
-                changed: crate::pack::FileTime::ZERO,
-                identity: None,
-            },
-        }
+        let zero = crate::pack::FileTime::ZERO;
+        stream::DownloadCheckpoint::new(path, 4, stream::FileVersion::new(10, zero, zero, None))
     }
 
     #[derive(Debug, Clone, Copy)]

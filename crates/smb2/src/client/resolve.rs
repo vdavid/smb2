@@ -368,7 +368,6 @@ impl Tree {
         let index_req = FileIdentity::index_query();
         let volume_req = FileIdentity::volume_query();
         let all_req = name_query(conn, FILE_ALL_INFORMATION);
-        let streams_req = super::streams::stream_list_request(super::streams::STREAM_LIST_BUFFER);
         let normalized_req = name_query(conn, FILE_NORMALIZED_NAME_INFORMATION);
         let op = |command, body| CompoundOp {
             command,
@@ -377,7 +376,8 @@ impl Tree {
             credit_charge: CreditCharge(1),
         };
         let reading = handle == OpenFor::Reading;
-        let list_streams = list_streams && reading;
+        let streams_req = (list_streams && reading)
+            .then(|| super::streams::stream_list_request(super::streams::STREAM_LIST_BUFFER));
         let mut ops = vec![
             op(Command::Create, create_req),
             op(Command::QueryInfo, &index_req),
@@ -386,8 +386,8 @@ impl Tree {
         if reading {
             ops.push(op(Command::QueryInfo, &all_req));
         }
-        if list_streams {
-            ops.push(op(Command::QueryInfo, &streams_req));
+        if let Some(streams_req) = &streams_req {
+            ops.push(op(Command::QueryInfo, streams_req));
         }
         ops.push(op(Command::QueryInfo, &normalized_req));
 
@@ -405,7 +405,8 @@ impl Tree {
             OpenFor::Reading => (Some(&frames[3]), identity),
             OpenFor::Writing => (None, identity.filter(FileIdentity::is_proof)),
         };
-        let streams = list_streams
+        let streams = streams_req
+            .is_some()
             .then(|| super::streams::stream_list_answer(&frames[4], path))
             .flatten();
         let name = resolved_name(&crate::name::encode_path(path), all, frames.last());

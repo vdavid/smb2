@@ -167,6 +167,24 @@ pub struct FileVersion {
 }
 
 impl FileVersion {
+    /// A version read back from wherever the caller persisted one (inside a
+    /// [`DownloadCheckpoint`], say). The fields are what
+    /// [`FileReader::version`] and [`FileDownload::checkpoint`] report.
+    #[must_use]
+    pub fn new(
+        size: u64,
+        modified: FileTime,
+        changed: FileTime,
+        identity: Option<FileIdentity>,
+    ) -> Self {
+        Self {
+            size,
+            modified,
+            changed,
+            identity,
+        }
+    }
+
     /// The version an open saw: length and times from its CREATE, identity
     /// from the queries compounded onto it.
     pub(crate) fn at_open(info: &FileInfo, identity: Option<FileIdentity>) -> Self {
@@ -409,6 +427,20 @@ pub struct DownloadCheckpoint {
     pub version: FileVersion,
 }
 
+impl DownloadCheckpoint {
+    /// A checkpoint read back from wherever the caller persisted one. The
+    /// resume proves the file is still `version` before reading anything, so
+    /// a stale or mistyped one is refused, never trusted.
+    #[must_use]
+    pub fn new(path: impl Into<String>, offset: u64, version: FileVersion) -> Self {
+        Self {
+            path: path.into(),
+            offset,
+            version,
+        }
+    }
+}
+
 /// Carry on a download from where `checkpoint` says it got to, once the
 /// server shows the file is still the version the download was reading.
 ///
@@ -436,7 +468,9 @@ pub struct DownloadCheckpoint {
 ///
 /// ❗ The check is best-effort, as for a reader: a server that rewrites a
 /// file in place to the same length while holding back both times would get
-/// past it. And it can only compare the file with the version the download
+/// past it. On a server that won't say which file it is (no identity in the
+/// checkpoint), a different file of the same size and times, swapped in at
+/// the path on purpose, passes too. And it can only compare the file with the version the download
 /// opened, so a change made while the first download was still reading is
 /// caught here, at the resume, and not before.
 ///
