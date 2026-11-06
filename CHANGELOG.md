@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **The reasons inside an error are importable from the crate root.** `FileChange`, `ResumeRefusal`, `DurableLoss`, and `SignatureFailure` (what `Error::FileChanged`, `ResumeRefused`, `DurableHandleLost`, and `SignatureInvalid` carry) are now `smb2::FileChange` and so on, next to `Error` and `ErrorKind`. `smb2::error::*` still works.
+
 ## [0.43.0] - 2026-11-06
 
 ### Added

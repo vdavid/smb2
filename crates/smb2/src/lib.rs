@@ -95,7 +95,9 @@ pub mod __bench {
 // ── Re-exports: the simple-case imports ────────────────────────────────
 
 // Error types
-pub use error::{Error, ErrorKind, Result};
+pub use error::{
+    DurableLoss, Error, ErrorKind, FileChange, ResumeRefusal, Result, SignatureFailure,
+};
 
 /// Filename mapping for characters SMB2 does not allow on the wire.
 pub use name::{decode_name, decode_path, encode_name, encode_path};
