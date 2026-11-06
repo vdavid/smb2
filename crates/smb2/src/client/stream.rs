@@ -19,9 +19,12 @@ use log::{debug, trace};
 
 use crate::client::connection::{Connection, Frame, WaiterGuard};
 use crate::client::credits;
-use crate::client::durable::FileIdentity;
+use crate::client::durable::{DurableHandle, FileIdentity};
 use crate::client::read_ahead::{Dispatch, Outstanding, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
+pub use crate::client::reopen::{
+    open_file_reader_with, reopen_file_reader, FileVersion, ReaderOptions,
+};
 use crate::client::resolve::OpenFor;
 use crate::client::times::FileTimes;
 use crate::client::tree::{close_outcome, file_info_from_create, FileInfo, Tree};
@@ -747,6 +750,12 @@ pub struct FileReader {
     max_read: u32,
     resolved_path: Option<String>,
     closed: bool,
+    /// Which version of the file this reader reads, for a reopen to check.
+    pub(super) version: FileVersion,
+    /// The durable handle behind it, when it asked for one and got one.
+    pub(super) durable: Option<DurableHandle>,
+    /// What it was opened with, so a reopen asks for the same.
+    pub(super) options: ReaderOptions,
 }
 
 /// Open a file for reading and return a random-access [`FileReader`] that owns
@@ -802,11 +811,49 @@ impl FileReader {
             tree,
             conn,
             file_id,
+            version: FileVersion {
+                size: info.size,
+                modified: info.modified,
+                identity: None,
+            },
             info,
             max_read,
             resolved_path: None,
             closed: false,
+            durable: None,
+            options: ReaderOptions::default(),
         }
+    }
+
+    /// Which version of the file this reader reads: its length and
+    /// last-write time at open, and which file it is when the reader was
+    /// opened with [`open_file_reader_with`] (the plain open doesn't ask).
+    /// [`reopen_file_reader`] checks the file still matches it.
+    #[must_use]
+    pub fn version(&self) -> FileVersion {
+        self.version
+    }
+
+    /// The durable handle behind this reader, when it was opened with
+    /// [`ReaderOptions::durable`] and the server granted one. `None` is the
+    /// normal outcome on a server that doesn't do durable handles.
+    #[must_use]
+    pub fn durable_handle(&self) -> Option<&DurableHandle> {
+        self.durable.as_ref()
+    }
+
+    /// Whether this reader can still read: `false` once the session it was
+    /// opened on has ended (a reconnect), after which every read fails with
+    /// [`Error::HandleInvalidated`] and [`reopen_file_reader`] is the way
+    /// back.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.conn.pinned_session_is_current()
+    }
+
+    /// The session this reader's requests are pinned to.
+    pub(super) fn pin(&self) -> Option<crate::client::connection::SessionPin> {
+        self.conn.pin()
     }
 
     /// Total file size in bytes, as seen when the handle was opened.

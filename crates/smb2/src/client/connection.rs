@@ -3269,7 +3269,7 @@ impl Connection {
         }
     }
 
-    fn pin_is_current(&self, pin: SessionPin) -> bool {
+    pub(crate) fn pin_is_current(&self, pin: SessionPin) -> bool {
         pin.session_id != SessionId(0) && pin == self.current_pin()
     }
 

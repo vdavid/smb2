@@ -105,8 +105,8 @@ pub use client::{connect, ClientConfig, DfsSignIn, DfsTargetPolicy, SmbClient};
 
 // Streaming I/O
 pub use client::stream::{
-    FileDownload, FileReader, FileUpload, FileWriter, Progress, ReadAhead, WriteBehind,
-    WriteCheckpoint, DOWNLOAD_CHUNK_SIZE, UPLOAD_CHUNK_SIZE,
+    FileDownload, FileReader, FileUpload, FileVersion, FileWriter, Progress, ReadAhead,
+    ReaderOptions, WriteBehind, WriteCheckpoint, DOWNLOAD_CHUNK_SIZE, UPLOAD_CHUNK_SIZE,
 };
 
 // Server-side copy (FSCTL_SRV_COPYCHUNK): copy byte ranges between two files

@@ -2647,6 +2647,34 @@ impl Tree {
         super::stream::open_file_reader(Arc::clone(self), conn, path).await
     }
 
+    /// Open a read-only random-access reader that records which version of
+    /// the file it reads, optionally on a durable handle.
+    ///
+    /// See [`open_file_reader_with`](super::stream::open_file_reader_with).
+    pub async fn open_file_reader_with(
+        self: &Arc<Self>,
+        conn: Connection,
+        path: &str,
+        options: super::stream::ReaderOptions,
+    ) -> Result<super::stream::FileReader> {
+        let conn = self.pinned_conn(&conn);
+        super::stream::open_file_reader_with(Arc::clone(self), conn, path, options).await
+    }
+
+    /// Reopen the file `previous` was reading on this tree, after a
+    /// reconnect, and check it is still the same version.
+    ///
+    /// See [`reopen_file_reader`](super::stream::reopen_file_reader).
+    pub async fn reopen_file_reader(
+        self: &Arc<Self>,
+        conn: Connection,
+        path: &str,
+        previous: &super::stream::FileReader,
+    ) -> Result<super::stream::FileReader> {
+        let conn = self.pinned_conn(&conn);
+        super::stream::reopen_file_reader(Arc::clone(self), conn, path, previous).await
+    }
+
     /// Create a push-based pipelined streaming writer that owns its
     /// `Connection` and `Arc<Tree>`.
     ///

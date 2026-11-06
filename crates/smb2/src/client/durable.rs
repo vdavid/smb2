@@ -212,6 +212,11 @@ pub struct DurableHandle {
     create_guid: Guid,
     /// The connection generation this handle was last valid on.
     generation: u64,
+    /// Opened with read access only, by a
+    /// [`FileReader`](crate::FileReader). A reclaim asks for exactly the
+    /// access the open had, so a read handle is never reclaimed as a write
+    /// one.
+    read_only: bool,
 }
 
 impl DurableHandle {
@@ -226,6 +231,13 @@ impl DurableHandle {
     /// so it must be reclaimed before use.
     pub fn is_current(&self, conn: &Connection) -> bool {
         self.generation == conn.generation()
+    }
+
+    /// Whether this handle was opened for reading only (by
+    /// [`open_file_reader_with`](crate::client::stream::open_file_reader_with)),
+    /// and so is reclaimed with read access only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -263,34 +275,8 @@ impl Tree {
         path: &str,
     ) -> Result<DurableOpen> {
         let conn = &mut self.pinned_conn(conn);
-        let create_guid = crate::client::connection::random_guid();
-        // A server below SMB 3.0 has only the v1 contexts, whose reclaim this
-        // crate refuses to perform. Asking anyway would buy a batch oplock and
-        // its costs in exchange for nothing.
-        let durable_possible = conn.params().is_some_and(|p| p.dialect >= Dialect::Smb3_0);
-
-        let contexts = if durable_possible {
-            create_context::pack_contexts(&[DurableRequestV2 {
-                // The server knows its own resource limits and clamps whatever
-                // we ask for, so naming a window only invites a smaller one.
-                timeout_ms: 0,
-                persistent: false,
-                create_guid,
-            }
-            .context()])
-        } else {
-            Vec::new()
-        };
-
         let create_req = CreateRequest {
-            requested_oplock_level: if durable_possible {
-                // The price of durability: without a batch oplock (or a
-                // handle-caching lease) the server ignores the DH2Q context
-                // entirely (MS-SMB2 § 3.3.5.9.10).
-                OplockLevel::Batch
-            } else {
-                OplockLevel::None
-            },
+            requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
             desired_access: FileAccessMask::new(
                 FileAccessMask::FILE_READ_DATA
@@ -304,8 +290,52 @@ impl Tree {
             create_disposition: CreateDisposition::FileOpenIf,
             create_options: FILE_NON_DIRECTORY_FILE,
             name: self.format_path(path),
-            create_contexts: contexts,
+            create_contexts: Vec::new(),
         };
+        let (resp, _, durable) = self.open_durably(conn, create_req, path, false).await?;
+        Ok(DurableOpen {
+            file_id: resp.file_id,
+            size: resp.end_of_file,
+            durable,
+        })
+    }
+
+    /// The CREATE behind every durable open: `create_req` plus, on SMB 3.x,
+    /// the batch oplock and the `DH2Q` context, with the file's identity asked
+    /// in the same compound. Hands back the CREATE's answer, the identity, and
+    /// the durable handle when the server granted one AND identified the file.
+    ///
+    /// `read_only` is recorded on the handle, so its reclaim asks for the same
+    /// access `create_req` did.
+    pub(super) async fn open_durably(
+        &self,
+        conn: &mut Connection,
+        mut create_req: CreateRequest,
+        path: &str,
+        read_only: bool,
+    ) -> Result<(CreateResponse, Option<FileIdentity>, Option<DurableHandle>)> {
+        let conn = &mut self.pinned_conn(conn);
+        let create_guid = crate::client::connection::random_guid();
+        // A server below SMB 3.0 has only the v1 contexts, whose reclaim this
+        // crate refuses to perform. Asking anyway would buy a batch oplock and
+        // its costs in exchange for nothing.
+        let durable_possible = conn.params().is_some_and(|p| p.dialect >= Dialect::Smb3_0);
+
+        if durable_possible {
+            // The price of durability: without a batch oplock (or a
+            // handle-caching lease) the server ignores the DH2Q context
+            // entirely (MS-SMB2 § 3.3.5.9.10).
+            create_req.requested_oplock_level = OplockLevel::Batch;
+            create_req.create_contexts = create_context::pack_contexts(&[DurableRequestV2 {
+                // The server knows its own resource limits and clamps whatever
+                // we ask for, so naming a window only invites a smaller one.
+                timeout_ms: 0,
+                persistent: false,
+                create_guid,
+            }
+            .context()]);
+        }
+
         let (create, identity) = self.create_and_identify(conn, &create_req).await?;
         let resp = CreateResponse::unpack(&mut ReadCursor::new(&create.body))?;
         let answered = create_context::parse_contexts(&resp.create_contexts)?;
@@ -338,6 +368,7 @@ impl Tree {
                     identity,
                     create_guid,
                     generation: conn.generation(),
+                    read_only,
                 })
             }
             (Some(_), None) => {
@@ -351,17 +382,12 @@ impl Tree {
             (None, _) => {
                 debug!(
                     "durable: opened without durability (server declined or does not \
-                     support it); an interrupted write will restart path={path:?}"
+                     support it); an interrupted transfer will restart path={path:?}"
                 );
                 None
             }
         };
-
-        Ok(DurableOpen {
-            file_id: resp.file_id,
-            size: resp.end_of_file,
-            durable,
-        })
+        Ok((resp, identity, durable))
     }
 
     /// Claim a durable open back after a reconnect, or fail rather than guess.
@@ -385,24 +411,57 @@ impl Tree {
         handle: &DurableHandle,
         path: &str,
     ) -> Result<DurableHandle> {
+        self.reclaim(conn, handle, path)
+            .await
+            .map(|(_, reclaimed)| reclaimed)
+    }
+
+    /// [`reclaim_durable_handle`](Self::reclaim_durable_handle), also handing
+    /// back the CREATE's answer: the file's length and times now, which a
+    /// reader checks against the version it was reading.
+    pub(super) async fn reclaim(
+        &self,
+        conn: &mut Connection,
+        handle: &DurableHandle,
+        path: &str,
+    ) -> Result<(CreateResponse, DurableHandle)> {
         let conn = &mut self.pinned_conn(conn);
         let lost = |reason| Error::DurableHandleLost {
             path: path.to_string(),
             reason,
         };
 
-        let create_req = CreateRequest {
-            requested_oplock_level: OplockLevel::Batch,
-            impersonation_level: ImpersonationLevel::Impersonation,
-            desired_access: FileAccessMask::new(
+        // The same access and sharing the open asked for: a read handle must
+        // never come back as a write one.
+        let (desired_access, share_access) = if handle.read_only {
+            (
+                FileAccessMask::FILE_READ_DATA
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            )
+        } else {
+            (
                 FileAccessMask::FILE_READ_DATA
                     | FileAccessMask::FILE_WRITE_DATA
                     | FileAccessMask::FILE_READ_ATTRIBUTES
                     | FileAccessMask::FILE_WRITE_ATTRIBUTES
                     | FileAccessMask::SYNCHRONIZE,
-            ),
-            file_attributes: FileAttributes::NORMAL,
-            share_access: ShareAccess(ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE),
+                ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE,
+            )
+        };
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::Batch,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(desired_access),
+            file_attributes: if handle.read_only {
+                0
+            } else {
+                FileAttributes::NORMAL
+            },
+            share_access: ShareAccess(share_access),
             create_disposition: CreateDisposition::FileOpen,
             create_options: FILE_NON_DIRECTORY_FILE,
             name: self.format_path(path),
@@ -465,11 +524,12 @@ impl Tree {
              restarting path={path:?}"
         );
         conn.register_oplock(resp.file_id, self.tree_id);
-        Ok(DurableHandle {
+        let reclaimed = DurableHandle {
             file_id: resp.file_id,
             generation: conn.generation(),
             ..*handle
-        })
+        };
+        Ok((resp, reclaimed))
     }
 
     /// One round trip: open the file and ask which file it is.
@@ -477,7 +537,7 @@ impl Tree {
     /// Either `QUERY_INFO` is allowed to fail — a server that will not answer
     /// them still opened the file, it just cannot offer a resume — so their
     /// failure comes back as `None` rather than sinking the CREATE.
-    async fn create_and_identify(
+    pub(super) async fn create_and_identify(
         &self,
         conn: &mut Connection,
         create_req: &CreateRequest,
