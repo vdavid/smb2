@@ -3631,6 +3631,67 @@ mod tests {
         );
     }
 
+    /// A reader opened through a link remembers the CALLER's path, so a reopen
+    /// with the caller's tree follows the link again and reopens the target's
+    /// file, never a same-named path on the caller's share.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_opened_through_a_link_reopens_on_the_links_target() {
+        use crate::client::test_helpers::{build_create_response, build_reader_open_response};
+        let reader_open = || {
+            build_reader_open_response(
+                build_create_response(
+                    FileId {
+                        persistent: 5,
+                        volatile: 5,
+                    },
+                    10,
+                ),
+                None,
+                None,
+                None,
+            )
+        };
+        let create_name = |bytes: &[u8]| {
+            let mut cursor = crate::pack::ReadCursor::new(bytes);
+            Header::unpack(&mut cursor).unwrap();
+            crate::msg::create::CreateRequest::unpack(&mut cursor)
+                .unwrap()
+                .name
+        };
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let mut tree = a_dfs_root_tree();
+        mock.queue_response(path_not_covered(5));
+        queue_link_referral(&mock);
+        mock.queue_response(reader_open());
+
+        let reader = client
+            .open_file_reader(&tree, "data/f.bin")
+            .await
+            .expect("open through the link");
+        assert_eq!(reader.opened_path(), "data/f.bin");
+        let opened_at = create_name(mock.sent_messages().last().unwrap());
+
+        // The link is cached now, so the reopen goes straight to its target.
+        mock.queue_response(reader_open());
+        let reopened = client
+            .reopen_file_reader(&mut tree, &reader)
+            .await
+            .expect("reopen through the link");
+
+        assert_eq!(
+            creates_on(&mock).last(),
+            Some(&Some(LINK_TARGET_TREE)),
+            "the reopen went to the link's target share"
+        );
+        assert_eq!(
+            create_name(mock.sent_messages().last().unwrap()),
+            opened_at,
+            "at the target's path for the file, the one the open used"
+        );
+        assert_eq!(reopened.opened_path(), "data/f.bin");
+    }
+
     /// A link that points at another link is followed once, not forever: the
     /// second `STATUS_PATH_NOT_COVERED` is the caller's answer.
     #[tokio::test(start_paused = true)]

@@ -84,7 +84,7 @@ use crate::msg::query_info::{InfoType, QueryInfoRequest, QueryInfoResponse};
 use crate::pack::{Guid, ReadCursor, Unpack};
 use crate::types::flags::{FileAccessMask, FileAttributes};
 use crate::types::status::NtStatus;
-use crate::types::{Command, CreditCharge, Dialect, FileId, OplockLevel};
+use crate::types::{Command, CreditCharge, Dialect, FileId, OplockLevel, TreeId};
 
 use super::resolve::OpenFor;
 use super::tree::Tree;
@@ -263,6 +263,20 @@ pub struct DurableOpen {
     pub durable: Option<DurableHandle>,
 }
 
+/// Register `resp`'s handle for oplock-break acknowledgments when the oplock
+/// it was granted needs one: Exclusive or Batch (MS-SMB2 § 3.2.5.19.1). A
+/// Level II oplock is broken to none with no acknowledgment, and sending one
+/// anyway only earns an error answer, so it isn't registered. The connection
+/// answers breaks for registered handles only (`acknowledge_oplock_break`).
+fn register_if_acknowledged(conn: &Connection, resp: &CreateResponse, tree_id: TreeId) {
+    if matches!(
+        resp.oplock_level,
+        OplockLevel::Batch | OplockLevel::Exclusive
+    ) {
+        conn.register_oplock(resp.file_id, tree_id);
+    }
+}
+
 /// What [`Tree::reclaim`] got back.
 pub(super) struct Reclaimed {
     /// The reclaim CREATE's answer: the file's length and times now.
@@ -395,9 +409,7 @@ impl Tree {
         // the server's break timeout (~35 s) for as long as this handle lives.
         // Registered before anything here can fail, so the caller's CLOSE on
         // that path retires it again.
-        if resp.oplock_level != OplockLevel::None {
-            conn.register_oplock(resp.file_id, self.tree_id);
-        }
+        register_if_acknowledged(conn, resp, self.tree_id);
         let answered = create_context::parse_contexts(&resp.create_contexts)?;
         let grant = create_context::find(&answered, create_context::NAME_DH2Q)
             .map(|c| DurableGrant::from_bytes(&c.data))
@@ -596,7 +608,7 @@ impl Tree {
             "durable: reclaimed on the new session; the transfer resumes rather than \
              restarting path={path:?}"
         );
-        conn.register_oplock(resp.file_id, self.tree_id);
+        register_if_acknowledged(conn, &resp, self.tree_id);
         let reclaimed = DurableHandle {
             file_id: resp.file_id,
             generation: conn.generation(),
@@ -1393,6 +1405,39 @@ mod oplock_break_tests {
             std::mem::forget(reader);
         })
         .await;
+    }
+
+    /// A Level II oplock is broken to none without an acknowledgment (MS-SMB2
+    /// § 3.2.5.19.1: only an Exclusive or Batch break asks for one), so a
+    /// server that granted Level II instead of Batch gets nothing back.
+    #[tokio::test]
+    async fn a_level_ii_oplock_break_is_not_acknowledged() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = plain_connection(&mock);
+        let handle_id = FileId {
+            persistent: 7,
+            volatile: 7,
+        };
+        let mut granted_level_ii = with_msg_ids(answer(handle_id, &[], Some(OURS)), 0);
+        // The CREATE response's OplockLevel byte: past the 64-byte header and
+        // the 2-byte StructureSize.
+        granted_level_ii[66] = OplockLevel::LevelII as u8;
+        mock.queue_response(granted_level_ii);
+        a_share()
+            .open_file_durable(&mut conn, "big.iso")
+            .await
+            .unwrap();
+        let sent_after_open = mock.sent_count();
+
+        mock.queue_response(a_break(handle_id));
+        // Long enough that an acknowledgment would certainly have been sent.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            mock.sent_count(),
+            sent_after_open,
+            "a Level II break needs no acknowledgment"
+        );
     }
 
     /// A break for a handle we hold no oplock on is not ours to answer, and
