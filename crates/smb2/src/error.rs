@@ -86,6 +86,48 @@ impl std::fmt::Display for ResumeRefusal {
     }
 }
 
+/// How a file differs from the version a reader was opened on.
+///
+/// Returned inside [`Error::FileChanged`] by
+/// [`reopen_file_reader`](crate::client::stream::reopen_file_reader), which
+/// refuses to carry on reading a file that is no longer the one it read:
+/// bytes cached from the old version would be mixed with the new one's. All
+/// of them mean the same thing to a caller: start over from the new version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FileChange {
+    /// A different file is at the path now: its
+    /// [`FileIdentity`](crate::FileIdentity) differs from the one the reader
+    /// was opened on. Deleted and recreated, or another file renamed over it.
+    Replaced,
+    /// The server identified the file when the reader opened it and won't
+    /// now, so nothing proves it is still the same one.
+    IdentityUnavailable,
+    /// The file's length changed.
+    Size {
+        /// The length when the reader opened it.
+        was: u64,
+        /// The length now.
+        now: u64,
+    },
+    /// The file's last-write time moved: same length, possibly different
+    /// bytes.
+    Modified,
+}
+
+impl std::fmt::Display for FileChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replaced => f.write_str("a different file is at that path now"),
+            Self::IdentityUnavailable => {
+                f.write_str("the server won't say which file it is, so it can't be proven the same")
+            }
+            Self::Size { was, now } => write!(f, "its length changed from {was} to {now} bytes"),
+            Self::Modified => f.write_str("it was written to since it was opened"),
+        }
+    }
+}
+
 /// What was wrong with a response's signature.
 ///
 /// Both mean the response was refused unread: it can't be shown to come from
@@ -372,6 +414,23 @@ pub enum Error {
         path: String,
         /// Which guarantee did not hold.
         reason: DurableLoss,
+    },
+
+    /// A reader could not be reopened because the file is no longer the
+    /// version it was reading.
+    ///
+    /// Returned by
+    /// [`reopen_file_reader`](crate::client::stream::reopen_file_reader) and
+    /// its wrappers, with the handle the reopen got already closed. `change`
+    /// says what differs. Classifies as [`ErrorKind::FileChanged`] and is
+    /// **not** retryable: asking again for the same version can only be
+    /// refused again. Open the file afresh to read its new version.
+    #[error("{path} changed since it was opened: {change}")]
+    FileChanged {
+        /// The path the reopen opened.
+        path: String,
+        /// What differs.
+        change: FileChange,
     },
 
     /// An interrupted upload can't resume from its checkpoint, because the
@@ -910,6 +969,10 @@ pub enum ErrorKind {
     /// file again from the start. Only [`Error::ResumeRefused`] has it, and
     /// its `reason` says why.
     ResumeRefused,
+    /// A reopened file is no longer the version its reader was reading. Only
+    /// [`Error::FileChanged`] has it, and its `change` says how. Not
+    /// retryable: open the file afresh.
+    FileChanged,
     /// A response on a signed session had a missing or wrong signature, so it
     /// was refused: a broken server, or the connection being tampered with.
     /// Only [`Error::SignatureInvalid`] has it, and its `reason` says which.
@@ -994,6 +1057,7 @@ impl Error {
             Error::ReconnectFailed { .. } => ErrorKind::ConnectionLost,
             Error::DurableHandleLost { .. } => ErrorKind::ConnectionLost,
             Error::ResumeRefused { .. } => ErrorKind::ResumeRefused,
+            Error::FileChanged { .. } => ErrorKind::FileChanged,
             // The session the handle was opened on is the connection that was
             // lost; the revived one can't use it.
             Error::HandleInvalidated { .. } => ErrorKind::ConnectionLost,

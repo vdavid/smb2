@@ -21,6 +21,9 @@ pub mod durable;
 mod fault_injection_tests;
 pub mod pipeline;
 pub mod read_ahead;
+pub mod reopen;
+#[cfg(test)]
+mod reopen_tests;
 pub mod resolve;
 #[cfg(test)]
 mod resume_tests;
@@ -2401,6 +2404,46 @@ impl SmbClient {
     ) -> Result<stream::FileReader> {
         self.beside_tree(tree, path, |conn, tree, path| async move {
             stream::open_file_reader(std::sync::Arc::new(tree), conn, &path).await
+        })
+        .await
+        .map(|(reader, _)| reader)
+    }
+
+    /// Open a read-only [`FileReader`](stream::FileReader) that records which
+    /// version of the file it reads, optionally on a durable handle.
+    ///
+    /// See [`open_file_reader_with`](stream::open_file_reader_with) for what
+    /// it asks the server for. Follows a DFS link like
+    /// [`open_file_reader`](Self::open_file_reader).
+    pub async fn open_file_reader_with(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        options: stream::ReaderOptions,
+    ) -> Result<stream::FileReader> {
+        self.beside_tree(tree, path, |conn, tree, path| async move {
+            stream::open_file_reader_with(std::sync::Arc::new(tree), conn, &path, options).await
+        })
+        .await
+        .map(|(reader, _)| reader)
+    }
+
+    /// Reopen the file `previous` was reading, after its connection dropped,
+    /// and check it is still the same version.
+    ///
+    /// See [`reopen_file_reader`](stream::reopen_file_reader) for the durable
+    /// reclaim, the path fallback, and [`Error::FileChanged`]. Takes
+    /// `&mut Tree` because it runs again after reviving a dead session, like
+    /// the other reads: a revival gives the share a new tree id, which is
+    /// written into `tree`. `path` is the path `previous` was opened at.
+    pub async fn reopen_file_reader(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        previous: &stream::FileReader,
+    ) -> Result<stream::FileReader> {
+        self.replaying(tree, path, |conn, tree, path| async move {
+            stream::reopen_file_reader(std::sync::Arc::new(tree), conn, &path, previous).await
         })
         .await
         .map(|(reader, _)| reader)
