@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crate::client::connection::{pack_message, Connection};
 use crate::client::durable::FileIdentity;
-use crate::client::reopen::{open_file_reader_with, reopen_file_reader, ReaderOptions};
+use crate::client::reopen::{
+    open_file_reader_with, reopen_file_reader, FileVersion, ReaderOptions,
+};
 use crate::client::stream::FileReader;
 use crate::client::test_helpers::{
     build_close_response, build_compound_response_frame, build_query_info_error_response,
@@ -80,12 +82,14 @@ fn file(n: u64) -> FileId {
 struct Seen {
     size: u64,
     modified: FileTime,
+    changed: FileTime,
     identity: Option<FileIdentity>,
 }
 
 const UNCHANGED: Seen = Seen {
     size: SIZE,
     modified: WRITTEN,
+    changed: WRITTEN,
     identity: Some(OURS),
 };
 
@@ -113,7 +117,7 @@ fn created(file_id: FileId, seen: Seen, contexts: &[CreateContext]) -> Vec<u8> {
             creation_time: FileTime::ZERO,
             last_access_time: FileTime::ZERO,
             last_write_time: seen.modified,
-            change_time: seen.modified,
+            change_time: seen.changed,
             allocation_size: 0,
             end_of_file: seen.size,
             file_attributes: 0,
@@ -220,7 +224,7 @@ async fn open_durable(mock: &Arc<MockTransport>, conn: &Connection) -> FileReade
 }
 
 async fn reopen(conn: &Connection, previous: &FileReader) -> crate::Result<FileReader> {
-    reopen_file_reader(share(), conn.clone(), PATH, previous).await
+    reopen_file_reader(share(), conn.clone(), previous).await
 }
 
 fn changed(outcome: crate::Result<FileReader>) -> FileChange {
@@ -468,6 +472,11 @@ async fn an_unchanged_file_reopens_by_path() {
 
     let reader = outcome.expect("same file, same length, same time");
     assert_read_only(&sent_create(&mock, 1));
+    assert_eq!(
+        sent_create(&mock, 1).name,
+        sent_create(&mock, 0).name,
+        "the reader remembers the path it was opened at"
+    );
     assert!(contexts(&sent_create(&mock, 1)).is_empty());
     assert_eq!(reader.version().identity, Some(OURS));
 }
@@ -476,6 +485,21 @@ async fn an_unchanged_file_reopens_by_path() {
 async fn a_file_written_since_is_refused_and_closed() {
     let (mock, outcome) = reopen_plain(Seen {
         modified: FileTime(WRITTEN.0 + 1),
+        ..UNCHANGED
+    })
+    .await;
+
+    assert_eq!(changed(outcome), FileChange::Modified);
+    assert_eq!(sent_command(&mock, 2), Command::Close);
+}
+
+/// Samba and NTFS hold LastWriteTime back while a writer's handle is open,
+/// so a same-length edit in place can leave it where it was; ChangeTime moves
+/// with the write. A false refusal is the safe direction.
+#[tokio::test]
+async fn a_file_whose_change_time_moved_is_refused_even_at_the_same_write_time() {
+    let (mock, outcome) = reopen_plain(Seen {
+        changed: FileTime(WRITTEN.0 + 1),
         ..UNCHANGED
     })
     .await;
@@ -573,4 +597,57 @@ async fn a_write_handle_is_still_reclaimed_with_write_access() {
 
     let access = sent_create(&mock, 1).desired_access.bits();
     assert_ne!(access & FileAccessMask::FILE_WRITE_DATA, 0);
+}
+
+// ── Comparing versions ───────────────────────────────────────────────
+
+fn version(identity: Option<FileIdentity>) -> FileVersion {
+    FileVersion {
+        size: SIZE,
+        modified: WRITTEN,
+        changed: WRITTEN,
+        identity,
+    }
+}
+
+/// A server answering index 0 (or volume 0) for every file proves nothing,
+/// so such an identity counts as missing on either side.
+const NO_PROOF: FileIdentity = FileIdentity {
+    volume_serial: 0xABCD,
+    index_number: 0,
+};
+
+#[test]
+fn an_identity_that_proves_nothing_now_is_unavailable_not_replaced() {
+    assert_eq!(
+        version(Some(OURS)).change_to(&version(Some(NO_PROOF))),
+        Some(FileChange::IdentityUnavailable)
+    );
+}
+
+#[test]
+fn an_identity_that_proved_nothing_at_open_falls_through_to_length_and_time() {
+    assert_eq!(
+        version(Some(NO_PROOF)).change_to(&version(Some(OURS))),
+        None
+    );
+    let mut longer = version(Some(OURS));
+    longer.size += 1;
+    assert_eq!(
+        version(Some(NO_PROOF)).change_to(&longer),
+        Some(FileChange::Size {
+            was: SIZE,
+            now: SIZE + 1
+        })
+    );
+}
+
+#[test]
+fn a_zero_match_cannot_hide_a_change() {
+    let mut touched = version(Some(NO_PROOF));
+    touched.changed = FileTime(WRITTEN.0 + 1);
+    assert_eq!(
+        version(Some(NO_PROOF)).change_to(&touched),
+        Some(FileChange::Modified)
+    );
 }

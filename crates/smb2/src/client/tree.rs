@@ -2668,11 +2668,10 @@ impl Tree {
     pub async fn reopen_file_reader(
         self: &Arc<Self>,
         conn: Connection,
-        path: &str,
         previous: &super::stream::FileReader,
     ) -> Result<super::stream::FileReader> {
         let conn = self.pinned_conn(&conn);
-        super::stream::reopen_file_reader(Arc::clone(self), conn, path, previous).await
+        super::stream::reopen_file_reader(Arc::clone(self), conn, previous).await
     }
 
     /// Create a push-based pipelined streaming writer that owns its

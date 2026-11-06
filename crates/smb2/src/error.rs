@@ -110,8 +110,9 @@ pub enum FileChange {
         /// The length now.
         now: u64,
     },
-    /// The file's last-write time moved: same length, possibly different
-    /// bytes.
+    /// The file's last-write time or change time moved: same length,
+    /// possibly different bytes (a change to its metadata alone moves the
+    /// change time too, and is refused all the same).
     Modified,
 }
 
@@ -123,7 +124,7 @@ impl std::fmt::Display for FileChange {
                 f.write_str("the server won't say which file it is, so it can't be proven the same")
             }
             Self::Size { was, now } => write!(f, "its length changed from {was} to {now} bytes"),
-            Self::Modified => f.write_str("it was written to since it was opened"),
+            Self::Modified => f.write_str("it was written to or changed since it was opened"),
         }
     }
 }

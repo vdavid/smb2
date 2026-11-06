@@ -28,20 +28,30 @@
 //! The open is `resolve.rs` `open_and_name` with `OpenFor::Reading`: CREATE,
 //! the two [`FileIdentity`] queries, class 18, class 48 (last, AGENTS.md
 //! pitfall 31). So every reader, durable or not, carries a [`FileVersion`]
-//! (length and last-write time from the CREATE, identity from the queries)
+//! (length, last-write time, and change time from the CREATE, identity from
+//! the queries)
 //! and its [`resolved_path`](FileReader::resolved_path). A durable reader's
 //! reclaim runs the same compound, so the reader it produces keeps both too.
 //!
 //! ## The version check
 //!
 //! [`reopen_file_reader`] compares the reopened file against the recorded
-//! version, identity first (a different file's length says nothing), and
-//! fails with [`Error::FileChanged`] after closing what it opened.
-//!
-//! The identity is best-effort: a server that won't answer the queries still
-//! gives a working reader, whose reopen then checks length and time alone. A
-//! server that answered at open and won't at reopen fails the check, which is
+//! version, identity first (a different file's length says nothing), then
+//! length, then last-write AND change time, and fails with
+//! [`Error::FileChanged`] after closing what it opened. The change time is
+//! there because Samba and NTFS hold the last-write time back while a
+//! writer's handle is open, so a same-length edit in place could otherwise
+//! slip through; a metadata-only change moves it too, and a false refusal is
 //! the safe direction.
+//!
+//! The identity is best-effort, and only a full one counts
+//! (`FileIdentity::is_proof`, both halves non-zero): a server that won't
+//! answer, or answers 0, still gives a working reader, whose reopen then
+//! checks length and times alone. A server that proved the identity at open
+//! and won't at reopen fails the check, which is the safe direction.
+//!
+//! ❗ The whole check is best-effort and happens at the reopen only. Nothing
+//! tells a live reader that another client wrote to the file under it.
 //!
 //! ## Durable first, path second
 //!
@@ -133,6 +143,10 @@ pub struct FileVersion {
     pub size: u64,
     /// The file's last-write time at open.
     pub modified: FileTime,
+    /// The file's change time at open: moves on every write and metadata
+    /// change, including the writes whose last-write time a server holds back
+    /// while the writer's handle is open.
+    pub changed: FileTime,
     /// Which file it is, or `None` on a server that won't say (see
     /// [`FileIdentity`]).
     pub identity: Option<FileIdentity>,
@@ -140,13 +154,24 @@ pub struct FileVersion {
 
 impl FileVersion {
     /// How `now` differs from this version, or `None` when it is the same
-    /// file with the same length and last-write time.
+    /// file with the same length, last-write time, and change time.
     ///
-    /// Identity first: once it differs, the length says nothing. An identity
-    /// only `now` has is ignored (there is nothing to compare it with); one
-    /// only `self` has is [`FileChange::IdentityUnavailable`].
+    /// Identity first: once it differs, the length says nothing. Only an
+    /// identity that proves something counts ([`FileIdentity::is_proof`]: both
+    /// halves non-zero), so a server answering 0 for every file can't hide a
+    /// replacement behind a zero match; one that doesn't is treated as
+    /// missing. An identity only `now` has is ignored (there is nothing to
+    /// compare it with); one only `self` has is
+    /// [`FileChange::IdentityUnavailable`].
+    ///
+    /// The change time is compared beside the last-write time because Samba
+    /// and NTFS hold the last-write time back while a writer's handle is
+    /// open, so a same-length edit in place can leave it unmoved. Anything
+    /// that touches the metadata moves the change time too, which refuses a
+    /// file that didn't change in content: the safe direction.
     pub(crate) fn change_to(&self, now: &FileVersion) -> Option<FileChange> {
-        match (self.identity, now.identity) {
+        let proof = |id: Option<FileIdentity>| id.filter(FileIdentity::is_proof);
+        match (proof(self.identity), proof(now.identity)) {
             (Some(was), Some(is)) if was != is => return Some(FileChange::Replaced),
             (Some(_), None) => return Some(FileChange::IdentityUnavailable),
             _ => {}
@@ -157,7 +182,7 @@ impl FileVersion {
                 now: now.size,
             });
         }
-        if self.modified != now.modified {
+        if self.modified != now.modified || self.changed != now.changed {
             return Some(FileChange::Modified);
         }
         None
@@ -213,6 +238,7 @@ pub async fn open_file_reader_with(
         &opened.created,
         opened.identity,
         opened.name,
+        path,
         options,
     );
     reader.durable = durable.transpose()?.flatten();
@@ -222,12 +248,14 @@ pub async fn open_file_reader_with(
 /// Carry on reading after a reconnect: reopen the file `previous` was
 /// reading, read-only, and check it is still the same version.
 ///
-/// `tree` is a tree connect to the same share on the current session, and
-/// `path` the path `previous` was opened at. When `previous` holds a durable
-/// handle and its session is gone, the handle is reclaimed; when the server
-/// no longer has it, the path is opened afresh. A `previous` whose session is
-/// still current is not reclaimed (its handle is still open): the path is
-/// opened again, and `previous` stays the caller's to close.
+/// `tree` is a tree connect to the same share on the current session; the
+/// path is the one `previous` was opened at, which it remembers. When
+/// `previous` holds a durable handle and its session is gone, the handle is
+/// reclaimed; when the server no longer has it, the path is opened afresh. A
+/// `previous` whose session is still current is not reclaimed (its handle is
+/// still open): the path is opened again, and `previous` stays the caller's
+/// to close. ⚠️ Reopening a live durable reader asks for a second batch
+/// oplock, which breaks `previous`'s, so `previous` loses its durability.
 ///
 /// The new reader is opened with `previous`'s options, and its own
 /// [`version`](FileReader::version), read fresh from the server, was checked
@@ -236,6 +264,12 @@ pub async fn open_file_reader_with(
 /// own error when the file is gone. Any other error (the network, access
 /// denied) comes back as itself, so [`Error::is_retryable`] says whether to
 /// try the reopen again later.
+///
+/// The check is best-effort, and it happens here, at the reopen, and nowhere
+/// else: a reader whose session is alive isn't told when another client
+/// writes to the file under it. Length, last-write time, and change time are
+/// what a server reports, and a server that rewrites a file in place to the
+/// same length while holding all three back would get past it.
 ///
 /// # Example
 ///
@@ -247,7 +281,7 @@ pub async fn open_file_reader_with(
 /// # ) -> Result<(), smb2::Error> {
 /// let reader = match reader.read_at(0, 4096).await {
 ///     Err(e) if e.kind() == smb2::ErrorKind::ConnectionLost => {
-///         let reopened = client.reopen_file_reader(share, "film.mkv", &reader).await?;
+///         let reopened = client.reopen_file_reader(share, &reader).await?;
 ///         // Its session is gone, so this sends nothing.
 ///         reader.close().await?;
 ///         reopened
@@ -259,6 +293,17 @@ pub async fn open_file_reader_with(
 /// # }
 /// ```
 pub async fn reopen_file_reader(
+    tree: Arc<Tree>,
+    conn: Connection,
+    previous: &FileReader,
+) -> Result<FileReader> {
+    reopen_at(tree, conn, previous.opened_path(), previous).await
+}
+
+/// [`reopen_file_reader`] at `path` on `tree`, for an opener that followed a
+/// DFS link: `path` is then the link target's, where the reader's remembered
+/// path is the caller's. The reader it returns remembers `path`.
+pub(crate) async fn reopen_at(
     tree: Arc<Tree>,
     conn: Connection,
     path: &str,
@@ -276,6 +321,7 @@ pub async fn reopen_file_reader(
                     &reclaimed.created,
                     Some(reclaimed.handle.identity()),
                     reclaimed.name,
+                    path,
                     previous.options,
                 );
                 reader.durable = Some(reclaimed.handle);

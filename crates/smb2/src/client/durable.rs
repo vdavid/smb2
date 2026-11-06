@@ -196,8 +196,8 @@ impl FileIdentity {
 /// everything needed to prove a reclaimed one is the same file.
 ///
 /// Obtained from [`Tree::open_file_durable`] (a write handle) or a durable
-/// [`FileReader`](crate::FileReader) (a read handle, see
-/// [`is_read_only`](Self::is_read_only)), and spent by
+/// [`FileReader`](crate::FileReader) (a read handle, which a reclaim asks
+/// for with read access only), and spent by
 /// [`Tree::reclaim_durable_handle`] or
 /// [`reopen_file_reader`](crate::client::stream::reopen_file_reader). Cheap
 /// to copy and safe to hold across a reconnect — that is its whole job — but
@@ -240,8 +240,10 @@ impl DurableHandle {
 
     /// Whether this handle was opened for reading only (by
     /// [`open_file_reader_with`](crate::client::stream::open_file_reader_with)),
-    /// and so is reclaimed with read access only.
-    pub fn is_read_only(&self) -> bool {
+    /// and so is reclaimed with read access only. The reclaim reads the
+    /// field itself; this is for tests.
+    #[cfg(test)]
+    pub(crate) fn is_read_only(&self) -> bool {
         self.read_only
     }
 }
@@ -370,8 +372,9 @@ impl Tree {
 
     /// What the server said to a CREATE that [`ask_for_durability`] dressed:
     /// the durable handle when it granted one AND the file was identified,
-    /// with its oplock registered so breaks get answered. `None` otherwise,
-    /// which is never an error.
+    /// `None` otherwise, which is never an error. Whatever oplock came back is
+    /// registered either way, so its breaks get answered on the right tree
+    /// (a break arrives with no usable tree id of its own).
     ///
     /// `read_only` is recorded on the handle, so its reclaim asks for the same
     /// access the open did.
@@ -385,6 +388,16 @@ impl Tree {
         read_only: bool,
     ) -> Result<Option<DurableHandle>> {
         let AskedDurability(create_guid) = asked;
+        // The batch oplock went out with every durable request, and a server
+        // can grant it while ignoring DH2Q (durable handles off) or while we
+        // refuse the durability below (no identity). Its breaks need an
+        // answer either way, or every other client opening the file waits out
+        // the server's break timeout (~35 s) for as long as this handle lives.
+        // Registered before anything here can fail, so the caller's CLOSE on
+        // that path retires it again.
+        if resp.oplock_level != OplockLevel::None {
+            conn.register_oplock(resp.file_id, self.tree_id);
+        }
         let answered = create_context::parse_contexts(&resp.create_contexts)?;
         let grant = create_context::find(&answered, create_context::NAME_DH2Q)
             .map(|c| DurableGrant::from_bytes(&c.data))
@@ -406,9 +419,6 @@ impl Tree {
                     },
                     path
                 );
-                // So an oplock break, which arrives with no usable tree id of
-                // its own, can be answered on the right tree.
-                conn.register_oplock(resp.file_id, self.tree_id);
                 Some(DurableHandle {
                     file_id: resp.file_id,
                     grant,
@@ -667,7 +677,7 @@ mod tests {
     use crate::types::TreeId;
     use std::sync::Arc;
 
-    const OURS: FileIdentity = FileIdentity {
+    pub(super) const OURS: FileIdentity = FileIdentity {
         volume_serial: 0xABCD,
         index_number: 0x1234_5678,
     };
@@ -730,7 +740,7 @@ mod tests {
     }
 
     /// The compounded CREATE + QUERY_INFO ×2 answer both paths expect.
-    fn answer(
+    pub(super) fn answer(
         file_id: FileId,
         contexts: &[CreateContext],
         identity: Option<FileIdentity>,
@@ -1315,6 +1325,74 @@ mod oplock_break_tests {
             "we only ever took the oplock to get durability, and durability is \
              already gone by the time a break arrives"
         );
+    }
+
+    /// The batch oplock is asked for whether or not durability comes with it,
+    /// so a server that grants the oplock and ignores `DH2Q` (durable handles
+    /// off) still sends us breaks, and they still have to be answered.
+    async fn a_granted_oplock_without_durability_is_still_answered(
+        open: impl AsyncFnOnce(&Arc<MockTransport>, &mut Connection, FileId),
+    ) {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = plain_connection(&mock);
+        let handle_id = FileId {
+            persistent: 6,
+            volatile: 6,
+        };
+        open(&mock, &mut conn, handle_id).await;
+        let sent_after_open = mock.sent_count();
+
+        mock.queue_response(a_break(handle_id));
+        wait_for("the acknowledgment to be sent", || {
+            mock.sent_count() > sent_after_open
+        })
+        .await;
+        let sent = mock.sent_message(sent_after_open).unwrap();
+        let header = Header::unpack(&mut ReadCursor::new(&sent)).unwrap();
+        assert_eq!(header.command, Command::OplockBreak);
+        assert_eq!(header.tree_id, Some(THE_TREE));
+    }
+
+    #[tokio::test]
+    async fn a_durable_write_open_granted_only_the_oplock_answers_its_breaks() {
+        a_granted_oplock_without_durability_is_still_answered(async |mock, conn, file_id| {
+            // Batch granted, no DH2Q in the answer.
+            mock.queue_response(with_msg_ids(answer(file_id, &[], Some(OURS)), 0));
+            let open = a_share().open_file_durable(conn, "big.iso").await.unwrap();
+            assert!(open.durable.is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_durable_reader_granted_only_the_oplock_answers_its_breaks() {
+        a_granted_oplock_without_durability_is_still_answered(async |mock, conn, file_id| {
+            mock.queue_response(with_msg_ids(
+                crate::client::test_helpers::build_reader_open_response(
+                    crate::client::test_helpers::build_create_response_with_contexts(
+                        file_id,
+                        0,
+                        &[],
+                    ),
+                    Some(OURS),
+                    None,
+                    None,
+                ),
+                0,
+            ));
+            let reader = crate::client::stream::open_file_reader_with(
+                Arc::new(a_share()),
+                conn.clone(),
+                "big.iso",
+                crate::ReaderOptions::new().durable(true),
+            )
+            .await
+            .unwrap();
+            assert!(reader.durable_handle().is_none());
+            // Kept open: the break is for a live handle.
+            std::mem::forget(reader);
+        })
+        .await;
     }
 
     /// A break for a handle we hold no oplock on is not ours to answer, and

@@ -6695,7 +6695,6 @@ async fn guest_a_durable_reader_carries_on_after_a_reconnect_and_refuses_a_chang
     let handle = *reader
         .durable_handle()
         .expect("Samba 4.20 grants a durable handle to a batch-oplocked read");
-    assert!(handle.is_read_only());
     assert_eq!(reader.resolved_path(), Some(path));
     let version = reader.version();
     assert_eq!(version.size, original.len() as u64);
@@ -6707,14 +6706,13 @@ async fn guest_a_durable_reader_carries_on_after_a_reconnect_and_refuses_a_chang
     tree = client.connect_share("public").await.expect("re-connect");
     assert!(!reader.is_current(), "its session is gone");
     let reopened = client
-        .reopen_file_reader(&mut tree, path, &reader)
+        .reopen_file_reader(&mut tree, &reader)
         .await
         .expect("the same file, unchanged");
     let reclaimed = reopened
         .durable_handle()
         .expect("the reopen reclaimed the durable handle");
     assert_eq!(reclaimed.identity(), handle.identity());
-    assert!(reclaimed.is_read_only());
     assert_eq!(reopened.version(), version, "verified against the open");
     assert_eq!(
         reopened.resolved_path(),
@@ -6762,7 +6760,7 @@ async fn guest_a_durable_reader_carries_on_after_a_reconnect_and_refuses_a_chang
             Err(e) => panic!("rewrite: {e}"),
         }
     }
-    match client.reopen_file_reader(&mut tree, path, &reopened).await {
+    match client.reopen_file_reader(&mut tree, &reopened).await {
         Err(smb2::Error::FileChanged { change, .. }) => assert_eq!(
             change,
             FileChange::Size {

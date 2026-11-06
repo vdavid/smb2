@@ -756,6 +756,9 @@ pub struct FileReader {
     pub(super) durable: Option<DurableHandle>,
     /// What it was opened with, so a reopen asks for the same.
     pub(super) options: ReaderOptions,
+    /// The path it was opened at, as its opener was given it, so a reopen
+    /// needs nothing but the reader.
+    path: String,
 }
 
 /// Open a file for reading and return a random-access [`FileReader`] that owns
@@ -789,6 +792,7 @@ impl FileReader {
         created: &CreateResponse,
         identity: Option<FileIdentity>,
         resolved_path: Option<String>,
+        path: &str,
         options: ReaderOptions,
     ) -> Self {
         let conn = tree.pinned_conn(&conn).pinned_to_session();
@@ -801,6 +805,7 @@ impl FileReader {
             version: FileVersion {
                 size: info.size,
                 modified: info.modified,
+                changed: info.changed,
                 identity,
             },
             info,
@@ -809,11 +814,26 @@ impl FileReader {
             closed: false,
             durable: None,
             options,
+            path: path.to_string(),
         }
     }
 
+    /// The path this reader was opened at, relative to the tree its opener
+    /// was given (for a reader from `SmbClient`, the caller's tree, even when
+    /// a DFS link sent the open to another share).
+    pub(crate) fn opened_path(&self) -> &str {
+        &self.path
+    }
+
+    /// Record the path as the caller gave it, for an opener that followed a
+    /// DFS link and opened a different path on the link's target.
+    pub(crate) fn set_opened_path(&mut self, path: &str) {
+        self.path = path.to_string();
+    }
+
     /// Which version of the file this reader reads: its length, last-write
-    /// time, and [`FileIdentity`] (when the server said) at open.
+    /// time, change time, and [`FileIdentity`] (when the server said) at
+    /// open.
     /// [`reopen_file_reader`] checks the file still matches it.
     #[must_use]
     pub fn version(&self) -> FileVersion {

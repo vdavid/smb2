@@ -2402,11 +2402,8 @@ impl SmbClient {
         tree: &Tree,
         path: &str,
     ) -> Result<stream::FileReader> {
-        self.beside_tree(tree, path, |conn, tree, path| async move {
-            stream::open_file_reader(std::sync::Arc::new(tree), conn, &path).await
-        })
-        .await
-        .map(|(reader, _)| reader)
+        self.open_file_reader_with(tree, path, stream::ReaderOptions::default())
+            .await
     }
 
     /// Open a read-only [`FileReader`](stream::FileReader) that records which
@@ -2421,11 +2418,15 @@ impl SmbClient {
         path: &str,
         options: stream::ReaderOptions,
     ) -> Result<stream::FileReader> {
-        self.beside_tree(tree, path, |conn, tree, path| async move {
-            stream::open_file_reader_with(std::sync::Arc::new(tree), conn, &path, options).await
-        })
-        .await
-        .map(|(reader, _)| reader)
+        let (mut reader, _) = self
+            .beside_tree(tree, path, |conn, tree, path| async move {
+                stream::open_file_reader_with(std::sync::Arc::new(tree), conn, &path, options).await
+            })
+            .await?;
+        // The caller's path, on the caller's tree, even through a DFS link,
+        // so `reopen_file_reader` with the same tree follows the link again.
+        reader.set_opened_path(path);
+        Ok(reader)
     }
 
     /// Reopen the file `previous` was reading, after its connection dropped,
@@ -2435,18 +2436,23 @@ impl SmbClient {
     /// reclaim, the path fallback, and [`Error::FileChanged`]. Takes
     /// `&mut Tree` because it runs again after reviving a dead session, like
     /// the other reads: a revival gives the share a new tree id, which is
-    /// written into `tree`. `path` is the path `previous` was opened at.
+    /// written into `tree`. `tree` is the share `previous` was opened through
+    /// (with [`open_file_reader`](Self::open_file_reader) or
+    /// [`open_file_reader_with`](Self::open_file_reader_with)), and the path
+    /// is the one `previous` remembers, so a DFS link is followed again.
     pub async fn reopen_file_reader(
         &mut self,
         tree: &mut Tree,
-        path: &str,
         previous: &stream::FileReader,
     ) -> Result<stream::FileReader> {
-        self.replaying(tree, path, |conn, tree, path| async move {
-            stream::reopen_file_reader(std::sync::Arc::new(tree), conn, &path, previous).await
-        })
-        .await
-        .map(|(reader, _)| reader)
+        let path = previous.opened_path().to_string();
+        let (mut reader, _) = self
+            .replaying(tree, &path, |conn, tree, target_path| async move {
+                reopen::reopen_at(std::sync::Arc::new(tree), conn, &target_path, previous).await
+            })
+            .await?;
+        reader.set_opened_path(&path);
+        Ok(reader)
     }
 
     /// Create a push-based pipelined streaming file writer.
