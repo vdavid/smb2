@@ -96,7 +96,7 @@ pub mod __bench {
 
 // Error types
 pub use error::{
-    DurableLoss, Error, ErrorKind, FileChange, ResumeRefusal, Result, SignatureFailure,
+    DurableLoss, Error, ErrorKind, FileChange, Result, ResumeRefusal, SignatureFailure,
 };
 
 /// Filename mapping for characters SMB2 does not allow on the wire.
