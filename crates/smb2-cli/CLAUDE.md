@@ -80,8 +80,13 @@ server's `MaxReadSize` (8 MB on a stock Samba) is a hard ceiling on what one REA
   - The library's `Tree::read_file` is `read_file_compound` with no size check, unlike `write_file`, which picks
     compound or pipelined by size. If `read_file` ever grows the same dispatch, this can go back to one round
     trip for small files and keep streaming for large ones.
-- A `FileReader` must be closed explicitly. Dropping one only logs, and leaks the server-side handle until the
-  session goes away.
+- Close a `FileReader` explicitly to hear how the CLOSE went. Dropping one still closes its handle (the library
+  queues the CLOSE as it drops), but the answer goes unseen.
+- **No resume after a dropped connection, on purpose for now.** `get` and `cat` pump a `FileReader` with positioned
+  reads landing out of order, so "how far did we get" is a set of ranges, not one offset; the library's
+  `DownloadCheckpoint` / `resume_download` fit a `FileDownload`, and a resume here would mean either switching
+  `Download` to `FileDownload` or tracking the contiguous prefix and using `reopen_file_reader`. The connection also
+  runs without `auto_reconnect`, so a dropped link ends the command and `get` removes its `.smb2-part` file.
 
 ## Testing
 
