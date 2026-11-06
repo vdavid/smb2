@@ -3705,10 +3705,7 @@ impl Tree {
     /// closed with this, or it leaks server-side until session teardown.
     pub async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
-        // A no-op for the handles that never held an oplock, which is nearly
-        // all of them. Done before the CLOSE so a break arriving in the gap
-        // isn't acknowledged on a handle that is on its way out.
-        conn.forget_oplock(file_id);
+        forget_oplock_if_current(conn, file_id);
         let req = CloseRequest { flags: 0, file_id };
 
         let frame = conn
@@ -3727,8 +3724,7 @@ impl Tree {
         file_id: FileId,
     ) -> Result<WaiterGuard> {
         let conn = &self.pinned_conn(conn);
-        // See `close_handle`.
-        conn.forget_oplock(file_id);
+        forget_oplock_if_current(conn, file_id);
         let req = CloseRequest { flags: 0, file_id };
         conn.dispatch(Command::Close, &req, Some(self.tree_id))
             .await
@@ -3759,6 +3755,22 @@ impl Tree {
         owner: &'static str,
     ) {
         close_dropped_handle_on(self.pinned_conn(conn), self.tree_id, file_id, owner);
+    }
+}
+
+/// Drop the oplock bookkeeping for `file_id` before its CLOSE goes out, so a
+/// break arriving in the gap isn't acknowledged on a handle on its way out. A
+/// no-op for the handles that never held an oplock, which is nearly all of
+/// them.
+///
+/// ❌ Only while `conn`'s pinned session is current. A revival already
+/// cleared the dead session's bookkeeping, and a reclaim can register the
+/// SAME file id for the new session's open, so a stale handle forgetting it
+/// would leave the live open's breaks unanswered (other clients then wait out
+/// the server's ~35 s break timeout). The CLOSE itself is refused by the pin.
+fn forget_oplock_if_current(conn: &Connection, file_id: FileId) {
+    if conn.pinned_session_is_current() {
+        conn.forget_oplock(file_id);
     }
 }
 
@@ -3841,8 +3853,7 @@ pub(crate) fn close_dropped_handle_on(
     if !conn.pinned_session_is_current() {
         return;
     }
-    // See `close_handle`.
-    conn.forget_oplock(file_id);
+    forget_oplock_if_current(&conn, file_id);
     let req = CloseRequest { flags: 0, file_id };
     match conn.dispatch_without_waiting(Command::Close, &req, Some(tree_id)) {
         Ok(Some(queued)) => {

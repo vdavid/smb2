@@ -13,6 +13,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Closing a handle from a session that has ended no longer silences a live handle's oplock breaks.** A reclaimed durable handle can come back under the same file id, and closing the old reader or writer afterwards (which sends nothing to the server) still removed the oplock registration the reclaim had just made, so the server's breaks for the live handle went unanswered and every other client opening the file waited out its ~35 s break timeout. A stale handle's close now leaves the connection's bookkeeping alone.
 - **Share listing no longer trusts the server's entry count to size its buffers.** `list_shares` decoded a `NetShareEnumAll` reply by allocating room for as many entries as the reply claimed, before checking that it held them, so a malformed or hostile reply of a few bytes could ask for gigabytes. A count larger than the reply has room for is now refused with `ErrorKind::InvalidData`, and the reassembled reply (every RPC fragment and `STATUS_BUFFER_OVERFLOW` read) is capped at 4 MiB, room for tens of thousands of shares.
 
 ## [0.42.1] - 2026-11-04

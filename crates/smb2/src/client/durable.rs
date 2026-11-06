@@ -1284,4 +1284,60 @@ mod oplock_break_tests {
             "a break for a closed handle must not produce an acknowledgment"
         );
     }
+
+    /// A handle from a session that has ended may share its file id with a
+    /// handle the new session holds: a reclaim can hand back the same id. A
+    /// revival already cleared the dead session's oplock bookkeeping, so
+    /// closing the stale handle must not touch it, or the live handle's breaks
+    /// go unanswered and other clients wait out the server's break timeout.
+    async fn closing_a_stale_handle_keeps_the_live_ones_oplock(
+        close: impl AsyncFnOnce(&Connection, FileId),
+    ) {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = plain_connection(&mock);
+        let handle_id = FileId {
+            persistent: 5,
+            volatile: 5,
+        };
+        mock.queue_response(with_msg_ids(durable_answer(handle_id), 0));
+        a_share()
+            .open_file_durable(&mut conn, "big.iso")
+            .await
+            .unwrap();
+        let stale = conn.pinned_to_session();
+
+        // The session ends, and the new one reclaims the open under the same
+        // file id, registering its oplock afresh.
+        conn.set_session_id(SessionId(2));
+        conn.register_oplock(handle_id, THE_TREE);
+
+        close(&stale, handle_id).await;
+        let sent_after_close = mock.sent_count();
+
+        mock.queue_response(a_break(handle_id));
+        wait_for("the live handle's break to be acknowledged", || {
+            mock.sent_count() > sent_after_close
+        })
+        .await;
+        let sent = mock.sent_message(sent_after_close).unwrap();
+        let header = Header::unpack(&mut ReadCursor::new(&sent)).unwrap();
+        assert_eq!(header.command, Command::OplockBreak);
+    }
+
+    #[tokio::test]
+    async fn closing_a_stale_handle_keeps_the_live_handles_oplock() {
+        closing_a_stale_handle_keeps_the_live_ones_oplock(async |stale, file_id| {
+            let mut stale = stale.clone();
+            let _ = a_share().close_handle(&mut stale, file_id).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dispatching_a_stale_handles_close_keeps_the_live_handles_oplock() {
+        closing_a_stale_handle_keeps_the_live_ones_oplock(async |stale, file_id| {
+            let _ = a_share().dispatch_close(stale, file_id).await;
+        })
+        .await;
+    }
 }
