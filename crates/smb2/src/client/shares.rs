@@ -91,7 +91,8 @@ async fn rpc_bind_and_request(
     trace!("shares: sent RPC BIND ({} bytes)", bind_data.len());
 
     // 4. Read RPC BIND_ACK
-    let bind_ack_data = read_pipe_message(conn, tree_id, file_id).await?;
+    let bind_ack_data =
+        read_pipe_message(conn, tree_id, file_id, srvsvc::MAX_SHARE_ENUM_RESPONSE).await?;
     rpc::parse_bind_ack(&bind_ack_data)?;
     trace!("shares: received BIND_ACK, context accepted");
 
@@ -106,11 +107,18 @@ async fn rpc_bind_and_request(
 
     // 6. Read RPC RESPONSE, reassembling DCE/RPC fragments (MS-RPCE 2.2.2.6).
     // A large NetShareEnum reply may arrive as several fragment PDUs, each its
-    // own pipe message, with PFC_LAST_FRAG set only on the last.
+    // own pipe message, with PFC_LAST_FRAG set only on the last. The whole
+    // reply, every fragment's PDU included, stays within
+    // `MAX_SHARE_ENUM_RESPONSE`: the server decides how many pieces it sends,
+    // so without a bound one that never sets PFC_LAST_FRAG grows `stub` until
+    // the process runs out of memory.
     let mut stub = Vec::new();
     let mut fragments = 0;
+    let mut received = 0usize;
     loop {
-        let pdu = read_pipe_message(conn, tree_id, file_id).await?;
+        let budget = srvsvc::MAX_SHARE_ENUM_RESPONSE - received;
+        let pdu = read_pipe_message(conn, tree_id, file_id, budget).await?;
+        received += pdu.len();
         let (frag_stub, is_last) = rpc::parse_response_fragment(&pdu)?;
         stub.extend_from_slice(frag_stub);
         fragments += 1;
@@ -200,10 +208,15 @@ async fn write_pipe(
 /// `STATUS_BUFFER_OVERFLOW` reads carrying partial data, terminated by a
 /// `STATUS_SUCCESS` read with the remainder (MS-SMB2 3.3.5.10). We append each
 /// chunk until a `SUCCESS` read completes the message.
+///
+/// A message longer than `limit` bytes fails with [`Error::InvalidData`]
+/// before the chunk that would cross it is kept, so a server that keeps
+/// answering `BUFFER_OVERFLOW` can't make the message grow without end.
 async fn read_pipe_message(
     conn: &mut Connection,
     tree_id: TreeId,
     file_id: FileId,
+    limit: usize,
 ) -> Result<Vec<u8>> {
     let mut message = Vec::new();
 
@@ -235,6 +248,11 @@ async fn read_pipe_message(
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = ReadResponse::unpack(&mut cursor)?;
         let chunk_len = resp.data.len();
+        if chunk_len > limit - message.len() {
+            return Err(Error::invalid_data(format!(
+                "pipe message is longer than the {limit} bytes allowed for it"
+            )));
+        }
         message.extend_from_slice(&resp.data);
 
         // SUCCESS completes the message; BUFFER_OVERFLOW means read more.
@@ -608,6 +626,69 @@ pub(crate) mod tests {
         assert_eq!(shares.len(), 2);
         assert_eq!(shares[0].name, "Documents");
         assert_eq!(shares[1].name, "Photos");
+    }
+
+    /// The pipe responses up to and including the NetShareEnumAll request,
+    /// for a test that supplies its own reply.
+    fn queue_until_the_reply(mock: &MockTransport) {
+        let file_id = FileId {
+            persistent: 0xAAAA,
+            volatile: 0xBBBB,
+        };
+        mock.queue_response(build_tree_connect_response(TreeId(42), ShareType::Pipe));
+        mock.queue_response(build_create_response(file_id, 0));
+        mock.queue_response(build_write_response(72));
+        mock.queue_response(build_read_response(build_bind_ack()));
+        mock.queue_response(build_write_response(100));
+    }
+
+    /// A server that answers every pipe read with `BUFFER_OVERFLOW` never
+    /// finishes its message. The listing gives up once the message passes
+    /// `MAX_SHARE_ENUM_RESPONSE` instead of buffering it for ever.
+    #[tokio::test]
+    async fn list_shares_refuses_a_pipe_message_that_never_ends() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        queue_until_the_reply(&mock);
+        let chunk = vec![0u8; PIPE_READ_BUFFER_SIZE as usize];
+        let chunks_to_cross = srvsvc::MAX_SHARE_ENUM_RESPONSE / chunk.len() + 1;
+        for _ in 0..chunks_to_cross {
+            mock.queue_response(build_read_response_with_status(
+                chunk.clone(),
+                NtStatus::BUFFER_OVERFLOW,
+            ));
+        }
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_tree_disconnect_response());
+
+        let err = list_shares(&mut conn).await.unwrap_err();
+
+        assert_eq!(err.kind(), crate::error::ErrorKind::InvalidData, "{err}");
+        // TREE_CONNECT, CREATE, WRITE, READ, WRITE, the reads, CLOSE,
+        // TREE_DISCONNECT: the pipe and IPC$ are still cleaned up.
+        assert_eq!(mock.sent_count(), 5 + chunks_to_cross + 2);
+    }
+
+    /// The same bound holds across DCE/RPC fragments: a server that never
+    /// sets `PFC_LAST_FRAG` is cut off at `MAX_SHARE_ENUM_RESPONSE` in total,
+    /// not per fragment.
+    #[tokio::test]
+    async fn list_shares_refuses_fragments_that_never_end() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        queue_until_the_reply(&mock);
+        let fragment = wrap_rpc_response_pdu(&[0u8; 60_000], 0x00); // never the last
+        let fragments_to_cross = srvsvc::MAX_SHARE_ENUM_RESPONSE / fragment.len() + 1;
+        for _ in 0..fragments_to_cross {
+            mock.queue_response(build_read_response(fragment.clone()));
+        }
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_tree_disconnect_response());
+
+        let err = list_shares(&mut conn).await.unwrap_err();
+
+        assert_eq!(err.kind(), crate::error::ErrorKind::InvalidData, "{err}");
+        assert_eq!(mock.sent_count(), 5 + fragments_to_cross + 2);
     }
 
     #[tokio::test]

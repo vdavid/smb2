@@ -21,6 +21,19 @@ pub const STYPE_SPECIAL: u32 = 0x8000_0000;
 /// Mask for the base share type (low bits).
 const STYPE_BASE_MASK: u32 = 0x0000_FFFF;
 
+/// Wire size of the fixed part of one `SHARE_INFO_1` entry: the name pointer,
+/// the share type, and the comment pointer, 4 bytes each.
+const SHARE_INFO_1_FIXED_SIZE: usize = 12;
+
+/// The largest `NetShareEnumAll` response the client reassembles (4 MiB).
+///
+/// A share costs at least 12 bytes on the wire, and a real one, with its name
+/// and comment, around 100, so this is room for some 40,000 shares — far past
+/// any server seen. The bound exists because the reply arrives in pieces
+/// (RPC fragments, each possibly split again by `STATUS_BUFFER_OVERFLOW`
+/// reads) and nothing else stops a server that never sends the last piece.
+pub(crate) const MAX_SHARE_ENUM_RESPONSE: usize = 4 * 1024 * 1024;
+
 /// Information about a single network share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareInfo {
@@ -160,7 +173,21 @@ pub(crate) fn parse_net_share_enum_all_stub(stub: &[u8]) -> Result<Vec<ShareInfo
         comment_ptr: u32,
     }
 
-    let mut entries = Vec::with_capacity(count as usize);
+    // `count` comes from the server, and so does `max_count` it was checked
+    // against, so neither bounds anything yet. The fixed-size entries must all
+    // be in the bytes we actually received, which caps every allocation below
+    // at a small multiple of the response's own length. ❌ Don't size a buffer
+    // from `count` before this check: a 20-byte reply claiming 4 billion
+    // entries would otherwise ask for a ~48 GiB allocation.
+    let count = count as usize;
+    let fits = r.remaining() / SHARE_INFO_1_FIXED_SIZE;
+    if count > fits {
+        return Err(Error::invalid_data(format!(
+            "share list claims {count} entries, but the response only has room for {fits}"
+        )));
+    }
+
+    let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let name_ptr = r.read_u32_le()?;
         let share_type = r.read_u32_le()?;
@@ -173,7 +200,7 @@ pub(crate) fn parse_net_share_enum_all_stub(stub: &[u8]) -> Result<Vec<ShareInfo
     }
 
     // Now read the deferred pointer data (conformant+varying strings)
-    let mut shares = Vec::with_capacity(count as usize);
+    let mut shares = Vec::with_capacity(count);
     for entry in &entries {
         let name = if entry.name_ptr != 0 {
             read_ndr_string(&mut r)?
@@ -440,6 +467,69 @@ mod tests {
         let filtered = filter_disk_shares(shares);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "My$hare");
+    }
+
+    /// The header of a `NetShareEnumAll` reply up to and including the
+    /// array's `MaxCount`, claiming `count` entries.
+    fn stub_header_claiming(count: u32) -> WriteCursor {
+        let mut w = WriteCursor::with_capacity(64);
+        w.write_u32_le(1); // Level
+        w.write_u32_le(1); // Union discriminant
+        w.write_u32_le(0x0002_0000); // Container pointer
+        w.write_u32_le(count); // EntriesRead
+        w.write_u32_le(0x0002_0004); // Array pointer
+        w.write_u32_le(count); // MaxCount, agreeing, as a hostile server would
+        w
+    }
+
+    /// A 24-byte reply claiming four billion shares. The count used to size
+    /// the entry buffer before anything checked it, which asked the allocator
+    /// for ~48 GiB on the strength of one server-chosen field.
+    #[test]
+    fn a_count_far_past_the_response_is_refused_before_allocating() {
+        let stub = stub_header_claiming(u32::MAX).into_inner();
+
+        let err = parse_net_share_enum_all_stub(&stub).unwrap_err();
+
+        assert_eq!(err.kind(), crate::error::ErrorKind::InvalidData, "{err}");
+    }
+
+    /// One more entry than the bytes hold is refused the same way, with no
+    /// partial list.
+    #[test]
+    fn a_count_one_past_the_entries_present_is_refused() {
+        let mut w = stub_header_claiming(3);
+        for i in 0..2 {
+            w.write_u32_le(0); // name pointer (null)
+            w.write_u32_le(STYPE_DISKTREE);
+            w.write_u32_le(i); // comment pointer (null for i = 0)
+        }
+        let stub = w.into_inner();
+
+        let err = parse_net_share_enum_all_stub(&stub).unwrap_err();
+
+        assert_eq!(err.kind(), crate::error::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("room for 2"), "{err}");
+    }
+
+    /// The bound is exactly the fixed-size entries: a reply whose entries fill
+    /// it to the last byte, with no strings behind them, still parses.
+    #[test]
+    fn a_count_that_exactly_fills_the_response_parses() {
+        let mut w = stub_header_claiming(2);
+        for _ in 0..2 {
+            w.write_u32_le(0); // name pointer (null)
+            w.write_u32_le(STYPE_DISKTREE);
+            w.write_u32_le(0); // comment pointer (null)
+        }
+        let stub = w.into_inner();
+
+        let shares = parse_net_share_enum_all_stub(&stub).unwrap();
+
+        assert_eq!(shares.len(), 2);
+        assert!(shares
+            .iter()
+            .all(|s| s.name.is_empty() && s.comment.is_empty()));
     }
 
     // -- Test helpers --

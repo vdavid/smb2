@@ -11,6 +11,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Read-only readers that survive a reconnect, and refuse to when the file changed.** `open_file_reader_with` (also on `Tree` and `SmbClient`) opens a `FileReader` with read access only (`FILE_READ_DATA`, `FILE_READ_ATTRIBUTES`, `SYNCHRONIZE`, `FileOpen`, never creating), records the file's `FileVersion` (length, last-write time, and its `FileIdentity` where the server says), and with `ReaderOptions::durable(true)` asks for a durable handle on SMB 3.x. `reopen_file_reader` carries on after a reconnect: it reclaims the durable handle when there is one, reopens the path when the server no longer has it, and fails with the new `Error::FileChanged` (`ErrorKind::FileChanged`, whose `FileChange` says whether the file was replaced, resized, or written) when the file is no longer the version the reader was reading. `FileReader` gains `version`, `durable_handle`, and `is_current`, and `DurableHandle` gains `is_read_only`: a read handle is always reclaimed with read access only.
 
+### Fixed
+
+- **Share listing no longer trusts the server's entry count to size its buffers.** `list_shares` decoded a `NetShareEnumAll` reply by allocating room for as many entries as the reply claimed, before checking that it held them, so a malformed or hostile reply of a few bytes could ask for gigabytes. A count larger than the reply has room for is now refused with `ErrorKind::InvalidData`, and the reassembled reply (every RPC fragment and `STATUS_BUFFER_OVERFLOW` read) is capped at 4 MiB, room for tens of thousands of shares.
+
 ## [0.42.1] - 2026-11-04
 
 ### Fixed
