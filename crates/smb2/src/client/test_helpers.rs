@@ -577,6 +577,55 @@ pub(crate) fn build_writer_open_response(
     ])
 }
 
+/// What every `FileReader` open (and a read handle's reclaim) gets back:
+/// `create`, then the two identity queries (answered when `identity` is
+/// `Some`), class 18 (answered with `all` when given), and class 48
+/// (answered with `name` when given). Every unanswered query is refused.
+pub(crate) fn build_reader_open_response(
+    create: Vec<u8>,
+    identity: Option<crate::client::durable::FileIdentity>,
+    all: Option<&str>,
+    name: Option<&str>,
+) -> Vec<u8> {
+    use crate::types::status::NtStatus;
+    let refused = || build_query_info_error_response(NtStatus::NOT_SUPPORTED);
+    let (index, volume) = match identity {
+        Some(id) => {
+            let mut volume = vec![0u8; 8];
+            volume.extend_from_slice(&id.volume_serial.to_le_bytes());
+            volume.extend_from_slice(&[0u8; 6]);
+            (
+                build_query_info_response(id.index_number.to_le_bytes().to_vec()),
+                build_query_info_response(volume),
+            )
+        }
+        None => (refused(), refused()),
+    };
+    build_compound_response_frame(&[
+        create,
+        index,
+        volume,
+        all.map_or_else(refused, |n| {
+            build_query_info_response(file_all_information(n))
+        }),
+        name.map_or_else(refused, |n| {
+            build_query_info_response(file_name_information(n))
+        }),
+    ])
+}
+
+/// A reader open the server refused at the CREATE: every query after it
+/// fails with the same status, as Samba cascades it.
+pub(crate) fn build_reader_open_refused(status: crate::types::status::NtStatus) -> Vec<u8> {
+    build_compound_response_frame(&[
+        build_create_error_response(status),
+        build_query_info_error_response(status),
+        build_query_info_error_response(status),
+        build_query_info_error_response(status),
+        build_query_info_error_response(status),
+    ])
+}
+
 /// `FILE_ALL_INFORMATION` (MS-FSCC § 2.4.2) with every fixed field zeroed and
 /// `name` in its trailing `FILE_NAME_INFORMATION`, 96 bytes in.
 pub(crate) fn file_all_information(name: &str) -> Vec<u8> {

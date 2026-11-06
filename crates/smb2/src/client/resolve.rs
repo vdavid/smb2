@@ -101,15 +101,19 @@ pub struct Resolved {
 }
 
 /// Which handle [`Tree::open_and_name`] opens, which decides what else it can
-/// ask in the same round trip.
+/// ask in the same round trip. Both ask the file's [`FileIdentity`] and the
+/// class 48 name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OpenFor {
     /// A [`FileReader`](crate::FileReader): adds the class 18 name fallback,
-    /// which needs the `FILE_READ_ATTRIBUTES` a read handle carries.
+    /// which needs the `FILE_READ_ATTRIBUTES` a read handle carries. The
+    /// identity is kept as answered (a `0` volume serial included), the rule
+    /// a durable reclaim and a reader's [`FileVersion`](crate::FileVersion)
+    /// compare by.
     Reading,
-    /// A [`FileWriter`](crate::FileWriter): adds the file's
-    /// [`FileIdentity`], which a checkpoint carries so a resume can prove it
-    /// reopened the same file. No class 18: a write handle has no
+    /// A [`FileWriter`](crate::FileWriter): the identity is kept only when
+    /// it's a full proof ([`FileIdentity::is_proof`]), since a checkpoint has
+    /// nothing else to resume on. No class 18: a write handle has no
     /// `FILE_READ_ATTRIBUTES`, and ❌ adding it could make an open that works
     /// today fail with `ACCESS_DENIED`. The identity classes need no access
     /// at all.
@@ -121,8 +125,8 @@ pub(super) struct NamedOpen {
     pub(super) created: CreateResponse,
     /// What the server calls the file, if it said.
     pub(super) name: Option<String>,
-    /// Which file it is, for a [`OpenFor::Writing`] open whose server said
-    /// so in full (see [`FileIdentity::is_proof`]).
+    /// Which file it is, when the server said (see [`OpenFor`] for how much
+    /// of an answer each kind keeps).
     pub(super) identity: Option<FileIdentity>,
 }
 
@@ -334,17 +338,19 @@ impl Tree {
         Ok(resolved)
     }
 
-    /// Open with `create_req` and ask what the server calls the file it
-    /// opened, in the same round trip. The handle a
+    /// Open with `create_req` and ask which file the server opened and what
+    /// it calls it, in the same round trip. The handle a
     /// [`FileReader`](crate::FileReader) or [`FileWriter`](crate::FileWriter)
     /// keeps is the one named, so a policy check on the name can't race the
     /// I/O that follows.
     ///
-    /// What else rides along depends on `handle` (see [`OpenFor`]). Class 48
-    /// goes last because it's the query most likely to be refused, and a
-    /// server that cascades failures (MS-SMB2 § 3.3.5.2.7.2) would otherwise
-    /// take everything after it down too. No query can fail the open: a
-    /// server that answers none of them gives `None` for each.
+    /// The order is CREATE, the two identity queries, class 18 (readers
+    /// only), then class 48. Identity comes first because a reader's version
+    /// check and a durable reclaim both stand on it; class 48 goes last
+    /// because it's the query most likely to be refused, and a server that
+    /// cascades failures (MS-SMB2 § 3.3.5.2.7.2) would otherwise take
+    /// everything after it down too. No query can fail the open: a server
+    /// that answers none of them gives `None` for each.
     pub(super) async fn open_and_name(
         &self,
         conn: &mut Connection,
@@ -353,9 +359,9 @@ impl Tree {
         handle: OpenFor,
     ) -> Result<NamedOpen> {
         let conn = &mut self.pinned_conn(conn);
-        let all_req = name_query(conn, FILE_ALL_INFORMATION);
         let index_req = FileIdentity::index_query();
         let volume_req = FileIdentity::volume_query();
+        let all_req = name_query(conn, FILE_ALL_INFORMATION);
         let normalized_req = name_query(conn, FILE_NORMALIZED_NAME_INFORMATION);
         let op = |command, body| CompoundOp {
             command,
@@ -363,13 +369,13 @@ impl Tree {
             tree_id: Some(self.tree_id),
             credit_charge: CreditCharge(1),
         };
-        let mut ops = vec![op(Command::Create, create_req)];
-        match handle {
-            OpenFor::Reading => ops.push(op(Command::QueryInfo, &all_req)),
-            OpenFor::Writing => {
-                ops.push(op(Command::QueryInfo, &index_req));
-                ops.push(op(Command::QueryInfo, &volume_req));
-            }
+        let mut ops = vec![
+            op(Command::Create, create_req),
+            op(Command::QueryInfo, &index_req),
+            op(Command::QueryInfo, &volume_req),
+        ];
+        if handle == OpenFor::Reading {
+            ops.push(op(Command::QueryInfo, &all_req));
         }
         ops.push(op(Command::QueryInfo, &normalized_req));
 
@@ -382,13 +388,10 @@ impl Tree {
             });
         }
         let created = CreateResponse::unpack(&mut ReadCursor::new(&create.body))?;
+        let identity = FileIdentity::from_frames(Some(&frames[1]), Some(&frames[2]));
         let (all, identity) = match handle {
-            OpenFor::Reading => (Some(&frames[1]), None),
-            OpenFor::Writing => (
-                None,
-                FileIdentity::from_frames(Some(&frames[1]), Some(&frames[2]))
-                    .filter(FileIdentity::is_proof),
-            ),
+            OpenFor::Reading => (Some(&frames[3]), identity),
+            OpenFor::Writing => (None, identity.filter(FileIdentity::is_proof)),
         };
         let name = resolved_name(&crate::name::encode_path(path), all, frames.last());
         trace!("tree: opened path={path:?} name={name:?} identity={identity:?}");

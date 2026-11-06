@@ -31,7 +31,7 @@ use crate::client::tree::{close_outcome, file_info_from_create, FileInfo, Tree};
 pub use crate::client::write_behind::{WriteBehind, UPLOAD_CHUNK_SIZE};
 use crate::client::write_pipe::WritePipe;
 use crate::error::{Result, ResumeRefusal};
-use crate::msg::create::CreateDisposition;
+use crate::msg::create::{CreateDisposition, CreateResponse};
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::pack::{ReadCursor, Unpack};
 use crate::types::status::NtStatus;
@@ -751,7 +751,7 @@ pub struct FileReader {
     resolved_path: Option<String>,
     closed: bool,
     /// Which version of the file this reader reads, for a reopen to check.
-    pub(super) version: FileVersion,
+    version: FileVersion,
     /// The durable handle behind it, when it asked for one and got one.
     pub(super) durable: Option<DurableHandle>,
     /// What it was opened with, so a reopen asks for the same.
@@ -769,65 +769,51 @@ pub struct FileReader {
 /// [`Tree::open_file_reader`] are thin convenience wrappers; reach for them when
 /// you already hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
 /// connection clone.
+///
+/// The same open as [`open_file_reader_with`] with the default
+/// [`ReaderOptions`]: read access only, never creating, and one round trip
+/// that also records the reader's [`version`](FileReader::version) and
+/// [`resolved_path`](FileReader::resolved_path).
 pub async fn open_file_reader(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileReader> {
-    trace!("stream: open_file_reader path={path:?}");
-
-    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
-    let opened = tree
-        .open_and_name(
-            &mut conn,
-            path,
-            &tree.read_open_request(path),
-            OpenFor::Reading,
-        )
-        .await?;
-    let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
-
-    let mut reader = FileReader::new(
-        tree,
-        conn,
-        opened.created.file_id,
-        file_info_from_create(&opened.created),
-        max_read,
-    );
-    reader.resolved_path = opened.name;
-    Ok(reader)
+    open_file_reader_with(tree, conn, path, ReaderOptions::default()).await
 }
 
 impl FileReader {
-    /// Wrap an already-opened read handle. Most callers want
-    /// [`open_file_reader`], [`Tree::open_file_reader`], or
-    /// [`SmbClient::open_file_reader`](crate::SmbClient::open_file_reader),
-    /// which issue the CREATE for you.
-    pub(crate) fn new(
+    /// A reader over what a reader open (or a read handle's reclaim) opened,
+    /// sending through `conn`, which must be the clone pinned before that
+    /// CREATE (AGENTS.md pitfall 35). The one constructor, so every reader
+    /// carries its version, name, and options the same way.
+    pub(super) fn opened(
         tree: Arc<Tree>,
         conn: Connection,
-        file_id: FileId,
-        info: FileInfo,
-        max_read: u32,
+        created: &CreateResponse,
+        identity: Option<FileIdentity>,
+        resolved_path: Option<String>,
+        options: ReaderOptions,
     ) -> Self {
         let conn = tree.pinned_conn(&conn).pinned_to_session();
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        let info = file_info_from_create(created);
         Self {
             tree,
             conn,
-            file_id,
+            file_id: created.file_id,
             version: FileVersion {
                 size: info.size,
                 modified: info.modified,
-                identity: None,
+                identity,
             },
             info,
             max_read,
-            resolved_path: None,
+            resolved_path,
             closed: false,
             durable: None,
-            options: ReaderOptions::default(),
+            options,
         }
     }
 
-    /// Which version of the file this reader reads: its length and
-    /// last-write time at open, and which file it is when the reader was
-    /// opened with [`open_file_reader_with`] (the plain open doesn't ask).
+    /// Which version of the file this reader reads: its length, last-write
+    /// time, and [`FileIdentity`] (when the server said) at open.
     /// [`reopen_file_reader`] checks the file still matches it.
     #[must_use]
     pub fn version(&self) -> FileVersion {
@@ -1915,13 +1901,11 @@ impl Drop for FileWriter {
 mod tests {
     use super::*;
     use crate::client::test_helpers::{
-        build_close_error_response, build_close_response, build_compound_response_frame,
-        build_create_error_response, build_create_response, build_create_response_dated,
-        build_flush_response, build_query_info_error_response, build_query_info_response,
-        build_read_error_response, build_read_response, build_set_info_response,
-        build_write_error_response, build_write_response, build_write_response_granting,
-        build_writer_open_response, file_all_information, file_name_information, setup_connection,
-        CREATE_TIMES,
+        build_close_error_response, build_close_response, build_create_response,
+        build_create_response_dated, build_flush_response, build_read_error_response,
+        build_read_response, build_reader_open_refused, build_reader_open_response,
+        build_set_info_response, build_write_error_response, build_write_response,
+        build_write_response_granting, build_writer_open_response, setup_connection, CREATE_TIMES,
     };
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -1953,14 +1937,15 @@ mod tests {
         build_writer_open_response(file_id, 0, None, None)
     }
 
-    /// The compound a reader's open gets back: CREATE, then class 18 and
-    /// class 48, both refused.
+    /// The compound a reader's open gets back: CREATE, then the identity
+    /// and name queries, all refused.
     fn reader_opened(file_id: FileId, end_of_file: u64) -> Vec<u8> {
-        build_compound_response_frame(&[
+        build_reader_open_response(
             build_create_response(file_id, end_of_file),
-            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-        ])
+            None,
+            None,
+            None,
+        )
     }
 
     // ── FileWriter tests ───────────────────────────────────────────────
@@ -2529,11 +2514,12 @@ mod tests {
     #[tokio::test]
     async fn file_reader_reports_the_dates_its_open_returned() {
         let mock = Arc::new(MockTransport::new());
-        mock.queue_response(build_compound_response_frame(&[
+        mock.queue_response(build_reader_open_response(
             build_create_response_dated(test_file_id(), 10),
-            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-        ]));
+            None,
+            None,
+            None,
+        ));
         let conn = setup_connection(&mock);
 
         let reader = test_tree().open_file_reader(conn, "a.bin").await.unwrap();
@@ -3004,34 +2990,50 @@ mod tests {
         }
     }
 
+    const IDENTITY: FileIdentity = FileIdentity {
+        volume_serial: 0xBEEF,
+        index_number: 0x77,
+    };
+
+    /// The plain open is the same open as `open_file_reader_with`: one round
+    /// trip that records the name AND the version, identity included.
     #[tokio::test]
-    async fn a_reader_records_the_name_the_server_opened_in_the_open_round_trip() {
+    async fn a_reader_records_its_name_and_version_in_the_open_round_trip() {
         let mock = Arc::new(MockTransport::new());
-        mock.queue_response(build_compound_response_frame(&[
+        mock.queue_response(build_reader_open_response(
             build_create_response(test_file_id(), 5),
-            build_query_info_response(file_all_information("\\Docs\\Report.txt")),
-            build_query_info_response(file_name_information("Docs\\Report.txt")),
-        ]));
+            Some(IDENTITY),
+            Some("\\Docs\\Report.txt"),
+            Some("Docs\\Report.txt"),
+        ));
         let reader = test_tree()
             .open_file_reader(setup_connection(&mock), "DOCS/report.TXT")
             .await
             .unwrap();
         assert_eq!(reader.resolved_path(), Some("Docs/Report.txt"));
         assert_eq!(reader.size(), 5);
-        assert_eq!(mock.sent_count(), 1, "the name costs no extra round trip");
-        // Class 18 before 48, so a server cascading a refused 18 can't take
-        // 48 down with it.
-        assert_eq!(sent_query_classes(&mock, 0), vec![18, 48]);
+        assert_eq!(reader.version().size, 5);
+        assert_eq!(reader.version().identity, Some(IDENTITY));
+        assert_eq!(
+            mock.sent_count(),
+            1,
+            "the name and version cost no extra round trip"
+        );
+        // Identity first, then class 18 before 48, so a server cascading a
+        // refused 18 can't take 48 down with it, and 48 (the likeliest to be
+        // refused) can take nothing down (AGENTS.md pitfall 31).
+        assert_eq!(sent_query_classes(&mock, 0), vec![6, 1, 18, 48]);
     }
 
     #[tokio::test]
     async fn a_reader_falls_back_to_file_all_information() {
         let mock = Arc::new(MockTransport::new());
-        mock.queue_response(build_compound_response_frame(&[
+        mock.queue_response(build_reader_open_response(
             build_create_response(test_file_id(), 5),
-            build_query_info_response(file_all_information("\\Docs\\Report.txt")),
-            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-        ]));
+            None,
+            Some("\\Docs\\Report.txt"),
+            None,
+        ));
         let reader = test_tree()
             .open_file_reader(setup_connection(&mock), "docs/report.txt")
             .await
@@ -3054,11 +3056,7 @@ mod tests {
     #[tokio::test]
     async fn a_reader_that_cannot_open_reports_the_create_error() {
         let mock = Arc::new(MockTransport::new());
-        mock.queue_response(build_compound_response_frame(&[
-            build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-            build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-        ]));
+        mock.queue_response(build_reader_open_refused(NtStatus::OBJECT_NAME_NOT_FOUND));
         let err = test_tree()
             .open_file_reader(setup_connection(&mock), "missing.txt")
             .await

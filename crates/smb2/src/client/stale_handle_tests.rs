@@ -17,7 +17,7 @@ use crate::client::stream::FileUpload;
 use crate::client::test_helpers::{
     build_close_response, build_compound_response_frame, build_create_response,
     build_file_both_dir_info, build_flush_response, build_query_directory_response,
-    build_query_info_error_response, build_read_response, build_write_response, setup_connection,
+    build_read_response, build_write_response, setup_connection,
 };
 use crate::client::tree::Tree;
 use crate::error::{Error, Result};
@@ -42,14 +42,15 @@ const FILE: FileId = FileId {
     volatile: 0xBB,
 };
 
-/// What a reader's open gets back: CREATE, then class 18 and class 48, both
-/// refused.
+/// What a reader's open gets back: CREATE, then the identity and name
+/// queries, all refused.
 fn reader_opened(end_of_file: u64) -> Vec<u8> {
-    build_compound_response_frame(&[
+    crate::client::test_helpers::build_reader_open_response(
         build_create_response(FILE, end_of_file),
-        build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-        build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-    ])
+        None,
+        None,
+        None,
+    )
 }
 
 /// What a writer's open gets back: CREATE, then refused identity and class

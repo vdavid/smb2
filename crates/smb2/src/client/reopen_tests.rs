@@ -12,9 +12,9 @@ use crate::client::durable::FileIdentity;
 use crate::client::reopen::{open_file_reader_with, reopen_file_reader, ReaderOptions};
 use crate::client::stream::FileReader;
 use crate::client::test_helpers::{
-    build_close_response, build_compound_response_frame, build_create_error_response,
-    build_query_info_error_response, build_query_info_response, build_read_response,
-    setup_connection,
+    build_close_response, build_compound_response_frame, build_query_info_error_response,
+    build_query_info_response, build_read_response, build_reader_open_refused,
+    build_reader_open_response, setup_connection,
 };
 use crate::client::tree::Tree;
 use crate::error::{Error, ErrorKind, FileChange};
@@ -96,13 +96,15 @@ fn granted() -> CreateContext {
     CreateContext::new(create_context::NAME_DH2Q, body)
 }
 
-/// CREATE + the two identity `QUERY_INFO`s, the compound every open and
-/// reclaim here sends.
-fn answer(file_id: FileId, seen: Seen, contexts: &[CreateContext]) -> Vec<u8> {
+/// The name the server stores [`PATH`] under, in its own casing.
+const STORED: &str = "Films/Big.mkv";
+
+/// The CREATE's own answer.
+fn created(file_id: FileId, seen: Seen, contexts: &[CreateContext]) -> Vec<u8> {
     let mut h = Header::new_request(Command::Create);
     h.flags.set_response();
     h.credits = 32;
-    let create = pack_message(
+    pack_message(
         &h,
         &CreateResponse {
             oplock_level: OplockLevel::Batch,
@@ -118,7 +120,23 @@ fn answer(file_id: FileId, seen: Seen, contexts: &[CreateContext]) -> Vec<u8> {
             file_id,
             create_contexts: create_context::pack_contexts(contexts),
         },
-    );
+    )
+}
+
+/// CREATE + identity + class 18 + class 48, the compound every reader open
+/// and every read handle's reclaim sends. The server names the file
+/// [`STORED`].
+fn answer(file_id: FileId, seen: Seen, contexts: &[CreateContext]) -> Vec<u8> {
+    build_reader_open_response(
+        created(file_id, seen, contexts),
+        seen.identity,
+        None,
+        Some(&STORED.replace('/', "\\")),
+    )
+}
+
+/// CREATE + identity alone, what a WRITE handle's open and reclaim send.
+fn write_answer(file_id: FileId, seen: Seen, contexts: &[CreateContext]) -> Vec<u8> {
     let (index, volume) = match seen.identity {
         Some(id) => {
             let mut volume = vec![0u8; 8];
@@ -134,7 +152,7 @@ fn answer(file_id: FileId, seen: Seen, contexts: &[CreateContext]) -> Vec<u8> {
             build_query_info_error_response(NtStatus::NOT_SUPPORTED),
         ),
     };
-    build_compound_response_frame(&[create, index, volume])
+    build_compound_response_frame(&[created(file_id, seen, contexts), index, volume])
 }
 
 /// The CREATE the client sent as request `n`.
@@ -144,6 +162,25 @@ fn sent_create(mock: &MockTransport, n: usize) -> CreateRequest {
     let header = Header::unpack(&mut cursor).unwrap();
     assert_eq!(header.command, Command::Create, "request {n}");
     CreateRequest::unpack(&mut cursor).unwrap()
+}
+
+/// The `QUERY_INFO` classes compounded into request `n`, in order.
+fn sent_query_classes(mock: &MockTransport, n: usize) -> Vec<u8> {
+    let sent = mock.sent_message(n).unwrap();
+    let mut classes = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let mut cursor = ReadCursor::new(&sent[offset..]);
+        let header = Header::unpack(&mut cursor).unwrap();
+        if header.command == Command::QueryInfo {
+            let req = crate::msg::query_info::QueryInfoRequest::unpack(&mut cursor).unwrap();
+            classes.push(req.file_info_class);
+        }
+        if header.next_command == 0 {
+            return classes;
+        }
+        offset += header.next_command as usize;
+    }
 }
 
 fn sent_command(mock: &MockTransport, n: usize) -> Command {
@@ -218,7 +255,29 @@ async fn a_plain_reader_asks_for_read_access_only_and_records_its_version() {
     assert_eq!(version.size, SIZE);
     assert_eq!(version.modified, WRITTEN);
     assert_eq!(version.identity, Some(OURS));
+    assert_eq!(reader.resolved_path(), Some(STORED));
     assert!(reader.durable_handle().is_none());
+}
+
+/// `open_file_reader` is the default-options case of the same open, so it
+/// records exactly what `open_file_reader_with` does.
+#[tokio::test]
+async fn the_plain_open_is_the_default_options_open() {
+    let mock = Arc::new(MockTransport::new());
+    let conn = smb3(&mock);
+    mock.queue_response(answer(file(1), UNCHANGED, &[]));
+    mock.queue_response(answer(file(1), UNCHANGED, &[]));
+
+    let plain = crate::client::stream::open_file_reader(share(), conn.clone(), PATH)
+        .await
+        .unwrap();
+    let with = open(&conn, ReaderOptions::new()).await;
+
+    assert_eq!(sent_create(&mock, 0), sent_create(&mock, 1));
+    assert_eq!(sent_query_classes(&mock, 0), vec![6, 1, 18, 48]);
+    assert_eq!(sent_query_classes(&mock, 1), vec![6, 1, 18, 48]);
+    assert_eq!(plain.version(), with.version());
+    assert_eq!(plain.resolved_path(), with.resolved_path());
 }
 
 #[tokio::test]
@@ -236,9 +295,16 @@ async fn a_durable_reader_asks_for_a_durable_handle_with_read_access_only() {
         "without a batch oplock the server ignores the durable request"
     );
     assert!(create_context::find(&contexts(&req), create_context::NAME_DH2Q).is_some());
+    assert_eq!(
+        sent_query_classes(&mock, 0),
+        vec![6, 1, 18, 48],
+        "the durable open is the same compound as a plain one"
+    );
     let handle = reader.durable_handle().unwrap();
     assert!(handle.is_read_only());
     assert_eq!(handle.identity(), OURS);
+    assert_eq!(reader.version().identity, Some(OURS));
+    assert_eq!(reader.resolved_path(), Some(STORED));
 }
 
 /// A server that won't identify the file still gives a working reader; its
@@ -292,6 +358,12 @@ async fn a_reopen_reclaims_the_durable_handle_with_read_access_only() {
     assert_eq!(reader.version(), previous.version());
     assert!(reader.is_current());
     assert!(reader.durable_handle().unwrap().is_read_only());
+    assert_eq!(
+        reader.resolved_path(),
+        Some(STORED),
+        "the reclaim asks the name too, so the reader keeps one"
+    );
+    assert_eq!(sent_query_classes(&mock, 1), vec![6, 1, 18, 48]);
 
     // And it reads through the reclaimed handle, not the dead one.
     mock.queue_response(build_read_response(vec![7; 16]));
@@ -343,11 +415,7 @@ async fn a_lost_durable_handle_falls_back_to_reopening_the_path() {
     let previous = open_durable(&mock, &conn).await;
     reconnect(&mut conn);
 
-    mock.queue_response(build_compound_response_frame(&[
-        build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-        build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-        build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-    ]));
+    mock.queue_response(build_reader_open_refused(NtStatus::OBJECT_NAME_NOT_FOUND));
     mock.queue_response(answer(file(3), UNCHANGED, &[granted()]));
     let reader = reopen(&conn, &previous)
         .await
@@ -462,11 +530,7 @@ async fn a_file_that_is_gone_reports_not_found() {
     let previous = open(&conn, ReaderOptions::new()).await;
     reconnect(&mut conn);
 
-    mock.queue_response(build_compound_response_frame(&[
-        build_create_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-        build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-        build_query_info_error_response(NtStatus::OBJECT_NAME_NOT_FOUND),
-    ]));
+    mock.queue_response(build_reader_open_refused(NtStatus::OBJECT_NAME_NOT_FOUND));
     let err = reopen(&conn, &previous).await.err().unwrap();
 
     assert_eq!(err.kind(), ErrorKind::NotFound, "{err}");
@@ -491,7 +555,7 @@ fn a_changed_file_is_its_own_kind_and_not_retryable() {
 async fn a_write_handle_is_still_reclaimed_with_write_access() {
     let mock = Arc::new(MockTransport::new());
     let mut conn = smb3(&mock);
-    mock.queue_response(answer(file(1), UNCHANGED, &[granted()]));
+    mock.queue_response(write_answer(file(1), UNCHANGED, &[granted()]));
     let durable = share()
         .open_file_durable(&mut conn, PATH)
         .await
@@ -501,7 +565,7 @@ async fn a_write_handle_is_still_reclaimed_with_write_access() {
     assert!(!durable.is_read_only());
     reconnect(&mut conn);
 
-    mock.queue_response(answer(file(2), UNCHANGED, &[]));
+    mock.queue_response(write_answer(file(2), UNCHANGED, &[]));
     share()
         .reclaim_durable_handle(&mut conn, &durable, PATH)
         .await

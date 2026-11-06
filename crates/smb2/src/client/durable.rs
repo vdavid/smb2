@@ -86,6 +86,7 @@ use crate::types::flags::{FileAccessMask, FileAttributes};
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, Dialect, FileId, OplockLevel};
 
+use super::resolve::OpenFor;
 use super::tree::Tree;
 
 /// `FILE_NON_DIRECTORY_FILE` (MS-SMB2 § 2.2.13).
@@ -191,12 +192,16 @@ impl FileIdentity {
     }
 }
 
-/// A write handle the server has promised to keep alive across a disconnect,
-/// plus everything needed to prove a reclaimed one is the same file.
+/// A handle the server has promised to keep alive across a disconnect, plus
+/// everything needed to prove a reclaimed one is the same file.
 ///
-/// Obtained from [`Tree::open_file_durable`] and spent by
-/// [`Tree::reclaim_durable_handle`]. Cheap to copy and safe to hold across a
-/// reconnect — that is its whole job — but ❌ never construct one by hand or
+/// Obtained from [`Tree::open_file_durable`] (a write handle) or a durable
+/// [`FileReader`](crate::FileReader) (a read handle, see
+/// [`is_read_only`](Self::is_read_only)), and spent by
+/// [`Tree::reclaim_durable_handle`] or
+/// [`reopen_file_reader`](crate::client::stream::reopen_file_reader). Cheap
+/// to copy and safe to hold across a reconnect — that is its whole job — but
+/// ❌ never construct one by hand or
 /// copy the `create_guid` between files: it is the token the server matches
 /// on, and reusing it is how a reclaim finds the wrong open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +261,53 @@ pub struct DurableOpen {
     pub durable: Option<DurableHandle>,
 }
 
+/// What [`Tree::reclaim`] got back.
+pub(super) struct Reclaimed {
+    /// The reclaim CREATE's answer: the file's length and times now.
+    pub(super) created: CreateResponse,
+    /// The handle, valid on the current session.
+    pub(super) handle: DurableHandle,
+    /// The name the server stores the file under, for a read handle whose
+    /// server said.
+    pub(super) name: Option<String>,
+}
+
+/// The `CreateGuid` a CREATE asked for durability with, which the server
+/// will match a reclaim against. Only [`ask_for_durability`] makes one.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AskedDurability(Guid);
+
+/// Dress `create_req` for a durable open: on SMB 3.x, the batch oplock and
+/// the `DH2Q` context with a fresh `CreateGuid`. `None`, and `create_req`
+/// untouched, below 3.0: those servers have only the v1 contexts, whose
+/// reclaim this crate refuses to perform, so asking would buy a batch oplock
+/// and its costs for nothing.
+///
+/// Every durable open goes through this, writer and reader alike, followed
+/// by [`Tree::durability_granted`] on the answer.
+pub(super) fn ask_for_durability(
+    conn: &Connection,
+    create_req: &mut CreateRequest,
+) -> Option<AskedDurability> {
+    if !conn.params().is_some_and(|p| p.dialect >= Dialect::Smb3_0) {
+        return None;
+    }
+    let create_guid = crate::client::connection::random_guid();
+    // The price of durability: without a batch oplock (or a handle-caching
+    // lease) the server ignores the DH2Q context entirely (MS-SMB2
+    // § 3.3.5.9.10).
+    create_req.requested_oplock_level = OplockLevel::Batch;
+    create_req.create_contexts = create_context::pack_contexts(&[DurableRequestV2 {
+        // The server knows its own resource limits and clamps whatever we ask
+        // for, so naming a window only invites a smaller one.
+        timeout_ms: 0,
+        persistent: false,
+        create_guid,
+    }
+    .context()]);
+    Some(AskedDurability(create_guid))
+}
+
 impl Tree {
     /// Open (or create) a file for writing, asking for a handle that survives
     /// a disconnect.
@@ -275,7 +327,7 @@ impl Tree {
         path: &str,
     ) -> Result<DurableOpen> {
         let conn = &mut self.pinned_conn(conn);
-        let create_req = CreateRequest {
+        let mut create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
             desired_access: FileAccessMask::new(
@@ -292,7 +344,23 @@ impl Tree {
             name: self.format_path(path),
             create_contexts: Vec::new(),
         };
-        let (resp, _, durable) = self.open_durably(conn, create_req, path, false).await?;
+        let asked = ask_for_durability(conn, &mut create_req);
+        let (create, identity) = self.create_and_identify(conn, &create_req).await?;
+        let resp = CreateResponse::unpack(&mut ReadCursor::new(&create.body))?;
+        let durable = match asked {
+            Some(asked) => {
+                match self.durability_granted(conn, &resp, identity, asked, path, false) {
+                    Ok(durable) => durable,
+                    Err(e) => {
+                        // The open happened; an answer we can't parse must not
+                        // leave it holding the file.
+                        let _ = self.close_handle(conn, resp.file_id).await;
+                        return Err(e);
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(DurableOpen {
             file_id: resp.file_id,
             size: resp.end_of_file,
@@ -300,44 +368,23 @@ impl Tree {
         })
     }
 
-    /// The CREATE behind every durable open: `create_req` plus, on SMB 3.x,
-    /// the batch oplock and the `DH2Q` context, with the file's identity asked
-    /// in the same compound. Hands back the CREATE's answer, the identity, and
-    /// the durable handle when the server granted one AND identified the file.
+    /// What the server said to a CREATE that [`ask_for_durability`] dressed:
+    /// the durable handle when it granted one AND the file was identified,
+    /// with its oplock registered so breaks get answered. `None` otherwise,
+    /// which is never an error.
     ///
     /// `read_only` is recorded on the handle, so its reclaim asks for the same
-    /// access `create_req` did.
-    pub(super) async fn open_durably(
+    /// access the open did.
+    pub(super) fn durability_granted(
         &self,
-        conn: &mut Connection,
-        mut create_req: CreateRequest,
+        conn: &Connection,
+        resp: &CreateResponse,
+        identity: Option<FileIdentity>,
+        asked: AskedDurability,
         path: &str,
         read_only: bool,
-    ) -> Result<(CreateResponse, Option<FileIdentity>, Option<DurableHandle>)> {
-        let conn = &mut self.pinned_conn(conn);
-        let create_guid = crate::client::connection::random_guid();
-        // A server below SMB 3.0 has only the v1 contexts, whose reclaim this
-        // crate refuses to perform. Asking anyway would buy a batch oplock and
-        // its costs in exchange for nothing.
-        let durable_possible = conn.params().is_some_and(|p| p.dialect >= Dialect::Smb3_0);
-
-        if durable_possible {
-            // The price of durability: without a batch oplock (or a
-            // handle-caching lease) the server ignores the DH2Q context
-            // entirely (MS-SMB2 § 3.3.5.9.10).
-            create_req.requested_oplock_level = OplockLevel::Batch;
-            create_req.create_contexts = create_context::pack_contexts(&[DurableRequestV2 {
-                // The server knows its own resource limits and clamps whatever
-                // we ask for, so naming a window only invites a smaller one.
-                timeout_ms: 0,
-                persistent: false,
-                create_guid,
-            }
-            .context()]);
-        }
-
-        let (create, identity) = self.create_and_identify(conn, &create_req).await?;
-        let resp = CreateResponse::unpack(&mut ReadCursor::new(&create.body))?;
+    ) -> Result<Option<DurableHandle>> {
+        let AskedDurability(create_guid) = asked;
         let answered = create_context::parse_contexts(&resp.create_contexts)?;
         let grant = create_context::find(&answered, create_context::NAME_DH2Q)
             .map(|c| DurableGrant::from_bytes(&c.data))
@@ -387,7 +434,7 @@ impl Tree {
                 None
             }
         };
-        Ok((resp, identity, durable))
+        Ok(durable)
     }
 
     /// Claim a durable open back after a reconnect, or fail rather than guess.
@@ -413,18 +460,19 @@ impl Tree {
     ) -> Result<DurableHandle> {
         self.reclaim(conn, handle, path)
             .await
-            .map(|(_, reclaimed)| reclaimed)
+            .map(|reclaimed| reclaimed.handle)
     }
 
     /// [`reclaim_durable_handle`](Self::reclaim_durable_handle), also handing
-    /// back the CREATE's answer: the file's length and times now, which a
-    /// reader checks against the version it was reading.
+    /// back the CREATE's answer (the file's length and times now, which a
+    /// reader checks against the version it was reading) and, for a read
+    /// handle, the name the server stores the file under.
     pub(super) async fn reclaim(
         &self,
         conn: &mut Connection,
         handle: &DurableHandle,
         path: &str,
-    ) -> Result<(CreateResponse, DurableHandle)> {
+    ) -> Result<Reclaimed> {
         let conn = &mut self.pinned_conn(conn);
         let lost = |reason| Error::DurableHandleLost {
             path: path.to_string(),
@@ -476,8 +524,24 @@ impl Tree {
             }
             .context()]),
         };
-        let (create, identity) = match self.create_and_identify(conn, &create_req).await {
-            Ok(pair) => pair,
+        // A read handle reclaims through the reader's own open, so the reader
+        // it goes back into keeps its `resolved_path`; a write handle through
+        // the plain identity compound it was opened with.
+        let opened = if handle.read_only {
+            self.open_and_name(conn, path, &create_req, OpenFor::Reading)
+                .await
+                .map(|o| (o.created, o.identity, o.name))
+        } else {
+            match self.create_and_identify(conn, &create_req).await {
+                Ok((create, identity)) => {
+                    CreateResponse::unpack(&mut ReadCursor::new(&create.body))
+                        .map(|resp| (resp, identity, None))
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let (resp, identity, name) = match opened {
+            Ok(opened) => opened,
             Err(Error::Protocol { status, .. }) => {
                 debug!(
                     "durable: the server would not give the handle back ({status}); the \
@@ -487,7 +551,6 @@ impl Tree {
             }
             Err(e) => return Err(e),
         };
-        let resp = CreateResponse::unpack(&mut ReadCursor::new(&create.body))?;
 
         let Some(identity) = identity else {
             // It answered the reclaim but not the question. We hold a handle we
@@ -529,7 +592,11 @@ impl Tree {
             generation: conn.generation(),
             ..*handle
         };
-        Ok((resp, reclaimed))
+        Ok(Reclaimed {
+            created: resp,
+            handle: reclaimed,
+            name,
+        })
     }
 
     /// One round trip: open the file and ask which file it is.
@@ -756,6 +823,25 @@ mod tests {
         assert!(
             create_context::find(&sent_contexts(&mock, 0), create_context::NAME_DH2Q).is_some()
         );
+    }
+
+    /// The open has happened by the time its durable answer is read, so an
+    /// answer that doesn't parse must not leave the handle holding the file.
+    #[tokio::test]
+    async fn an_unparseable_durable_answer_closes_the_handle_it_came_with() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        smb3(&mut conn);
+        let truncated = CreateContext::new(create_context::NAME_DH2Q, vec![0, 0]);
+        mock.queue_response(answer(a_file_id(1), &[truncated], Some(OURS)));
+        mock.queue_response(build_close_response());
+
+        let outcome = a_share().open_file_durable(&mut conn, "big.iso").await;
+
+        assert!(outcome.is_err(), "a grant we can't read is an error");
+        let sent = mock.sent_message(1).expect("a second request");
+        let header = crate::msg::header::Header::unpack(&mut ReadCursor::new(&sent)).unwrap();
+        assert_eq!(header.command, Command::Close);
     }
 
     /// A server that will not do durable handles is normal, not an error. The

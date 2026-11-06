@@ -21,7 +21,7 @@ pub mod durable;
 mod fault_injection_tests;
 pub mod pipeline;
 pub mod read_ahead;
-pub mod reopen;
+pub(crate) mod reopen;
 #[cfg(test)]
 mod reopen_tests;
 pub mod resolve;
@@ -3541,8 +3541,8 @@ mod tests {
             match self {
                 // CREATE + WRITE + FLUSH (the CLOSE follows on its own).
                 LinkCall::UploadSmall => 3,
-                // CREATE + QUERY_INFO (class 18) + QUERY_INFO (class 48).
-                LinkCall::OpenFileReader => 3,
+                // CREATE + QUERY_INFO (index, volume, class 18, class 48).
+                LinkCall::OpenFileReader => 5,
                 // CREATE + QUERY_INFO (index, volume, class 48).
                 LinkCall::CreateFileWriter
                 | LinkCall::CreateFileWriterExclusive
