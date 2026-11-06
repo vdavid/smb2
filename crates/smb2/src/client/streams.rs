@@ -1510,26 +1510,45 @@ mod tests {
     #[tokio::test]
     async fn a_download_lists_the_streams_with_its_open() {
         let (mock, mut conn, tree) = connected().await;
-        mock.queue_response(build_compound_response_frame(&[
-            build_create_response(FILE, 0),
-            build_query_info_response(stream_entry(":AFP_AfpInfo:$DATA", 60, 0)),
-        ]));
+        mock.queue_response(
+            crate::client::test_helpers::build_download_open_with_listing(
+                build_create_response(FILE, 0),
+                None,
+                build_query_info_response(stream_entry(":AFP_AfpInfo:$DATA", 60, 0)),
+            ),
+        );
         let download = tree
             .download_with_streams(&mut conn, "f.txt")
             .await
             .unwrap();
         assert_eq!(download.streams().unwrap()[0].name, "AFP_AfpInfo");
-        assert_eq!(sent(&mock, 1).0, [Command::Create, Command::QueryInfo]);
-        assert_eq!(query_class(&mock, 1), FILE_STREAM_INFORMATION);
+        // The reader open's compound (identity, class 18, class 48), with
+        // the listing before class 48 (`download_resume_tests.rs` pins the
+        // classes). One frame, no CLOSE: the download keeps the handle.
+        assert_eq!(
+            sent(&mock, 1).0,
+            [
+                Command::Create,
+                Command::QueryInfo,
+                Command::QueryInfo,
+                Command::QueryInfo
+            ]
+            .into_iter()
+            .chain([Command::QueryInfo; 2])
+            .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
     async fn a_download_whose_listing_is_refused_opens_all_the_same() {
         let (mock, mut conn, tree) = connected().await;
-        mock.queue_response(build_compound_response_frame(&[
-            build_create_response(FILE, 0),
-            build_query_info_error_response(NtStatus::INVALID_PARAMETER),
-        ]));
+        mock.queue_response(
+            crate::client::test_helpers::build_download_open_with_listing(
+                build_create_response(FILE, 0),
+                None,
+                build_query_info_error_response(NtStatus::INVALID_PARAMETER),
+            ),
+        );
         let download = tree
             .download_with_streams(&mut conn, "f.txt")
             .await

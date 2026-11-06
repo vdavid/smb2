@@ -128,6 +128,8 @@ pub(super) struct NamedOpen {
     /// Which file it is, when the server said (see [`OpenFor`] for how much
     /// of an answer each kind keeps).
     pub(super) identity: Option<FileIdentity>,
+    /// The file's named streams, when the open asked and the server answered.
+    pub(super) streams: Option<Vec<super::streams::StreamInfo>>,
 }
 
 /// A `QUERY_INFO` for a name-carrying class, compounded onto a CREATE.
@@ -345,23 +347,28 @@ impl Tree {
     /// I/O that follows.
     ///
     /// The order is CREATE, the two identity queries, class 18 (readers
-    /// only), then class 48. Identity comes first because a reader's version
-    /// check and a durable reclaim both stand on it; class 48 goes last
-    /// because it's the query most likely to be refused, and a server that
-    /// cascades failures (MS-SMB2 § 3.3.5.2.7.2) would otherwise take
-    /// everything after it down too. No query can fail the open: a server
-    /// that answers none of them gives `None` for each.
+    /// only), the stream list (when `list_streams`, readers only), then class
+    /// 48. Identity comes first because a reader's version check and a
+    /// durable reclaim both stand on it; class 48 goes last because it's the
+    /// query most likely to be refused, and a server that cascades failures
+    /// (MS-SMB2 § 3.3.5.2.7.2) would otherwise take everything after it down
+    /// too. The stream list sits just before it, so a refused listing can
+    /// only cascade into class 48, whose fallback (class 18) is already
+    /// answered. No query can fail the open: a server that answers none of
+    /// them gives `None` for each.
     pub(super) async fn open_and_name(
         &self,
         conn: &mut Connection,
         path: &str,
         create_req: &CreateRequest,
         handle: OpenFor,
+        list_streams: bool,
     ) -> Result<NamedOpen> {
         let conn = &mut self.pinned_conn(conn);
         let index_req = FileIdentity::index_query();
         let volume_req = FileIdentity::volume_query();
         let all_req = name_query(conn, FILE_ALL_INFORMATION);
+        let streams_req = super::streams::stream_list_request(super::streams::STREAM_LIST_BUFFER);
         let normalized_req = name_query(conn, FILE_NORMALIZED_NAME_INFORMATION);
         let op = |command, body| CompoundOp {
             command,
@@ -369,13 +376,18 @@ impl Tree {
             tree_id: Some(self.tree_id),
             credit_charge: CreditCharge(1),
         };
+        let reading = handle == OpenFor::Reading;
+        let list_streams = list_streams && reading;
         let mut ops = vec![
             op(Command::Create, create_req),
             op(Command::QueryInfo, &index_req),
             op(Command::QueryInfo, &volume_req),
         ];
-        if handle == OpenFor::Reading {
+        if reading {
             ops.push(op(Command::QueryInfo, &all_req));
+        }
+        if list_streams {
+            ops.push(op(Command::QueryInfo, &streams_req));
         }
         ops.push(op(Command::QueryInfo, &normalized_req));
 
@@ -393,12 +405,16 @@ impl Tree {
             OpenFor::Reading => (Some(&frames[3]), identity),
             OpenFor::Writing => (None, identity.filter(FileIdentity::is_proof)),
         };
+        let streams = list_streams
+            .then(|| super::streams::stream_list_answer(&frames[4], path))
+            .flatten();
         let name = resolved_name(&crate::name::encode_path(path), all, frames.last());
         trace!("tree: opened path={path:?} name={name:?} identity={identity:?}");
         Ok(NamedOpen {
             created,
             name,
             identity,
+            streams,
         })
     }
 

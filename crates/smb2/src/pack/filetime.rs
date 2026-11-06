@@ -14,6 +14,11 @@ const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
 
 /// Windows FILETIME: 100-nanosecond intervals since 1601-01-01 00:00:00 UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
 pub struct FileTime(
     /// The raw 100-nanosecond tick count.
     pub u64,

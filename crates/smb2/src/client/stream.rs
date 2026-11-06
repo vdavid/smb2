@@ -23,9 +23,10 @@ use crate::client::durable::{DurableHandle, FileIdentity};
 use crate::client::read_ahead::{Dispatch, Outstanding, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
 pub use crate::client::reopen::{
-    open_file_reader_with, reopen_file_reader, FileVersion, ReaderOptions,
+    open_file_reader_with, reopen_file_reader, resume_file_download, DownloadCheckpoint,
+    FileVersion, ReaderOptions,
 };
-use crate::client::resolve::OpenFor;
+use crate::client::resolve::{NamedOpen, OpenFor};
 use crate::client::times::FileTimes;
 use crate::client::tree::{close_outcome, file_info_from_create, FileInfo, Tree};
 pub use crate::client::write_behind::{WriteBehind, UPLOAD_CHUNK_SIZE};
@@ -151,6 +152,16 @@ pub struct FileDownload<'a> {
     /// Why the CLOSE couldn't be sent, held for the `None` call so the last
     /// chunk, whose data is good, is still handed out.
     close_failed: Option<Error>,
+    /// Why the download stopped right after taking a chunk off the wire,
+    /// held for the next call so that chunk, whose data is good, is still
+    /// handed out (and counted, which a checkpoint relies on).
+    failed: Option<Error>,
+    /// Which version of the file this download reads, and the path it was
+    /// opened at: what a [`DownloadCheckpoint`] carries. `None` for
+    /// [`FileDownload::new`] around a caller's own handle.
+    version: Option<(FileVersion, String)>,
+    /// Where in the file this download started: 0, or a resume's offset.
+    start: u64,
 }
 
 /// One requested READ of a [`FileDownload`].
@@ -200,31 +211,47 @@ impl<'a> FileDownload<'a> {
         )
     }
 
-    /// A download of a file [`Tree::open_file`] just opened, reading
+    /// A download of what a reader open (`open_and_name`, `OpenFor::Reading`)
+    /// just opened at `path`, reading
     /// [`DOWNLOAD_CHUNK_SIZE`](crate::DOWNLOAD_CHUNK_SIZE) at a time (or
-    /// `MaxReadSize`, if that's smaller).
+    /// `MaxReadSize`, if that's smaller), and recording the file's version.
     ///
     /// `conn` is the clone the file was opened on, pinned before the CREATE.
-    pub(crate) fn of_open_file(
-        tree: Cow<'a, Tree>,
-        conn: Connection,
-        file_id: FileId,
-        info: FileInfo,
-    ) -> Self {
+    fn opened(tree: Cow<'a, Tree>, conn: Connection, opened: NamedOpen, path: &str) -> Self {
         let max_read = conn.params().map_or(65536, |p| p.max_read_size);
         let chunk_size = crate::DOWNLOAD_CHUNK_SIZE.min(max_read);
+        let info = file_info_from_create(&opened.created);
+        let file_id = opened.created.file_id;
         let mut download = Self::with_tree(tree, conn, file_id, info.size, chunk_size);
+        let version = FileVersion::at_open(&info, opened.identity);
+        download.version = Some((version, path.to_string()));
         download.info = Some(info);
+        download.streams = opened.streams;
         download
     }
 
-    /// The listing a [`Tree::download_with_streams`] open got back.
-    pub(crate) fn with_streams(
-        mut self,
-        streams: Option<Vec<crate::client::streams::StreamInfo>>,
-    ) -> Self {
-        self.streams = streams;
-        self
+    /// Carry on from `offset`, keeping `version` (the one the first download
+    /// opened, which a resume has just checked the file still is). Nothing
+    /// has been sent yet, so the first READ goes out at `offset`.
+    pub(crate) fn resume_from(&mut self, offset: u64, version: FileVersion) {
+        self.start = offset;
+        self.next_offset = offset;
+        if let Some((recorded, _)) = &mut self.version {
+            *recorded = version;
+        }
+    }
+
+    /// The version this download read at open, if it recorded one.
+    pub(crate) fn version(&self) -> Option<FileVersion> {
+        self.version.as_ref().map(|(version, _)| *version)
+    }
+
+    /// Record the path as the caller gave it, for an opener that followed a
+    /// DFS link and opened a different path on the link's target.
+    pub(crate) fn set_opened_path(&mut self, path: &str) {
+        if let Some((_, recorded)) = &mut self.version {
+            *recorded = path.to_string();
+        }
     }
 
     fn with_tree(
@@ -256,6 +283,9 @@ impl<'a> FileDownload<'a> {
             close_started: false,
             closing: None,
             close_failed: None,
+            failed: None,
+            version: None,
+            start: 0,
         }
     }
 
@@ -331,19 +361,49 @@ impl<'a> FileDownload<'a> {
         self.streams.as_deref()
     }
 
-    /// Bytes received so far.
+    /// Bytes this download has received so far. A resumed download counts
+    /// from its checkpoint, so this is what it read, not where it is in the
+    /// file ([`progress`](Self::progress) says that).
     #[must_use]
     pub fn bytes_received(&self) -> u64 {
         self.bytes_received
     }
 
-    /// Current transfer progress.
+    /// Current transfer progress through the whole file: a resumed download
+    /// counts the bytes before its checkpoint as transferred, so the fraction
+    /// is of the file, not of what was left.
     #[must_use]
     pub fn progress(&self) -> Progress {
         Progress {
-            bytes_transferred: self.bytes_received,
+            bytes_transferred: self.start + self.bytes_received,
             total_bytes: Some(self.file_size),
         }
+    }
+
+    /// Where this download can carry on from after a dropped connection: the
+    /// path, how many bytes of the file have been handed to you, and which
+    /// version of the file they came from. Hand it to
+    /// [`SmbClient::resume_download`](crate::SmbClient::resume_download) (or
+    /// [`Tree::resume_download`], or [`resume_file_download`]) to read the
+    /// rest, which is refused if the file changed meanwhile.
+    ///
+    /// Counts only bytes [`next_chunk`](Self::next_chunk) has returned: none
+    /// still on the wire, and none that arrived but weren't handed out yet.
+    /// So keeping every chunk you got and resuming from here leaves no gap
+    /// and no overlap. Call it any time, including after an error; it's a
+    /// plain read.
+    ///
+    /// `None` for a download built with [`FileDownload::new`] around a handle
+    /// you opened, since nothing recorded which version that handle reads.
+    #[must_use]
+    pub fn checkpoint(&self) -> Option<DownloadCheckpoint> {
+        let (version, path) = self.version.as_ref()?;
+        let held = self.ready.as_ref().map_or(0, |chunk| chunk.len() as u64);
+        Some(DownloadCheckpoint {
+            path: path.clone(),
+            offset: self.start + self.bytes_received - held,
+            version: *version,
+        })
     }
 
     /// Get the next chunk of data from the server.
@@ -352,7 +412,9 @@ impl<'a> FileDownload<'a> {
     /// order and are at most the chunk size; a short read from the server
     /// shows up as a shorter chunk. After an error, the download is over:
     /// every later call returns `None`, and the handle is left open (the
-    /// connection may be what failed).
+    /// connection may be what failed). A chunk that had already arrived when
+    /// the download failed is handed out first, and the error comes on the
+    /// call after it; [`checkpoint`](Self::checkpoint) says where to resume.
     ///
     /// The CLOSE goes out as the last chunk lands, and the last chunk is handed
     /// out without waiting for its answer. The call after the last chunk
@@ -365,6 +427,9 @@ impl<'a> FileDownload<'a> {
     /// lost and the next call continues the download.
     pub async fn next_chunk(&mut self) -> Option<Result<Vec<u8>>> {
         if self.ready.is_none() {
+            if let Some(e) = self.failed.take() {
+                return Some(Err(e));
+            }
             if self.closing.is_some() || self.close_failed.is_some() {
                 return self.finish_close().await.err().map(Err);
             }
@@ -385,8 +450,9 @@ impl<'a> FileDownload<'a> {
                 self.close_failed = Some(e);
             }
         } else if let Err(e) = self.send_reads().await {
-            self.ready = None;
-            return Some(Err(self.fail(e)));
+            // The chunk in hand is good, and counted: hand it out, and the
+            // error waits for the next call.
+            self.failed = Some(self.fail(e));
         }
         self.ready.take().map(Ok)
     }
@@ -589,7 +655,7 @@ impl<'a> FileDownload<'a> {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
-        let mut data = Vec::with_capacity(self.file_size as usize);
+        let mut data = Vec::with_capacity(self.remaining() as usize);
 
         while let Some(result) = self.next_chunk().await {
             let chunk = result?;
@@ -605,9 +671,10 @@ impl<'a> FileDownload<'a> {
         Ok(data)
     }
 
-    /// Consume the download and collect all data into a `Vec<u8>`.
+    /// Consume the download and collect all data into a `Vec<u8>`. A resumed
+    /// download collects what's after its checkpoint.
     pub async fn collect(mut self) -> Result<Vec<u8>> {
-        let mut data = Vec::with_capacity(self.file_size as usize);
+        let mut data = Vec::with_capacity(self.remaining() as usize);
 
         while let Some(result) = self.next_chunk().await {
             let chunk = result?;
@@ -617,8 +684,13 @@ impl<'a> FileDownload<'a> {
         Ok(data)
     }
 
+    /// Bytes from where this download started to the end of the file.
+    fn remaining(&self) -> u64 {
+        self.file_size.saturating_sub(self.start)
+    }
+
     /// Close the file handle and wait for the answer.
-    async fn close(&mut self) -> Result<()> {
+    pub(super) async fn close(&mut self) -> Result<()> {
         self.start_close().await?;
         self.finish_close().await
     }
@@ -690,6 +762,26 @@ async fn send_read(
         CreditCharge(credits::charge_for_payload(u64::from(len))),
     )
     .await
+}
+
+/// Open `path` for a [`FileDownload`]: the reader's open (read access only,
+/// `FileOpen`, the version and name asked in the same round trip), plus the
+/// stream listing when `list_streams`. Every download that opens its own file
+/// comes through here, so each can hand out a [`DownloadCheckpoint`].
+pub(crate) async fn open_download<'a>(
+    tree: Cow<'a, Tree>,
+    conn: Connection,
+    path: &str,
+    list_streams: bool,
+) -> Result<FileDownload<'a>> {
+    trace!("stream: open_download path={path:?} list_streams={list_streams}");
+    // Pinned before the CREATE, like every handle (AGENTS.md pitfall 35).
+    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
+    let request = tree.read_open_request(path);
+    let opened = tree
+        .open_and_name(&mut conn, path, &request, OpenFor::Reading, list_streams)
+        .await?;
+    Ok(FileDownload::opened(tree, conn, opened, path))
 }
 
 impl Drop for FileDownload<'_> {
@@ -802,12 +894,7 @@ impl FileReader {
             tree,
             conn,
             file_id: created.file_id,
-            version: FileVersion {
-                size: info.size,
-                modified: info.modified,
-                changed: info.changed,
-                identity,
-            },
+            version: FileVersion::at_open(&info, identity),
             info,
             max_read,
             resolved_path,
@@ -1512,6 +1599,7 @@ async fn open_writer(
             path,
             &tree.write_open_request(path, disposition),
             OpenFor::Writing,
+            false,
         )
         .await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -2901,7 +2989,9 @@ mod tests {
     async fn file_download_dropped_partway_closes_its_handle() {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
-        mock.queue_response(build_create_response(file_id, 3 * 65536));
+        mock.queue_response(crate::client::test_helpers::build_download_open(
+            build_create_response(file_id, 3 * 65536),
+        ));
         mock.queue_response(build_read_response(vec![0x11; 65536]));
         // The READ after it is already out when the download is dropped.
         mock.queue_response(build_read_response(vec![0x22; 65536]));

@@ -198,7 +198,9 @@ async fn aborting_a_writer_from_before_a_reconnect_sends_nothing() {
 #[tokio::test]
 async fn a_download_from_before_a_reconnect_does_not_read_the_new_sessions_file() {
     let mock = Arc::new(MockTransport::new());
-    mock.queue_response(build_create_response(FILE, 14));
+    mock.queue_response(crate::client::test_helpers::build_download_open(
+        build_create_response(FILE, 14),
+    ));
     let conn = setup_connection(&mock);
     let tree = test_tree();
     let mut caller = conn.clone();

@@ -82,7 +82,7 @@ tokio = ["tokio/net", "tokio/io-util", "tokio/rt", "tokio/time"]
 smol = ["dep:smol"]
 testing = []  # Enables smb2::testing module for Docker-based test servers
 fuzzing = []  # Exposes parser entry points for `fuzz/` targets; not for applications
-serde = ["dep:serde"]  # `Serialize` on `Diagnostics` types and the protocol enums they embed; `Serialize` + `Deserialize` on `WriteCheckpoint` and `FileIdentity`, so a checkpoint persists and loads back.
+serde = ["dep:serde"]  # `Serialize` on `Diagnostics` types and the protocol enums they embed; `Serialize` + `Deserialize` on `WriteCheckpoint`, `DownloadCheckpoint`, and the types inside them (`FileIdentity`, `FileVersion`, `FileTime`), so a checkpoint persists and loads back.
 # Unstable and not for applications: exposes `smb2::__bench`, which overrides the read-ahead tuning process-wide so
 # `benchmarks/read-ahead/` can compare candidates. No SemVer promise; it can change or go away in any release.
 __bench-tuning = []

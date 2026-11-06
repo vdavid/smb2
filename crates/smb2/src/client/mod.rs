@@ -15,6 +15,8 @@ mod dfs_policy;
 pub mod diagnostics;
 pub mod directory;
 #[cfg(test)]
+mod download_resume_tests;
+#[cfg(test)]
 mod download_tests;
 pub mod durable;
 #[cfg(test)]
@@ -2300,19 +2302,45 @@ impl SmbClient {
         // download sends only on the session its handle belongs to. The tree
         // comes back owned: the caller's, or the link's target when the call
         // was redirected (the caller's own tree never moves).
-        let ((file_id, info, conn, tree), _) = self
+        let (mut download, _) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
-                let mut conn = tree.pinned_conn(&conn).pinned_to_session();
-                let (file_id, info) = tree.open_for_read(&mut conn, &path).await?;
-                Ok((file_id, info, conn, tree))
+                stream::open_download(Cow::Owned(tree), conn, &path, false).await
             })
             .await?;
-        Ok(FileDownload::of_open_file(
-            Cow::Owned(tree),
-            conn,
-            file_id,
-            info,
-        ))
+        // The caller's path, on the caller's tree, even through a DFS link,
+        // so `resume_download` with the same tree follows the link again.
+        download.set_opened_path(path);
+        Ok(download)
+    }
+
+    /// Carry on a download from its [`DownloadCheckpoint`](stream::DownloadCheckpoint)
+    /// after a dropped connection, once the server shows the file is still
+    /// the version the download was reading; [`Error::FileChanged`] when it
+    /// isn't.
+    ///
+    /// See [`resume_file_download`](stream::resume_file_download) for what is
+    /// checked. `tree` is the one the download was opened on (with
+    /// [`open_file_download`](Self::open_file_download) or
+    /// [`download`](Self::download)), and the path is the checkpoint's, so a
+    /// DFS link is followed again. A tree from a session that has since been
+    /// revived is reconnected first, like the other reads.
+    pub async fn resume_download(
+        &mut self,
+        tree: &mut Tree,
+        checkpoint: &stream::DownloadCheckpoint,
+    ) -> Result<FileDownload<'static>> {
+        let (mut download, _) = self
+            .replaying(
+                tree,
+                &checkpoint.path,
+                |conn, tree, target_path| async move {
+                    reopen::resume_download_at(Cow::Owned(tree), conn, &target_path, checkpoint)
+                        .await
+                },
+            )
+            .await?;
+        download.set_opened_path(&checkpoint.path);
+        Ok(download)
     }
 
     /// Start a streaming file upload with progress tracking.
@@ -3324,6 +3352,20 @@ mod tests {
         )
     }
 
+    /// A download checkpoint at `path`, for a file that is 10 bytes long.
+    fn resumable_download(path: &str) -> stream::DownloadCheckpoint {
+        stream::DownloadCheckpoint {
+            path: path.to_string(),
+            offset: 4,
+            version: stream::FileVersion {
+                size: 10,
+                modified: crate::pack::FileTime::ZERO,
+                changed: crate::pack::FileTime::ZERO,
+                identity: None,
+            },
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum TreeCall {
         Download,
@@ -3511,6 +3553,7 @@ mod tests {
     enum LinkCall {
         Download,
         OpenFileDownload,
+        ResumeDownload,
         UploadSmall,
         UploadLarge,
         Watch,
@@ -3525,9 +3568,10 @@ mod tests {
     }
 
     impl LinkCall {
-        const ALL: [LinkCall; 13] = [
+        const ALL: [LinkCall; 14] = [
             LinkCall::Download,
             LinkCall::OpenFileDownload,
+            LinkCall::ResumeDownload,
             LinkCall::UploadSmall,
             LinkCall::UploadLarge,
             LinkCall::Watch,
@@ -3548,7 +3592,10 @@ mod tests {
                 // CREATE + WRITE + FLUSH (the CLOSE follows on its own).
                 LinkCall::UploadSmall => 3,
                 // CREATE + QUERY_INFO (index, volume, class 18, class 48).
-                LinkCall::OpenFileReader => 5,
+                LinkCall::Download
+                | LinkCall::OpenFileDownload
+                | LinkCall::ResumeDownload
+                | LinkCall::OpenFileReader => 5,
                 // CREATE + QUERY_INFO (index, volume, class 48).
                 LinkCall::CreateFileWriter
                 | LinkCall::CreateFileWriterExclusive
@@ -3569,6 +3616,10 @@ mod tests {
             match self {
                 LinkCall::Download => client.download(tree, path).await.map(drop),
                 LinkCall::OpenFileDownload => client.open_file_download(tree, path).await.map(drop),
+                LinkCall::ResumeDownload => client
+                    .resume_download(tree, &resumable_download(path))
+                    .await
+                    .map(drop),
                 LinkCall::UploadSmall => client.upload(tree, path, b"hi").await.map(drop),
                 LinkCall::UploadLarge => client.upload(tree, path, &large).await.map(drop),
                 LinkCall::Watch => client.watch(tree, path, false).await.map(drop),
@@ -4251,9 +4302,12 @@ mod tests {
         use crate::client::test_helpers::*;
         let mock = Arc::new(MockTransport::new());
         let mut client = make_mock_client(&mock, SessionId(0x77)).await;
-        mock.queue_response(path_not_covered(1));
+        mock.queue_response(path_not_covered(5));
         queue_link_referral(&mock);
-        mock.queue_response(build_create_response(FileId::SENTINEL, 0));
+        mock.queue_response(build_download_open(build_create_response(
+            FileId::SENTINEL,
+            0,
+        )));
 
         let tree = a_dfs_root_tree();
         let download = client
@@ -4266,6 +4320,37 @@ mod tests {
         assert!(matches!(download.read_ahead(), crate::ReadAhead::Adaptive));
         assert_eq!(download.size(), 0);
         assert_eq!(creates_on(&mock), [Some(TreeId(1)), Some(LINK_TARGET_TREE)]);
+        assert_eq!(
+            download.checkpoint().unwrap().path,
+            "data/f.bin",
+            "the caller's path, so a resume with the caller's tree follows the link again"
+        );
+    }
+
+    /// A download resumed through a link goes to the link's target, at the
+    /// path the open used there, and its checkpoint keeps the caller's path.
+    #[tokio::test(start_paused = true)]
+    async fn a_download_resumes_on_the_links_target() {
+        use crate::client::test_helpers::{build_create_response, build_download_open};
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x77)).await;
+        let mut tree = a_dfs_root_tree();
+        mock.queue_response(path_not_covered(5));
+        queue_link_referral(&mock);
+        mock.queue_response(build_download_open(build_create_response(
+            FileId::SENTINEL,
+            10,
+        )));
+        let checkpoint = resumable_download("data/f.bin");
+
+        let resumed = client
+            .resume_download(&mut tree, &checkpoint)
+            .await
+            .expect("the same version, through the link");
+
+        assert_eq!(creates_on(&mock), [Some(TreeId(1)), Some(LINK_TARGET_TREE)]);
+        assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+        assert_eq!(tree.tree_id, TreeId(1), "the caller's tree never moves");
     }
 
     // ── DFS namespace roots ───────────────────────────────────────────

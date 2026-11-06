@@ -2321,8 +2321,12 @@ impl Tree {
 
     /// Start a streaming file download on this tree.
     ///
-    /// Issues CREATE and returns a [`FileDownload`] that pulls the body in
-    /// chunks via [`next_chunk`](FileDownload::next_chunk). Mirrors
+    /// Opens the file the way a [`FileReader`](crate::FileReader) does (read
+    /// access only, never creating, its version asked in the same round
+    /// trip) and returns a [`FileDownload`] that pulls the body in chunks via
+    /// [`next_chunk`](FileDownload::next_chunk). After a dropped connection,
+    /// [`FileDownload::checkpoint`] and [`resume_download`](Self::resume_download)
+    /// carry on where it stopped, refused if the file changed. Mirrors
     /// [`SmbClient::download`](crate::SmbClient::download) but accepts a
     /// borrowed [`Connection`] directly, so callers who hold a cloned
     /// `Connection` (see [`Connection::clone`]) can drive concurrent
@@ -2360,33 +2364,45 @@ impl Tree {
         conn: &'a mut Connection,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let mut conn = conn.pinned_to_session();
-        let (file_id, info) = self.open_for_read(&mut conn, path).await?;
-        Ok(FileDownload::of_open_file(
-            std::borrow::Cow::Borrowed(self),
-            conn,
-            file_id,
-            info,
-        ))
+        super::stream::open_download(std::borrow::Cow::Borrowed(self), conn.clone(), path, false)
+            .await
     }
 
     /// [`download`](Self::download), with the file's named streams listed in
-    /// the open's own frame (CREATE + QUERY_INFO), so
-    /// [`FileDownload::streams`] has them for no extra round trip. For a copy
-    /// that keeps xattrs: the list says which streams to read, and a file with
-    /// none needs nothing more. Ask only when you'll use the answer: it costs
-    /// the server a listing on every open.
+    /// the open's own frame, so [`FileDownload::streams`] has them for no
+    /// extra round trip. For a copy that keeps xattrs: the list says which
+    /// streams to read, and a file with none needs nothing more. Ask only
+    /// when you'll use the answer: it costs the server a listing on every
+    /// open.
     pub async fn download_with_streams<'a>(
         &'a self,
         conn: &'a mut Connection,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let mut conn = conn.pinned_to_session();
-        let (file_id, info, streams) = self.open_for_read_with_streams(&mut conn, path).await?;
-        Ok(
-            FileDownload::of_open_file(std::borrow::Cow::Borrowed(self), conn, file_id, info)
-                .with_streams(streams),
+        super::stream::open_download(std::borrow::Cow::Borrowed(self), conn.clone(), path, true)
+            .await
+    }
+
+    /// Carry on a download from where `checkpoint` says it got to, after a
+    /// dropped connection, once the server shows the file is still the
+    /// version the download was reading.
+    ///
+    /// See [`resume_file_download`](super::stream::resume_file_download) for
+    /// what is checked; this is the same on a borrowed connection, like
+    /// [`download`](Self::download). The path is the checkpoint's, on this
+    /// tree, and no DFS link is followed.
+    pub async fn resume_download<'a>(
+        &'a self,
+        conn: &'a mut Connection,
+        checkpoint: &super::stream::DownloadCheckpoint,
+    ) -> Result<FileDownload<'a>> {
+        super::reopen::resume_download_at(
+            std::borrow::Cow::Borrowed(self),
+            conn.clone(),
+            &checkpoint.path,
+            checkpoint,
         )
+        .await
     }
 
     /// Write a file using pipelined I/O.
@@ -3089,43 +3105,6 @@ impl Tree {
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
         Ok((resp.file_id, file_info_from_create(&resp)))
-    }
-
-    /// [`open_for_read`](Self::open_for_read) with a related QUERY_INFO for
-    /// the stream list in the same frame. The handle stays open either way;
-    /// a refused listing only leaves the list `None`.
-    async fn open_for_read_with_streams(
-        &self,
-        conn: &mut Connection,
-        path: &str,
-    ) -> Result<(FileId, FileInfo, Option<Vec<StreamInfo>>)> {
-        let conn = &mut self.pinned_conn(conn);
-        let create = self.read_open_request(path);
-        let query = streams::stream_list_request(streams::STREAM_LIST_BUFFER);
-        let ops = [
-            CompoundOp {
-                command: Command::Create,
-                body: &create,
-                tree_id: Some(self.tree_id),
-                credit_charge: CreditCharge(1),
-            },
-            CompoundOp {
-                command: Command::QueryInfo,
-                body: &query,
-                tree_id: Some(self.tree_id),
-                credit_charge: CreditCharge(1),
-            },
-        ];
-        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
-        if responses[0].header.status != NtStatus::SUCCESS {
-            return Err(Error::Protocol {
-                status: responses[0].header.status,
-                command: Command::Create,
-            });
-        }
-        let resp = CreateResponse::unpack(&mut ReadCursor::new(&responses[0].body))?;
-        let listed = streams::stream_list_answer(&responses[1], path);
-        Ok((resp.file_id, file_info_from_create(&resp), listed))
     }
 
     /// The CREATE [`open_file`](Self::open_file) and a
@@ -8805,7 +8784,9 @@ mod tests {
         let payload = b"streaming hello from Tree::download".to_vec();
 
         // CREATE (open_file) — server returns handle + size.
-        mock.queue_response(build_create_response(file_id, payload.len() as u64));
+        mock.queue_response(crate::client::test_helpers::build_download_open(
+            build_create_response(file_id, payload.len() as u64),
+        ));
         // Single READ covering the whole file (payload fits in one
         // max_read_size=65536 chunk).
         mock.queue_response(build_read_response(NtStatus::SUCCESS, payload.clone()));
@@ -8846,19 +8827,9 @@ mod tests {
     #[tokio::test]
     async fn tree_download_create_failure_returns_protocol_error() {
         let mock = Arc::new(MockTransport::new());
-
-        let mut create_hdr = Header::new_request(Command::Create);
-        create_hdr.flags.set_response();
-        create_hdr.credits = 32;
-        create_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
-        let create_err = pack_message(
-            &create_hdr,
-            &crate::msg::header::ErrorResponse {
-                error_context_count: 0,
-                error_data: vec![],
-            },
-        );
-        mock.queue_response(create_err);
+        mock.queue_response(crate::client::test_helpers::build_reader_open_refused(
+            NtStatus::OBJECT_NAME_NOT_FOUND,
+        ));
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
@@ -8889,7 +8860,9 @@ mod tests {
         // 3x max_read_size payload so at least one READ remains unsent
         // after the caller drops early.
         let total = 3 * 65536usize;
-        mock.queue_response(build_create_response(file_id, total as u64));
+        mock.queue_response(crate::client::test_helpers::build_download_open(
+            build_create_response(file_id, total as u64),
+        ));
         // Queue one READ response; we'll consume only that one and drop.
         mock.queue_response(build_read_response(NtStatus::SUCCESS, vec![0xAB; 65536]));
 
@@ -9024,8 +8997,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        mock.queue_response(build_create_response(file_id_1, payload.len() as u64));
-        mock.queue_response(build_create_response(file_id_2, payload.len() as u64));
+        mock.queue_response(crate::client::test_helpers::build_download_open(
+            build_create_response(file_id_1, payload.len() as u64),
+        ));
+        mock.queue_response(crate::client::test_helpers::build_download_open(
+            build_create_response(file_id_2, payload.len() as u64),
+        ));
 
         // Wait for both READs, then answer with identical payloads.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -9107,7 +9084,9 @@ mod tests {
             persistent: 1,
             volatile: 2,
         };
-        mock.queue_response(build_create_response_dated(file_id, 3));
+        mock.queue_response(crate::client::test_helpers::build_download_open(
+            build_create_response_dated(file_id, 3),
+        ));
         mock.queue_response(build_read_response(NtStatus::SUCCESS, vec![7, 8, 9]));
         mock.queue_response(build_close_response());
 

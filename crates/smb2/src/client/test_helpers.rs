@@ -587,6 +587,35 @@ pub(crate) fn build_reader_open_response(
     all: Option<&str>,
     name: Option<&str>,
 ) -> Vec<u8> {
+    build_compound_response_frame(&reader_open_frames(create, identity, all, name))
+}
+
+/// What a download's open gets back (the reader open's compound) around
+/// `create`, from a server that answers none of the queries.
+pub(crate) fn build_download_open(create: Vec<u8>) -> Vec<u8> {
+    build_reader_open_response(create, None, None, None)
+}
+
+/// [`build_reader_open_response`] for a download that also asked for the
+/// stream list: `listing` (a QUERY_INFO answer) goes before class 48, the
+/// order the open sends them in. Identity answered, class 18 refused, class
+/// 48 answered with `name`.
+pub(crate) fn build_download_open_with_listing(
+    create: Vec<u8>,
+    identity: Option<crate::client::durable::FileIdentity>,
+    listing: Vec<u8>,
+) -> Vec<u8> {
+    let mut frames = reader_open_frames(create, identity, None, Some("f.txt"));
+    frames.insert(4, listing);
+    build_compound_response_frame(&frames)
+}
+
+fn reader_open_frames(
+    create: Vec<u8>,
+    identity: Option<crate::client::durable::FileIdentity>,
+    all: Option<&str>,
+    name: Option<&str>,
+) -> Vec<Vec<u8>> {
     use crate::types::status::NtStatus;
     let refused = || build_query_info_error_response(NtStatus::NOT_SUPPORTED);
     let (index, volume) = match identity {
@@ -601,7 +630,7 @@ pub(crate) fn build_reader_open_response(
         }
         None => (refused(), refused()),
     };
-    build_compound_response_frame(&[
+    vec![
         create,
         index,
         volume,
@@ -611,7 +640,7 @@ pub(crate) fn build_reader_open_response(
         name.map_or_else(refused, |n| {
             build_query_info_response(file_name_information(n))
         }),
-    ])
+    ]
 }
 
 /// A reader open the server refused at the CREATE: every query after it

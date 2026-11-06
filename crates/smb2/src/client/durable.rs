@@ -550,7 +550,7 @@ impl Tree {
         // it goes back into keeps its `resolved_path`; a write handle through
         // the plain identity compound it was opened with.
         let opened = if handle.read_only {
-            self.open_and_name(conn, path, &create_req, OpenFor::Reading)
+            self.open_and_name(conn, path, &create_req, OpenFor::Reading, false)
                 .await
                 .map(|o| (o.created, o.identity, o.name))
         } else {

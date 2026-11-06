@@ -1,5 +1,6 @@
 //! Opening a [`FileReader`], and reopening one after a reconnect without
-//! reading on into a file that changed.
+//! reading on into a file that changed. A [`FileDownload`] resumes from its
+//! [`DownloadCheckpoint`] the same way (§ Resuming a download, below).
 //!
 //! Every reader open goes through [`open_file_reader_with`];
 //! [`open_file_reader`](crate::client::stream::open_file_reader) is its
@@ -68,7 +69,19 @@
 //! the acknowledgment gives the durability up on the server. A reconnect
 //! after that finds nothing to reclaim and takes the path. A handle-caching
 //! lease would survive other clients' opens; this crate doesn't do leases.
+//!
+//! ## Resuming a download
+//!
+//! A [`FileDownload`] opens like a reader (`stream.rs` `open_download`), so it
+//! knows its [`FileVersion`] too, and its [`DownloadCheckpoint`] is that
+//! version plus the path and the bytes handed to the caller.
+//! [`resume_file_download`] opens the path afresh (no durable handle: a
+//! download's handle is cheap to lose, the check is what matters), runs the
+//! same [`FileVersion::change_to`] check, and starts the download at the
+//! checkpoint. The checkpoint carries the FIRST open's version through every
+//! resume, so a resumed download never drifts onto a newer one.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use log::{debug, trace};
@@ -76,8 +89,8 @@ use log::{debug, trace};
 use crate::client::connection::Connection;
 use crate::client::durable::{ask_for_durability, FileIdentity};
 use crate::client::resolve::OpenFor;
-use crate::client::stream::FileReader;
-use crate::client::tree::Tree;
+use crate::client::stream::{open_download, FileDownload, FileReader};
+use crate::client::tree::{FileInfo, Tree};
 use crate::error::{FileChange, Result};
 use crate::pack::FileTime;
 use crate::Error;
@@ -137,6 +150,7 @@ impl ReaderOptions {
 /// Get one from [`FileReader::version`]. Non-exhaustive, so what a version
 /// records can grow without breaking anyone reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct FileVersion {
     /// The file's length at open.
@@ -153,6 +167,17 @@ pub struct FileVersion {
 }
 
 impl FileVersion {
+    /// The version an open saw: length and times from its CREATE, identity
+    /// from the queries compounded onto it.
+    pub(crate) fn at_open(info: &FileInfo, identity: Option<FileIdentity>) -> Self {
+        Self {
+            size: info.size,
+            modified: info.modified,
+            changed: info.changed,
+            identity,
+        }
+    }
+
     /// How `now` differs from this version, or `None` when it is the same
     /// file with the same length, last-write time, and change time.
     ///
@@ -225,7 +250,7 @@ pub async fn open_file_reader_with(
         None
     };
     let opened = tree
-        .open_and_name(&mut conn, path, &request, OpenFor::Reading)
+        .open_and_name(&mut conn, path, &request, OpenFor::Reading, false)
         .await?;
     let durable = asked.map(|asked| {
         tree.durability_granted(&conn, &opened.created, opened.identity, asked, path, true)
@@ -342,12 +367,146 @@ async fn verified(reader: FileReader, expected: &FileVersion, path: &str) -> Res
     let Some(change) = expected.change_to(&reader.version()) else {
         return Ok(reader);
     };
-    debug!("reopen: refusing path={path:?}: {change}");
     // The refusal is the answer; a failed CLOSE can't change it, and the
     // reader closes on drop regardless.
     let _ = reader.close().await;
-    Err(Error::FileChanged {
+    Err(file_changed(path, change))
+}
+
+/// The refusal for a file that is no longer `expected`'s version.
+fn file_changed(path: &str, change: FileChange) -> Error {
+    debug!("reopen: refusing path={path:?}: {change}");
+    Error::FileChanged {
         path: path.to_string(),
         change,
-    })
+    }
+}
+
+// ── Resuming a download ──────────────────────────────────────────────
+
+/// How far a [`FileDownload`] got, and which version of which file it was
+/// reading: what [`resume_file_download`] carries on from after a dropped
+/// connection.
+///
+/// [`FileDownload::checkpoint`] makes one. It's plain data: keep it in memory
+/// for a reconnect, or (with the `serde` feature) persist it beside the
+/// partial local file to resume after a restart. The resume proves the file
+/// is still that version before it reads a byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct DownloadCheckpoint {
+    /// The path the download was opened at, relative to the tree its opener
+    /// was given (for a download from `SmbClient`, the caller's tree, even
+    /// when a DFS link sent the open to another share).
+    pub path: String,
+    /// How many bytes, from the start of the file, the download handed to
+    /// its caller. Bytes still on the wire never count, so the caller has
+    /// exactly the bytes before this offset.
+    pub offset: u64,
+    /// Which version of the file those bytes came from: the one the
+    /// download's first open saw, carried through every resume.
+    pub version: FileVersion,
+}
+
+/// Carry on a download from where `checkpoint` says it got to, once the
+/// server shows the file is still the version the download was reading.
+///
+/// One round trip before any READ: the same read-only open a
+/// [`FileReader`] uses (`FileOpen`, never creating, the identity and name
+/// asked in the same compound), then the version check a reopened reader
+/// runs ([`reopen_file_reader`]): identity, then length, then last-write and
+/// change time. A file that is no longer that version fails with
+/// [`Error::FileChanged`], after closing what was opened, and nothing is
+/// read: bytes from the new version would be spliced onto the old one's. A
+/// file that's gone is the CREATE's own error (`ErrorKind::NotFound`). Any
+/// other error comes back as itself, so
+/// [`Error::is_retryable`](crate::Error::is_retryable) tells "try the resume
+/// again" from "start over". A checkpoint past the end of the version it
+/// names is refused before anything is sent (`ErrorKind::Io`, `InvalidInput`).
+///
+/// The download it returns reads from the checkpoint to the end; its
+/// [`checkpoint`](FileDownload::checkpoint) counts from the start of the file
+/// and keeps the first open's version, so a download can be resumed any
+/// number of times. `tree` is a tree connect to the same share on the
+/// current session, and the path is the checkpoint's.
+/// [`SmbClient::resume_download`](crate::SmbClient::resume_download) (which
+/// follows a DFS link and heals a tree from a dead session) and
+/// [`Tree::resume_download`] are the convenience wrappers.
+///
+/// ❗ The check is best-effort, as for a reader: a server that rewrites a
+/// file in place to the same length while holding back both times would get
+/// past it. And it can only compare the file with the version the download
+/// opened, so a change made while the first download was still reading is
+/// caught here, at the resume, and not before.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(
+/// #     client: &mut smb2::SmbClient,
+/// #     share: &mut smb2::Tree,
+/// #     out: &mut Vec<u8>,
+/// # ) -> Result<(), smb2::Error> {
+/// let mut download = client.open_file_download(share, "big.iso").await?;
+/// loop {
+///     match download.next_chunk().await {
+///         Some(Ok(chunk)) => out.extend_from_slice(&chunk),
+///         // A dropped connection, or a handle its reconnect left behind.
+///         Some(Err(e)) if e.kind() == smb2::ErrorKind::ConnectionLost => {
+///             let checkpoint = download.checkpoint().expect("opened from a path");
+///             // A `FileChanged` here means start over from byte 0.
+///             download = client.resume_download(share, &checkpoint).await?;
+///         }
+///         Some(Err(e)) => return Err(e),
+///         None => break,
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn resume_file_download(
+    tree: Arc<Tree>,
+    conn: Connection,
+    checkpoint: &DownloadCheckpoint,
+) -> Result<FileDownload<'static>> {
+    let tree = Cow::Owned(Tree::clone(&tree));
+    resume_download_at(tree, conn, &checkpoint.path, checkpoint).await
+}
+
+/// [`resume_file_download`] at `path` on `tree`, for an opener that followed
+/// a DFS link: `path` is then the link target's, where the checkpoint's is
+/// the caller's. The download it returns remembers `path`.
+pub(crate) async fn resume_download_at<'a>(
+    tree: Cow<'a, Tree>,
+    conn: Connection,
+    path: &str,
+    checkpoint: &DownloadCheckpoint,
+) -> Result<FileDownload<'a>> {
+    let expected = checkpoint.version;
+    trace!(
+        "reopen: resume_download path={path:?} offset={}",
+        checkpoint.offset
+    );
+    if checkpoint.offset > expected.size {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "a download checkpoint at {} is past the end of the {}-byte file it names",
+                checkpoint.offset, expected.size
+            ),
+        )));
+    }
+    let mut download = open_download(tree, conn, path, false).await?;
+    let now = download
+        .version()
+        .expect("a download that opened its own file records its version");
+    if let Some(change) = expected.change_to(&now) {
+        // The refusal is the answer, whatever the CLOSE says, and the
+        // download closes on drop regardless.
+        let _ = download.close().await;
+        return Err(file_changed(path, change));
+    }
+    download.resume_from(checkpoint.offset, expected);
+    Ok(download)
 }

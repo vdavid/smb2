@@ -89,8 +89,9 @@ impl std::fmt::Display for ResumeRefusal {
 /// How a file differs from the version a reader was opened on.
 ///
 /// Returned inside [`Error::FileChanged`] by
-/// [`reopen_file_reader`](crate::client::stream::reopen_file_reader), which
-/// refuses to carry on reading a file that is no longer the one it read:
+/// [`reopen_file_reader`](crate::client::stream::reopen_file_reader) and
+/// [`resume_file_download`](crate::client::stream::resume_file_download),
+/// which refuse to carry on reading a file that is no longer the one they read:
 /// bytes cached from the old version would be mixed with the new one's. All
 /// of them mean the same thing to a caller: start over from the new version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,8 +422,9 @@ pub enum Error {
     /// version it was reading.
     ///
     /// Returned by
-    /// [`reopen_file_reader`](crate::client::stream::reopen_file_reader) and
-    /// its wrappers, with the handle the reopen got already closed. `change`
+    /// [`reopen_file_reader`](crate::client::stream::reopen_file_reader),
+    /// [`resume_file_download`](crate::client::stream::resume_file_download),
+    /// and their wrappers, with the handle they got already closed. `change`
     /// says what differs. Classifies as [`ErrorKind::FileChanged`] and is
     /// **not** retryable: asking again for the same version can only be
     /// refused again. Open the file afresh to read its new version.
