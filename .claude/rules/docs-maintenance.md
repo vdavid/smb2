@@ -8,5 +8,5 @@ If something failed due to a wrong assumption, add a `Gotcha/Why` entry to the n
 Add `Decision/Why` entries to the nearest colocated `CLAUDE.md` for key decisions. If the decision has rich evidence
 (benchmarks, detailed analysis), put the evidence in `docs/notes/` and link from the CLAUDE.md.
 
-When writing guides, see [this diff](https://github.com/vdavid/cmdr/commit/13ad8f3#diff-795210f) for the formatting
+When writing guides, see [this diff](https://github.com/getcmdr/cmdr/commit/13ad8f3#diff-795210f) for the formatting
 standard. (Before: AI-written. After: matching our standards for conciseness and clarity.)

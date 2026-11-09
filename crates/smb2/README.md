@@ -9,7 +9,7 @@
 A pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. Faster than native macOS SMB in all
 operations: 1.3-5x faster on uploads, downloads, listings, and deletes.
 
-I built this because I needed fast SMB access for [Cmdr](https://github.com/vdavid/cmdr) (my file manager), and the
+I built this because I needed fast SMB access for [Cmdr](https://github.com/getcmdr/cmdr) (my file manager), and the
 existing Rust SMB options weren't good enough. The `smb` crate works fine for listing files but downloads are painfully
 slow because it sends one read at a time. Native OS SMB clients pipeline their reads, and so does this library, and here
 we have more control to reach even better speeds.
@@ -502,7 +502,7 @@ which means system package management, cross-compilation headaches, and all the 
 - [smb2-cli](https://crates.io/crates/smb2-cli): a command-line client built on this crate, in the same repo under
   `crates/smb2-cli/`. Run `ls`, `stat`, `rm`, `rmdir`, `mv`, and file transfers against a share without mounting it,
   and spread a batch over N connections. Bulk deletes go 34/s through a macOS mount and 500/s here.
-- [Cmdr](https://github.com/vdavid/cmdr): an AI-native file manager that uses `smb2` for SMB access.
+- [Cmdr](https://github.com/getcmdr/cmdr): an AI-native file manager that uses `smb2` for SMB access.
 
 ## Implementation notes
 

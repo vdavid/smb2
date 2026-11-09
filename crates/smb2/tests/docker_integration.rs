@@ -238,7 +238,7 @@ async fn hold_open(conn: &Connection, tree: &Tree, path: &str, lease: bool) -> s
 /// name again (the next step of an overwrite) fails. Opening for delete
 /// without sharing read or write makes the server ask the holder to give its
 /// handle back first, as macOS does at once, so the name is free right after
-/// the delete returns. Regression test for vdavid/cmdr#307.
+/// the delete returns. Regression test for getcmdr/cmdr#307.
 #[tokio::test]
 #[ignore]
 async fn a_delete_asks_a_lingering_lease_holder_to_let_go() {
@@ -390,7 +390,7 @@ async fn replace_a_session_holding_a_file(config: ClientConfig, share: &str) -> 
 /// before answering the login, so the file the old session was writing is
 /// free at once. Without it, the server keeps the old session's write handle
 /// open until it notices the dead connection by itself, and a delete meets
-/// `STATUS_SHARING_VIOLATION` (vdavid/cmdr#581). The old connection stays up
+/// `STATUS_SHARING_VIOLATION` (getcmdr/cmdr#581). The old connection stays up
 /// here, which is the hard case: the server has no reason of its own to let go.
 #[tokio::test]
 #[ignore]

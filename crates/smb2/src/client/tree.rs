@@ -4705,7 +4705,7 @@ mod tests {
         assert!(req.desired_access.contains(FileAccessMask::DELETE));
         assert_ne!(req.create_options & FILE_NON_DIRECTORY_FILE, 0);
         // Sharing only delete is what makes the server break a lingering
-        // handle lease (vdavid/cmdr#307).
+        // handle lease (getcmdr/cmdr#307).
         assert_eq!(
             req.share_access,
             ShareAccess(ShareAccess::FILE_SHARE_DELETE)
