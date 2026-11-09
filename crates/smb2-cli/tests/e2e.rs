@@ -315,7 +315,12 @@ impl Fixture {
     /// `relative` survives, since that's what `put` and `get` read as "into
     /// this directory".
     fn target(&self, relative: &str) -> String {
-        format!("//{ADDR}/{SHARE}/{}", self.path(relative))
+        self.target_at(ADDR, relative)
+    }
+
+    /// [`target`](Self::target) through another address, such as a proxy's.
+    fn target_at(&self, addr: &str, relative: &str) -> String {
+        format!("//{addr}/{SHARE}/{}", self.path(relative))
     }
 
     /// A local scratch directory, created on first use.
@@ -593,6 +598,287 @@ fn put_streams_a_file_larger_than_one_write() {
 
     ok(&["put", source.to_str().unwrap(), &share.target("big.bin")]);
     assert_eq!(share.read("big.bin"), data, "uploaded bytes differ");
+}
+
+/// `put` lands its bytes on a `.smb2-part` sibling and renames it over the
+/// destination, so a replaced file is swapped in whole and nothing is left
+/// beside it.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn put_swaps_in_the_new_file_and_leaves_no_partial_behind() {
+    let share = Fixture::new("put-swap");
+    share.write("doc.txt", b"the old version");
+    let small = share.local().join("doc.txt");
+    std::fs::write(&small, b"the new version").unwrap();
+    let large = share.local().join("big.bin");
+    let data = payload(LARGER_THAN_ONE_READ);
+    std::fs::write(&large, &data).unwrap();
+
+    ok(&["put", small.to_str().unwrap(), &share.target("doc.txt")]);
+    ok(&["put", large.to_str().unwrap(), &share.target("big.bin")]);
+
+    assert_eq!(share.read("doc.txt"), b"the new version");
+    assert_eq!(share.read("big.bin"), data);
+    assert_eq!(share.names(""), ["big.bin", "doc.txt"]);
+}
+
+// ── Dropped connections ──────────────────────────────────────────────
+
+/// Which way a [`CuttingProxy`] counts the bytes it cuts after.
+#[derive(Clone, Copy)]
+enum Toward {
+    /// What the CLI sends: an upload.
+    Server,
+    /// What the server sends: a download.
+    Client,
+}
+
+/// A TCP proxy in front of the fixture that cuts its first `cut` connections
+/// once `after` bytes have gone one way, and lets every later one through.
+///
+/// A cut closes both sockets, so the CLI sees its connection drop at a byte
+/// count the test chose and Samba sees a clean close (and lets go of the dead
+/// session's handles at once). That's what makes a drop deterministic here,
+/// where the `smb-flaky` fixture's 5 s up / 5 s down depends on timing.
+struct CuttingProxy {
+    addr: String,
+    /// Bytes each connection carried in the counted direction, in accept order.
+    carried: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicU64>>>>,
+}
+
+impl CuttingProxy {
+    fn start(toward: Toward, after: u64, cut: usize) -> Self {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the proxy");
+        let addr = listener.local_addr().unwrap().to_string();
+        let carried = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&carried);
+        std::thread::spawn(move || {
+            for (index, client) in listener.incoming().enumerate() {
+                let Ok(client) = client else { continue };
+                let server = std::net::TcpStream::connect(ADDR).expect("reaching the fixture");
+                let counter = Arc::new(AtomicU64::new(0));
+                log.lock().unwrap().push(Arc::clone(&counter));
+                let limit = (index < cut).then_some(after);
+                let ends = [client.try_clone().unwrap(), server.try_clone().unwrap()];
+                let (up, down) = match toward {
+                    Toward::Server => ((Some(Arc::clone(&counter)), limit), (None, None)),
+                    Toward::Client => ((None, None), (Some(Arc::clone(&counter)), limit)),
+                };
+                relay(
+                    client.try_clone().unwrap(),
+                    server.try_clone().unwrap(),
+                    up,
+                    clone_ends(&ends),
+                );
+                relay(server, client, down, ends);
+            }
+        });
+        Self { addr, carried }
+    }
+
+    /// Bytes each connection carried in the counted direction, so far.
+    fn carried(&self) -> Vec<u64> {
+        self.carried
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|counter| counter.load(std::sync::atomic::Ordering::SeqCst))
+            .collect()
+    }
+}
+
+fn clone_ends(ends: &[std::net::TcpStream; 2]) -> [std::net::TcpStream; 2] {
+    [ends[0].try_clone().unwrap(), ends[1].try_clone().unwrap()]
+}
+
+/// Copies `from` into `to` on a thread of its own, counting into `counted`
+/// and stopping at its limit. Whichever way it stops, it closes both
+/// connections, so the other direction stops too.
+fn relay(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    counted: (
+        Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        Option<u64>,
+    ),
+    ends: [std::net::TcpStream; 2],
+) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    std::thread::spawn(move || {
+        let (counter, limit) = counted;
+        let mut sent = 0u64;
+        let mut buffer = vec![0u8; 64 * 1024];
+        // A read error or the end of the stream both end the relay.
+        while let Ok(read @ 1..) = from.read(&mut buffer) {
+            let allowed = limit.map_or(read, |limit| read.min((limit - sent) as usize));
+            if to.write_all(&buffer[..allowed]).is_err() {
+                break;
+            }
+            sent += allowed as u64;
+            if let Some(counter) = &counter {
+                counter.store(sent, Ordering::SeqCst);
+            }
+            if limit == Some(sent) {
+                break;
+            }
+        }
+        for end in &ends {
+            let _ = end.shutdown(std::net::Shutdown::Both);
+        }
+    });
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// Runs `smb2 args`, requires success, and requires that it reconnected.
+fn ok_after_a_drop(args: &[&str]) -> Output {
+    let output = smb2(args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`smb2 {}` exited {:?}\nstderr: {stderr}",
+        args.join(" "),
+        output.status.code(),
+    );
+    assert!(
+        stderr.contains("reconnecting"),
+        "the connection should have dropped and come back\nstderr: {stderr}"
+    );
+    output
+}
+
+/// The download carries on from the bytes it already wrote, rather than
+/// starting over: the second connection moves well under the whole file.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn get_picks_up_after_a_dropped_connection() {
+    let share = Fixture::new("get-resume");
+    let data = payload(20 * MIB);
+    share.write("big.bin", &data);
+    let proxy = CuttingProxy::start(Toward::Client, 10 * MIB as u64, 1);
+
+    let destination = share.local().join("big.bin");
+    ok_after_a_drop(&[
+        "get",
+        &share.target_at(&proxy.addr, "big.bin"),
+        destination.to_str().unwrap(),
+    ]);
+
+    assert_eq!(std::fs::read(&destination).unwrap(), data);
+    let carried = proxy.carried();
+    assert_eq!(carried.len(), 2, "one drop, one reconnect: {carried:?}");
+    // At least 10 MiB less the read-ahead window (4 MiB at most) reached the
+    // file before the cut, so a resume moves under 17 MiB; a restart, 20.
+    assert!(carried[1] < 17 * MIB as u64, "it started over: {carried:?}");
+}
+
+/// `cat` resumes into a pipe, which only works because nothing it already
+/// printed is printed again.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn cat_picks_up_after_a_dropped_connection() {
+    let share = Fixture::new("cat-resume");
+    let data = payload(20 * MIB);
+    share.write("big.bin", &data);
+    let proxy = CuttingProxy::start(Toward::Client, 10 * MIB as u64, 1);
+
+    let output = ok_after_a_drop(&["cat", &share.target_at(&proxy.addr, "big.bin")]);
+    assert_eq!(output.stdout.len(), data.len());
+    assert!(output.stdout == data, "cat printed different bytes");
+}
+
+/// A drop after the 64 MiB checkpoint resumes from it: the second connection
+/// moves the last 8 MiB, not all 72.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn put_resumes_from_its_last_checkpoint() {
+    let share = Fixture::new("put-resume");
+    let data = payload(72 * MIB);
+    let source = share.local().join("big.bin");
+    std::fs::write(&source, &data).unwrap();
+    let proxy = CuttingProxy::start(Toward::Server, 70 * MIB as u64, 1);
+
+    ok_after_a_drop(&[
+        "put",
+        source.to_str().unwrap(),
+        &share.target_at(&proxy.addr, "big.bin"),
+    ]);
+
+    assert!(share.read("big.bin") == data, "uploaded bytes differ");
+    assert_eq!(share.names(""), ["big.bin"]);
+    let carried = proxy.carried();
+    assert_eq!(carried.len(), 2, "one drop, one reconnect: {carried:?}");
+    assert!(carried[1] < 16 * MIB as u64, "it started over: {carried:?}");
+}
+
+/// Before the first checkpoint there's nothing to resume from, so the upload
+/// starts again, and still ends up whole.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn put_starts_over_after_a_drop_before_any_checkpoint() {
+    let share = Fixture::new("put-restart");
+    let data = payload(LARGER_THAN_ONE_READ);
+    let source = share.local().join("big.bin");
+    std::fs::write(&source, &data).unwrap();
+    let proxy = CuttingProxy::start(Toward::Server, 4 * MIB as u64, 1);
+
+    ok_after_a_drop(&[
+        "put",
+        source.to_str().unwrap(),
+        &share.target_at(&proxy.addr, "big.bin"),
+    ]);
+
+    assert!(share.read("big.bin") == data, "uploaded bytes differ");
+    assert_eq!(share.names(""), ["big.bin"]);
+    let carried = proxy.carried();
+    assert!(carried[1] >= data.len() as u64, "{carried:?}");
+}
+
+/// The one-WRITE path is simply sent again.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn a_small_put_survives_a_dropped_connection() {
+    let share = Fixture::new("put-small-resume");
+    let data = payload(2 * MIB);
+    let source = share.local().join("small.bin");
+    std::fs::write(&source, &data).unwrap();
+    let proxy = CuttingProxy::start(Toward::Server, MIB as u64, 1);
+
+    ok_after_a_drop(&[
+        "put",
+        source.to_str().unwrap(),
+        &share.target_at(&proxy.addr, "small.bin"),
+    ]);
+
+    assert!(share.read("small.bin") == data, "uploaded bytes differ");
+    assert_eq!(share.names(""), ["small.bin"]);
+}
+
+/// A link that keeps dropping ends the upload with an error, leaves the file
+/// it was replacing exactly as it was, and cleans up its partial file.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn a_put_that_keeps_dropping_gives_up_and_leaves_the_old_file() {
+    let share = Fixture::new("put-gives-up");
+    share.write("keep.bin", b"the copy already there");
+    let source = share.local().join("keep.bin");
+    std::fs::write(&source, payload(LARGER_THAN_ONE_READ)).unwrap();
+    let proxy = CuttingProxy::start(Toward::Server, MIB as u64, usize::MAX);
+
+    let stderr = fails(&[
+        "put",
+        source.to_str().unwrap(),
+        &share.target_at(&proxy.addr, "keep.bin"),
+    ]);
+
+    assert!(stderr.contains("gave up"), "{stderr}");
+    assert_eq!(share.read("keep.bin"), b"the copy already there");
+    assert_eq!(share.names(""), ["keep.bin"]);
 }
 
 // ââ mkdir â───────────────────────────────────────────────────────────

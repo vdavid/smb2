@@ -115,6 +115,10 @@ smb2 streams //raspi/PiHDD/notes.txt                 # the raw stream list
 
 Transfers stream in both directions, so size isn't a limit and neither is your memory: a 600 MB `get` runs in about 60 MB of RAM, and `put` is the same the other way.
 
+`get`, `cat`, and `put` ride out a dropped connection. They reconnect and carry on: a download from the last byte it wrote, an upload from its last checkpoint (one every 64 MiB). A download refuses to carry on if the file changed on the share meanwhile, so it never stitches two versions into one. After five drops in one transfer, the command gives up.
+
+Neither direction leaves a half-written file under the real name. `get` writes to `name.smb2-part` next to the destination and `put` does the same on the share, and each renames the finished file over the destination in one step. If a transfer fails, the file that was already there stays exactly as it was.
+
 `--json` works on every command. `--dry-run` works on everything that writes (`mkdir`, `rm`, `rmdir`, `mv`, `put`, `get`, and `xattr -w` / `-d`): it prints what would happen and makes no connection at all.
 
 ## Batches

@@ -58,14 +58,21 @@ Neither direction ever holds a whole file. That is a correctness matter as much 
 server's `MaxReadSize` (8 MB on a stock Samba) is a hard ceiling on what one READ can return.
 
 - **`put`** (`transfer::upload`): a file that fits in one WRITE is read into memory and sent as a single compound
-  CREATE+WRITE+FLUSH and a CLOSE, which keeps a small upload at two round trips. Anything larger is pulled off disk a
-  chunk at a time and fed to `write_file_streamed`, whose pipeline window is what the upload then costs. The
-  callback reads with blocking `std::fs`, on purpose: it is called from inside the write pipeline's own task, so
-  it stalls only itself.
-- **`get` and `cat`** (`transfer::Download`): always a `FileReader` plus a sliding window of positioned reads,
-  each chunk written to the sink as it lands. The window is `IN_FLIGHT_BYTES / MaxReadSize`, clamped to 2..32, so
-  a server with a 64 KB cap gets the same 32-deep pipeline the library's own `read_file_pipelined` uses and one
-  with an 8 MB cap gets two.
+  CREATE+WRITE+FLUSH and a CLOSE (`write_file`), two round trips. Anything larger streams through a `FileWriter`,
+  read off disk 1 MiB at a time with `tokio::fs`, so the writer's window is what the upload costs.
+  - **It writes to `<destination>.smb2-part` on the share and renames that over the destination**
+    (`RenameOptions::replace_if_exists`, so the name is never missing) only once every byte is there
+    (`move_into_place`); a failure deletes the partial file (`discard_partial_upload`, which reconnects once to do
+    it and says so on stderr when it can't). Decision/Why: writing in place truncated the destination at the
+    CREATE, so a failed upload destroyed a good earlier copy. The costs: one more round trip (the rename), the
+    folder must let us create a file, and the replaced file's ACLs, streams, and creation time are the new file's,
+    the same trade `rsync` makes by default.
+- **`get` and `cat`** (`transfer::Download`): a `FileDownload` (`SmbClient::open_file_download`), each chunk
+  written to the sink as `next_chunk` hands it out, in file order. The library's adaptive window paces the READs to
+  the link (`crates/smb2/src/client/CLAUDE.md` § Streaming download entry points), which beats the fixed
+  16 MiB-of-positioned-reads window this used to hand-roll over a `FileReader`, and is what makes resume possible.
+  Measured against the QNAP over Tailscale (512 MiB, 2026-11-09): no throughput change either way, ~20 MiB/s up and
+  down for both, which is that link's ceiling; a fast-LAN comparison hasn't been run.
   - **Opening is a separate step from pumping, and `get` needs it that way.** Streaming means the destination is
     open while the bytes are still arriving, so a `get` that creates the destination first turns every failed
     download into a truncated local file -- including the case where the destination was a good earlier copy of
@@ -80,19 +87,41 @@ server's `MaxReadSize` (8 MB on a stock Samba) is a hard ceiling on what one REA
   - The library's `Tree::read_file` is `read_file_compound` with no size check, unlike `write_file`, which picks
     compound or pipelined by size. If `read_file` ever grows the same dispatch, this can go back to one round
     trip for small files and keep streaming for large ones.
+
+## Resuming after a dropped connection
+
+`get`, `cat`, and `put` reconnect and carry on. The library proves every resume safe; the CLI only decides when to
+try and how often (`transfer::Resumes`).
+
+- **Explicit reconnects, no `auto_reconnect`.** `Resumes::recover` calls `SmbClient::reconnect` then `connect_share`
+  (`revive`), and every other command still ends on a drop. A dead session's tree is gone, so `revive` replaces the
+  caller's `Tree`; `resume_file_writer` goes through `beside_tree`, which doesn't heal a stale tree the way
+  `resume_download`'s `replaying` does.
+- **Any `is_retryable()` error reconnects**, not only a lost connection: a timeout or a credit stall gets a fresh
+  session too, since the resume is proven safe whatever the old session's state. Anything else is final, including
+  `FileChanged` on a download.
+- **Bounds:** `MAX_RESUMES` (5) per transfer step, each reconnect bounded by the library's `ReconnectPolicy` (about a
+  minute). A `SharingViolation` right after a reconnect is the dead session still holding our file (a writer shares
+  nothing), so it waits `BUSY_WAIT` (2 s) up to `MAX_BUSY_WAITS` (15) times without reconnecting. Samba lets go at once
+  on a clean close, and for a named login also when the new session names the old one (`PreviousSessionId`); a guest
+  session that died quietly is the case the wait is for.
+- **Downloads resume from `FileDownload::checkpoint`**, which counts exactly the bytes handed out, so nothing reaches
+  the sink twice and `cat` can resume into a pipe. `pump` refuses to resume if the checkpoint and its own count
+  disagree, rather than corrupt the copy.
+- **Uploads checkpoint every `CHECKPOINT_EVERY` (64 MiB)** with `FileWriter::flush_checkpoint` (drain, FLUSH), and a
+  drop resumes from the last one with `resume_file_writer`, seeking the source to its offset. Before the first
+  checkpoint, it starts over. A `ResumeRefused` starts over too, since the partial file is ours alone. A small file's
+  one compound is simply sent again.
+- **The rename is retried after a reconnect**, and a retry that finds the partial gone with a file of the right size
+  at the destination counts as done: the first rename may have happened with its answer lost.
 - Close a `FileReader` explicitly to hear how the CLOSE went. Dropping one still closes its handle (the library
   queues the CLOSE as it drops), but the answer goes unseen.
-- **No resume after a dropped connection, on purpose for now.** `get` and `cat` pump a `FileReader` with positioned
-  reads landing out of order, so "how far did we get" is a set of ranges, not one offset; the library's
-  `DownloadCheckpoint` / `resume_download` fit a `FileDownload`, and a resume here would mean either switching
-  `Download` to `FileDownload` or tracking the contiguous prefix and using `reopen_file_reader`. The connection also
-  runs without `auto_reconnect`, so a dropped link ends the command and `get` removes its `.smb2-part` file.
 
 ## Testing
 
 `cargo test -p smb2-cli` covers parsing, formatting, the transfer destination rules, the `mkdir` collision rules, and which commands accept `-j`, all with no network. `tests/dry_run.rs` runs the built binary against `//127.0.0.1:1/…`, where connecting is refused instantly, which is what makes "`--dry-run` doesn't connect" testable.
 
-`tests/e2e.rs` is the other half: 41 tests that run the built binary against a live Samba fixture and check what
+`tests/e2e.rs` is the other half: 48 tests that run the built binary against a live Samba fixture and check what
 it left on the share, because a command that writes the wrong thing passes every test that never connects. Both
 data-safety bugs this CLI has shipped were caught by hand for exactly that reason. Run it with `just test-cli-e2e`,
 or by hand:
@@ -113,5 +142,9 @@ Two things to know before adding a test there:
 - **Each test owns `cli-e2e/<its own name>/`** and wipes it on entry, which is what lets the file run in parallel
   and makes a re-run independent of the last one. Setup and verification go through the library, so a CLI bug
   can't hide behind the CLI agreeing with itself.
+- **Dropped connections come from `CuttingProxy`**, a std-thread TCP proxy in front of `smb-auth` that cuts its
+  first N connections after a chosen byte count in one direction and lets later ones through (`Fixture::target_at`
+  aims the CLI at it). Decision/Why: deterministic, where `smb-flaky`'s 5 s up / 5 s down depends on how fast the
+  transfer runs. `carried()` reports each connection's bytes, which is how a test tells a resume from a restart.
 
 The bulk-operation benchmark that produced the `-j` numbers lives at `benchmarks/cli-bulk-ops/`.

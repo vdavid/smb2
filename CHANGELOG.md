@@ -9,7 +9,12 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **CLI: `get`, `cat`, and `put` carry on after a dropped connection.** They reconnect and pick up where they left off, so a Wi-Fi blip costs a pause rather than the whole transfer. A download resumes from the last byte it wrote and refuses a file that changed meanwhile; an upload resumes from its last checkpoint (every 64 MiB), or starts over before the first one. A transfer gives up after five drops.
 - **The reasons inside an error are importable from the crate root.** `FileChange`, `ResumeRefusal`, `DurableLoss`, and `SignatureFailure` (what `Error::FileChanged`, `ResumeRefused`, `DurableHandleLost`, and `SignatureInvalid` carry) are now `smb2::FileChange` and so on, next to `Error` and `ErrorKind`. `smb2::error::*` still works.
+
+### Fixed
+
+- **CLI: a failed `put` no longer destroys the file it was replacing.** `put` used to write straight over the destination, so an upload that failed partway left a truncated file where a good copy had been. It now uploads to `name.smb2-part` beside the destination and renames that over it in one step once every byte is on the share (a replacing rename, so the name is never missing), and a failure deletes the partial file. This needs permission to create a file in the destination's folder, not only to write the file itself.
 
 ## [0.43.0] - 2026-11-06
 
