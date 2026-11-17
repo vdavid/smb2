@@ -16,8 +16,8 @@ jobs:
   publish:
     # Homebrew and jq come preinstalled on GitHub's Ubuntu images. A GA image only: this job runs
     # once per release and no PR CI exercises it, so a preview image's breakage would surface
-    # mid-release. renovate.json holds it below 26.04 until that image leaves preview.
-    runs-on: ubuntu-24.04
+    # mid-release, so pin a GA image rather than tracking a preview.
+    runs-on: ubuntu-26.04
     env:
       PLAN: ${{ inputs.plan }}
     steps:

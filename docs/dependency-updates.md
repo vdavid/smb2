@@ -67,8 +67,9 @@ job checks the consumer's view independently.
   window (see above), and PR CI never builds the harness (`fuzz.yml` runs only on its Monday 04:15 UTC schedule).
   Cmdr's weekly `/weekly-upgrades` pass merges it once every version in it is at least three days old and the harness
   builds (`cargo +nightly fuzz build` in `crates/smb2/`). A package rule turns it off for every other `Cargo.toml`.
-- **Ubuntu runner**: held on GA images (`allowedVersions` below 26 while 26.04 is a preview), since the Homebrew publish
-  job only runs at release time. The rule's `description` says when to lift it.
+- **Ubuntu runner**: the Homebrew publish job pins a GA image (`ubuntu-26.04`, GA per actions/runner-images#14748,
+  checked 2026-11-17), since it only runs at release time. Renovate manages it; a future preview image arriving as a
+  major update needs the same check before merging.
 - **Not managed**: the Rust toolchain in workflows (moves with the MSRV), `dist`'s generated release workflow, and
   `benchmarks/smb/**`. Their rules say why.
 
