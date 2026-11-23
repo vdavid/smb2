@@ -117,7 +117,7 @@ async fn main() {
             &args.root
         }
     ));
-    emit(format!("Started {}", chrono::Local::now().to_rfc3339()));
+    emit(format!("Started {}", jiff::Zoned::now()));
 
     let mut primary = match probe::connect_session(&target).await {
         Ok(s) => s,
@@ -382,14 +382,14 @@ async fn main() {
         }
     }
 
-    emit(format!("\nFinished {}", chrono::Local::now().to_rfc3339()));
+    emit(format!("\nFinished {}", jiff::Zoned::now()));
 
     // Save the report.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("results");
     if std::fs::create_dir_all(&dir).is_ok() {
         let path = dir.join(format!(
             "listing-{}.txt",
-            chrono::Local::now().format("%Y-%m-%d-%H%M%S")
+            jiff::Zoned::now().strftime("%Y-%m-%d-%H%M%S")
         ));
         if std::fs::write(&path, &out).is_ok() {
             println!("\nSaved report to {}", path.display());
