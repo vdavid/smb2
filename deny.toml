@@ -8,6 +8,8 @@ targets = []
 all-features = true
 
 [advisories]
+# An ignore that no longer matches anything fails the check, so it can't outlive its reason.
+unused-ignored-advisory = "deny"
 ignore = []
 
 [licenses]
