@@ -4,13 +4,14 @@ version = "0.7.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# No `homepage`: it would only repeat `repository` (`cargo::redundant_homepage`). dist warns that it's missing and
+# uses `repository` for the Homebrew formula instead, which is the same URL.
 repository.workspace = true
 description = "Command-line SMB2/3 client: list, stat, move, and delete files on a share without mounting it"
 keywords = ["smb", "smb2", "smb3", "cifs", "cli"]
 categories = ["command-line-utilities", "network-programming", "filesystem"]
 readme = "README.md"
 documentation = "https://docs.rs/smb2-cli"
-homepage = "https://github.com/vdavid/smb2"
 
 exclude = [
     # Agent tooling, not source a consumer installing the binary wants. Restored
@@ -49,6 +50,5 @@ anyhow = "1.0.104"
 clap = { version = "4.6.5", features = ["derive", "env"] }
 env_logger = "0.11.11"
 rpassword = "7.5.4"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-std", "io-util", "sync", "time"] }

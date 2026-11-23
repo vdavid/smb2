@@ -1250,7 +1250,6 @@ dependencies = [
  "clap",
  "env_logger",
  "rpassword",
- "serde",
  "serde_json",
  "smb2",
  "tokio",
