@@ -69,7 +69,7 @@ sha1 = "0.11"
 getrandom = "0.4"
 
 # Compression
-lz4_flex = "0.14"
+lz4rip = { version = "0.12.5", default-features = false, features = ["std"] }
 
 # Optional: `Serialize` derives on diagnostics types. Off by default.
 serde = { version = "1", optional = true, features = ["derive"] }

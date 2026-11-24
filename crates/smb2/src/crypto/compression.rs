@@ -42,7 +42,7 @@ pub fn compress_message(message: &[u8], offset: usize) -> Option<CompressedMessa
     let prefix = &message[..offset];
     let to_compress = &message[offset..];
 
-    let compressed = lz4_flex::block::compress(to_compress);
+    let compressed = lz4rip::block::compress(to_compress);
 
     // Only use compression if it actually reduces size.
     if compressed.len() >= to_compress.len() {
@@ -77,12 +77,11 @@ pub fn decompress_message(
         )));
     }
 
-    let decompressed = lz4_flex::block::decompress(compressed_data, original_size as usize)
-        .map_err(|e| crate::Error::invalid_data(format!("LZ4 decompression failed: {e}")))?;
-
-    let mut result = Vec::with_capacity(uncompressed_prefix.len() + decompressed.len());
+    // Decoded right after the prefix, with no second buffer to copy from.
+    let mut result = Vec::with_capacity(uncompressed_prefix.len() + original_size as usize);
     result.extend_from_slice(uncompressed_prefix);
-    result.extend_from_slice(&decompressed);
+    lz4rip::block::decompress_append(compressed_data, &mut result, original_size as usize)
+        .map_err(|e| crate::Error::invalid_data(format!("LZ4 decompression failed: {e}")))?;
     Ok(result)
 }
 

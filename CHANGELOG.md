@@ -16,6 +16,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **CLI: a failed `put` no longer destroys the file it was replacing.** `put` used to write straight over the destination, so an upload that failed partway left a truncated file where a good copy had been. It now uploads to `name.smb2-part` beside the destination and renames that over it in one step once every byte is on the share (a replacing rename, so the name is never missing), and a failure deletes the partial file. This needs permission to create a file in the destination's folder, not only to write the file itself.
 
+### Dependencies
+
+- **`lz4_flex` → `lz4rip` 0.12.5 for LZ4 compression.** A compressed response decodes in 7-73% less time, straight after its uncompressed prefix, and a message compresses in up to 87% less time. Compressed text and binaries come out up to 13% larger.
+
 ## [0.43.0] - 2026-11-06
 
 ### Added
