@@ -14,6 +14,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`fs_info` works on DFS shares.** It opened the share root with an empty name, but a DFS share (one tree-connected with `SHARE_CAP_DFS`, such as a QNAP "portal folder") expects `server\share` there, so the server refused every space query with `STATUS_INVALID_PARAMETER` while listings and stats on the same share worked. `fs_info` now names the root through `Tree::format_path`, like every other op. This also fixes `smb2 df` on such shares.
 - **CLI: a failed `put` no longer destroys the file it was replacing.** `put` used to write straight over the destination, so an upload that failed partway left a truncated file where a good copy had been. It now uploads to `name.smb2-part` beside the destination and renames that over it in one step once every byte is on the share (a replacing rename, so the name is never missing), and a failure deletes the partial file. This needs permission to create a file in the destination's folder, not only to write the file itself.
 
 ## [0.43.0] - 2026-11-06

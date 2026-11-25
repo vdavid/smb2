@@ -1596,7 +1596,11 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: FILE_DIRECTORY_FILE,
-            name: String::new(), // root of share
+            // The share root. On a DFS share that's `host\share`, not empty:
+            // the request carries SMB2_FLAGS_DFS_OPERATIONS, so the server
+            // strips two components off the name, and a QNAP portal-folder
+            // share refused the empty one with STATUS_INVALID_PARAMETER.
+            name: self.format_path(""),
             create_contexts: vec![],
         };
 
@@ -4718,6 +4722,47 @@ mod tests {
         let mut cursor = ReadCursor::new(&sent);
         let _header = Header::unpack(&mut cursor).unwrap();
         CreateRequest::unpack(&mut cursor).unwrap()
+    }
+
+    /// `fs_info` opens the share root by the same wire path every other op
+    /// uses. On a DFS share (one whose TREE_CONNECT reply carries
+    /// `SHARE_CAP_DFS`), every request goes out with `SMB2_FLAGS_DFS_OPERATIONS`,
+    /// so the server expects `host\share\...` and strips two components off
+    /// it (MS-SMB2 § 3.3.5.9). An empty name there is two components short:
+    /// a QNAP "portal folder" share refused it with `STATUS_INVALID_PARAMETER`
+    /// on every space query while listings and stats, which do prefix, worked.
+    #[tokio::test]
+    async fn fs_info_names_the_share_root_with_the_dfs_prefix() {
+        let fs_full_size = || {
+            let mut out = Vec::new();
+            out.extend_from_slice(&1000i64.to_le_bytes()); // total units
+            out.extend_from_slice(&400i64.to_le_bytes()); // caller available
+            out.extend_from_slice(&500i64.to_le_bytes()); // actual available
+            out.extend_from_slice(&8u32.to_le_bytes()); // sectors per unit
+            out.extend_from_slice(&512u32.to_le_bytes()); // bytes per sector
+            build_compound_response_frame(&[
+                build_create_response(STAT_FILE, 0),
+                build_query_info_response(out),
+                build_close_response(),
+            ])
+        };
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(fs_full_size());
+        mock.queue_response(fs_full_size());
+        let mut conn = setup_connection(&mock);
+
+        let mut dfs = stat_tree();
+        dfs.server = "testnas.local:445".to_string();
+        dfs.share_name = "portal share".to_string();
+        dfs.is_dfs = true;
+        let info = dfs.fs_info(&mut conn).await.unwrap();
+        assert_eq!(sent_create(&mock, 0).name, r"testnas.local\portal share");
+        assert_eq!(info.total_bytes, 1000 * 4096);
+        assert_eq!(info.free_bytes, 400 * 4096);
+
+        // A plain share keeps naming its root with the empty path.
+        stat_tree().fs_info(&mut conn).await.unwrap();
+        assert_eq!(sent_create(&mock, 1).name, "");
     }
 
     /// Deleting or renaming a junction or symlink acts on the link, never on
