@@ -3722,6 +3722,34 @@ async fn dfs_tree_connect_reports_dfs_capability() {
         .expect("disconnect failed");
 }
 
+/// The space query on a DFS root share names the root as `host\share`. With
+/// the empty name it used to send, Samba answers `STATUS_INVALID_PARAMETER`,
+/// the same refusal a QNAP portal-folder share gave on every call.
+#[tokio::test]
+#[ignore]
+async fn dfs_root_share_reports_its_free_space() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+    assert!(tree.is_dfs);
+
+    let info = client
+        .fs_info(&mut tree)
+        .await
+        .expect("fs_info on a DFS root share failed");
+    assert!(info.total_bytes > 0, "{info:?}");
+    assert!(info.free_bytes <= info.total_bytes, "{info:?}");
+
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
 #[tokio::test]
 #[ignore]
 async fn dfs_read_file_through_link() {
