@@ -77,12 +77,23 @@ pub fn decompress_message(
         )));
     }
 
-    let decompressed = lz4_flex::block::decompress(compressed_data, original_size as usize)
+    // Decode straight into the space after the prefix: no second buffer to
+    // copy from. The slice starts at the prefix's end, so a back-reference
+    // in the stream can't reach the header bytes.
+    let prefix_len = uncompressed_prefix.len();
+    let mut result = vec![0u8; prefix_len + original_size as usize];
+    result[..prefix_len].copy_from_slice(uncompressed_prefix);
+    let decoded = lz4_flex::block::decompress_into(compressed_data, &mut result[prefix_len..])
         .map_err(|e| crate::Error::invalid_data(format!("LZ4 decompression failed: {e}")))?;
 
-    let mut result = Vec::with_capacity(uncompressed_prefix.len() + decompressed.len());
-    result.extend_from_slice(uncompressed_prefix);
-    result.extend_from_slice(&decompressed);
+    // MS-SMB2 § 2.2.42.1: OriginalCompressedSegmentSize is the size of the
+    // uncompressed segment, so a shorter stream is a malformed frame, never a
+    // short message.
+    if decoded != original_size as usize {
+        return Err(crate::Error::invalid_data(format!(
+            "LZ4 stream decoded to {decoded} bytes, header promised {original_size}"
+        )));
+    }
     Ok(result)
 }
 
@@ -221,6 +232,21 @@ mod tests {
         // because LZ4 validates the output size.
         let result = decompress_message(&[], &compressed.compressed_data, 512);
         assert!(result.is_err(), "wrong original_size should cause an error");
+    }
+
+    #[test]
+    fn decompress_refuses_a_stream_shorter_than_original_size() {
+        // A server claiming more bytes than its stream decodes to would
+        // otherwise get a silently truncated message parsed as whole.
+        let message: Vec<u8> = vec![0xAA; 1024];
+        let compressed = compress_message(&message, 0).expect("should compress");
+
+        let result = decompress_message(b"prefix", &compressed.compressed_data, 2048);
+        let err_msg = result.expect_err("a short stream must fail").to_string();
+        assert!(
+            err_msg.contains("1024") && err_msg.contains("2048"),
+            "error should name both sizes, got: {err_msg}"
+        );
     }
 
     #[test]

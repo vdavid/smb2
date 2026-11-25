@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A compressed response that decodes short is refused.** A server's compression header names the decoded size, and a stream that came up short used to come back as a truncated message, parsed as if it were whole. It now fails with `Error::InvalidData`. The decoder also writes straight after the uncompressed header now, so there's no second buffer to copy from.
+
 ## [0.43.1] - 2026-11-25
 
 ### Added
