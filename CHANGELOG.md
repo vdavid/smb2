@@ -5,7 +5,7 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.43.2] - 2026-11-28
 
 ### Fixed
 
@@ -13,7 +13,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Dependencies
 
-- **`lz4_flex` → `lz4rip` 0.12.10 for LZ4 compression, with its ratio profile.** A 512 KiB upload chunk comes out 1-12% smaller (Markdown 42.1% of its size instead of 46.4%), and a compressed response of 64 KiB or more decodes in 10-38% less time. Compressing a chunk of 64 KiB or more takes 0-29% longer (raw image data 3-4x), so uploads finish sooner on links up to about 1 Gbit and later above that. Compressible messages up to 4 KiB come out the same size and compress in 15-36% less time.
+- **`lz4_flex` → `lz4rip` 0.12.10 for LZ4 compression, with its ratio profile.** Uploads of compressible data to a server that negotiates compression finish ~6–10% sooner on links up to ~1 Gbit (Intel i7) or ~2.5 Gbit (Apple M3), and later on faster ones. A 512 KiB upload chunk comes out 1–12% smaller, for 0–29% more time compressing it (raw image data 3–4x). Messages up to 4 KiB come out the same size and compress faster. Photos, videos, and other incompressible data go out unchanged, as before. The `twox-hash` dependency is gone. Thanks to the `lz4rip` author for the change and the careful numbers in #54 and #56.
 
 ## [0.43.1] - 2026-11-25
 
