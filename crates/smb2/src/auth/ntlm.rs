@@ -38,6 +38,7 @@ const NTLMSSP_REQUEST_TARGET: u32 = 0x0000_0004;
 const NTLMSSP_NEGOTIATE_SIGN: u32 = 0x0000_0010;
 const NTLMSSP_NEGOTIATE_SEAL: u32 = 0x0000_0020;
 const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x0000_0200;
+const NTLMSSP_NEGOTIATE_ANONYMOUS: u32 = 0x0000_0800;
 const NTLMSSP_NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
 const NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
 const NTLMSSP_NEGOTIATE_TARGET_INFO: u32 = 0x0080_0000;
@@ -89,6 +90,8 @@ const MSV_AV_TARGET_NAME: u16 = 0x0009;
 // ---------------------------------------------------------------------------
 
 /// Credentials for NTLM authentication.
+///
+/// An empty username and password log in anonymously (a null session).
 pub struct NtlmCredentials {
     /// The username.
     pub username: String,
@@ -181,6 +184,10 @@ impl NtlmAuthenticator {
             challenge.target_info.len()
         );
 
+        if self.credentials.username.is_empty() && self.credentials.password.is_empty() {
+            return Ok(self.authenticate_anonymously(&challenge));
+        }
+
         // Compute NTLMv2 response
         let nt_hash = compute_nt_hash(&self.credentials.password);
         let ntlmv2_hash = compute_ntlmv2_hash(
@@ -225,19 +232,9 @@ impl NtlmAuthenticator {
             mac.finalize().into_bytes().to_vec()
         };
 
-        // Key exchange: if KEY_EXCH is negotiated, generate random session key
         let negotiate_flags = challenge.negotiate_flags;
-        let key_exch = (negotiate_flags & NTLMSSP_NEGOTIATE_KEY_EXCH) != 0
-            && ((negotiate_flags & NTLMSSP_NEGOTIATE_SIGN) != 0
-                || (negotiate_flags & NTLMSSP_NEGOTIATE_SEAL) != 0);
-
-        let (exported_session_key, encrypted_random_session_key) = if key_exch {
-            let random_key = self.get_random_session_key();
-            let encrypted = rc4_encrypt(&session_base_key, &random_key);
-            (random_key.to_vec(), encrypted)
-        } else {
-            (session_base_key.clone(), Vec::new())
-        };
+        let (exported_session_key, encrypted_random_session_key) =
+            self.exchange_key(negotiate_flags, &session_base_key);
 
         // LmChallengeResponse: if timestamp present, send Z(24); otherwise compute LMv2
         let lm_challenge_response = if has_timestamp {
@@ -294,6 +291,52 @@ impl NtlmAuthenticator {
             has_timestamp
         );
         Ok(final_msg)
+    }
+
+    /// The AUTHENTICATE_MESSAGE of an anonymous login (MS-NLMP § 3.1.5.1.2):
+    /// no user, no domain, an empty NtChallengeResponse, a
+    /// LmChallengeResponse of one zero byte, and `NTLMSSP_NEGOTIATE_ANONYMOUS`.
+    /// The session base key is all zeros, so there's no MIC: nothing secret
+    /// would key it. Servers that refuse a guest login to an unknown or empty
+    /// user (Samba's default `map to guest = never`) still grant this one on
+    /// shares open to guests, as they do for `smbclient -N`.
+    fn authenticate_anonymously(&mut self, challenge: &ChallengeMessage) -> Vec<u8> {
+        let negotiate_flags = challenge.negotiate_flags | NTLMSSP_NEGOTIATE_ANONYMOUS;
+        let session_base_key = [0u8; 16];
+        let (exported_session_key, encrypted_random_session_key) =
+            self.exchange_key(negotiate_flags, &session_base_key);
+        let msg = build_authenticate_message(
+            negotiate_flags,
+            "",
+            "",
+            &[0],
+            &[],
+            &encrypted_random_session_key,
+            false,
+        );
+        self.session_key = Some(exported_session_key);
+        trace!(
+            "ntlm: anonymous authenticate message built, len={}",
+            msg.len()
+        );
+        msg
+    }
+
+    /// The exported session key and the EncryptedRandomSessionKey field: a
+    /// random key encrypted with `session_base_key` when KEY_EXCH is
+    /// negotiated with signing or sealing, else the base key itself and an
+    /// empty field.
+    fn exchange_key(&self, negotiate_flags: u32, session_base_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let key_exch = (negotiate_flags & NTLMSSP_NEGOTIATE_KEY_EXCH) != 0
+            && ((negotiate_flags & NTLMSSP_NEGOTIATE_SIGN) != 0
+                || (negotiate_flags & NTLMSSP_NEGOTIATE_SEAL) != 0);
+        if key_exch {
+            let random_key = self.get_random_session_key();
+            let encrypted = rc4_encrypt(session_base_key, &random_key);
+            (random_key.to_vec(), encrypted)
+        } else {
+            (session_base_key.to_vec(), Vec::new())
+        }
     }
 
     /// Get the session key (available after authenticate()).
@@ -618,13 +661,18 @@ pub(crate) fn exported_session_key_as_server(
     };
     // NtChallengeResponseFields at 20, EncryptedRandomSessionKeyFields at 52
     // (MS-NLMP § 2.2.1.3).
-    let nt_proof_str = &field(20)[..16];
+    let nt_challenge_response = field(20);
     let encrypted_random_session_key = field(52);
 
-    let ntlmv2_hash = compute_ntlmv2_hash(&compute_nt_hash(password), username, domain);
-    let mut mac = HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
-    mac.update(nt_proof_str);
-    let session_base_key = mac.finalize().into_bytes().to_vec();
+    // An anonymous login has no NT response and an all-zero base key.
+    let session_base_key = if nt_challenge_response.is_empty() {
+        vec![0u8; 16]
+    } else {
+        let ntlmv2_hash = compute_ntlmv2_hash(&compute_nt_hash(password), username, domain);
+        let mut mac = HmacMd5::new_from_slice(&ntlmv2_hash).expect("HMAC accepts any key length");
+        mac.update(&nt_challenge_response[..16]);
+        mac.finalize().into_bytes().to_vec()
+    };
 
     if encrypted_random_session_key.is_empty() {
         session_base_key
@@ -1117,6 +1165,67 @@ mod tests {
 
         // Session key should be available
         assert!(auth.session_key().is_some());
+    }
+
+    /// The (len, offset) of the AUTHENTICATE_MESSAGE field at `at`.
+    fn field(msg: &[u8], at: usize) -> (usize, usize) {
+        let len = u16::from_le_bytes(msg[at..at + 2].try_into().unwrap()) as usize;
+        let offset = u32::from_le_bytes(msg[at + 4..at + 8].try_into().unwrap()) as usize;
+        (len, offset)
+    }
+
+    /// An empty username and password log in anonymously (MS-NLMP
+    /// § 3.1.5.1.2), as `smbclient -N` does, even when the challenge's
+    /// timestamp would otherwise call for a MIC.
+    #[test]
+    fn empty_credentials_build_an_anonymous_authenticate() {
+        let mut auth = NtlmAuthenticator::new(NtlmCredentials {
+            username: String::new(),
+            password: String::new(),
+            domain: String::new(),
+        });
+        auth.test_random_session_key = Some(TEST_RANDOM_SESSION_KEY);
+        let _negotiate = auth.negotiate();
+        let msg = auth
+            .authenticate(&build_test_challenge_message_with_timestamp())
+            .unwrap();
+
+        let flags = u32::from_le_bytes(msg[60..64].try_into().unwrap());
+        assert_ne!(flags & NTLMSSP_NEGOTIATE_ANONYMOUS, 0);
+
+        // No MIC: the payload starts right after the 72-byte header.
+        let (lm_len, lm_offset) = field(&msg, 12);
+        assert_eq!(lm_len, 1);
+        assert_eq!(msg[lm_offset], 0);
+        assert_eq!(field(&msg, 20).0, 0, "NtChallengeResponse");
+        assert_eq!(field(&msg, 28).0, 0, "DomainName");
+        assert_eq!(field(&msg, 36).0, 0, "UserName");
+        assert_eq!(lm_offset, 72);
+
+        // KEY_EXCH is on in the challenge: the random key travels encrypted
+        // with the all-zero session base key.
+        let (key_len, key_offset) = field(&msg, 52);
+        assert_eq!(
+            &msg[key_offset..key_offset + key_len],
+            rc4_encrypt(&[0u8; 16], &TEST_RANDOM_SESSION_KEY).as_slice()
+        );
+        assert_eq!(auth.session_key(), Some(&TEST_RANDOM_SESSION_KEY[..]));
+        assert_eq!(msg.len(), key_offset + key_len);
+    }
+
+    /// A password with no username is not an anonymous login.
+    #[test]
+    fn a_password_without_a_username_is_not_anonymous() {
+        let mut auth = NtlmAuthenticator::new(NtlmCredentials {
+            username: String::new(),
+            password: TEST_PASSWORD.to_string(),
+            domain: String::new(),
+        });
+        let _negotiate = auth.negotiate();
+        let msg = auth.authenticate(&build_test_challenge_message()).unwrap();
+        let flags = u32::from_le_bytes(msg[60..64].try_into().unwrap());
+        assert_eq!(flags & NTLMSSP_NEGOTIATE_ANONYMOUS, 0);
+        assert!(field(&msg, 20).0 > 0, "NtChallengeResponse");
     }
 
     #[test]
