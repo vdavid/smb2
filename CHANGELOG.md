@@ -11,6 +11,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **A compressed response that decodes short is refused.** A server's compression header names the decoded size, and a stream that came up short used to come back as a truncated message, parsed as if it were whole. It now fails with `Error::InvalidData`. The decoder also writes straight after the uncompressed header now, so there's no second buffer to copy from.
 
+### Dependencies
+
+- **`lz4_flex` → `lz4rip` 0.12.10 for LZ4 compression, with its ratio profile.** A 512 KiB upload chunk comes out 1-12% smaller (Markdown 42.1% of its size instead of 46.4%), and a compressed response of 64 KiB or more decodes in 10-38% less time. Compressing a chunk of 64 KiB or more takes 0-29% longer (raw image data 3-4x), so uploads finish sooner on links up to about 1 Gbit and later above that. Compressible messages up to 4 KiB come out the same size and compress in 15-36% less time.
+
 ## [0.43.1] - 2026-11-25
 
 ### Added
