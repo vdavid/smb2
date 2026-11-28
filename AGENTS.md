@@ -261,7 +261,7 @@ discards the late-arriving response silently. See `docs/connection-actor.md` for
 | Workspace            | Library + CLI crates                       | A library change and the CLI change it needs land in one commit      |
 | I/O performance      | Pipelined reads/writes as core feature     | Not an optimization, the reason the lib exists                       |
 | Batch operations     | Loops over the single-item calls, except the xattr calls on `client/batch.rs` | Convenience, not throughput; see `client/CLAUDE.md` § Batch operations and § The pipelined engine |
-| Compression          | Unchained LZ4 only (`lz4_flex`, pure Rust) | LZNT1 is legacy, and chained compression is rarely used              |
+| Compression          | Unchained LZ4 only (`lz4rip`, pure Rust)   | LZNT1 is legacy, and chained compression is rarely used              |
 | Scope                | Client only, SMB 2.0.2 and up, TCP only    | No server, no SMB1, no QUIC or RDMA; see `crates/smb2/README.md` § Limitations |
 | Testing              | TDD with mock transport                    | Spec-driven tests first                                              |
 | Primary reference    | MS-SMB2 spec (~80%)                        | smb-rs as sanity check (~15%), mtp-rs as architecture template (~5%) |

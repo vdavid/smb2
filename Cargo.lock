@@ -805,12 +805,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
-name = "lz4_flex"
-version = "0.14.2"
+name = "lz4rip"
+version = "0.12.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
+checksum = "1fdd7aa6ae3bac7052e56f64191ba169c774ef580da8e43d7c0e9b8a9b21380b"
 dependencies = [
- "twox-hash",
+ "lz4rip-core",
+ "lz4rip-decode",
+ "lz4rip-encode",
+]
+
+[[package]]
+name = "lz4rip-core"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bdf793dbc6411593ff9ee1213413edcbf6c7e838eb56b3410645c248ed7f15b"
+
+[[package]]
+name = "lz4rip-decode"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8842ba75da66887d9de80c336e283ecf40104f2432f34249c023950d21c9634"
+dependencies = [
+ "lz4rip-core",
+]
+
+[[package]]
+name = "lz4rip-encode"
+version = "0.10.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae8644d7943183d8149ce11534b9d84f5ef41944b60e5ee5d688e1f9dc61f935"
+dependencies = [
+ "lz4rip-core",
 ]
 
 [[package]]
@@ -1227,7 +1253,7 @@ dependencies = [
  "getrandom",
  "hmac",
  "log",
- "lz4_flex",
+ "lz4rip",
  "md-5",
  "md4",
  "num_enum",
@@ -1398,12 +1424,6 @@ checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "typenum"

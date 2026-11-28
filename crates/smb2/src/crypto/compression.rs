@@ -42,7 +42,7 @@ pub fn compress_message(message: &[u8], offset: usize) -> Option<CompressedMessa
     let prefix = &message[..offset];
     let to_compress = &message[offset..];
 
-    let compressed = lz4_flex::block::compress(to_compress);
+    let compressed = lz4rip::block::compress_ratio(to_compress);
 
     // Only use compression if it actually reduces size.
     if compressed.len() >= to_compress.len() {
@@ -83,7 +83,7 @@ pub fn decompress_message(
     let prefix_len = uncompressed_prefix.len();
     let mut result = vec![0u8; prefix_len + original_size as usize];
     result[..prefix_len].copy_from_slice(uncompressed_prefix);
-    let decoded = lz4_flex::block::decompress_into(compressed_data, &mut result[prefix_len..])
+    let decoded = lz4rip::block::decompress_into(compressed_data, &mut result[prefix_len..])
         .map_err(|e| crate::Error::invalid_data(format!("LZ4 decompression failed: {e}")))?;
 
     // MS-SMB2 § 2.2.42.1: OriginalCompressedSegmentSize is the size of the
