@@ -9,6 +9,8 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A login with no username and no password is anonymous, as `smbclient -N`.** It used to send an NTLMv2 response computed for an empty user, which Samba's default `map to guest = never` refuses with `STATUS_LOGON_FAILURE`, so a share with `guest ok = yes` was unreachable unless the server also mapped bad users to guest. It now sends the anonymous AUTHENTICATE of MS-NLMP § 3.1.5.1.2 (no user, empty NT response, `NTLMSSP_NEGOTIATE_ANONYMOUS`, no MIC), which those servers grant. A login named `Guest` still sends NTLMv2, for servers that take the named `Guest` login but refuse an anonymous one.
+
 - **A compressed response that decodes short is refused.** A server's compression header names the decoded size, and a stream that came up short used to come back as a truncated message, parsed as if it were whole. It now fails with `Error::InvalidData`. The decoder also writes straight after the uncompressed header now, so there's no second buffer to copy from.
 
 ## [0.43.1] - 2026-11-25

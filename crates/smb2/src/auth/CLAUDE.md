@@ -92,6 +92,16 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 - **Subkey in AP-REQ Authenticator**: The Kerberos authenticator includes a random subkey, which becomes the SMB session key. This provides forward secrecy.
 - **No full `authenticate()` unit tests**: The full flow requires a real KDC. Unit tests cover individual steps (encrypt/decrypt roundtrip, message encoding, etype parsing). Integration tests with Docker are planned.
 
+## Anonymous login (NTLM)
+
+An empty username with an empty password sends the anonymous AUTHENTICATE_MESSAGE of MS-NLMP § 3.1.5.1.2
+(`authenticate_anonymously`): no user or domain, an empty NtChallengeResponse, a LmChallengeResponse of one zero byte,
+`NTLMSSP_NEGOTIATE_ANONYMOUS` added to the flags, and no MIC even when the challenge has a timestamp. The session base
+key is 16 zero bytes; with KEY_EXCH the random session key travels encrypted with it, as `smbclient -N` does. Why: an
+NTLMv2 response for the empty user is an unknown user to the server, which Samba's default `map to guest = never`
+refuses with `STATUS_LOGON_FAILURE`, while it grants the anonymous login on `guest ok` shares. ❌ Don't send it for
+`Guest`: some servers take the named `Guest` login but refuse an anonymous one.
+
 ## Gotchas
 
 - **Retain raw challenge bytes for MIC (NTLM)**: The MIC is computed over the exact wire bytes of all three messages.

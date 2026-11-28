@@ -58,7 +58,7 @@ pub struct AuthArgs {
     #[arg(long, env = "SMB2_PASS_COMMAND", global = true)]
     pub password_command: Option<String>,
 
-    /// Connect as guest (no username or password).
+    /// Connect as guest, with an anonymous login (no username or password).
     #[arg(long, global = true, conflicts_with_all = ["user", "password", "password_command"])]
     pub guest: bool,
 

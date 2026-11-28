@@ -640,7 +640,8 @@ Step 6 exists because the final response's flags decide whether signing and encr
 else checks that response (the receiver only verifies once signing is active). Kerberos goes through the same function.
 Rules, in order (AGENTS.md pitfall 30):
 
-- **Empty username:** a guest or anonymous login the caller asked for. Nothing to prove; the server's flags stand.
+- **Empty username:** a guest or anonymous login the caller asked for. Nothing to prove; the server's flags stand. With
+  an empty password too, NTLM sends the anonymous AUTHENTICATE (`auth/CLAUDE.md`, "Anonymous login").
 - **Username `Guest` (any ASCII case, exactly), `IS_GUEST` or `IS_NULL`:** accepted, since that's what the name asks for
   (`is_guest_on_purpose`). Consumers log in to guest shares this way, and some servers take the named `Guest` login but
   refuse an anonymous one. Answered with a full session, it's a named account from here on. ❌ Don't widen the match to
